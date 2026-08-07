@@ -349,6 +349,91 @@ def t_coverage_block_on_fail():
     assert areas == sorted(areas)
 
 
+def t_attestation_reproducible():
+    # Issue #5: same untouched run aggregated twice yields the same digest, bit for
+    # bit, and cosmetic re-serialization of an artifact is not tampering.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)
+    v1 = read(run / "verdict.json")
+    att1 = v1["attestation"]
+    assert att1["algorithm"] == "sha256-canonical-json-v1"
+    assert att1["inputs"] == len(att1["files"]) > 0
+    assert "verdict.json" not in att1["files"]
+    assert "run.json" in att1["files"] and "gates/unit.json" in att1["files"]
+    sh(["aggregate.py"], repo, expect=0)   # re-aggregate the untouched run
+    v2 = read(run / "verdict.json")
+    att2 = v2["attestation"]
+    assert att1["digest"] == att2["digest"], "digest not reproducible"
+    # The attestation is descriptive, never an input: everything else in the verdict
+    # is byte-stable across re-aggregation too (run-20260807-215719 panel,
+    # test_quality-2).
+    strip = lambda v: {k: x for k, x in v.items() if k not in ("computed_at",)}
+    assert strip(v1) == strip(v2), "verdict fields drifted across re-aggregation"
+    assert v1["verdict"] == "PASS" and "coverage" in v1 and v1["counts"]["gates"] == 5
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=0)
+    assert "attestation OK" in r.stdout
+    # Reformat one artifact without changing content: canonical JSON must not drift.
+    g = run / "gates" / "unit.json"
+    g.write_text(json.dumps(read(g), indent=4, sort_keys=True))
+    sh(["aggregate.py", "--check-digest"], repo, expect=0)
+
+
+def t_attestation_tamper_detect():
+    # Issue #5: any semantic edit after the verdict is computed makes --check-digest
+    # fail and name the drifted artifact; added artifacts are named too.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)
+    rec = read(run / "gates" / "unit.json")
+    rec["exit_code"] = 1                                   # quiet post-verdict edit
+    write(run / "gates" / "unit.json", rec)
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=1)
+    assert "DRIFT modified" in r.stdout and "gates/unit.json" in r.stdout
+    assert "MISMATCH" in r.stdout
+    rec["exit_code"] = 0                                   # restore, then add a file
+    write(run / "gates" / "unit.json", rec)
+    sh(["aggregate.py", "--check-digest"], repo, expect=0)
+    write(run / "validation" / "sneaky.json", {"classification": "confirmed"})
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=1)
+    assert "DRIFT added" in r.stdout and "validation/sneaky.json" in r.stdout
+    # A run aggregated before #5 carries no attestation: --check-digest says so.
+    (run / "verdict.json").write_text(json.dumps(
+        {k: v for k, v in read(run / "verdict.json").items() if k != "attestation"}))
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=2)
+    assert "no attestation" in r.stdout
+
+
+def t_attestation_unparseable_fallback():
+    # A .json artifact that fails JSON parsing or UTF-8 decoding is hashed over raw
+    # bytes with a raw: prefix instead of crashing, and still participates in drift
+    # detection (run-20260807-215719 panel, correctness-3 + test_quality-1).
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    (run / "notes.json").write_text("{not valid json", encoding="utf-8")  # bad JSON
+    (run / "blob.json").write_bytes(b"\xff\xfe\x00garbage")               # bad UTF-8
+    sh(["aggregate.py"], repo, expect=0)
+    att = read(run / "verdict.json")["attestation"]
+    assert att["files"]["notes.json"].startswith("raw:"), att["files"]["notes.json"]
+    assert att["files"]["blob.json"].startswith("raw:"), att["files"]["blob.json"]
+    sh(["aggregate.py", "--check-digest"], repo, expect=0)
+    (run / "blob.json").write_bytes(b"\xff\xfe\x00tampered")
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=1)
+    assert "DRIFT modified" in r.stdout and "blob.json" in r.stdout
+
+
 def t_gate_blocked_status_yields_blocked_not_fail():
     repo = _complete_sensitive_repo()
     run = latest_run(repo)

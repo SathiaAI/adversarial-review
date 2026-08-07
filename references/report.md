@@ -14,6 +14,10 @@ not compute. Plain English throughout; the audience may not be the person who ra
 <One paragraph of prose context. If you disagree with the computed verdict, say so here
 and why — the verdict above still stands until artifacts change.>
 
+Attestation: `sha256 <attestation.digest>` over <attestation.inputs> recorded
+artifacts. Anyone holding the run directory can verify it is untouched with
+`aggregate.py --check-digest`.
+
 ## Change reviewed
 
 <What the change does, diff ref, size, acceptance criteria. Risk tier and why.>

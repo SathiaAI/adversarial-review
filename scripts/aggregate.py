@@ -16,6 +16,8 @@ Exit codes: 0 PASS, 1 FAIL, 2 BLOCKED.
           suppressions, missing rebuttal at CRITICAL, unauthorized degraded mode.
 """
 import argparse
+import hashlib
+import json
 import sys
 from datetime import date
 from pathlib import Path
@@ -140,6 +142,62 @@ def check_rebuttal(run, meta, plan, reports, blocked, notes):
     return rcov
 
 
+def compute_attestation(run):
+    """Reproducible SHA-256 over every recorded JSON artifact that can feed the
+    verdict — everything except verdict.json, which is the output (#5).
+
+    Each artifact is canonicalized (sorted keys, compact separators) so cosmetic
+    re-serialization does not read as tampering; a .json file that fails UTF-8
+    decoding or JSON parsing — both treated identically, by design — is hashed over
+    its raw bytes instead of crashing the enforcement point. The
+    per-file hashes are folded into one manifest digest, and returned alongside it
+    so --check-digest can name exactly which artifact drifted.
+    Same untouched run in, same digest out — bit for bit."""
+    files = {}
+    for p in sorted(run.rglob("*.json")):
+        rel = p.relative_to(run).as_posix()
+        if rel == "verdict.json":
+            continue
+        raw = p.read_bytes()
+        try:
+            canon = json.dumps(json.loads(raw.decode("utf-8")), sort_keys=True,
+                               separators=(",", ":"), ensure_ascii=False)
+            files[rel] = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+        except (ValueError, UnicodeDecodeError):
+            files[rel] = "raw:" + hashlib.sha256(raw).hexdigest()
+    manifest = "\n".join(f"{sha}  {rel}" for rel, sha in sorted(files.items()))
+    digest = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+    return {"algorithm": "sha256-canonical-json-v1", "inputs": len(files),
+            "digest": digest, "files": files}
+
+
+def check_digest(run):
+    """Recompute the attestation and compare to the one stored in verdict.json.
+    Exit 0 on match; on mismatch, name every drifted artifact and exit 1."""
+    vpath = run / "verdict.json"
+    if not vpath.exists():
+        print("no verdict.json in run — aggregate first")
+        sys.exit(2)
+    stored = read_json(vpath).get("attestation")
+    if not stored:
+        print("verdict.json carries no attestation (computed before #5) — re-aggregate")
+        sys.exit(2)
+    att = compute_attestation(run)
+    if att["digest"] == stored.get("digest"):
+        print(f"attestation OK: sha256 {att['digest']} over {att['inputs']} artifacts")
+        sys.exit(0)
+    old = stored.get("files", {})
+    for rel in sorted(set(old) | set(att["files"])):
+        a, b = old.get(rel), att["files"].get(rel)
+        if a != b:
+            tag = "added" if a is None else ("removed" if b is None else "modified")
+            print(f"  DRIFT {tag:9s}{rel}")
+    print(f"attestation MISMATCH: stored {stored.get('digest')}, "
+          f"recomputed {att['digest']} — this run's artifacts changed after the "
+          "verdict was computed")
+    sys.exit(1)
+
+
 def author_families(finding_ids, plan):
     fams = set()
     for fid in finding_ids:
@@ -245,8 +303,13 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run")
+    ap.add_argument("--check-digest", action="store_true",
+                    help="verify the stored attestation against the run directory "
+                         "and exit (0 intact, 1 drifted); does not rewrite anything")
     args = ap.parse_args()
     run = resolve_run(args.run)
+    if args.check_digest:
+        check_digest(run)
     meta = read_json(run / "run.json")
 
     fail, blocked, notes = [], [], []
@@ -279,9 +342,12 @@ def main():
                 "areas_not_reviewed": sorted(areas)}
 
     verdict = "FAIL" if fail else ("BLOCKED" if blocked else "PASS")
+    # Tamper-evident attestation over every recorded input, computed before the
+    # verdict file exists so re-aggregating an untouched run reproduces it (#5).
+    attestation = compute_attestation(run)
     out = {"verdict": verdict, "reasons": fail + blocked, "notes": notes,
-           "counts": counts, "coverage": coverage, "risk": meta["risk"],
-           "run_id": meta["run_id"], "computed_at": now_iso()}
+           "counts": counts, "coverage": coverage, "attestation": attestation,
+           "risk": meta["risk"], "run_id": meta["run_id"], "computed_at": now_iso()}
     write_json(run / "verdict.json", out)
 
     md = [f"# Release verdict: {verdict}", "",
@@ -299,6 +365,9 @@ def main():
            f"rebuttal policy '{rcov['policy']}' {reb}; "
            f"findings {fcov['triaged']}/{fcov['raised']} triaged; "
            f"{len(coverage['areas_not_reviewed'])} reviewer-attested unreviewed areas"]
+    md += ["", f"Attestation: sha256 {attestation['digest']} over "
+           f"{attestation['inputs']} recorded artifacts "
+           "(verify with `aggregate.py --check-digest`)"]
     (run / "verdict.md").write_text("\n".join(md) + "\n", encoding="utf-8")
 
     print(f"VERDICT: {verdict}  (risk={meta['risk']}, run={meta['run_id']})")

@@ -81,7 +81,7 @@ vote.
 
 ### What the aggregator refuses to accept
 
-These are tested behaviors, not aspirations (see `tests/run_tests.py`, 27 scenarios):
+These are tested behaviors, not aspirations (see `tests/run_tests.py`, 30 scenarios):
 
 | Attempt | Outcome |
 |---|---|
@@ -274,7 +274,7 @@ and the exact resolved IDs are pinned into the run's `plan.json` for the audit r
 python tests/run_tests.py
 ```
 
-27 end-to-end scenarios against an in-process mock router — no network, no API keys:
+30 end-to-end scenarios against an in-process mock router — no network, no API keys:
 role assignment and collision-resolution under multi-provider exclusions, degraded-mode
 authorization, malformed-JSON retry, dead-provider substitution, the full verdict matrix,
 rebuttal policies, suppression expiry, and the keyless MCP prepare/ingest path. CI runs
