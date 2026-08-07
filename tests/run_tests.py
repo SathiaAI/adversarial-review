@@ -265,6 +265,90 @@ def t_aggregate_suppression_rules():
     sh(["aggregate.py"], repo, expect=0)
 
 
+def t_coverage_block_on_pass():
+    # Issue #8: verdict.json carries a first-class coverage manifest, derived only
+    # from recorded artifacts, on every aggregation.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)
+    cov = read(run / "verdict.json")["coverage"]
+    assert cov["risk"] == "SENSITIVE"
+    assert cov["gates"]["plan_recorded"] is True
+    assert set(cov["gates"]["passed"]) == {"build", "unit", "secrets", "deps", "sast"}
+    assert cov["gates"]["missing"] == [] and cov["gates"]["failed"] == []
+    assert [w["name"] for w in cov["gates"]["waived"]] == ["mutation"]
+    assert len(cov["panel"]["roles_filled"]) == 5
+    assert sorted(cov["panel"]["roles_filled"]) == sorted(cov["panel"]["roles_required"])
+    assert cov["rebuttal"] == {"policy": "contention", "required": True, "ran": True}
+    assert cov["findings"]["raised"] >= 1 and cov["findings"]["triaged"] >= 1
+    assert cov["findings"]["untriaged_release_blocking"] == 0
+    assert isinstance(cov["areas_not_reviewed"], list)
+    assert "Coverage: gates 5/5 passed" in (run / "verdict.md").read_text()
+
+
+def t_coverage_block_on_blocked():
+    # Coverage must be present and honest on BLOCKED runs too: no gate plan means
+    # plan_recorded false and an empty required list — not a guessed one.
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+    sh(["panel.py", "assign"], repo)
+    sh(["panel.py", "run", "--context-file", "context.md"], repo)
+    sh(["aggregate.py"], repo, expect=2)
+    run = latest_run(repo)
+    cov = read(run / "verdict.json")["coverage"]
+    assert cov["gates"]["plan_recorded"] is False and cov["gates"]["required"] == []
+    assert len(cov["panel"]["roles_filled"]) == 3
+    assert cov["panel"]["dev_families_excluded"] == ["anthropic"]
+    assert cov["rebuttal"]["required"] is False and cov["rebuttal"]["ran"] is False
+    # A recorded degraded authorization reappears in roles_required: dropped roles
+    # stay visible as required-but-unfilled instead of vanishing (run-20260807-210733
+    # panel, test_quality-3).
+    plan_p = run / "panel" / "plan.json"
+    plan = read(plan_p)
+    plan["degraded"] = {"authorized_by": "Paul", "missing_roles": ["reliability"]}
+    write(plan_p, plan)
+    sh(["aggregate.py"], repo, expect=2)
+    pcov = read(run / "verdict.json")["coverage"]["panel"]
+    assert "reliability" in pcov["roles_required"], pcov
+    assert len(pcov["roles_required"]) == 4 and len(pcov["roles_filled"]) == 3
+
+
+def t_coverage_block_on_fail():
+    # Coverage must be present on FAIL as well (run-20260807-210733 panel,
+    # test_quality-1), areas_not_reviewed must be a deduplicated union
+    # (test_quality-2), and a hand-recorded report carrying a null attestation must
+    # not crash the aggregator — ingest-validated reports cannot carry one, but the
+    # enforcement point cannot assume every artifact passed ingest (correctness-5).
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    sh(["gate.py", "record", "--name", "unit", "--exit-code", "1",
+        "--summary", "2 tests failed"], repo)
+    sec = read(run / "panel" / "security.json")
+    corr = read(run / "panel" / "correctness.json")
+    tq = read(run / "panel" / "test_quality.json")
+    sec["areas_not_reviewed"] = ["auth", "rate limiting"]
+    corr["areas_not_reviewed"] = ["migrations", "auth"]   # "auth" overlaps
+    tq["areas_not_reviewed"] = None                       # hand-tampered artifact
+    write(run / "panel" / "security.json", sec)
+    write(run / "panel" / "correctness.json", corr)
+    write(run / "panel" / "test_quality.json", tq)
+    r = sh(["aggregate.py"], repo, expect=1)
+    assert "VERDICT: FAIL" in r.stdout   # a crash prints a traceback, not a verdict
+    v = read(run / "verdict.json")
+    cov = v["coverage"]
+    assert v["verdict"] == "FAIL"
+    assert cov["gates"]["failed"] == ["unit"]
+    assert set(cov["gates"]["passed"]) == {"build", "secrets", "deps", "sast"}
+    areas = cov["areas_not_reviewed"]
+    assert areas.count("auth") == 1, areas               # deduplicated union
+    assert {"auth", "migrations", "rate limiting"} <= set(areas)
+    assert areas == sorted(areas)
+
+
 def t_gate_blocked_status_yields_blocked_not_fail():
     repo = _complete_sensitive_repo()
     run = latest_run(repo)

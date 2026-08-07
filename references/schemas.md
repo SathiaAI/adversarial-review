@@ -95,8 +95,29 @@ human-readable `verdict.md` is written alongside `verdict.json`.
 ```json
 {"verdict": "PASS|FAIL|BLOCKED", "reasons": ["string"], "counts": {"gates": 0,
  "reviewers": 0, "findings_high_critical": 0, "confirmed": 0, "unresolved": 0},
+ "coverage": {"risk": "TIER",
+   "gates": {"plan_recorded": true, "required": [], "recorded": [], "passed": [],
+             "failed": [], "blocked": [{"name": "", "reason": ""}], "missing": [],
+             "waived": [{"name": "", "authorized_by": ""}]},
+   "panel": {"roles_required": [], "roles_filled": [], "substitutions": 0,
+             "degraded": null, "dev_families_excluded": []},
+   "rebuttal": {"policy": "contention", "required": false, "ran": false},
+   "findings": {"raised": 0, "triaged": 0, "untriaged_release_blocking": 0},
+   "areas_not_reviewed": ["union of reviewer attestations"]},
  "computed_at": "ISO-8601"}
 ```
+
+The `coverage` block is the machine-readable manifest of what the run did and did not
+verify. It is assembled exclusively from recorded artifacts — the same inputs as the
+verdict — so an unrecorded fact is absent from coverage too, never inferred. It is
+present on every aggregation, including FAIL and BLOCKED. `roles_required` is
+reconstructed from the panel plan plus any roles a recorded degraded authorization
+dropped; `areas_not_reviewed` is the deduplicated union of the reviewers' own
+attestations (a hand-recorded report carrying null or a non-list there is skipped —
+ingest-validated reports always carry a list, and the aggregator must not crash on
+artifacts that bypassed ingest). Consumers gating in CI should treat `gates.missing`, `gates.blocked`,
+and a `rebuttal` of `{"required": true, "ran": false}` as the specific unknowns behind
+a BLOCKED verdict.
 
 Definitions: **PASS** — all tier-required gates recorded and passing, panel complete and
 independent, every high/critical finding validated with a compliant record. **FAIL** — a
