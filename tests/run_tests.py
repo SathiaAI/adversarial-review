@@ -429,6 +429,75 @@ def t_prepare_ingest_mcp_path():
         assert (run / "panel" / f"{role}.json").exists()
 
 
+def t_prepared_requests_inline_schema():
+    # Issue #2: MCP transports (e.g. Composio) drop response_format, so the schema
+    # must live in the system message for all three request kinds: report (prepare;
+    # run_one_role flows through the same build_request), rebuttal, and concurrence.
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+    sh(["panel.py", "assign"], repo)
+    sh(["panel.py", "prepare", "--context-file", "context.md"], repo)
+    run = latest_run(repo)
+    plan = read(run / "panel" / "plan.json")
+    for role, info in plan["roles"].items():
+        body = read(run / "panel" / "requests" / f"{role}.json")
+        sysmsg = body["messages"][0]
+        assert sysmsg["role"] == "system", f"{role}: first message not system"
+        for marker in ("REQUIRED RESPONSE SCHEMA", '"top_residual_risks"',
+                       '"injection_suspected"', '"minItems":1'):
+            assert marker in sysmsg["content"], f"{role}: schema marker {marker!r} missing"
+        if info["structured_outputs"]:
+            assert body["response_format"]["json_schema"]["strict"] is True, \
+                f"{role}: response_format must stay alongside the inlined schema"
+    # rebuttal kind (panel finding test_quality-1): synthesize one high finding,
+    # then check the prepared rebuttal requests carry the REBUTTAL_SCHEMA.
+    roles = list(plan["roles"])
+    write(run / "panel" / f"{roles[0]}.json", {
+        "role": roles[0], "model_id": "m", "findings": [{
+            "id": f"{roles[0]}-1", "title": "t", "severity": "high", "file": "f",
+            "line": 1, "evidence": "e", "scenario": "s"}]})
+    sh(["panel.py", "rebuttal", "--prepare"], repo)
+    for role in roles[1:]:
+        reb = read(run / "rebuttal" / "requests" / f"{role}.json")
+        for marker in ("REQUIRED RESPONSE SCHEMA", '"position"', '"refute"'):
+            assert marker in reb["messages"][0]["content"], \
+                f"rebuttal {role}: schema marker {marker!r} missing"
+    # concurrence kind — multi-marker, same rigor as above (finding test_quality-3)
+    (repo / "dismissal.md").write_text("finding X evidence Y")
+    sh(["panel.py", "concur", "--prompt-file", "dismissal.md", "--prepare"], repo)
+    concur = read(run / "validation" / "concur-request.json")
+    for marker in ("REQUIRED RESPONSE SCHEMA", '"agrees_false_positive"', '"reasoning"'):
+        assert marker in concur["messages"][0]["content"], \
+            f"concurrence: schema marker {marker!r} missing"
+
+
+def t_build_request_unit_edges():
+    # Direct unit checks on build_request (panel findings correctness-1 and
+    # test_quality-2): None/missing system content must not crash or misplace the
+    # schema, and the caller's messages list must never be mutated in place.
+    sys.path.insert(0, str(SKILL / "scripts"))
+    import panel  # noqa: E402
+    # system message with no content key at all
+    body, _ = panel.build_request("prov/model", [{"role": "system"}],
+                                  panel.CONCUR_SCHEMA, "concurrence", True, "NORMAL")
+    assert body["messages"][0]["role"] == "system"
+    assert "REQUIRED RESPONSE SCHEMA" in body["messages"][0]["content"]
+    # immutability: original list and dicts untouched
+    original = [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]
+    snapshot = json.loads(json.dumps(original))
+    body, _ = panel.build_request("prov/model", original, panel.CONCUR_SCHEMA,
+                                  "concurrence", True, "NORMAL")
+    assert original == snapshot, "build_request mutated the caller's messages"
+    assert body["messages"][0]["content"].startswith("S")
+    assert body["messages"][1] == {"role": "user", "content": "U"}
+    # no leading system message: one is prepended, caller messages preserved in order
+    body, _ = panel.build_request("prov/model", [{"role": "user", "content": "U"}],
+                                  panel.CONCUR_SCHEMA, "concurrence", True, "NORMAL")
+    assert body["messages"][0]["role"] == "system"
+    assert "REQUIRED RESPONSE SCHEMA" in body["messages"][0]["content"]
+    assert body["messages"][1] == {"role": "user", "content": "U"}
+
+
 def t_keyless_run_blocks_with_guidance():
     repo = fresh_repo()
     sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
