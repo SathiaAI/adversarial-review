@@ -303,6 +303,21 @@ def reviewer_messages(role, meta, context_text, boundary):
 
 
 def build_request(model_slug, messages, schema, schema_name, supports_structured, risk):
+    # Inline the schema into the system message for every transport: some MCP routes
+    # (e.g. Composio's chat-completions tool) silently drop response_format, and a
+    # "provided schema" the model never sees produces malformed first attempts (#2).
+    schema_note = (
+        "\n\nREQUIRED RESPONSE SCHEMA (normative — some transports strip the "
+        "response_format parameter, so it is inlined here verbatim):\n"
+        + json.dumps(schema, separators=(",", ":")))
+    if messages and messages[0].get("role") == "system":
+        # `or ""` guards None/missing content (panel finding correctness-1):
+        # concatenating onto None would raise TypeError for a hypothetical caller.
+        messages = ([{"role": "system",
+                      "content": (messages[0].get("content") or "") + schema_note}]
+                    + list(messages[1:]))
+    else:
+        messages = [{"role": "system", "content": schema_note.lstrip()}] + list(messages)
     body = {
         "model": model_slug,
         "messages": messages,
