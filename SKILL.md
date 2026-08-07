@@ -173,7 +173,10 @@ Verify — not merely recommend — that the protected branch enforces PRs, requ
 up-to-date branches, no force pushes or deletions, and no admin bypass where supported:
 
 ```bash
+# classic branch protection:
 gh api repos/{owner}/{repo}/branches/{branch}/protection
+# ruleset-based protection (the classic endpoint 404s when only a ruleset applies):
+gh api repos/{owner}/{repo}/rules/branches/{branch}
 ```
 
 Record the result as a gate: exit 0 only if all required protections are verified
