@@ -147,8 +147,9 @@ def compute_attestation(run):
     verdict — everything except verdict.json, which is the output (#5).
 
     Each artifact is canonicalized (sorted keys, compact separators) so cosmetic
-    re-serialization does not read as tampering; a .json file that no longer parses
-    is hashed over its raw bytes instead of crashing the enforcement point. The
+    re-serialization does not read as tampering; a .json file that fails UTF-8
+    decoding or JSON parsing — both treated identically, by design — is hashed over
+    its raw bytes instead of crashing the enforcement point. The
     per-file hashes are folded into one manifest digest, and returned alongside it
     so --check-digest can name exactly which artifact drifted.
     Same untouched run in, same digest out — bit for bit."""

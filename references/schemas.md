@@ -112,8 +112,9 @@ human-readable `verdict.md` is written alongside `verdict.json`.
 The `attestation` block makes the audit record tamper-evident. Every `*.json` file in
 the run directory except `verdict.json` (the output) is canonicalized — sorted keys,
 compact separators, so cosmetic re-serialization is not tampering — and hashed; a
-`.json` file that no longer parses is hashed over its raw bytes (`raw:` prefix) rather
-than crashing the aggregator. The per-file hashes are folded into one manifest digest.
+`.json` file that fails UTF-8 decoding or JSON parsing is hashed over its raw bytes
+(`raw:` prefix) rather than crashing the aggregator — both failure modes are treated
+identically and deliberately. The per-file hashes are folded into one manifest digest.
 Re-aggregating an untouched run reproduces the digest bit-for-bit.
 `aggregate.py --check-digest` recomputes it against the stored value: exit 0 intact;
 exit 1 with each drifted artifact named `DRIFT modified|added|removed`; exit 2 when no
