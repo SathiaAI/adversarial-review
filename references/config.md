@@ -26,6 +26,25 @@ order by `panel.py`; the first one that resolves wins unless overridden with
    `https://openrouter.ai/api/v1/models`, save it to a file and pass
    `panel.py assign --catalog-file <path>`.
 
+   Some MCP tool schemas silently drop `response_format` (and `provider` preferences)
+   from the payload — observed with Composio's OpenRouter chat-completions tool — so
+   server-side strict JSON enforcement never reaches the model on this path. Two
+   mitigations are built in: every request `build_request` produces carries the full
+   JSON schema inlined in the system message (so the model sees it even when
+   `response_format` is stripped), and `panel.py ingest` validates locally against the
+   same schema, which remains the guarantee regardless of transport. If ingest reports
+   errors, send them back to the model for one corrective round, then re-ingest.
+
+   Prompt budget: the inlined schema adds roughly 600-900 tokens per request, and
+   `AR_MAX_TOKENS` caps the completion, not the prompt. Context assembly (Step 1)
+   owns the prompt budget — if context plus schema exceeds the model's window,
+   OpenRouter rejects the request with an explicit context-length error (a loud
+   transport failure that surfaces through retry/substitution, not a silent pass).
+   Keep `context.md` comfortably below the smallest panel model's window. Reasoning
+   models spend completion tokens on hidden reasoning before emitting JSON; if a
+   reviewer returns `finish_reason: length` with empty content, raise `AR_MAX_TOKENS`
+   and re-run that role rather than treating it as a malformed report.
+
 Never paste API keys into chat transcripts or commit them. Never put keys in the run
 artifacts — the scripts don't, and you shouldn't either.
 
