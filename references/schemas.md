@@ -104,8 +104,21 @@ human-readable `verdict.md` is written alongside `verdict.json`.
    "rebuttal": {"policy": "contention", "required": false, "ran": false},
    "findings": {"raised": 0, "triaged": 0, "untriaged_release_blocking": 0},
    "areas_not_reviewed": ["union of reviewer attestations"]},
+ "attestation": {"algorithm": "sha256-canonical-json-v1", "inputs": 0,
+   "digest": "hex", "files": {"run.json": "hex", "gates/unit.json": "hex"}},
  "computed_at": "ISO-8601"}
 ```
+
+The `attestation` block makes the audit record tamper-evident. Every `*.json` file in
+the run directory except `verdict.json` (the output) is canonicalized — sorted keys,
+compact separators, so cosmetic re-serialization is not tampering — and hashed; a
+`.json` file that no longer parses is hashed over its raw bytes (`raw:` prefix) rather
+than crashing the aggregator. The per-file hashes are folded into one manifest digest.
+Re-aggregating an untouched run reproduces the digest bit-for-bit.
+`aggregate.py --check-digest` recomputes it against the stored value: exit 0 intact;
+exit 1 with each drifted artifact named `DRIFT modified|added|removed`; exit 2 when no
+verdict or no attestation exists. Third parties can verify a shipped run directory the
+same way.
 
 The `coverage` block is the machine-readable manifest of what the run did and did not
 verify. It is assembled exclusively from recorded artifacts — the same inputs as the
