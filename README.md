@@ -6,6 +6,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)
 ![stdlib only](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen)
+[![GitHub stars](https://img.shields.io/github/stars/SathiaAI/adversarial-review?style=social)](https://github.com/SathiaAI/adversarial-review/stargazers)
+
+> **Dogfooded from day one:** every substantive change to this repo has to pass its own
+> multi-model panel before it merges — real models, real findings, real verdicts.
+> [See the receipts ↓](#proven-on-itself-the-first-real-runs)
 
 A portable agent skill that answers one question honestly: **is this change actually safe to ship?**
 It combines deterministic verification (build, tests, SAST, secrets, dependencies, mutation, DAST)
@@ -76,7 +81,7 @@ vote.
 
 ### What the aggregator refuses to accept
 
-These are tested behaviors, not aspirations (see `tests/run_tests.py`, 22 scenarios):
+These are tested behaviors, not aspirations (see `tests/run_tests.py`, 24 scenarios):
 
 | Attempt | Outcome |
 |---|---|
@@ -92,6 +97,58 @@ These are tested behaviors, not aspirations (see `tests/run_tests.py`, 22 scenar
 | Reviewer-flagged release-blocking finding left untriaged (any severity) | BLOCKED |
 | Accepted risk without a narrow, owned, unexpired suppression | FAIL |
 | Skipping the rebuttal round when policy requires it | BLOCKED |
+
+## Proven on itself: the first real runs
+
+This repository is gated by the skill it ships. The first two production runs are public,
+linkable, and unedited — the run history *is* the case study.
+
+**Run 1 — the panel found a real bug in its own plumbing.** Reviewing
+[PR #1](https://github.com/SathiaAI/adversarial-review/pull/1) (a docs patch) with a live
+3-family panel over the Composio MCP transport, both keyless-path reviewers failed strict
+JSON validation on their first attempt. Root cause: the MCP tool schema silently strips
+`response_format`, so the "provided schema" the prompt referenced never reached the
+models. That observation became
+[issue #2](https://github.com/SathiaAI/adversarial-review/issues/2) — filed with the
+failure evidence and a control group from the same run.
+
+**Run 2 — the skill reviewed its own fix, and pushed back.** The fix for issue #2 went
+through the full pipeline in
+[PR #3](https://github.com/SathiaAI/adversarial-review/pull/3): five deterministic gates,
+then an independent panel of `google/gemini-3.6-flash` (security),
+`mistralai/mistral-small-2603` (correctness), and `qwen/qwen3.6-flash` (test quality) —
+deliberately the same three models as Run 1, making it a controlled A/B on the fix
+itself.
+
+| What happened | Numbers |
+|---|---|
+| First-attempt schema-valid reviews, before → after the fix | **0/2 → 2/2** |
+| Findings raised by the panel against its author's own fix | **7** (3 high, 3 medium, 1 low) |
+| Findings that survived triage and forced code/doc/test changes | **6 confirmed** across 3 records — an input guard, a documented prompt-budget policy, and closed test-coverage gaps |
+| Findings dismissed | **1**, as an evidence-backed false positive (per-request random boundaries make the claimed collision impossible) |
+| The aggregator blocking its own author | **Once** — `BLOCKED: gate plan missing` when the operator skipped `gate.py plan`; the step was completed and re-aggregation earned the PASS |
+| Total panel cost | **$0.038** |
+| Final verdict, computed by `aggregate.py` | **PASS** (exit 0) — then, and only then, merged |
+
+Three details worth noticing: the panel's high findings were real enough to change the
+code; a wrong finding could not be waved away — dismissal required written evidence
+against the concrete claim; and the pipeline blocked *its own author* for a process skip
+with zero pushback, because the verdict is computed, not negotiated.
+
+## How it compares
+
+| | "Are you sure?" self-review | CI scanners alone | Single-model AI PR bots | **adversarial-review** |
+|---|---|---|---|---|
+| Reviewer independent of the code's author | ✗ same model | n/a | ✗/partial — one vendor, often the authoring family | ✓ computed from model IDs; authoring families excluded |
+| Multiple model perspectives | ✗ | ✗ | ✗ | ✓ 3–5 distinct provider families, per-role rubrics |
+| Deterministic floor AI cannot override | ✗ | ✓ | ✗ advisory comments | ✓ gates recorded as artifacts; FAIL is FAIL |
+| Final verdict | vibes | per-tool exit codes | prose | ✓ one machine-computed PASS / FAIL / BLOCKED |
+| "Couldn't verify" distinct from "passed" | ✗ | ✗ | ✗ | ✓ tri-state; unknown = BLOCKED = unshippable |
+| Audit trail | ✗ | partial | vendor-hosted | ✓ immutable JSON artifacts per run |
+| Runs in Claude Code / Codex / any SKILL.md agent | — | — | ✗ SaaS | ✓ one folder, stdlib-only Python |
+
+These categories complement each other — keep your scanners; this skill is the layer
+that makes their results *and* the AI review converge into one honest verdict.
 
 ## Quickstart
 
@@ -217,7 +274,7 @@ and the exact resolved IDs are pinned into the run's `plan.json` for the audit r
 python tests/run_tests.py
 ```
 
-22 end-to-end scenarios against an in-process mock router — no network, no API keys:
+24 end-to-end scenarios against an in-process mock router — no network, no API keys:
 role assignment and collision-resolution under multi-provider exclusions, degraded-mode
 authorization, malformed-JSON retry, dead-provider substitution, the full verdict matrix,
 rebuttal policies, suppression expiry, and the keyless MCP prepare/ingest path. CI runs
@@ -228,6 +285,8 @@ the suite on Python 3.9 and 3.12.
 ```
 SKILL.md              # canonical protocol (all platforms)
 AGENTS.md             # condensed instructions for AGENTS.md-reading agents
+CONTRIBUTING.md       # dev setup, ground rules, how PRs get (adversarially) reviewed
+SECURITY.md           # how to report vulnerabilities, incl. prompt-injection bypasses
 agents/openai.yaml    # Codex display metadata
 scripts/
   panel.py            # catalog resolution, role assignment, reviewer calls, rebuttal, concurrence
@@ -239,7 +298,7 @@ references/
   roles.md            # role rubrics, prompt contract, injection defense
   schemas.md          # artifact schemas and blocking rules
   report.md           # final report template
-tests/                # mock router + 22-scenario suite
+tests/                # mock router + 24-scenario suite
 ```
 
 ## Security notes
@@ -250,7 +309,23 @@ LLM Top 10, LLM01). Secrets, `.env` files, and production data must never enter 
 context or artifacts. The skill never merges, pushes, publishes, or deploys — verdicts
 gate those actions, humans authorize them.
 
+## Contributing
+
+Contributions welcome — [CONTRIBUTING.md](CONTRIBUTING.md) has the five-minute setup
+(no dependencies to install) and the ground rules. The short version: run the test
+suite, keep the scripts stdlib-only, and pair any verdict-semantics change with a
+regression test. Substantive PRs are reviewed the only way this repo knows how: by an
+independent multi-model panel, with the verdict computed. Security reports:
+[SECURITY.md](SECURITY.md) — prompt-injection bypasses of the review boundaries are
+explicitly in scope and especially welcome.
+
+## Star history
+
+If independent, computed verdicts are how you think AI code review should work, a ⭐
+helps other engineers find this.
+
+[![Star History Chart](https://api.star-history.com/svg?repos=SathiaAI/adversarial-review&type=Date)](https://star-history.com/#SathiaAI/adversarial-review&Date)
+
 ## License
 
-[MIT](LICENSE) © 2026 SathiaAI. Contributions welcome — run the test suite, keep the
-scripts stdlib-only, and pair any verdict-semantics change with a regression test.
+[MIT](LICENSE) © 2026 SathiaAI.
