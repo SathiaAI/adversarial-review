@@ -82,19 +82,37 @@ def cmd_run(args):
 
 def cmd_record(args):
     run = resolve_run(args.run)
-    # Tri-state status: PASS/FAIL derive from the exit code by default; BLOCKED is for
-    # required coverage that could not be verified or run at all (unsupported stack,
-    # missing access) — that is "unknown", which must never be recorded as pass/fail.
-    if args.status != "BLOCKED" and args.exit_code is None:
-        die("--exit-code is required unless --status BLOCKED (nothing ran to produce one)")
+    # Status states, none of which may be inferred silently:
+    #   PASS/FAIL    derive from the exit code by default.
+    #   BLOCKED      required coverage that could not be run or verified (unknown).
+    #   NOT_APPLICABLE  the gate genuinely does not apply to this stack (e.g. a
+    #                config-only repo has no build/unit gate). Unlike BLOCKED it does
+    #                not restrict the verdict — but it is an accountable, on-record
+    #                determination, so it REQUIRES a named authorizer and a reason and
+    #                is surfaced distinctly in the verdict. Nothing ran, so no exit code.
+    no_exit_ok = args.status in ("BLOCKED", "NOT_APPLICABLE")
+    if not no_exit_ok and args.exit_code is None:
+        die("--exit-code is required unless --status BLOCKED or NOT_APPLICABLE "
+            "(nothing ran to produce one)")
     status = args.status or ("PASS" if args.exit_code == 0 else "FAIL")
     if status == "BLOCKED" and not args.summary.strip():
         die("a BLOCKED gate needs --summary naming exactly what could not be verified")
-    write_json(run / "gates" / f"{args.name}.json", {
-        "gate": args.name, "command": args.command or "(external)",
-        "exit_code": args.exit_code, "status": status, "summary": args.summary,
-        "output_tail": "", "recorded_at": now_iso(), "source": "record"})
-    print(f"gate {args.name}: recorded {status} (exit {args.exit_code})")
+    if status == "NOT_APPLICABLE":
+        if not args.authorized_by.strip():
+            die("NOT_APPLICABLE requires --authorized-by '<user>' — marking a required "
+                "gate inapplicable is an accountable decision, never anonymous")
+        if not args.summary.strip():
+            die("NOT_APPLICABLE requires --summary explaining why the gate does not "
+                "apply to this stack")
+    rec = {"gate": args.name, "command": args.command or "(external)",
+           "exit_code": args.exit_code, "status": status, "summary": args.summary,
+           "output_tail": "", "recorded_at": now_iso(), "source": "record"}
+    if status == "NOT_APPLICABLE":
+        rec["authorized_by"] = args.authorized_by
+    write_json(run / "gates" / f"{args.name}.json", rec)
+    tail = f" (authorized by {args.authorized_by})" if status == "NOT_APPLICABLE" else \
+           f" (exit {args.exit_code})"
+    print(f"gate {args.name}: recorded {status}{tail}")
 
 
 def main():
@@ -121,9 +139,13 @@ def main():
     p = sub.add_parser("record")
     p.add_argument("--run"); p.add_argument("--name", required=True)
     p.add_argument("--exit-code", type=int, default=None)
-    p.add_argument("--status", choices=["PASS", "FAIL", "BLOCKED"],
-                   help="override derived status; BLOCKED = could not verify/run")
+    p.add_argument("--status", choices=["PASS", "FAIL", "BLOCKED", "NOT_APPLICABLE"],
+                   help="override derived status; BLOCKED = could not verify/run; "
+                        "NOT_APPLICABLE = gate does not apply to this stack "
+                        "(requires --authorized-by, does not restrict the verdict)")
     p.add_argument("--summary", required=True)
+    p.add_argument("--authorized-by", default="",
+                   help="named authorizer, required for --status NOT_APPLICABLE")
     p.add_argument("--command", default="")
     p.set_defaults(fn=cmd_record)
 
