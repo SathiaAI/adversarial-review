@@ -91,6 +91,19 @@ never silence. `MINIMUM_GATES` floors are unchanged (promoting `ai-defects` into
 floors would be a separate, breaking decision), and no aggregator change is involved —
 gates are already tool-agnostic commands with exit codes.
 
+## The enforcement gate: 404 is not "absent"
+
+Branch-protection verification (the `enforcement` gate, SENSITIVE+) has one recurring
+trap worth calling out because it produces a confident-but-wrong record: a **404 from
+the classic protection endpoint is ambiguous**. It means any of "no protection
+configured," "the caller lacks permission to read it," or "a ruleset applies instead of
+classic protection." Never record a 404 as protection confirmed-absent. Query
+`repos/{owner}/{repo}/rules/branches/{branch}` as well, and treat protection as
+verified-absent only from an authenticated response under a token you know carries
+sufficient scope (e.g. `admin:repo`). When the cause of a 404 cannot be disambiguated,
+the honest record is `--status BLOCKED` naming the ambiguity — unknown is not pass, and
+a permission gap must never read as a clean bill of health. See `SKILL.md`, Step 5.
+
 ## Blocking semantics
 
 Gate status is tri-state. Exit code 0 = PASS. Anything else on a tier-required gate =

@@ -185,13 +185,21 @@ gh api repos/{owner}/{repo}/branches/{branch}/protection
 gh api repos/{owner}/{repo}/rules/branches/{branch}
 ```
 
+A **404 is not proof of "no protection."** The classic-protection endpoint returns 404
+both when no protection is configured *and* when the caller lacks permission to read it
+(and also when a ruleset, not classic protection, applies — check `rules/branches`
+before concluding anything). Never record a 404 as "confirmed absent." Treat protection
+as verified-absent only from an authenticated response you know has sufficient scope
+(e.g. an empty `[]` from `rules/branches` plus a 404 from the classic endpoint under a
+token with `admin:repo`); otherwise the honest status is BLOCKED, naming the ambiguity.
+
 Record the result as a gate: exit 0 only if all required protections are verified
-present. If access is insufficient to verify, record it as blocked — unknown is not
-pass and not fail:
+present. If access is insufficient to verify — including a bare 404 whose cause you
+cannot disambiguate — record it as blocked; unknown is not pass and not fail:
 
 ```bash
 python <skill>/scripts/gate.py record --name enforcement --status BLOCKED \
-  --summary "cannot read branch protection: missing admin:repo scope"
+  --summary "branch-protection 404 is ambiguous: no ruleset returned and admin:repo scope unconfirmed"
 ```
 
 That yields a BLOCKED verdict, which is correct. The same `--status BLOCKED` applies to
