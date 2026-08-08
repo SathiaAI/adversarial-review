@@ -747,6 +747,7 @@ def t_policy_malformed_is_loud():
         ("pins:\n  a:\n    b: c\n", "nesting"),
         ("risk: NORMAL\nrisk: SENSITIVE\n", "duplicate"),
         ("dev_providers: [anthropic\n", "unterminated"),
+        ("risk: NORMAL\ndev_providers: []\n", "non-empty"),
         ("", "empty"),
     ]
     for text, needle in cases:
@@ -790,6 +791,36 @@ def t_policy_missing_is_identical():
     sh(["gate.py", "plan", "--require", "build,unit"], repo)
     req = read(latest_run(repo) / "gates" / "_required.json")
     assert req["requested_source"] == "cli", req
+
+
+def t_policy_required_gates_missing_tier():
+    # Policy present WITH required_gates, but not for this run's tier: that is
+    # "not provided", and with no other source plan must die naming the tier.
+    repo = fresh_repo()
+    (repo / ".adversarial-review.yml").write_text(
+        "dev_providers: [anthropic]\nrequired_gates:\n  NORMAL: [build]\n")
+    sh(["panel.py", "init", "--risk", "SENSITIVE"], repo)
+    r = sh(["gate.py", "plan"], repo, expect=1)
+    assert "unresolved for tier SENSITIVE" in r.stderr, r.stderr
+
+
+def t_policy_rebuttal_precedence():
+    repo = fresh_repo()
+    (repo / ".adversarial-review.yml").write_text(
+        "risk: NORMAL\ndev_providers: [anthropic]\nrebuttal_policy: critical\n")
+    sh(["panel.py", "init"], repo, env={**ENV, "AR_REBUTTAL": "any"})
+    meta = read(latest_run(repo) / "run.json")
+    assert meta["rebuttal_policy"] == "any", meta
+    assert meta["sources"]["rebuttal_policy"] == "env", meta["sources"]
+    sh(["panel.py", "init", "--rebuttal-policy", "contention"], repo,
+       env={**ENV, "AR_REBUTTAL": "any"})
+    meta = read(latest_run(repo) / "run.json")
+    assert meta["rebuttal_policy"] == "contention", meta
+    assert meta["sources"]["rebuttal_policy"] == "cli", meta["sources"]
+    sh(["panel.py", "init"], repo)
+    meta = read(latest_run(repo) / "run.json")
+    assert meta["rebuttal_policy"] == "critical", meta
+    assert meta["sources"]["rebuttal_policy"] == "policy", meta["sources"]
 
 
 def t_policy_pins_precedence():
