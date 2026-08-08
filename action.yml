@@ -73,8 +73,18 @@ runs:
         python "$AR_SCRIPTS/panel.py" init "${args[@]}"
         names=""
         while IFS= read -r line; do
+          line="${line%$'\r'}"                 # tolerate CRLF YAML
           [ -z "${line// }" ] && continue
-          names="${names:+$names,}${line%%=*}"
+          if [[ "$line" != *=* ]]; then
+            echo "::error::adversarial-review: gate line missing '=' (expected name=command): $line"
+            exit 1
+          fi
+          name="${line%%=*}"; name="${name//[[:space:]]/}"
+          if [ -z "$name" ]; then
+            echo "::error::adversarial-review: gate line has an empty name: $line"
+            exit 1
+          fi
+          names="${names:+$names,}$name"
         done <<< "$IN_GATES"
         if [ -n "$names" ]; then
           python "$AR_SCRIPTS/gate.py" plan --require "$names"
@@ -90,11 +100,25 @@ runs:
       run: |
         set -uo pipefail
         while IFS= read -r line; do
+          line="${line%$'\r'}"                 # tolerate CRLF YAML
           [ -z "${line// }" ] && continue
-          name="${line%%=*}"
+          # Same shape guard as the plan step: a malformed line is a loud error,
+          # never a silently mis-parsed gate.
+          if [[ "$line" != *=* ]]; then
+            echo "::error::adversarial-review: gate line missing '=' (expected name=command): $line"
+            exit 1
+          fi
+          name="${line%%=*}"; name="${name//[[:space:]]/}"
           cmd="${line#*=}"
+          if [ -z "$name" ]; then
+            echo "::error::adversarial-review: gate line has an empty name: $line"
+            exit 1
+          fi
           # A failing command is RECORDED (status FAIL), not fatal here — the
-          # aggregator owns the verdict; hiding a failure would defeat it.
+          # aggregator owns the verdict; hiding a failure would defeat it. The
+          # command is authored in the trusted workflow file (on fork PRs GitHub
+          # takes it from the base repo), and its own $VARS expand inside this
+          # inner bash -c exactly as the author intends.
           python "$AR_SCRIPTS/gate.py" run --name "$name" -- bash -c "$cmd" || true
         done <<< "$IN_GATES"
 
@@ -110,15 +134,18 @@ runs:
           echo "::notice::adversarial-review: no openrouter-api-key provided — skipping the reviewer panel. The verdict will be BLOCKED for missing panel coverage (honest for an un-reviewed change)."
           exit 0
         fi
+        # mktemp, not a fixed $RUNNER_TEMP/context.md name — standard temp-file
+        # hygiene (no predictable path, honors the runner's temp dir).
+        context_file="$(mktemp "${RUNNER_TEMP:-/tmp}/ar-context.XXXXXX")"
         {
           echo "# Change under review (CI)"
           echo
           echo '```diff'
           git diff "$IN_DIFF_REF" || echo "(diff unavailable — check fetch-depth)"
           echo '```'
-        } > "$RUNNER_TEMP/context.md"
+        } > "$context_file"
         python "$AR_SCRIPTS/panel.py" assign
-        python "$AR_SCRIPTS/panel.py" run --context-file "$RUNNER_TEMP/context.md"
+        python "$AR_SCRIPTS/panel.py" run --context-file "$context_file"
 
     - name: Compute verdict
       id: verdict

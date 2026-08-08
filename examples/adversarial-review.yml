@@ -29,9 +29,15 @@ jobs:
           python-version: '3.12'
       - uses: SathiaAI/adversarial-review@main
         with:
-          # risk / dev-providers may come from .adversarial-review.yml instead
+          # risk / dev-providers may come from .adversarial-review.yml instead.
+          # gates: newline-separated name=command; each runs through gate.py.
           gates: |
             build=python -m py_compile $(git ls-files '*.py')
             unit=python -m pytest -q
-          fail-on: fail   # tolerate BLOCKED while adopting; tighten to 'blocked'
+          # fail-on controls how a nonzero verdict maps to the job result:
+          #   fail    — fail the job only on FAIL; BLOCKED is a warning (exit 0).
+          #             Use while adopting, so a missing gate/panel doesn't block.
+          #   blocked — (default) fail the job on FAIL *or* BLOCKED. Tighten to
+          #             this once your gates and panel key are wired up.
+          fail-on: fail
           openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}

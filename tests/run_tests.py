@@ -861,6 +861,31 @@ def t_packaging_entrypoints_resolve():
         assert re.search(r"^def main\(\):", src, re.M), f"{mod}.py lacks main()"
 
 
+def t_action_definition_hygiene():
+    # Regression cover for the composite GitHub Action (issue #7b). Stdlib-only
+    # (no YAML dep), so these are structural string assertions — the fuller
+    # YAML-parse + bash -n smoke runs as the action-syntax gate at review time.
+    act = (SKILL / "action.yml").read_text()
+    assert "using: 'composite'" in act, "action must be composite"
+    for step in ("Initialize run and plan gates", "Run and record gates",
+                 "Independent reviewer panel", "Compute verdict"):
+        assert step in act, f"missing step: {step}"
+    # Injection hygiene, enforced: a ${{ ... }} template may appear only as an
+    # env/output mapping value (KEY: ${{ ... }}) — never interpolated into a
+    # run: script body, where an input could smuggle shell.
+    for line in act.splitlines():
+        if "${{" in line:
+            s = line.strip()
+            assert re.match(r"^[A-Za-z_-]+: \$\{\{", s) or s.startswith("value:"), \
+                f"template outside an env/value mapping (injection risk): {line!r}"
+    # The gate loops guard malformed lines rather than silently mis-parsing.
+    assert act.count("gate line missing '='") == 2, "both loops must guard '='"
+    assert "empty name" in act, "loops must reject empty gate names"
+    wf = (SKILL / "examples" / "adversarial-review.yml").read_text()
+    assert "SathiaAI/adversarial-review@" in wf, "example must use the action"
+    assert "fetch-depth: 0" in wf, "panel needs full history"
+
+
 def t_policy_pins_precedence():
     repo = fresh_repo()
     (repo / ".adversarial-review.yml").write_text(
