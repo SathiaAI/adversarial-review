@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -821,6 +822,32 @@ def t_policy_rebuttal_precedence():
     meta = read(latest_run(repo) / "run.json")
     assert meta["rebuttal_policy"] == "critical", meta
     assert meta["sources"]["rebuttal_policy"] == "policy", meta["sources"]
+
+
+def t_packaging_version_sync():
+    # pyproject.toml [project] version and scripts/__init__.py __version__ must
+    # agree — both are hand-written; this is the automation that enforces it.
+    py = (SKILL / "pyproject.toml").read_text()
+    m = re.search(r'^version = "([^"]+)"$', py, re.M)
+    assert m, "no version in pyproject.toml"
+    init = (SKILL / "scripts" / "__init__.py").read_text()
+    m2 = re.search(r'^__version__ = "([^"]+)"$', init, re.M)
+    assert m2, "no __version__ in scripts/__init__.py"
+    assert m.group(1) == m2.group(1), (m.group(1), m2.group(1))
+
+
+def t_packaging_entrypoints_resolve():
+    # Every [project.scripts] target must point at adversarial_review.<mod>:main
+    # where scripts/<mod>.py exists and defines a module-level main().
+    py = (SKILL / "pyproject.toml").read_text()
+    targets = re.findall(r'^(ar-[a-z]+) = "([^"]+)"$', py, re.M)
+    assert len(targets) == 3, targets
+    for name, target in targets:
+        modpath, _, func = target.partition(":")
+        pkg, _, mod = modpath.partition(".")
+        assert pkg == "adversarial_review" and func == "main", target
+        src = (SKILL / "scripts" / (mod + ".py")).read_text()
+        assert re.search(r"^def main\(\):", src, re.M), f"{mod}.py lacks main()"
 
 
 def t_policy_pins_precedence():
