@@ -206,6 +206,78 @@ def t_aggregate_pass_after_confirmed_fix():
     assert v["verdict"] == "PASS" and v["counts"]["confirmed"] == 1
 
 
+def t_gate_not_applicable_reaches_pass():
+    # A required gate marked NOT_APPLICABLE with an authorizer + reason does not
+    # restrict the verdict — a config-only repo can reach a clean PASS — and is
+    # surfaced distinctly in coverage and verdict.md (issue #18).
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced then fixed",
+        "reproduced": True, "regression_test": "tests/test_invoices.py::t_x",
+        "resolution": {"fixed": True, "gates_rerun": ["unit", "sast"]}})
+    sh(["gate.py", "record", "--name", "sast", "--status", "NOT_APPLICABLE",
+        "--authorized-by", "Paul", "--summary", "config-only repo: no source for SAST"],
+       repo)
+    r = sh(["aggregate.py"], repo, expect=0)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
+    v = read(run / "verdict.json")
+    na = v["coverage"]["gates"]["not_applicable"]
+    assert [x["name"] for x in na] == ["sast"], na
+    assert na[0]["authorized_by"] == "Paul" and na[0]["reason"], na
+    assert "sast" not in v["coverage"]["gates"]["passed"]
+    # the other required floor gates still had to pass for this to be a PASS — N/A on
+    # one gate does not stand in for the rest (fixture records build/unit/secrets/deps)
+    assert set(["build", "unit", "secrets", "deps"]) <= set(v["coverage"]["gates"]["passed"])
+    md = (run / "verdict.md").read_text()
+    assert "not applicable: gate 'sast' (authorized by Paul)" in md, md
+
+
+def t_gate_not_applicable_null_authorizer_blocks():
+    # A JSON null (or missing / non-string) authorizer must read as ABSENT — never
+    # stringified to "None" and honored. This is the accountability guard's teeth.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "fixed", "reproduced": True,
+        "regression_test": "t::x", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    write(run / "gates" / "sast.json", {
+        "gate": "sast", "command": "(external)", "exit_code": None,
+        "status": "NOT_APPLICABLE", "summary": "no source", "authorized_by": None,
+        "recorded_at": "x", "source": "record"})
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "NOT_APPLICABLE without a named authorizer" in r.stdout, r.stdout
+
+
+def t_gate_not_applicable_requires_authorizer_and_reason():
+    repo = _complete_sensitive_repo()
+    # gate.py itself refuses an N/A without an authorizer, and with an empty reason.
+    r = sh(["gate.py", "record", "--name", "sast", "--status", "NOT_APPLICABLE",
+            "--summary", "no source"], repo, expect=1)
+    assert "authorized-by" in r.stderr, r.stderr
+    r = sh(["gate.py", "record", "--name", "sast", "--status", "NOT_APPLICABLE",
+            "--authorized-by", "Paul", "--summary", "   "], repo, expect=1)
+    assert "summary" in r.stderr, r.stderr
+
+
+def t_gate_not_applicable_unaccountable_record_blocks():
+    # Defense in depth: a hand-written N/A record missing the authorizer is BLOCKED
+    # by the aggregator, never silently honored.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "fixed", "reproduced": True,
+        "regression_test": "t::x", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    write(run / "gates" / "sast.json", {
+        "gate": "sast", "command": "(external)", "exit_code": None,
+        "status": "NOT_APPLICABLE", "summary": "", "recorded_at": "x", "source": "record"})
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "NOT_APPLICABLE without a named authorizer" in r.stdout, r.stdout
+
+
 def t_aggregate_confirmed_unfixed_fails():
     repo = _complete_sensitive_repo()
     run = latest_run(repo)

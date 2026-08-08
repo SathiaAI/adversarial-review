@@ -41,7 +41,8 @@ def check_gates(run, tier, fail, blocked, notes):
     """Returns (results, gates_coverage). Coverage is derived from the same records
     the verdict uses — an unrecorded fact stays invisible in both."""
     gcov = {"plan_recorded": False, "required": [], "recorded": [], "passed": [],
-            "failed": [], "blocked": [], "missing": [], "waived": []}
+            "failed": [], "blocked": [], "not_applicable": [], "missing": [],
+            "waived": []}
     req_path = run / "gates" / "_required.json"
     if not req_path.exists():
         blocked.append("gate plan missing — run `gate.py plan` after detecting the stack")
@@ -72,6 +73,28 @@ def check_gates(run, tier, fail, blocked, notes):
             reason = rec.get("summary", "could not verify")
             gcov["blocked"].append({"name": name, "reason": reason})
             blocked.append(f"gate '{name}' blocked: {reason}")
+        elif status == "NOT_APPLICABLE":
+            # A gate that genuinely does not apply to this stack does NOT restrict the
+            # verdict — but it is an accountable, on-record determination, so an N/A
+            # without a named authorizer and a reason is itself a BLOCK (unaccountable
+            # skips are exactly what this pipeline exists to prevent).
+            # Guard against non-string values (JSON null, numbers, objects): a
+            # `null` authorizer must read as absent, not as the string "None". Only a
+            # non-empty *string* counts as accountable.
+            who = rec.get("authorized_by")
+            reason = rec.get("summary")
+            who = who.strip() if isinstance(who, str) else ""
+            reason = reason.strip() if isinstance(reason, str) else ""
+            if not who or not reason:
+                gcov["blocked"].append(
+                    {"name": name, "reason": "NOT_APPLICABLE without an authorizer and reason"})
+                blocked.append(f"gate '{name}' marked NOT_APPLICABLE without a named "
+                               "authorizer and reason — an inapplicable gate must still "
+                               "be accountable")
+            else:
+                gcov["not_applicable"].append(
+                    {"name": name, "authorized_by": who, "reason": reason})
+                notes.append(f"gate '{name}' not applicable (authorized by {who}): {reason}")
         elif rec.get("exit_code") is None:
             gcov["blocked"].append({"name": name, "reason": "recorded without an exit code"})
             blocked.append(f"gate '{name}' recorded without an exit code")
@@ -360,11 +383,15 @@ def main():
            ("required but missing" if rcov["required"] else "not required"))
     md += ["", f"Coverage: gates {len(gcov['passed'])}/{len(gcov['required'])} passed "
            f"({len(gcov['missing'])} missing, {len(gcov['blocked'])} blocked, "
-           f"{len(gcov['waived'])} waived); "
+           f"{len(gcov['not_applicable'])} n/a, {len(gcov['waived'])} waived); "
            f"panel {len(pcov['roles_filled'])}/{len(pcov['roles_required'])} roles; "
            f"rebuttal policy '{rcov['policy']}' {reb}; "
            f"findings {fcov['triaged']}/{fcov['raised']} triaged; "
            f"{len(coverage['areas_not_reviewed'])} reviewer-attested unreviewed areas"]
+    # Surface every not-applicable determination and its authorizer distinctly — a
+    # skipped gate must never be silent, even when it does not restrict the verdict.
+    md += [f"- not applicable: gate '{na['name']}' (authorized by "
+           f"{na['authorized_by']}): {na['reason']}" for na in gcov["not_applicable"]]
     md += ["", f"Attestation: sha256 {attestation['digest']} over "
            f"{attestation['inputs']} recorded artifacts "
            "(verify with `aggregate.py --check-digest`)"]

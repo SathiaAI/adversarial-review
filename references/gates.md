@@ -110,11 +110,27 @@ as a clean bill of health. See `SKILL.md`, Step 5.
 
 ## Blocking semantics
 
-Gate status is tri-state. Exit code 0 = PASS. Anything else on a tier-required gate =
+Gate status is four-state. Exit code 0 = PASS. Anything else on a tier-required gate =
 FAIL (aggregator enforces). A tier-required gate with no record at all = BLOCKED, and a
 gate recorded with `--status BLOCKED` (required coverage that could not be run or
 verified: unsupported stack, missing access, unreachable staging) = BLOCKED — unknown
-is never recorded as pass or fail. Specifically blocking, per tool:
+is never recorded as pass or fail.
+
+The fourth state is **`NOT_APPLICABLE`** — a required gate that genuinely does not exist
+for this stack (a config-only repo has no build to run, no unit suite to execute). It is
+distinct from BLOCKED on purpose: BLOCKED means "should exist but I couldn't verify it"
+and restricts the verdict; NOT_APPLICABLE means "there is nothing here to verify" and does
+**not** restrict it, so a genuinely config-only repo can reach a clean PASS. That is not a
+self-service skip: `gate.py record --name build --status NOT_APPLICABLE --authorized-by
+"<user>" --summary "<why this stack has no build gate>"` requires a named authorizer and a
+reason, the aggregator BLOCKS an N/A record missing either, and every N/A gate is listed
+with its authorizer in the verdict — accountable and never silent. (Contrast with
+`plan --waive`, which drops a gate from the required set entirely; NOT_APPLICABLE keeps it
+on the record as an explicit, attributed determination — prefer it when the gate is simply
+inapplicable to the stack.) Floors are unchanged: an N/A floor gate is still *required to
+be addressed*, just addressed as inapplicable-with-accountability rather than skipped.
+
+Specifically blocking, per tool:
 
 - Confirmed secret exposure (gitleaks) — also rotate the secret; a removed line does not
   un-leak a key that was committed.

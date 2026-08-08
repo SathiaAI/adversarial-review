@@ -34,7 +34,8 @@ This skill enforces three structural rules instead:
    advising the change is excluded from the panel. Provider independence is *computed from
    model IDs*, not self-declared.
 2. **A deterministic floor.** AI approval can never override a failing build, test, or
-   scanner. Every check is recorded as an artifact with an exit code and tri-state status.
+   scanner. Every check is recorded as an artifact with an exit code and an explicit
+   status (PASS / FAIL / BLOCKED / NOT_APPLICABLE).
 3. **A computed verdict.** `aggregate.py` alone emits PASS / FAIL / BLOCKED (exit 0 / 1 / 2)
    from the recorded artifacts. The orchestrating model relays it verbatim. "Never
    reinterpret FAIL as probably-fine" is enforced by architecture, not by asking nicely.
@@ -84,12 +85,13 @@ vote.
 
 ### What the aggregator refuses to accept
 
-These are tested behaviors, not aspirations (see `tests/run_tests.py`, 37 scenarios):
+These are tested behaviors, not aspirations (see `tests/run_tests.py`, 46 scenarios):
 
 | Attempt | Outcome |
 |---|---|
 | Skip a required gate, or record one without an exit code | BLOCKED |
 | Record a gate that couldn't run as "passed" | BLOCKED (`--status BLOCKED` is required honesty) |
+| Mark a gate `NOT_APPLICABLE` without a named authorizer and reason | BLOCKED (an inapplicable gate is still accountable) |
 | Failing gate anywhere in the required set | FAIL |
 | Panel smaller than the tier requires, or a dev-family model on it | BLOCKED |
 | Two roles served by the same provider family | BLOCKED |
@@ -261,6 +263,14 @@ analysis, path-scoped mutmut) so the gate survives real repositories. A minimum 
 floor per tier cannot be silently dropped — only waived on the record with a named
 authorizer, which the verdict surfaces.
 
+A gate that genuinely doesn't apply to a stack (a config-only repo has no build to run,
+no unit suite to execute) is recorded `--status NOT_APPLICABLE --authorized-by "<user>"
+--summary "<why>"`. Unlike BLOCKED it does not restrict the verdict — a genuinely
+config-only repo can reach a clean PASS — but it is accountable, not a self-service skip:
+the aggregator BLOCKS an N/A record missing an authorizer or reason, and every N/A gate is
+listed with its authorizer in the verdict. It tells a human skimming verdicts "nothing to
+run here" apart from BLOCKED's "something should exist but couldn't be verified."
+
 **Rebuttal policy** (`--rebuttal-policy` at init, or `AR_REBUTTAL`): `critical` |
 `contention` (default: SENSITIVE + CRITICAL) | `any`. In every mode the round only runs
 when there are high/critical findings to contest — cost scales with contention.
@@ -382,7 +392,7 @@ and the exact resolved IDs are pinned into the run's `plan.json` for the audit r
 python tests/run_tests.py
 ```
 
-37 end-to-end scenarios against an in-process mock router — no network, no API keys:
+46 end-to-end scenarios against an in-process mock router — no network, no API keys:
 role assignment and collision-resolution under multi-provider exclusions, degraded-mode
 authorization, malformed-JSON retry, dead-provider substitution, the full verdict matrix,
 rebuttal policies, suppression expiry, the keyless MCP prepare/ingest path, and
@@ -408,7 +418,7 @@ references/
   roles.md            # role rubrics, prompt contract, injection defense
   schemas.md          # artifact schemas and blocking rules
   report.md           # final report template
-tests/                # mock router + 37-scenario suite
+tests/                # mock router + 46-scenario suite
 ```
 
 ## Security notes

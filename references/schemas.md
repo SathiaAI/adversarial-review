@@ -49,13 +49,20 @@ this file.
 ## Gate record — `gates/<name>.json`
 
 ```json
-{"gate": "unit", "command": "npm test", "exit_code": 0, "status": "PASS|FAIL|BLOCKED",
+{"gate": "unit", "command": "npm test", "exit_code": 0,
+ "status": "PASS|FAIL|BLOCKED|NOT_APPLICABLE",
  "summary": "312 passed", "output_tail": "...", "recorded_at": "ISO-8601",
- "source": "run|record"}
+ "source": "run|record", "authorized_by": "name (NOT_APPLICABLE only)"}
 ```
 
 `status` BLOCKED marks required coverage that could not be run or verified (`exit_code`
-may be null there). Absent `status` falls back to the exit code.
+may be null there). `status` NOT_APPLICABLE marks a required gate that genuinely does not
+apply to this stack (e.g. a config-only repo with no build or unit gate); unlike BLOCKED
+it does **not** restrict the verdict, but it is an accountable determination — the
+aggregator requires a named `authorized_by` and a non-empty `summary`, and an N/A record
+missing either is itself BLOCKED. Every N/A gate is listed distinctly (with its
+authorizer) in `verdict.json` coverage (`gates.not_applicable`) and in `verdict.md`, so a
+skipped gate is never silent. Absent `status` falls back to the exit code.
 
 ## Validation record — `validation/<slug>.json` (one per deduped issue)
 
