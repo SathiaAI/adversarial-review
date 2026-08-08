@@ -181,6 +181,33 @@ working — it does not guess.
 
 The whole skill is one folder. `SKILL.md` is the entry point on every platform.
 
+**GitHub Action** — wire the verdict's exit code into CI. The action records
+your gate commands through `gate.py`, optionally runs the reviewer panel when
+an OpenRouter key secret is provided, and fails the job exactly as
+`aggregate.py` decides (PASS/FAIL/BLOCKED = exit 0/1/2), with the verdict
+written to the job summary:
+
+```yaml
+- uses: SathiaAI/adversarial-review@main
+  with:
+    gates: |
+      build=npm run build
+      unit=npm test
+    fail-on: fail   # tolerate BLOCKED while adopting; tighten to 'blocked'
+    openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+```
+
+Starter workflow: [`examples/adversarial-review.yml`](examples/adversarial-review.yml).
+Without a key the panel is skipped and the verdict is BLOCKED for missing
+panel coverage — the honest verdict for an un-reviewed change, downgradable
+to a warning via `fail-on: fail` while wiring up. High/critical findings
+still require triage by the operating agent/human; a clean automated PASS
+happens when gates pass and the panel raises nothing needing triage.
+
+**CLI (PyPI packaging prepped)** — `pyproject.toml` ships `ar-panel`,
+`ar-gate`, `ar-aggregate` console scripts (`python -m build`, then pip/pipx
+install the wheel; PyPI publication pending).
+
 **Claude Code / Claude (Cowork)**
 
 ```bash
