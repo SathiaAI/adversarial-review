@@ -1,4 +1,5 @@
 """Shared helpers for adversarial-review scripts. Stdlib only, by design."""
+import hashlib
 import json
 import os
 import sys
@@ -68,3 +69,223 @@ FAMILY_ALIASES = {
 def family_of(slug):
     prefix = slug.split("/", 1)[0].lower()
     return FAMILY_ALIASES.get(prefix, prefix)
+
+
+# ------------------------------------------------------------------- policy as code
+# Repo-versioned defaults (issue #6): `.adversarial-review.yml` (strict minimal YAML
+# subset) or `.adversarial-review.json` at the reviewed repo's root. Precedence
+# everywhere: CLI flag > env var > policy file > built-in default. A malformed policy
+# is a loud error — never a silent fallback — even when CLI flags would have sufficed.
+
+POLICY_BASENAMES = (".adversarial-review.yml", ".adversarial-review.json")
+POLICY_KEYS = ("risk", "dev_providers", "rebuttal_policy", "required_gates", "pins")
+VALID_RISKS = ("NORMAL", "SENSITIVE", "CRITICAL")
+VALID_REBUTTAL = ("critical", "contention", "any")
+
+
+def _strip_comment(line):
+    """Drop a trailing comment: '#' at start-of-line or preceded by whitespace,
+    outside single/double quotes."""
+    quote = None
+    for j, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (j == 0 or line[j - 1] in " \t"):
+            return line[:j]
+    return line
+
+
+def _parse_policy_yaml(text, name):
+    """Parse the documented strict YAML subset: 'key: value' scalars, inline
+    [a, b] lists, '{}' empty maps, 'key:' followed by '- item' block lists or ONE
+    nested mapping level, comments. No coercion — every scalar stays a string.
+    Anything outside the subset dies loudly; .adversarial-review.json is the
+    escape hatch for richer needs."""
+    def perr(ln, msg):
+        die(f"{name}:{ln}: {msg}\n  supported subset: 'key: value', 'key:' + "
+            "'- item' lists, one nested mapping level, inline [a, b] lists, '{}' "
+            "for an empty map, '#' comments. For anything richer use "
+            ".adversarial-review.json")
+
+    def scalar(tok, ln):
+        tok = tok.strip()
+        if not tok:
+            perr(ln, "missing value")
+        if tok[0] in "&*!|>" or tok.startswith("---"):
+            perr(ln, f"unsupported YAML construct {tok!r}")
+        if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "'\"":
+            tok = tok[1:-1].strip()
+            if not tok:
+                perr(ln, "empty quoted value")
+        if any(c in tok for c in "{}[],"):
+            perr(ln, f"unexpected flow character in scalar {tok!r}")
+        return tok
+
+    def value_of(tok, ln):
+        tok = tok.strip()
+        if tok == "{}":
+            return {}
+        if tok == "[]":
+            return []
+        if tok.startswith("["):
+            if not tok.endswith("]"):
+                perr(ln, f"unterminated flow list {tok!r}")
+            inner = tok[1:-1].strip()
+            return [scalar(p, ln) for p in inner.split(",")] if inner else []
+        if tok.startswith("{"):
+            perr(ln, "non-empty {…} flow mappings are not supported")
+        return scalar(tok, ln)
+
+    items = []
+    for ln, raw in enumerate(text.splitlines(), 1):
+        s = _strip_comment(raw).rstrip()
+        if not s.strip():
+            continue
+        stripped = s.lstrip(" ")
+        if stripped.startswith("\t"):
+            perr(ln, "tab characters are not allowed in indentation")
+        items.append((ln, len(s) - len(stripped), stripped))
+    if not items:
+        die(f"{name}: policy file exists but is empty — delete it or add settings")
+
+    idx = 0
+
+    def parse_list(parent_indent):
+        nonlocal idx
+        base = items[idx][1]
+        out = []
+        while idx < len(items) and items[idx][1] >= base and items[idx][2].startswith("-"):
+            ln, ind, s = items[idx]
+            if ind != base:
+                perr(ln, f"inconsistent indentation (expected column {base})")
+            if not s.startswith("- "):
+                perr(ln, f"list items must be '- value', got {s!r}")
+            out.append(scalar(s[2:], ln))
+            idx += 1
+        if idx < len(items) and items[idx][1] > parent_indent \
+                and not items[idx][2].startswith("-"):
+            perr(items[idx][0], "unexpected line after list items")
+        return out
+
+    def parse_map(depth):
+        nonlocal idx
+        base = items[idx][1]
+        if depth == 0 and base != 0:
+            perr(items[idx][0], "top-level keys must start at column 0")
+        out = {}
+        while idx < len(items) and items[idx][1] >= base:
+            ln, ind, s = items[idx]
+            if ind != base:
+                perr(ln, f"inconsistent indentation (expected column {base})")
+            if s.startswith("-"):
+                perr(ln, "list item found where a key was expected")
+            if ":" not in s:
+                perr(ln, f"expected 'key:' or 'key: value', got {s!r}")
+            key, _, rest = s.partition(":")
+            key = scalar(key, ln)
+            if key in out:
+                perr(ln, f"duplicate key {key!r}")
+            rest = rest.strip()
+            idx += 1
+            if rest:
+                out[key] = value_of(rest, ln)
+                continue
+            if idx >= len(items) or items[idx][1] <= base:
+                perr(ln, f"key {key!r} has no value (use '{{}}' or '[]' for empty)")
+            if items[idx][2].startswith("-"):
+                out[key] = parse_list(base)
+            elif depth >= 1:
+                perr(items[idx][0],
+                     "nesting beyond one mapping level is not supported")
+            else:
+                out[key] = parse_map(depth + 1)
+        return out
+
+    data = parse_map(0)
+    return data
+
+
+def _validate_policy(data, name):
+    if not isinstance(data, dict):
+        die(f"{name}: top level must be a mapping of settings")
+    unknown = sorted(set(data) - set(POLICY_KEYS))
+    if unknown:
+        die(f"{name}: unknown key(s): {', '.join(unknown)} "
+            f"(allowed: {', '.join(POLICY_KEYS)})")
+    if "risk" in data and data["risk"] not in VALID_RISKS:
+        die(f"{name}: invalid risk {data['risk']!r} ({'|'.join(VALID_RISKS)})")
+    if "rebuttal_policy" in data and data["rebuttal_policy"] not in VALID_REBUTTAL:
+        die(f"{name}: invalid rebuttal_policy {data['rebuttal_policy']!r} "
+            f"({'|'.join(VALID_REBUTTAL)})")
+    if "dev_providers" in data:
+        v = data["dev_providers"]
+        if not isinstance(v, list) or not v \
+                or not all(isinstance(x, str) and x.strip() for x in v):
+            die(f"{name}: dev_providers must be a non-empty list of provider families")
+    if "required_gates" in data:
+        v = data["required_gates"]
+        if not isinstance(v, dict):
+            die(f"{name}: required_gates must be a mapping of tier -> gate list")
+        bad = sorted(set(v) - set(VALID_RISKS))
+        if bad:
+            die(f"{name}: required_gates has unknown tier(s): {', '.join(bad)}")
+        for tier, gates in v.items():
+            if not isinstance(gates, list) \
+                    or not all(isinstance(g, str) and g.strip() for g in gates):
+                die(f"{name}: required_gates.{tier} must be a list of gate names")
+    if "pins" in data:
+        v = data["pins"]
+        if not isinstance(v, dict):
+            die(f"{name}: pins must be a mapping of role -> provider/model-slug")
+        for role, slug in v.items():
+            if not isinstance(slug, str) or "/" not in slug:
+                die(f"{name}: pins.{role} must be a provider/model-slug, "
+                    f"got {slug!r}")
+
+
+def load_policy(root=None):
+    """Load and validate the repo policy file. Returns None when absent, else
+    {'data': dict, 'path': Path, 'sha256': hex, 'text': str}. Malformed input
+    dies loudly (exit 1) — a policy is never silently ignored."""
+    root = Path(root) if root else Path.cwd()
+    found = [root / n for n in POLICY_BASENAMES if (root / n).is_file()]
+    if not found:
+        return None
+    if len(found) > 1:
+        die(f"both {' and '.join(POLICY_BASENAMES)} exist — keep exactly one")
+    path = found[0]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        die(f"{path.name}: not valid UTF-8: {e}")
+    if path.suffix == ".json":
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            die(f"{path.name}: invalid JSON: {e}")
+    else:
+        data = _parse_policy_yaml(text, path.name)
+    _validate_policy(data, path.name)
+    return {"data": data, "path": path,
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "text": text}
+
+
+def resolve_setting(cli_value, env_var, pol, key, default=None):
+    """One value through the precedence chain: CLI flag > env var > policy file >
+    built-in default. Returns (value, source); (None, 'unset') when nothing
+    provides one — callers decide whether that is fatal. An empty env var
+    counts as unset."""
+    if cli_value not in (None, ""):
+        return cli_value, "cli"
+    env_val = os.environ.get(env_var, "")
+    if env_val != "":
+        return env_val, "env"
+    if pol is not None and key in pol["data"]:
+        return pol["data"][key], "policy"
+    if default is not None:
+        return default, "default"
+    return None, "unset"

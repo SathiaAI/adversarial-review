@@ -58,6 +58,12 @@ python <skill>/scripts/panel.py init \
   --product "NAME"
 ```
 
+If the reviewed repo has a `.adversarial-review.yml` (or `.json`) policy file at its
+root, it supplies defaults for risk, dev providers, rebuttal policy, required gates,
+and pins — precedence is CLI flag > env var > policy file > built-in default, and
+each resolved value's source is recorded in the run's artifacts. A malformed policy
+is a loud error; see `references/config.md`.
+
 `--dev-providers` must list every provider family that planned, coded, debugged, or
 advised — always include your own. Add `.adversarial-review/` to `.gitignore`.
 Completed runs are immutable audit records: never edit or reuse a prior run's

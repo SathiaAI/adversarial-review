@@ -26,8 +26,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (RUN_ROOT, die, family_of, now_iso, read_json, resolve_run,
-                     write_json)
+from _common import (RUN_ROOT, VALID_REBUTTAL, VALID_RISKS, die, family_of,
+                     load_policy, now_iso, read_json, resolve_run,
+                     resolve_setting, write_json)
 
 DEFAULT_BASE = "https://openrouter.ai/api/v1"
 
@@ -204,10 +205,26 @@ def cmd_assign(args):
         by_family.setdefault(m["family"], []).append(m)
     eligible = {f: ms for f, ms in by_family.items() if f not in dev_families}
 
-    pins = {}
-    for spec in (args.pin or []) + [p for p in os.environ.get("AR_PINS", "").split(",") if p]:
+    # Pin precedence: CLI flag > AR_PINS env > policy file. Build lowest-first so
+    # higher-precedence sources overwrite; record where each pin came from.
+    pol = load_policy()
+    pins, pin_src = {}, {}
+    for role, slug in (pol["data"].get("pins", {}).items() if pol else ()):
+        pins[role.strip()] = slug.strip()
+        pin_src[role.strip()] = "policy"
+    for spec in [p for p in os.environ.get("AR_PINS", "").split(",") if p]:
         role, _, slug = spec.partition("=")
         pins[role.strip()] = slug.strip()
+        pin_src[role.strip()] = "env"
+    for spec in (args.pin or []):
+        role, _, slug = spec.partition("=")
+        pins[role.strip()] = slug.strip()
+        pin_src[role.strip()] = "cli"
+    known_roles = {r for rs in TIER_ROLES.values() for r in rs}
+    bad_roles = sorted(set(pins) - known_roles)
+    if bad_roles:  # a typo'd pin must never be silently ignored
+        die(f"pin(s) for unknown role(s): {', '.join(bad_roles)} "
+            f"(roles: {', '.join(sorted(known_roles))})", 2)
 
     plan, used = {}, set()
     for role in roles:
@@ -221,7 +238,7 @@ def cmd_assign(args):
                 die(f"pinned model {slug} is from development family '{fam}'", 2)
             if fam in used:
                 die(f"pinned model {slug} collides with an already-assigned family", 2)
-            plan[role] = {**cand, "pinned": True}
+            plan[role] = {**cand, "pinned": True, "pin_source": pin_src[role]}
             used.add(fam)
             continue
         for fam in ROLE_FAMILY_PRIORITY[role]:
@@ -253,7 +270,8 @@ def cmd_assign(args):
     out = {"risk": meta["risk"], "dev_families_excluded": sorted(dev_families),
            "roles": {r: {"model": plan[r]["slug"], "family": plan[r]["family"],
                          "structured_outputs": plan[r]["structured_outputs"],
-                         "pinned": plan[r]["pinned"]} for r in roles},
+                         "pinned": plan[r]["pinned"],
+                         "pin_source": plan[r].get("pin_source")} for r in roles},
            "substitutions": [], "degraded": degraded, "assigned_at": now_iso()}
     write_json(run / "panel" / "plan.json", out)
     for r in roles:
@@ -392,10 +410,28 @@ def validate_obj(obj, schema, path="$"):
 # ---------------------------------------------------------------- subcommands
 
 def cmd_init(args):
-    dev = sorted({family_of(p) if "/" in p else FAMILY_OR_SELF(p) for p in args.dev_providers.split(",") if p.strip()})
-    policy = args.rebuttal_policy or os.environ.get("AR_REBUTTAL", "contention")
-    if policy not in ("critical", "contention", "any"):
-        die(f"invalid rebuttal policy '{policy}' (critical|contention|any)")
+    pol = load_policy()  # malformed policy dies here — never silently ignored
+    risk, risk_src = resolve_setting(args.risk, "AR_RISK", pol, "risk")
+    if risk is None:
+        die("risk unresolved: pass --risk, set AR_RISK, or add 'risk:' to "
+            ".adversarial-review.yml")
+    if risk not in VALID_RISKS:
+        die(f"invalid risk '{risk}' from {risk_src} ({'|'.join(VALID_RISKS)})")
+    dev_raw, dev_src = resolve_setting(args.dev_providers, "AR_DEV_PROVIDERS",
+                                       pol, "dev_providers")
+    if dev_raw is None:
+        die("dev providers unresolved: pass --dev-providers, set AR_DEV_PROVIDERS, "
+            "or add 'dev_providers:' to .adversarial-review.yml")
+    dev_list = dev_raw if isinstance(dev_raw, list) else dev_raw.split(",")
+    dev = sorted({family_of(p) if "/" in p else FAMILY_OR_SELF(p)
+                  for p in dev_list if p.strip()})
+    if not dev:
+        die(f"dev providers from {dev_src} resolved to an empty list")
+    rebuttal, reb_src = resolve_setting(args.rebuttal_policy, "AR_REBUTTAL", pol,
+                                        "rebuttal_policy", default="contention")
+    if rebuttal not in VALID_REBUTTAL:
+        die(f"invalid rebuttal policy '{rebuttal}' from {reb_src} "
+            f"({'|'.join(VALID_REBUTTAL)})")
     base_id = "run-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     run_id, n = base_id, 1
     while (RUN_ROOT / run_id).exists():  # prior runs are immutable — never reuse a dir
@@ -404,12 +440,27 @@ def cmd_init(args):
     run = RUN_ROOT / run_id
     for sub in ("gates", "panel/raw", "panel/meta", "panel/requests", "rebuttal", "validation"):
         (run / sub).mkdir(parents=True, exist_ok=True)
+    policy_rec = None
+    if pol is not None:
+        policy_rec = {"file": pol["path"].name, "sha256": pol["sha256"]}
+        # Snapshot the exact policy text into the run as a JSON artifact so the
+        # attestation digest covers what the run actually resolved against.
+        write_json(run / "policy.snapshot.json", {
+            "file": pol["path"].name, "sha256": pol["sha256"],
+            "captured_at": now_iso(), "text": pol["text"]})
     write_json(run / "run.json", {
-        "run_id": run_id, "product": args.product or "", "risk": args.risk,
+        "run_id": run_id, "product": args.product or "", "risk": risk,
         "dev_providers": dev, "diff_ref": args.diff_ref or "",
-        "rebuttal_policy": policy, "created_at": now_iso()})
-    print(f"initialized {run}  (risk={args.risk}, rebuttal policy: {policy}, "
+        "rebuttal_policy": rebuttal,
+        "sources": {"risk": risk_src, "dev_providers": dev_src,
+                    "rebuttal_policy": reb_src},
+        "policy": policy_rec, "created_at": now_iso()})
+    print(f"initialized {run}  (risk={risk}, rebuttal policy: {rebuttal}, "
           f"dev families excluded: {', '.join(dev)})")
+    print(f"  sources: risk={risk_src}, dev_providers={dev_src}, "
+          f"rebuttal_policy={reb_src}"
+          + (f", policy file: {policy_rec['file']} "
+             f"sha256:{policy_rec['sha256'][:12]}…" if policy_rec else ""))
     print(f"reminder: add {RUN_ROOT}/ to .gitignore")
 
 
@@ -684,9 +735,12 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("init")
-    p.add_argument("--risk", required=True, choices=["NORMAL", "SENSITIVE", "CRITICAL"])
-    p.add_argument("--dev-providers", required=True,
-                   help="comma list of provider families that developed/advised the change")
+    p.add_argument("--risk", choices=["NORMAL", "SENSITIVE", "CRITICAL"],
+                   help="required unless AR_RISK or the repo policy file provides it")
+    p.add_argument("--dev-providers",
+                   help="comma list of provider families that developed/advised the "
+                        "change (required unless AR_DEV_PROVIDERS or the repo "
+                        "policy file provides it)")
     p.add_argument("--diff-ref", default="")
     p.add_argument("--product", default="")
     p.add_argument("--rebuttal-policy", choices=["critical", "contention", "any"],

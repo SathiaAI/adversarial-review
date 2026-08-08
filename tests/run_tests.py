@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """End-to-end tests for the adversarial-review skill scripts against a mock router."""
+import hashlib
 import json
 import os
 import shutil
@@ -675,6 +676,178 @@ def t_keyless_run_blocks_with_guidance():
            if k not in ("AR_API_KEY", "OPENROUTER_API_KEY")}
     r = sh(["panel.py", "run", "--context-file", "context.md"], repo, expect=2, env=env)
     assert "prepare" in r.stderr
+
+
+# Mirrors the issue #6 example: trailing comments, flow lists, a nested per-tier
+# map (with both flow and block list values), and an empty flow map.
+POLICY_YML = """\
+risk: SENSITIVE            # default tier for this repo
+dev_providers: [anthropic] # always-excluded families
+rebuttal_policy: contention
+required_gates:
+  NORMAL: [build, unit, secrets, deps, sast]
+  SENSITIVE:
+    - build
+    - unit
+pins: {}                   # role: provider/model-slug
+"""
+
+
+def t_policy_file_provides_defaults():
+    repo = fresh_repo()
+    (repo / ".adversarial-review.yml").write_text(POLICY_YML)
+    sh(["panel.py", "init"], repo)  # zero flags: everything from the policy
+    meta = read(latest_run(repo) / "run.json")
+    assert meta["risk"] == "SENSITIVE", meta["risk"]
+    assert meta["dev_providers"] == ["anthropic"], meta["dev_providers"]
+    assert meta["rebuttal_policy"] == "contention"
+    assert meta["sources"] == {"risk": "policy", "dev_providers": "policy",
+                               "rebuttal_policy": "policy"}, meta["sources"]
+    want_sha = hashlib.sha256(POLICY_YML.encode()).hexdigest()
+    assert meta["policy"] == {"file": ".adversarial-review.yml",
+                              "sha256": want_sha}, meta["policy"]
+    snap = read(latest_run(repo) / "policy.snapshot.json")
+    assert snap["text"] == POLICY_YML and snap["sha256"] == want_sha
+    sh(["gate.py", "plan"], repo)  # no --require: tier list from the policy
+    req = read(latest_run(repo) / "gates" / "_required.json")
+    assert req["requested_source"] == "policy", req
+    assert req["requested"] == ["build", "unit"], req["requested"]
+    assert "mutation" in req["required"], "SENSITIVE floor must still union in"
+
+
+def t_policy_precedence_cli_env_file():
+    repo = fresh_repo()
+    (repo / ".adversarial-review.yml").write_text(POLICY_YML)
+    sh(["panel.py", "init"], repo, env={**ENV, "AR_RISK": "NORMAL"})
+    meta = read(latest_run(repo) / "run.json")
+    assert meta["risk"] == "NORMAL" and meta["sources"]["risk"] == "env", meta
+    sh(["panel.py", "init", "--risk", "CRITICAL"], repo,
+       env={**ENV, "AR_RISK": "NORMAL"})
+    meta = read(latest_run(repo) / "run.json")
+    assert meta["risk"] == "CRITICAL" and meta["sources"]["risk"] == "cli", meta
+    sh(["panel.py", "init"], repo, env={**ENV, "AR_DEV_PROVIDERS": "openai"})
+    meta = read(latest_run(repo) / "run.json")
+    assert meta["dev_providers"] == ["openai"], meta
+    assert meta["sources"]["dev_providers"] == "env", meta["sources"]
+    assert meta["sources"]["risk"] == "policy", meta["sources"]
+    sh(["gate.py", "plan"], repo, env={**ENV, "AR_REQUIRE": "build,unit,fuzz"})
+    req = read(latest_run(repo) / "gates" / "_required.json")
+    assert req["requested_source"] == "env" and "fuzz" in req["required"], req
+
+
+def t_policy_malformed_is_loud():
+    # Malformed policy dies even when CLI flags would have sufficed — a policy
+    # is never silently ignored (acceptance criterion in issue #6).
+    full_flags = ["panel.py", "init", "--risk", "NORMAL",
+                  "--dev-providers", "anthropic"]
+    cases = [
+        ("risque: NORMAL\n", "unknown key"),
+        ("risk: EXTREME\n", "invalid risk"),
+        ("dev_providers:\n\t- anthropic\n", "tab"),
+        ("pins:\n  a:\n    b: c\n", "nesting"),
+        ("risk: NORMAL\nrisk: SENSITIVE\n", "duplicate"),
+        ("dev_providers: [anthropic\n", "unterminated"),
+        ("risk: NORMAL\ndev_providers: []\n", "non-empty"),
+        ("", "empty"),
+    ]
+    for text, needle in cases:
+        repo = fresh_repo()
+        (repo / ".adversarial-review.yml").write_text(text)
+        r = sh(full_flags, repo, expect=1)
+        assert needle in r.stderr, f"{text!r}: expected {needle!r} in {r.stderr!r}"
+    repo = fresh_repo()
+    (repo / ".adversarial-review.json").write_text("{nope")
+    r = sh(full_flags, repo, expect=1)
+    assert "invalid JSON" in r.stderr, r.stderr
+    repo = fresh_repo()
+    (repo / ".adversarial-review.yml").write_text(POLICY_YML)
+    (repo / ".adversarial-review.json").write_text("{}")
+    r = sh(full_flags, repo, expect=1)
+    assert "exactly one" in r.stderr, r.stderr
+    # gate.py plan hits the same wall: corrupting the policy after init blocks
+    # planning even with an explicit --require.
+    repo = fresh_repo()
+    (repo / ".adversarial-review.yml").write_text(POLICY_YML)
+    sh(["panel.py", "init"], repo)
+    (repo / ".adversarial-review.yml").write_text("risk: EXTREME\n")
+    r = sh(["gate.py", "plan", "--require", "build"], repo, expect=1)
+    assert "invalid risk" in r.stderr, r.stderr
+
+
+def t_policy_missing_is_identical():
+    # No policy file: nothing becomes optional, nothing changes shape.
+    repo = fresh_repo()
+    sh(["panel.py", "init"], repo, expect=1)
+    sh(["gate.py", "plan"], repo, expect=1)
+    sh(["panel.py", "init", "--risk", "NORMAL",
+        "--dev-providers", "anthropic"], repo)
+    meta = read(latest_run(repo) / "run.json")
+    assert meta["sources"] == {"risk": "cli", "dev_providers": "cli",
+                               "rebuttal_policy": "default"}, meta["sources"]
+    assert meta["policy"] is None
+    assert not (latest_run(repo) / "policy.snapshot.json").exists()
+    r = sh(["gate.py", "plan"], repo, expect=1)
+    assert "unresolved" in r.stderr, r.stderr
+    sh(["gate.py", "plan", "--require", "build,unit"], repo)
+    req = read(latest_run(repo) / "gates" / "_required.json")
+    assert req["requested_source"] == "cli", req
+
+
+def t_policy_required_gates_missing_tier():
+    # Policy present WITH required_gates, but not for this run's tier: that is
+    # "not provided", and with no other source plan must die naming the tier.
+    repo = fresh_repo()
+    (repo / ".adversarial-review.yml").write_text(
+        "dev_providers: [anthropic]\nrequired_gates:\n  NORMAL: [build]\n")
+    sh(["panel.py", "init", "--risk", "SENSITIVE"], repo)
+    r = sh(["gate.py", "plan"], repo, expect=1)
+    assert "unresolved for tier SENSITIVE" in r.stderr, r.stderr
+
+
+def t_policy_rebuttal_precedence():
+    repo = fresh_repo()
+    (repo / ".adversarial-review.yml").write_text(
+        "risk: NORMAL\ndev_providers: [anthropic]\nrebuttal_policy: critical\n")
+    sh(["panel.py", "init"], repo, env={**ENV, "AR_REBUTTAL": "any"})
+    meta = read(latest_run(repo) / "run.json")
+    assert meta["rebuttal_policy"] == "any", meta
+    assert meta["sources"]["rebuttal_policy"] == "env", meta["sources"]
+    sh(["panel.py", "init", "--rebuttal-policy", "contention"], repo,
+       env={**ENV, "AR_REBUTTAL": "any"})
+    meta = read(latest_run(repo) / "run.json")
+    assert meta["rebuttal_policy"] == "contention", meta
+    assert meta["sources"]["rebuttal_policy"] == "cli", meta["sources"]
+    sh(["panel.py", "init"], repo)
+    meta = read(latest_run(repo) / "run.json")
+    assert meta["rebuttal_policy"] == "critical", meta
+    assert meta["sources"]["rebuttal_policy"] == "policy", meta["sources"]
+
+
+def t_policy_pins_precedence():
+    repo = fresh_repo()
+    (repo / ".adversarial-review.yml").write_text(
+        "risk: NORMAL\ndev_providers: [anthropic]\n"
+        "pins:\n  correctness: mistralai/mistral-large-3\n")
+    sh(["panel.py", "init"], repo)
+    sh(["panel.py", "assign"], repo)
+    role = read(latest_run(repo) / "panel" / "plan.json")["roles"]["correctness"]
+    assert role["model"] == "mistralai/mistral-large-3" and role["pinned"]
+    assert role["pin_source"] == "policy", role
+    env = {**ENV, "AR_PINS": "correctness=qwen/qwen3.8-max"}
+    sh(["panel.py", "assign"], repo, env=env)
+    role = read(latest_run(repo) / "panel" / "plan.json")["roles"]["correctness"]
+    assert role["model"] == "qwen/qwen3.8-max" and role["pin_source"] == "env"
+    sh(["panel.py", "assign", "--pin", "correctness=openai/gpt-5.6-luna-pro"],
+       repo, env=env)
+    plan = read(latest_run(repo) / "panel" / "plan.json")["roles"]
+    assert plan["correctness"]["model"] == "openai/gpt-5.6-luna-pro"
+    assert plan["correctness"]["pin_source"] == "cli", plan["correctness"]
+    unpinned = [r for r, v in plan.items() if r != "correctness"]
+    assert all(plan[r]["pin_source"] is None for r in unpinned), plan
+    # A typo'd pin role — from any source — dies loudly instead of being ignored.
+    r = sh(["panel.py", "assign", "--pin", "corectness=x-ai/grok-4.5"],
+           repo, expect=2)
+    assert "unknown role" in r.stderr, r.stderr
 
 
 def main():
