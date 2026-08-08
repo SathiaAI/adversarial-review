@@ -836,6 +836,17 @@ def t_packaging_version_sync():
     assert m.group(1) == m2.group(1), (m.group(1), m2.group(1))
 
 
+def t_packaging_stays_stdlib_only():
+    # The stdlib-only invariant, enforced durably in CI: the manifest must
+    # declare an explicitly empty dependency list and no other dependency
+    # surface (optional-dependencies, dynamic) that could smuggle one in.
+    py = (SKILL / "pyproject.toml").read_text()
+    assert re.search(r"^dependencies = \[\]$", py, re.M), \
+        "pyproject.toml must declare dependencies = [] (stdlib-only invariant)"
+    assert "optional-dependencies" not in py, "no optional dependency surface"
+    assert not re.search(r"^dynamic\s*=", py, re.M), "no dynamic metadata"
+
+
 def t_packaging_entrypoints_resolve():
     # Every [project.scripts] target must point at adversarial_review.<mod>:main
     # where scripts/<mod>.py exists and defines a module-level main().
