@@ -47,15 +47,21 @@ package APIs, impossible dependency versions, unfinished stubs. `ai-defects` is 
 **category, not a vendor** — the protocol hardcodes no model IDs and hardcodes no tool
 IDs.
 
-What it verifies: every symbol, API, and dependency version referenced in changed code
-actually exists. Baseline: the stack's type-checker/compiler in strict mode, scoped to
-the diff. Example tools per ecosystem (any maintained equivalent qualifies; record
-substitutions in the gate summary as usual):
+What it verifies: that symbols, APIs, and dependency versions referenced in changed
+code actually exist — to the depth the chosen tool can see. A strict type-checker
+catches most phantom references in typed code; dynamically-typed call patterns and
+invented package APIs are exactly what the deeper verifiers below exist for. Baseline:
+the stack's type-checker/compiler in strict mode, scoped to the diff. Example tools
+per ecosystem (any maintained equivalent qualifies; record substitutions in the gate
+summary as usual):
 
-- **Python** — `pyright --strict` or `mypy --strict` on changed modules; `pip check` or
-  `pip install --dry-run -r requirements.txt` for dependency-version existence
+- **Python** — `pyright --strict` or `mypy --strict` on changed modules. Dependency
+  existence: `pip check` validates the installed environment;
+  `pip install --dry-run -r requirements.txt` runs the full resolver, so an
+  unsatisfiable or nonexistent version set fails loudly at resolution
 - **TypeScript/JS** — `tsc --noEmit` under `strict`, or ESLint with `no-undef` +
-  `import/no-unresolved`; `npm install --dry-run` for version resolvability
+  `import/no-unresolved`. Dependency existence: `npm install --dry-run` (full tree
+  resolution) or `npm ls` for consistency of the installed tree
 - **Go** — `go vet ./...` plus `staticcheck ./...` (`go build` itself already refuses
   unknown symbols)
 - **Rust** — `cargo check` (the compiler is this gate) plus `cargo clippy -- -D warnings`
@@ -68,8 +74,14 @@ gate, so the aggregator can see it:
 
 ```bash
 python <skill>/scripts/gate.py run --name ai-defects -- \
-  bash -c 'pyright --strict $(git diff --name-only main...HEAD -- "*.py")'
+  bash -c 'files=$(git diff --name-only main...HEAD -- "*.py"); \
+           if [ -z "$files" ]; then echo "no python files changed"; \
+           else pyright --strict $files; fi'
 ```
+
+(The guard matters: with an empty file list, bare `pyright --strict $(...)` would fall
+back to scanning the whole project — wrong scope, and a false FAIL on an unrelated
+tree. Filenames with spaces need `-z`/`xargs -0` variants.)
 
 Recommended at NORMAL and above, like `sast`. Standard tri-state semantics apply:
 nonzero exit on a required `ai-defects` gate = FAIL; tooling unavailable on the stack ⇒
