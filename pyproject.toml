@@ -31,6 +31,7 @@ Issues = "https://github.com/SathiaAI/adversarial-review/issues"
 ar-panel = "adversarial_review.panel:main"
 ar-gate = "adversarial_review.gate:main"
 ar-aggregate = "adversarial_review.aggregate:main"
+ar-mcp = "adversarial_review.mcp_server:main"
 
 [tool.setuptools]
 # The repo keeps its skills-folder layout (scripts/ run directly by agents);

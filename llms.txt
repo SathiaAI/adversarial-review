@@ -24,8 +24,9 @@ attestation digest over the whole recorded run. Every step writes JSON artifacts
 `.adversarial-review/<run-id>/`; the aggregator consumes those and nothing else.
 
 Distribution surfaces: a skills folder (`SKILL.md` on any agent platform), a composite
-GitHub Action (`action.yml`), and PyPI-prepped console scripts (`ar-panel`, `ar-gate`,
-`ar-aggregate`). Non-negotiables: a dev-family model never reviews its own change;
+GitHub Action (`action.yml`), PyPI-prepped console scripts (`ar-panel`, `ar-gate`,
+`ar-aggregate`), and a stdlib-only MCP server (`ar-mcp`) that exposes the pipeline as MCP
+tools over stdio. Non-negotiables: a dev-family model never reviews its own change;
 passing AI review never overrides a deterministic failure; tests/thresholds/scanners are
 never weakened to obtain a pass; suppressions must be narrow, documented, and expiring;
 credentials and production data never enter reviewer context or artifacts; the skill
@@ -43,6 +44,7 @@ humans authorize them.
 - [scripts/panel.py](scripts/panel.py): catalog resolution, provider-independent role assignment, reviewer calls (direct HTTP or keyless MCP prepare/ingest), the rebuttal round, and concurrence for dismissals.
 - [scripts/gate.py](scripts/gate.py): the deterministic gate runner/recorder — tri-state PASS/FAIL/BLOCKED, per-tier required-gate floors, and named, authorized waivers.
 - [scripts/aggregate.py](scripts/aggregate.py): the sole author of the verdict; also emits the coverage manifest and the `--check-digest` tamper-evident attestation.
+- [scripts/mcp_server.py](scripts/mcp_server.py): the stdlib-only MCP server (stdio JSON-RPC) — a thin subprocess bridge exposing init/gate-record/panel/aggregate as MCP tools. Not an arbitrary-command surface: it records gate results, it never executes gate commands itself.
 
 ## Reference
 
@@ -56,7 +58,8 @@ humans authorize them.
 
 - [action.yml](action.yml): the composite GitHub Action — records `gates` inputs through gate.py, optionally runs the panel with an OpenRouter key secret, and fails the job exactly as the aggregator decides.
 - [examples/adversarial-review.yml](examples/adversarial-review.yml): a copy-paste starter workflow.
-- [pyproject.toml](pyproject.toml): stdlib-only packaging exposing the `ar-panel`, `ar-gate`, `ar-aggregate` console scripts.
+- [scripts/mcp_server.py](scripts/mcp_server.py): the `ar-mcp` MCP server — drive a review from any MCP host over stdio; stdlib-only, zero new dependencies.
+- [pyproject.toml](pyproject.toml): stdlib-only packaging exposing the `ar-panel`, `ar-gate`, `ar-aggregate`, `ar-mcp` console scripts.
 
 ## Project
 

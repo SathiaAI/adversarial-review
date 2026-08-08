@@ -207,8 +207,17 @@ still require triage by the operating agent/human; a clean automated PASS
 happens when gates pass and the panel raises nothing needing triage.
 
 **CLI (PyPI packaging prepped)** — `pyproject.toml` ships `ar-panel`,
-`ar-gate`, `ar-aggregate` console scripts (`python -m build`, then pip/pipx
+`ar-gate`, `ar-aggregate`, `ar-mcp` console scripts (`python -m build`, then pip/pipx
 install the wheel; PyPI publication pending).
+
+**MCP server** — `ar-mcp` (or `python scripts/mcp_server.py`) exposes the pipeline as
+MCP tools over stdio, so an MCP host can drive a review directly: `ar_init` →
+`ar_gate_plan` → run your gates and record each with `ar_gate_record` → `ar_panel_assign`
+→ `ar_panel_prepare`+`ar_panel_ingest` (or `ar_panel_run`) → `ar_aggregate` for the
+verdict. It is stdlib-only (no MCP SDK, so the package stays zero-dependency) and
+deliberately not an arbitrary-command surface: it records the results of gates you run,
+it never executes gate commands itself. Launch it with the repository under review as the
+working directory.
 
 **Claude Code / Claude (Cowork)**
 

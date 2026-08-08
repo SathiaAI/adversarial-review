@@ -14,6 +14,8 @@ HERE = Path(__file__).resolve().parent
 SKILL = Path(os.environ.get("SKILL_DIR", HERE.parent))  # repo root = skill root
 sys.path.insert(0, str(HERE))
 import mock_router  # noqa: E402
+sys.path.insert(0, str(SKILL / "scripts"))
+import mcp_server as mcpsrv  # noqa: E402
 
 PORT = 8811
 ENV = {**os.environ, "AR_BASE_URL": f"http://127.0.0.1:{PORT}/v1",
@@ -924,7 +926,7 @@ def t_packaging_entrypoints_resolve():
     # where scripts/<mod>.py exists and defines a module-level main().
     py = (SKILL / "pyproject.toml").read_text()
     targets = re.findall(r'^(ar-[a-z]+) = "([^"]+)"$', py, re.M)
-    assert len(targets) == 3, targets
+    assert len(targets) == 4, targets
     for name, target in targets:
         modpath, _, func = target.partition(":")
         pkg, _, mod = modpath.partition(".")
@@ -1009,6 +1011,177 @@ def t_policy_pins_precedence():
     r = sh(["panel.py", "assign", "--pin", "corectness=x-ai/grok-4.5"],
            repo, expect=2)
     assert "unknown role" in r.stderr, r.stderr
+
+
+def _mcp_call(repo, name, arguments):
+    """Invoke one MCP tool through the server's dispatcher with the repo as cwd,
+    restoring cwd afterwards. Returns the tool result object."""
+    cwd0 = os.getcwd()
+    try:
+        os.chdir(repo)
+        resp = mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": name, "arguments": arguments}})
+    finally:
+        os.chdir(cwd0)
+    assert "result" in resp, resp
+    return resp["result"]
+
+
+def t_mcp_protocol_handshake():
+    # initialize echoes a supported protocol version and advertises tools
+    r = mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-06-18"}})
+    assert r["result"]["protocolVersion"] == "2025-06-18", r
+    assert r["result"]["serverInfo"]["name"] == "adversarial_review_mcp", r
+    assert "tools" in r["result"]["capabilities"], r
+    # an unsupported client version falls back to our latest, never crashes
+    r2 = mcpsrv.handle({"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                        "params": {"protocolVersion": "1.0.0"}})
+    assert r2["result"]["protocolVersion"] == "2025-06-18", r2
+    # tools/list exposes the pipeline with well-formed schemas + annotations
+    tl = mcpsrv.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+    names = {t["name"] for t in tl["result"]["tools"]}
+    assert {"ar_init", "ar_gate_plan", "ar_gate_record", "ar_panel_assign",
+            "ar_panel_prepare", "ar_panel_ingest", "ar_aggregate",
+            "ar_check_digest", "ar_get_verdict"} <= names, names
+    # the server is deliberately NOT an arbitrary-command surface: no gate-run tool
+    assert not any("run" in n and "gate" in n for n in names), names
+    for t in tl["result"]["tools"]:
+        assert t["inputSchema"]["type"] == "object" and "annotations" in t, t
+    # a notification (no id) is never answered
+    assert mcpsrv.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
+    # unknown method -> JSON-RPC method-not-found
+    assert mcpsrv.handle({"jsonrpc": "2.0", "id": 4, "method": "nope"})["error"]["code"] == -32601
+    assert mcpsrv.handle({"jsonrpc": "2.0", "id": 5, "method": "ping"})["result"] == {}
+
+
+def t_mcp_rejects_run_path_traversal():
+    # a run id carrying a path separator / .. must be refused before it can reach
+    # resolve_run() and escape .adversarial-review/
+    for bad in ["../../etc", "run-1/../..", "/etc/passwd", ".."]:
+        r = mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "ar_get_verdict", "arguments": {"run": bad}}})
+        res = r["result"]
+        assert res["isError"] and "invalid run id" in res["content"][0]["text"], (bad, res)
+    # bad enum on init is a clean tool error, not a crash
+    r2 = mcpsrv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                        "params": {"name": "ar_init",
+                                   "arguments": {"risk": "WHATEVER", "dev_providers": ["anthropic"]}}})
+    assert r2["result"]["isError"] and "risk must be" in r2["result"]["content"][0]["text"], r2
+    # unknown tool -> protocol-level error
+    r3 = mcpsrv.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                        "params": {"name": "ar_nope", "arguments": {}}})
+    assert r3["error"]["code"] == -32602, r3
+
+
+def t_mcp_drives_local_pipeline():
+    # the subprocess bridge really drives init -> plan -> record and writes artifacts
+    repo = fresh_repo()
+    res = _mcp_call(repo, "ar_init",
+                    {"risk": "NORMAL", "dev_providers": ["anthropic"], "diff_ref": "main...HEAD"})
+    assert not res.get("isError"), res
+    run_id = res["structuredContent"]["run_id"]
+    assert run_id and run_id.startswith("run-"), res
+    assert not _mcp_call(repo, "ar_gate_plan",
+                         {"require": ["build", "unit", "secrets", "deps", "sast"]}).get("isError")
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        res = _mcp_call(repo, "ar_gate_record", {"name": g, "exit_code": 0, "summary": "ok"})
+        assert not res.get("isError"), (g, res)
+    run = latest_run(repo)
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        assert (run / "gates" / f"{g}.json").is_file(), g
+    # aggregate returns a structured, machine-computed verdict (BLOCKED here: no panel)
+    res = _mcp_call(repo, "ar_aggregate", {})
+    assert "structuredContent" in res, res
+    assert res["structuredContent"]["verdict"] == "BLOCKED", res
+
+
+def t_mcp_reads_passing_verdict():
+    # against a genuine passing run, the read/aggregate tools surface PASS + intact digest
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+        "evidence": "reproduced then fixed", "reproduced": True,
+        "regression_test": "tests/test_invoices.py::t_x",
+        "resolution": {"fixed": True, "gates_rerun": ["unit", "sast"]}})
+    res = _mcp_call(repo, "ar_aggregate", {})
+    assert res["structuredContent"]["verdict"] == "PASS", res
+    assert not res.get("isError"), res
+    res2 = _mcp_call(repo, "ar_get_verdict", {})
+    assert res2["structuredContent"]["verdict"] == "PASS", res2
+    res3 = _mcp_call(repo, "ar_check_digest", {})
+    assert res3["structuredContent"]["intact"] is True, res3
+
+
+def t_mcp_hardening():
+    # regressions for panel findings on scripts/mcp_server.py
+    # security-1: a truthy non-dict `params` must not crash the handler
+    for bad in ["str", [1, 2], 123, True]:
+        r = mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": bad})
+        assert "result" in r or "error" in r, (bad, r)
+    # correctness-1: an explicit empty/whitespace `run` is rejected, never silently 'newest'
+    r = mcpsrv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                       "params": {"name": "ar_get_verdict", "arguments": {"run": ""}}})
+    assert r["result"]["isError"] and "invalid run id" in r["result"]["content"][0]["text"], r
+    # test_quality-4: catalog_file path traversal is refused
+    for bad in ["../../etc/shadow", "/etc/passwd", "a/../b"]:
+        r = mcpsrv.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                           "params": {"name": "ar_panel_assign", "arguments": {"catalog_file": bad}}})
+        assert r["result"]["isError"] and "catalog_file" in r["result"]["content"][0]["text"], (bad, r)
+    # list args passed as a bare string are rejected, never iterated per-character
+    r = mcpsrv.handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                       "params": {"name": "ar_gate_plan", "arguments": {"waive": "sast"}}})
+    assert r["result"]["isError"] and "waive must be a list" in r["result"]["content"][0]["text"], r
+    r = mcpsrv.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                       "params": {"name": "ar_panel_assign", "arguments": {"pin": "security=google/x"}}})
+    assert r["result"]["isError"] and "pin must be a list" in r["result"]["content"][0]["text"], r
+    # test_quality-3: exit_code bool guard and role regex are enforced
+    r = mcpsrv.handle({"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                       "params": {"name": "ar_gate_record",
+                                  "arguments": {"name": "build", "summary": "x", "exit_code": True}}})
+    assert r["result"]["isError"] and "exit_code must be an integer" in r["result"]["content"][0]["text"], r
+    r = mcpsrv.handle({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                       "params": {"name": "ar_panel_ingest", "arguments": {"role": "123", "response": "{}"}}})
+    assert r["result"]["isError"] and "invalid role" in r["result"]["content"][0]["text"], r
+
+
+def t_mcp_stdio_parse_error_survives():
+    # test_quality-1 + security-1 at the wire level: drive the real main() loop over
+    # stdio — a malformed line yields -32700, and a non-dict params is still answered
+    # (the loop survives both instead of crashing).
+    srv = str(SKILL / "scripts" / "mcp_server.py")
+    inp = "{bad json\n" + json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": "nope"}) + "\n"
+    p = subprocess.run([sys.executable, srv], input=inp, capture_output=True, text=True,
+                       timeout=30, cwd=tempfile.mkdtemp())
+    lines = [json.loads(x) for x in p.stdout.splitlines() if x.strip()]
+    assert any(o.get("error", {}).get("code") == -32700 for o in lines), lines
+    assert any("result" in o and o.get("id") == 1 for o in lines), lines
+
+
+def t_mcp_subprocess_timeout_surfaced():
+    # test_quality-2: a CLI timeout is surfaced as a tool error, not a hang/crash
+    orig = mcpsrv.subprocess.run
+    def _boom(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="x", timeout=1)
+    mcpsrv.subprocess.run = _boom
+    try:
+        r = mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "ar_gate_plan", "arguments": {}}})
+        assert r["result"]["isError"] and "timed out" in r["result"]["content"][0]["text"], r
+    finally:
+        mcpsrv.subprocess.run = orig
+
+
+def t_mcp_fail_verdict():
+    # test_quality-5: the FAIL verdict path is exercised through the server
+    repo = fresh_repo()
+    _mcp_call(repo, "ar_init", {"risk": "NORMAL", "dev_providers": ["anthropic"]})
+    _mcp_call(repo, "ar_gate_plan", {"require": ["build"]})
+    _mcp_call(repo, "ar_gate_record", {"name": "build", "exit_code": 1, "summary": "boom"})
+    res = _mcp_call(repo, "ar_aggregate", {})
+    assert res["structuredContent"]["verdict"] == "FAIL", res
 
 
 def main():
