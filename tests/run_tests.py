@@ -873,6 +873,20 @@ def t_llms_txt_link_integrity():
         assert (SKILL / target).exists(), f"llms.txt links a missing path: {target}"
 
 
+def t_push_integrity_snippet_hygiene():
+    # Lock in the push-integrity snippet's hardening (issue #17): it must compare the
+    # full ls-tree (not a lossy blob-sha subset), pin the intended commit, use mktemp
+    # rather than predictable temp paths, and hard-stop on mismatch.
+    skill = (SKILL / "SKILL.md").read_text()
+    assert "Push integrity" in skill, "SKILL.md must document push integrity"
+    lo = skill.index("Push integrity")
+    snippet = skill[lo:lo + 1600]
+    assert "git ls-tree -r" in snippet, "must compare the git tree"
+    assert "mktemp" in snippet, "must use mktemp, not a predictable /tmp path"
+    assert "rev-parse" in snippet, "must pin the intended commit, not a moving HEAD"
+    assert "exit 1" in snippet, "a mismatch must hard-stop, not just print"
+
+
 def t_action_definition_hygiene():
     # Regression cover for the composite GitHub Action (issue #7b). Stdlib-only
     # (no YAML dep), so these are structural string assertions — the fuller

@@ -94,10 +94,18 @@ the verdict:
 
 ```bash
 git fetch origin "$BRANCH"
-# per-file: the remote blob shas must equal your intended local ones
-git ls-tree -r "origin/$BRANCH" | awk '{print $3, $4}' | sort > /tmp/remote-blobs
-git ls-tree -r HEAD             | awk '{print $3, $4}' | sort > /tmp/local-blobs
-diff /tmp/remote-blobs /tmp/local-blobs   # must be empty
+# Compare against the exact commit you INTENDED to publish — pin it, because a moving
+# local HEAD (new commits since the push) would diverge legitimately and mask the check.
+INTENDED="$(git rev-parse HEAD)"
+remote_tree="$(mktemp)"; intended_tree="$(mktemp)"
+# Full ls-tree lines (mode type sha path) for EVERY file — catches content, mode, and
+# add/remove; comparing only changed files would miss corruption in an unchanged one.
+git ls-tree -r "origin/$BRANCH" | sort > "$remote_tree"
+git ls-tree -r "$INTENDED"      | sort > "$intended_tree"
+if ! diff -q "$intended_tree" "$remote_tree"; then
+  echo "push integrity: origin/$BRANCH diverges from the intended tree — HARD STOP" >&2
+  exit 1
+fi
 # and take the reviewed diff from the pushed ref, never from an un-verified relay:
 git diff "origin/main...origin/$BRANCH" | sha256sum
 ```
