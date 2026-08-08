@@ -10,12 +10,13 @@ exist; a dishonestly recorded gate defeats the pipeline you are relying on.
 Exit codes: `run` exits with the wrapped command's code; `plan`/`record` exit 0/1.
 """
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import die, now_iso, read_json, resolve_run, write_json
+from _common import die, load_policy, now_iso, read_json, resolve_run, write_json
 
 # Floors per tier: these cannot be silently omitted, only waived on the record with a
 # named authorizer (surfaced in the verdict reasons and the report).
@@ -29,7 +30,20 @@ MINIMUM_GATES = {
 def cmd_plan(args):
     run = resolve_run(args.run)
     tier = read_json(run / "run.json")["risk"]
-    requested = [g.strip() for g in args.require.split(",") if g.strip()]
+    # Requested-gate precedence: CLI flag > AR_REQUIRE env > policy file. The
+    # policy's required_gates is a per-tier map; a missing tier entry is simply
+    # "not provided" (tier keys themselves are validated at policy load).
+    pol = load_policy()  # malformed policy dies here — never silently ignored
+    if args.require:
+        requested, req_src = args.require.split(","), "cli"
+    elif os.environ.get("AR_REQUIRE", ""):
+        requested, req_src = os.environ["AR_REQUIRE"].split(","), "env"
+    elif pol is not None and tier in pol["data"].get("required_gates", {}):
+        requested, req_src = list(pol["data"]["required_gates"][tier]), "policy"
+    else:
+        die(f"required gates unresolved for tier {tier}: pass --require, set "
+            f"AR_REQUIRE, or add required_gates.{tier} to .adversarial-review.yml")
+    requested = [g.strip() for g in requested if g.strip()]
     waived = []
     for w in args.waive or []:
         if not args.authorized_by:
@@ -39,9 +53,11 @@ def cmd_plan(args):
     required = sorted(set(requested) | {g for g in MINIMUM_GATES[tier]
                                         if g not in waived_names})
     write_json(run / "gates" / "_required.json",
-               {"tier": tier, "required": required, "waived": waived,
+               {"tier": tier, "required": required, "requested": requested,
+                "requested_source": req_src, "waived": waived,
                 "planned_at": now_iso()})
-    print(f"required gates ({tier}): {', '.join(required)}")
+    print(f"required gates ({tier}): {', '.join(required)}  "
+          f"[requested via {req_src}]")
     for w in waived:
         print(f"  WAIVED: {w['name']} (authorized by {w['authorized_by']})")
 
@@ -87,7 +103,10 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("plan")
-    p.add_argument("--run"); p.add_argument("--require", required=True)
+    p.add_argument("--run")
+    p.add_argument("--require",
+                   help="comma list of gates (required unless AR_REQUIRE or the "
+                        "repo policy file's required_gates provides this tier)")
     p.add_argument("--waive", action="append")
     p.add_argument("--authorized-by", default="")
     p.set_defaults(fn=cmd_plan)

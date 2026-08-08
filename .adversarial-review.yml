@@ -1,0 +1,12 @@
+# Policy as code (issue #6): repo-versioned review defaults for adversarial-review
+# itself. Precedence everywhere: CLI flag > env var > policy file > built-in default.
+# Every resolved value's source is recorded in the run's artifacts.
+risk: NORMAL               # docs + stdlib tooling; no auth, payments, or personal data
+dev_providers:
+  - anthropic              # Claude develops this repo, so Claude never reviews it
+rebuttal_policy: contention
+required_gates:
+  NORMAL: [build, unit, secrets, deps, sast]
+  SENSITIVE: [build, unit, secrets, deps, sast, mutation]
+  CRITICAL: [build, unit, secrets, deps, sast, mutation]
+pins: {}                   # pins churn with live catalogs; pin per-run via --pin

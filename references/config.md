@@ -62,6 +62,52 @@ MCP transport caveat: request content transits the MCP provider's infrastructure
 confirm with the user that this is acceptable before using MCP transport, or use a
 direct key. ZDR guarantees only hold on the direct OpenRouter path.
 
+## Policy file: repo-versioned defaults
+
+Review standards can live with the code they govern: `.adversarial-review.yml` (or
+`.adversarial-review.json` — keep exactly one) at the reviewed repo's root supplies
+defaults to `panel.py init`, `gate.py plan`, and `panel.py assign` pins.
+
+```yaml
+risk: SENSITIVE            # default tier for this repo
+dev_providers: [anthropic] # always-excluded families
+rebuttal_policy: contention
+required_gates:
+  NORMAL: [build, unit, secrets, deps, sast]
+  SENSITIVE: [build, unit, secrets, deps, sast, mutation]
+pins: {}                   # role: provider/model-slug
+```
+
+Precedence, everywhere: **CLI flag > env var > policy file > built-in default** —
+explicit beats ambient. The resolution is recorded in the run's artifacts so the
+audit trail shows where every setting came from: `run.json` gets a `sources` block
+(`cli|env|policy|default` per setting) and a `policy` block (file name + sha256), the
+exact policy text is snapshotted into `policy.snapshot.json` (covered by the
+attestation digest), `gates/_required.json` records `requested_source`, and pinned
+roles in `panel/plan.json` record `pin_source`.
+
+Guarantees, enforced by regression tests:
+
+- **Missing file** — behavior identical to a repo without one: `init` still demands
+  risk and dev providers from a flag or env var, `plan` still demands `--require` or
+  `AR_REQUIRE`. Nothing becomes silently optional.
+- **Malformed file** — a loud error, never a silent fallback, even when CLI flags
+  would have sufficed. Unknown keys, invalid values, bad indentation, and both file
+  variants present at once all refuse to run.
+- **No coercion** — every scalar parses as a string; there is no yes/no-boolean or
+  version-number-becomes-float YAML footgun.
+
+The YAML parser is a deliberately strict stdlib-only subset: `key: value` scalars,
+inline `[a, b]` lists, `- item` block lists, ONE nested mapping level, `{}` for an
+empty map, `#` comments. Anchors, aliases, tags, multiline blocks, deeper nesting,
+and tab indentation are errors that name the unsupported construct. If you need
+richer structure, use `.adversarial-review.json` (parsed with `json.loads`).
+
+`required_gates` is a per-tier map; the entry matching the run's tier is used. A
+missing tier entry simply means "not provided" and resolution falls through to the
+next source. Tier floors from `references/gates.md` are always unioned in regardless
+of source — a policy file can add gates, never remove floors.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -76,8 +122,15 @@ direct key. ZDR guarantees only hold on the direct OpenRouter path.
 | `AR_MAX_TOKENS` | `8000` | Reviewer response cap |
 | `AR_TIMEOUT_S` | `240` | Per-request timeout |
 | `AR_RUN_DIR` | `.adversarial-review` | Artifact root |
+| `AR_RISK` | — | Default risk tier for `init` (below `--risk`, above policy) |
+| `AR_DEV_PROVIDERS` | — | Comma list of dev families for `init` (below flag, above policy) |
+| `AR_REQUIRE` | — | Comma list of gates for `plan` (below `--require`, above policy) |
 | `AR_PINS` | — | Comma list `role=model-slug` to pin specific models |
 | `AR_REBUTTAL` | `contention` | Rebuttal policy at init: `critical`, `contention`, `any` |
+
+An empty env var counts as unset. Note one precedence fix shipped with the policy
+feature: `--pin` now beats `AR_PINS` for the same role (previously the env var
+silently won), matching the CLI-over-env rule above.
 
 ## Live test (first-time setup check)
 

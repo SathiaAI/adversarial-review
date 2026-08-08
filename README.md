@@ -84,7 +84,7 @@ vote.
 
 ### What the aggregator refuses to accept
 
-These are tested behaviors, not aspirations (see `tests/run_tests.py`, 30 scenarios):
+These are tested behaviors, not aspirations (see `tests/run_tests.py`, 35 scenarios):
 
 | Attempt | Outcome |
 |---|---|
@@ -297,6 +297,36 @@ python scripts/aggregate.py --check-digest
 
 ## Configuration
 
+### Policy as code
+
+Review standards can be versioned with the code they govern. Drop
+`.adversarial-review.yml` (or `.adversarial-review.json`) at the repo root and
+`panel.py init`, `gate.py plan`, and `panel.py assign` read it as defaults —
+reviewable, diffable, and consistent across operators and sessions:
+
+```yaml
+risk: SENSITIVE            # default tier for this repo
+dev_providers: [anthropic] # always-excluded families
+rebuttal_policy: contention
+required_gates:
+  NORMAL: [build, unit, secrets, deps, sast]
+  SENSITIVE: [build, unit, secrets, deps, sast, mutation]
+pins: {}                   # role: provider/model-slug
+```
+
+Precedence is always **CLI flag > env var > policy file > built-in default**, and
+every resolved value's source (`cli|env|policy|default`) is recorded into the run's
+artifacts — `run.json` carries a `sources` block plus the policy file's sha256, and
+the exact policy text is snapshotted into the run where the attestation digest
+covers it. A missing file changes nothing; a malformed file is a loud error, never a
+silent fallback; tier floors are always unioned in — a policy can add gates, never
+remove floors. The YAML parser is a strict stdlib-only subset (scalars, lists, one
+nested mapping level, comments; no coercion — scalars stay strings); anything richer
+belongs in the JSON variant. This repo [reviews itself](.adversarial-review.yml)
+through one. Details in [`references/config.md`](references/config.md).
+
+### Environment variables
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `OPENROUTER_API_KEY` | — | Direct OpenRouter credential |
@@ -309,6 +339,9 @@ python scripts/aggregate.py --check-digest
 | `AR_MAX_TOKENS` | `8000` | Reviewer response cap |
 | `AR_TIMEOUT_S` | `240` | Per-request timeout |
 | `AR_RUN_DIR` | `.adversarial-review` | Artifact root |
+| `AR_RISK` | — | Default risk tier for `init` |
+| `AR_DEV_PROVIDERS` | — | Comma list of dev families for `init` |
+| `AR_REQUIRE` | — | Comma list of gates for `plan` |
 | `AR_PINS` | — | `role=provider/model-slug` overrides |
 | `AR_REBUTTAL` | `contention` | Rebuttal policy |
 
@@ -322,10 +355,11 @@ and the exact resolved IDs are pinned into the run's `plan.json` for the audit r
 python tests/run_tests.py
 ```
 
-30 end-to-end scenarios against an in-process mock router — no network, no API keys:
+35 end-to-end scenarios against an in-process mock router — no network, no API keys:
 role assignment and collision-resolution under multi-provider exclusions, degraded-mode
 authorization, malformed-JSON retry, dead-provider substitution, the full verdict matrix,
-rebuttal policies, suppression expiry, and the keyless MCP prepare/ingest path. CI runs
+rebuttal policies, suppression expiry, the keyless MCP prepare/ingest path, and
+policy-file precedence, source recording, and malformed-policy refusal. CI runs
 the suite on Python 3.9 and 3.12.
 
 ## Repository layout
@@ -333,6 +367,7 @@ the suite on Python 3.9 and 3.12.
 ```
 SKILL.md              # canonical protocol (all platforms)
 AGENTS.md             # condensed instructions for AGENTS.md-reading agents
+.adversarial-review.yml  # policy as code: this repo's own review defaults
 CONTRIBUTING.md       # dev setup, ground rules, how PRs get (adversarially) reviewed
 SECURITY.md           # how to report vulnerabilities, incl. prompt-injection bypasses
 agents/openai.yaml    # Codex display metadata
@@ -346,7 +381,7 @@ references/
   roles.md            # role rubrics, prompt contract, injection defense
   schemas.md          # artifact schemas and blocking rules
   report.md           # final report template
-tests/                # mock router + 24-scenario suite
+tests/                # mock router + 35-scenario suite
 ```
 
 ## Security notes
