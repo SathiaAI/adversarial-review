@@ -1,0 +1,66 @@
+# Adversarial Review
+
+> A portable agent skill that gates production software with a deterministic,
+> machine-computed release verdict. It combines deterministic verification (build,
+> tests, SAST, secrets, dependencies, mutation) with an independent panel of reviewer
+> models from providers that did NOT write the code — and the final PASS/FAIL/BLOCKED
+> decision is computed by `scripts/aggregate.py` from recorded artifacts, never narrated
+> by a model. Plain Python 3.9+, standard library only, no runtime dependencies.
+
+The problem it solves: when a model reviews its own work, you get the fox auditing the
+henhouse. This skill enforces separation of duties (reviewer families are excluded from
+any provider that planned, coded, debugged, or advised the change — computed from model
+IDs, not self-declared), a deterministic floor (AI approval can never override a failing
+gate), and a computed verdict (only `aggregate.py` emits PASS/FAIL/BLOCKED = exit
+0/1/2; the orchestrating model relays it verbatim).
+
+How a run works: `panel.py init` (risk tier + dev providers, optionally from a
+`.adversarial-review.yml` policy file) → `gate.py` records each deterministic check with
+its exit code → `panel.py assign`/`run` resolves an independent multi-family reviewer
+panel from the router's live catalog and collects strict-JSON reports → findings are
+triaged with reproductions and, for dismissed high/critical findings, an uninvolved
+model's written concurrence → `aggregate.py` computes the verdict and a tamper-evident
+attestation digest over the whole recorded run. Every step writes JSON artifacts under
+`.adversarial-review/<run-id>/`; the aggregator consumes those and nothing else.
+
+Distribution surfaces: a skills folder (`SKILL.md` on any agent platform), a composite
+GitHub Action (`action.yml`), and PyPI-prepped console scripts (`ar-panel`, `ar-gate`,
+`ar-aggregate`). Non-negotiables: a dev-family model never reviews its own change;
+passing AI review never overrides a deterministic failure; tests/thresholds/scanners are
+never weakened to obtain a pass; suppressions must be narrow, documented, and expiring;
+credentials and production data never enter reviewer context or artifacts; the skill
+never merges, pushes, publishes, or deploys on its own — verdicts gate those actions,
+humans authorize them.
+
+## Core protocol
+
+- [SKILL.md](SKILL.md): the canonical, step-by-step protocol for every platform — setup and risk classification, deterministic gates, the independent panel, rebuttal round, finding validation, release enforcement, and the computed verdict.
+- [AGENTS.md](AGENTS.md): condensed instructions for AGENTS.md-reading agents (OpenAI Codex and similar).
+- [.adversarial-review.yml](.adversarial-review.yml): this repo's own policy file — repo-versioned defaults for risk, dev providers, rebuttal policy, and required gates (the skill reviews itself through it).
+
+## Scripts (the only things that run)
+
+- [scripts/panel.py](scripts/panel.py): catalog resolution, provider-independent role assignment, reviewer calls (direct HTTP or keyless MCP prepare/ingest), the rebuttal round, and concurrence for dismissals.
+- [scripts/gate.py](scripts/gate.py): the deterministic gate runner/recorder — tri-state PASS/FAIL/BLOCKED, per-tier required-gate floors, and named, authorized waivers.
+- [scripts/aggregate.py](scripts/aggregate.py): the sole author of the verdict; also emits the coverage manifest and the `--check-digest` tamper-evident attestation.
+
+## Reference
+
+- [references/config.md](references/config.md): credentials and transports (OpenRouter key, key file, OpenAI-compatible proxy, keyless MCP/Composio), privacy/ZDR routing, the policy-as-code file, and all environment variables.
+- [references/gates.md](references/gates.md): the gate matrix by risk tier, tool commands and blocking thresholds, the vendor-neutral ai-defects gate, suppression rules, and supply-chain hygiene for the gate tools themselves.
+- [references/roles.md](references/roles.md): reviewer role rubrics, the prompt contract, injection defense, and anti-lazy-LGTM attestations.
+- [references/schemas.md](references/schemas.md): the reviewer-report, validation-record, gate-record, and verdict JSON schemas, plus the blocking rules the aggregator enforces.
+- [references/report.md](references/report.md): the final report template.
+
+## Distribution
+
+- [action.yml](action.yml): the composite GitHub Action — records `gates` inputs through gate.py, optionally runs the panel with an OpenRouter key secret, and fails the job exactly as the aggregator decides.
+- [examples/adversarial-review.yml](examples/adversarial-review.yml): a copy-paste starter workflow.
+- [pyproject.toml](pyproject.toml): stdlib-only packaging exposing the `ar-panel`, `ar-gate`, `ar-aggregate` console scripts.
+
+## Project
+
+- [README.md](README.md): overview, the "why", worked examples of the skill reviewing its own pull requests, and a comparison to adjacent tools.
+- [SECURITY.md](SECURITY.md): how to report vulnerabilities, including prompt-injection bypasses.
+- [CONTRIBUTING.md](CONTRIBUTING.md): dev setup, ground rules, and how contributions get (adversarially) reviewed.
+- [tests/run_tests.py](tests/run_tests.py): the end-to-end suite against an in-process mock router — no network, no API keys.
