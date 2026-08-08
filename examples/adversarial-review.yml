@@ -1,0 +1,43 @@
+# Starter workflow for the adversarial-review action (issue #7b).
+# Copy to .github/workflows/adversarial-review.yml in the reviewed repo:
+#   mkdir -p .github/workflows && curl -fsSL \
+#     https://raw.githubusercontent.com/SathiaAI/adversarial-review/main/examples/adversarial-review.yml \
+#     -o .github/workflows/adversarial-review.yml
+#
+# What green means: aggregate.py computed PASS from recorded artifacts —
+# gates, panel reports, and triage records. Without an OpenRouter key the
+# verdict is BLOCKED (no panel coverage), which fail-on lets you treat as a
+# warning while wiring up. High/critical panel findings need validation
+# records the operating agent/human writes — a clean automated PASS happens
+# when gates pass and the panel raises nothing that requires triage.
+name: adversarial-review
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the panel reviews a real git range
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: SathiaAI/adversarial-review@main
+        with:
+          # risk / dev-providers may come from .adversarial-review.yml instead.
+          # gates: newline-separated name=command; each runs through gate.py.
+          gates: |
+            build=python -m py_compile $(git ls-files '*.py')
+            unit=python -m pytest -q
+          # fail-on controls how a nonzero verdict maps to the job result:
+          #   fail    — fail the job only on FAIL; BLOCKED is a warning (exit 0).
+          #             Use while adopting, so a missing gate/panel doesn't block.
+          #   blocked — (default) fail the job on FAIL *or* BLOCKED. Tighten to
+          #             this once your gates and panel key are wired up.
+          fail-on: fail
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}

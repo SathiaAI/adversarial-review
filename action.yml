@@ -1,0 +1,186 @@
+name: 'Adversarial Review'
+description: >-
+  Deterministic gate recording plus a machine-computed PASS/FAIL/BLOCKED release
+  verdict (aggregate.py exit 0/1/2). Optionally runs the independent multi-model
+  reviewer panel when an OpenRouter key is provided.
+author: 'Paul Poulose'
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  risk:
+    description: >-
+      Risk tier (NORMAL|SENSITIVE|CRITICAL). Empty resolves from the repo's
+      .adversarial-review.yml policy file or AR_RISK.
+    default: ''
+  dev-providers:
+    description: >-
+      Comma list of provider families that developed/advised the change. Empty
+      resolves from the policy file or AR_DEV_PROVIDERS.
+    default: ''
+  gates:
+    description: >-
+      Newline-separated "name=command" pairs, e.g. "unit=npm test". Each runs
+      through gate.py so the exit code is recorded. Gate NAMES also form the
+      --require list; empty falls back to the policy file's required_gates.
+    default: ''
+  fail-on:
+    description: >-
+      "blocked" (default) fails the job on FAIL or BLOCKED; "fail" fails only
+      on FAIL, reporting BLOCKED as a warning (incremental-adoption mode).
+    default: 'blocked'
+  diff-ref:
+    description: 'Git range reviewed by the panel (needs fetch-depth: 0).'
+    default: 'origin/main...HEAD'
+  product:
+    description: 'Product/change label recorded in run.json.'
+    default: ''
+  openrouter-api-key:
+    description: >-
+      OpenRouter API key (pass a secret). When set, the independent reviewer
+      panel runs over the diff. When empty, only deterministic gates are
+      recorded — the aggregator will then report BLOCKED for missing panel
+      coverage, which is the honest verdict for an un-reviewed change.
+    default: ''
+
+outputs:
+  verdict:
+    description: 'PASS, FAIL, or BLOCKED — exactly what aggregate.py computed.'
+    value: ${{ steps.verdict.outputs.verdict }}
+  exit-code:
+    description: 'aggregate.py exit code: 0 PASS, 1 FAIL, 2 BLOCKED.'
+    value: ${{ steps.verdict.outputs.exit_code }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Initialize run and plan gates
+      shell: bash
+      env:
+        IN_RISK: ${{ inputs.risk }}
+        IN_DEV: ${{ inputs.dev-providers }}
+        IN_GATES: ${{ inputs.gates }}
+        IN_PRODUCT: ${{ inputs.product }}
+        IN_DIFF_REF: ${{ inputs.diff-ref }}
+        AR_SCRIPTS: ${{ github.action_path }}/scripts
+      run: |
+        set -euo pipefail
+        args=(--diff-ref "$IN_DIFF_REF")
+        [ -n "$IN_RISK" ] && args+=(--risk "$IN_RISK")
+        [ -n "$IN_DEV" ] && args+=(--dev-providers "$IN_DEV")
+        [ -n "$IN_PRODUCT" ] && args+=(--product "$IN_PRODUCT")
+        python "$AR_SCRIPTS/panel.py" init "${args[@]}"
+        names=""
+        while IFS= read -r line; do
+          line="${line%$'\r'}"                 # tolerate CRLF YAML
+          [ -z "${line// }" ] && continue
+          if [[ "$line" != *=* ]]; then
+            echo "::error::adversarial-review: gate line missing '=' (expected name=command): $line"
+            exit 1
+          fi
+          name="${line%%=*}"; name="${name//[[:space:]]/}"
+          if [ -z "$name" ]; then
+            echo "::error::adversarial-review: gate line has an empty name: $line"
+            exit 1
+          fi
+          names="${names:+$names,}$name"
+        done <<< "$IN_GATES"
+        if [ -n "$names" ]; then
+          python "$AR_SCRIPTS/gate.py" plan --require "$names"
+        else
+          python "$AR_SCRIPTS/gate.py" plan
+        fi
+
+    - name: Run and record gates
+      shell: bash
+      env:
+        IN_GATES: ${{ inputs.gates }}
+        AR_SCRIPTS: ${{ github.action_path }}/scripts
+      run: |
+        set -uo pipefail
+        while IFS= read -r line; do
+          line="${line%$'\r'}"                 # tolerate CRLF YAML
+          [ -z "${line// }" ] && continue
+          # Same shape guard as the plan step: a malformed line is a loud error,
+          # never a silently mis-parsed gate.
+          if [[ "$line" != *=* ]]; then
+            echo "::error::adversarial-review: gate line missing '=' (expected name=command): $line"
+            exit 1
+          fi
+          name="${line%%=*}"; name="${name//[[:space:]]/}"
+          cmd="${line#*=}"
+          if [ -z "$name" ]; then
+            echo "::error::adversarial-review: gate line has an empty name: $line"
+            exit 1
+          fi
+          # A failing command is RECORDED (status FAIL), not fatal here — the
+          # aggregator owns the verdict; hiding a failure would defeat it. The
+          # command is authored in the trusted workflow file (on fork PRs GitHub
+          # takes it from the base repo), and its own $VARS expand inside this
+          # inner bash -c exactly as the author intends.
+          python "$AR_SCRIPTS/gate.py" run --name "$name" -- bash -c "$cmd" || true
+        done <<< "$IN_GATES"
+
+    - name: Independent reviewer panel (only with a key)
+      shell: bash
+      env:
+        OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
+        IN_DIFF_REF: ${{ inputs.diff-ref }}
+        AR_SCRIPTS: ${{ github.action_path }}/scripts
+      run: |
+        set -euo pipefail
+        if [ -z "$OPENROUTER_API_KEY" ]; then
+          echo "::notice::adversarial-review: no openrouter-api-key provided — skipping the reviewer panel. The verdict will be BLOCKED for missing panel coverage (honest for an un-reviewed change)."
+          exit 0
+        fi
+        # mktemp, not a fixed $RUNNER_TEMP/context.md name — standard temp-file
+        # hygiene (no predictable path, honors the runner's temp dir).
+        context_file="$(mktemp "${RUNNER_TEMP:-/tmp}/ar-context.XXXXXX")"
+        {
+          echo "# Change under review (CI)"
+          echo
+          echo '```diff'
+          git diff "$IN_DIFF_REF" || echo "(diff unavailable — check fetch-depth)"
+          echo '```'
+        } > "$context_file"
+        python "$AR_SCRIPTS/panel.py" assign
+        python "$AR_SCRIPTS/panel.py" run --context-file "$context_file"
+
+    - name: Compute verdict
+      id: verdict
+      shell: bash
+      env:
+        IN_FAIL_ON: ${{ inputs.fail-on }}
+        AR_SCRIPTS: ${{ github.action_path }}/scripts
+      run: |
+        set -uo pipefail
+        python "$AR_SCRIPTS/aggregate.py"
+        code=$?
+        case "$code" in
+          0) verdict=PASS ;;
+          1) verdict=FAIL ;;
+          2) verdict=BLOCKED ;;
+          *) verdict=ERROR ;;
+        esac
+        echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+        echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+        run_dir=$(ls -d .adversarial-review/run-* 2>/dev/null | sort | tail -1 || true)
+        if [ -n "$run_dir" ] && [ -f "$run_dir/verdict.md" ]; then
+          cat "$run_dir/verdict.md" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        if [ "$verdict" = FAIL ]; then
+          echo "::error::adversarial-review verdict: FAIL (aggregate.py exit 1)"
+          exit 1
+        elif [ "$verdict" = BLOCKED ]; then
+          if [ "$IN_FAIL_ON" = "fail" ]; then
+            echo "::warning::adversarial-review verdict: BLOCKED (exit 2) — tolerated because fail-on=fail"
+            exit 0
+          fi
+          echo "::error::adversarial-review verdict: BLOCKED (aggregate.py exit 2)"
+          exit 1
+        elif [ "$verdict" = ERROR ]; then
+          echo "::error::adversarial-review: aggregate.py exited $code"
+          exit 1
+        fi
+        echo "::notice::adversarial-review verdict: PASS"
