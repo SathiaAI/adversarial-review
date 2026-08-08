@@ -91,6 +91,23 @@ never silence. `MINIMUM_GATES` floors are unchanged (promoting `ai-defects` into
 floors would be a separate, breaking decision), and no aggregator change is involved —
 gates are already tool-agnostic commands with exit codes.
 
+## The enforcement gate: 404 is not "absent"
+
+Branch-protection verification (the `enforcement` gate, SENSITIVE+) has one recurring
+trap worth calling out because it produces a confident-but-wrong record: a **404 from
+the classic protection endpoint is ambiguous**. It means any of "no classic protection
+configured," "a ruleset applies instead of classic protection," or "the token cannot see
+the repository." (Insufficient permission on a *visible* repo returns 403, not 404 — so
+neither status proves absence.) Never record a 404 as protection confirmed-absent. The
+skill does not — and cannot — introspect a token's grants; the operator confirms scope
+out of band. Query `repos/{owner}/{repo}/rules/branches/{branch}` as well, and treat
+protection as verified-absent **only** when, under a token confirmed to carry
+`admin:repo`, the classic endpoint 404s AND `rules/branches` returns an empty list; a
+non-empty `rules/branches` means ruleset protection is active (present, not absent). If
+scope is unconfirmed, or the secondary query itself fails or is ambiguous, the honest
+record is `--status BLOCKED` — unknown is not pass, and a permission gap must never read
+as a clean bill of health. See `SKILL.md`, Step 5.
+
 ## Blocking semantics
 
 Gate status is tri-state. Exit code 0 = PASS. Anything else on a tier-required gate =
