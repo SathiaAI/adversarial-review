@@ -82,6 +82,32 @@ Assemble `context.md`: requirements + invariants, full diff (`git diff main...HE
 relevant surrounding code, tests, schemas/migrations, infra changes. Do not truncate the
 diff. Do not include secrets or `.env` content.
 
+**Push integrity — review the artifact that actually exists, not the one you think you
+pushed.** The panel can only judge the bytes you hand it; if you assemble the context (or
+compute a verdict) from a local copy while the remote branch/PR contains something
+different, the pipeline will faithfully bless the wrong thing — "the panel reviewed it
+and found nothing" is indistinguishable in the verdict from "the panel reviewed corrupted
+content and found nothing." Whenever the change under review was pushed to a remote (a
+branch, a PR, a mirrored artifact), re-fetch it and verify byte-for-byte that what landed
+matches what you intended **before** building `context.md` and again **before** acting on
+the verdict:
+
+```bash
+git fetch origin "$BRANCH"
+# per-file: the remote blob shas must equal your intended local ones
+git ls-tree -r "origin/$BRANCH" | awk '{print $3, $4}' | sort > /tmp/remote-blobs
+git ls-tree -r HEAD             | awk '{print $3, $4}' | sort > /tmp/local-blobs
+diff /tmp/remote-blobs /tmp/local-blobs   # must be empty
+# and take the reviewed diff from the pushed ref, never from an un-verified relay:
+git diff "origin/main...origin/$BRANCH" | sha256sum
+```
+
+Any mismatch is a hard stop — fix the push (or the local source) and re-verify; never
+review or merge across an unexplained divergence. A transport that reports success is not
+proof the bytes arrived intact; only the digest is. (This gap is why an integrity check
+belongs in the protocol and not in an operator's memory — see the project's own PR
+pipeline for a worked example.)
+
 ## Step 2 — Deterministic gates
 
 Read `references/gates.md` for the tier matrix, commands, thresholds, and suppression
