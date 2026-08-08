@@ -227,8 +227,28 @@ def t_gate_not_applicable_reaches_pass():
     assert [x["name"] for x in na] == ["sast"], na
     assert na[0]["authorized_by"] == "Paul" and na[0]["reason"], na
     assert "sast" not in v["coverage"]["gates"]["passed"]
+    # the other required floor gates still had to pass for this to be a PASS — N/A on
+    # one gate does not stand in for the rest (fixture records build/unit/secrets/deps)
+    assert set(["build", "unit", "secrets", "deps"]) <= set(v["coverage"]["gates"]["passed"])
     md = (run / "verdict.md").read_text()
     assert "not applicable: gate 'sast' (authorized by Paul)" in md, md
+
+
+def t_gate_not_applicable_null_authorizer_blocks():
+    # A JSON null (or missing / non-string) authorizer must read as ABSENT — never
+    # stringified to "None" and honored. This is the accountability guard's teeth.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "fixed", "reproduced": True,
+        "regression_test": "t::x", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    write(run / "gates" / "sast.json", {
+        "gate": "sast", "command": "(external)", "exit_code": None,
+        "status": "NOT_APPLICABLE", "summary": "no source", "authorized_by": None,
+        "recorded_at": "x", "source": "record"})
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "NOT_APPLICABLE without a named authorizer" in r.stdout, r.stdout
 
 
 def t_gate_not_applicable_requires_authorizer_and_reason():

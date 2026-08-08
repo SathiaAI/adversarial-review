@@ -78,8 +78,13 @@ def check_gates(run, tier, fail, blocked, notes):
             # verdict — but it is an accountable, on-record determination, so an N/A
             # without a named authorizer and a reason is itself a BLOCK (unaccountable
             # skips are exactly what this pipeline exists to prevent).
-            who = str(rec.get("authorized_by", "")).strip()
-            reason = str(rec.get("summary", "")).strip()
+            # Guard against non-string values (JSON null, numbers, objects): a
+            # `null` authorizer must read as absent, not as the string "None". Only a
+            # non-empty *string* counts as accountable.
+            who = rec.get("authorized_by")
+            reason = rec.get("summary")
+            who = who.strip() if isinstance(who, str) else ""
+            reason = reason.strip() if isinstance(reason, str) else ""
             if not who or not reason:
                 gcov["blocked"].append(
                     {"name": name, "reason": "NOT_APPLICABLE without an authorizer and reason"})
