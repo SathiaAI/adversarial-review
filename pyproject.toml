@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adversarial-review"
+version = "0.1.0"
+description = "Multi-model adversarial code review with a deterministic, machine-computed release verdict"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Paul Poulose" }]
+requires-python = ">=3.9"
+# Stdlib-only by design: the empty list below is asserted by the deps gate.
+dependencies = []
+keywords = ["code-review", "llm", "security", "ci", "release-engineering", "agents"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://github.com/SathiaAI/adversarial-review"
+Issues = "https://github.com/SathiaAI/adversarial-review/issues"
+
+[project.scripts]
+ar-panel = "adversarial_review.panel:main"
+ar-gate = "adversarial_review.gate:main"
+ar-aggregate = "adversarial_review.aggregate:main"
+
+[tool.setuptools]
+# The repo keeps its skills-folder layout (scripts/ run directly by agents);
+# packaging maps that same directory to the adversarial_review package so the
+# console scripts exist without moving or rewriting a single module.
+package-dir = { adversarial_review = "scripts" }
+packages = ["adversarial_review"]
