@@ -290,8 +290,9 @@ the run directory can verify it:
 
 ```bash
 python scripts/aggregate.py --check-digest
-# attestation OK: sha256 1f58da91… over 27 artifacts        → exit 0
-#   DRIFT modified gates/deps.json                          → exit 1, each file named
+# exit 0 — intact.  Output: "attestation OK: sha256 1f58da91… over 27 artifacts"
+# exit 1 — drifted. One line per drifted artifact, e.g. "  DRIFT modified gates/deps.json"
+# exit 2 — nothing to verify yet (no verdict.json, or one computed before attestations existed)
 ```
 
 ## Configuration
