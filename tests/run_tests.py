@@ -861,6 +861,18 @@ def t_packaging_entrypoints_resolve():
         assert re.search(r"^def main\(\):", src, re.M), f"{mod}.py lacks main()"
 
 
+def t_llms_txt_link_integrity():
+    # llms.txt is only useful if its links resolve — guard against rot.
+    txt = (SKILL / "llms.txt").read_text()
+    lines = txt.splitlines()
+    assert lines[0].startswith("# "), "llms.txt must start with an H1 title"
+    assert any(l.startswith("> ") for l in lines[:5]), "needs a blockquote summary"
+    for target in re.findall(r"\]\(([^)]+)\)", txt):
+        if target.startswith(("http://", "https://", "#")):
+            continue
+        assert (SKILL / target).exists(), f"llms.txt links a missing path: {target}"
+
+
 def t_action_definition_hygiene():
     # Regression cover for the composite GitHub Action (issue #7b). Stdlib-only
     # (no YAML dep), so these are structural string assertions — the fuller
