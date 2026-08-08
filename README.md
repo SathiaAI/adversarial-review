@@ -56,7 +56,10 @@ flowchart LR
 Every step writes JSON artifacts to `.adversarial-review/<run-id>/` (gates, reviewer
 reports, rebuttals, validation records, suppressions). The aggregator consumes those files
 and nothing else — an unrecorded fact does not exist for verdict purposes. Completed runs
-are immutable audit records.
+are immutable audit records — and provably so: every verdict embeds a **coverage**
+manifest of what the run did and did not verify, plus a tamper-evident **attestation**
+digest over the entire recorded run
+([details ↓](#whats-inside-verdictjson-coverage-and-attestation)).
 
 ### The reviewer panel
 
@@ -97,6 +100,7 @@ These are tested behaviors, not aspirations (see `tests/run_tests.py`, 30 scenar
 | Reviewer-flagged release-blocking finding left untriaged (any severity) | BLOCKED |
 | Accepted risk without a narrow, owned, unexpired suppression | FAIL |
 | Skipping the rebuttal round when policy requires it | BLOCKED |
+| Edit, add, or remove any recorded artifact after the verdict is computed | `--check-digest` exits 1 and names each drifted file |
 
 ## Proven on itself: the first real runs
 
@@ -246,6 +250,50 @@ when there are high/critical findings to contest — cost scales with contention
 
 Wire it into CI: run the aggregator as the last step and let the exit code gate the
 deploy. `verdict.json` (machine) and `verdict.md` (human) land in the run directory.
+
+### What's inside verdict.json: coverage and attestation
+
+Beyond the verdict itself, every aggregation embeds two blocks that make the audit
+record self-describing and self-verifying:
+
+```jsonc
+"coverage": {                       // what this run did and did not verify
+  "risk": "NORMAL",
+  "gates": {"plan_recorded": true, "required": [...], "passed": [...],
+            "failed": [], "blocked": [], "missing": [], "waived": [...]},
+  "panel": {"roles_required": [...], "roles_filled": [...],
+            "degraded": null, "dev_families_excluded": ["anthropic"]},
+  "rebuttal": {"policy": "contention", "required": false, "ran": false},
+  "findings": {"raised": 8, "triaged": 8, "untriaged_release_blocking": 0},
+  "areas_not_reviewed": ["union of the reviewers' own attestations"]
+},
+"attestation": {                    // tamper-evident digest over the recorded run
+  "algorithm": "sha256-canonical-json-v1",
+  "inputs": 27,
+  "digest": "1f58da91…",
+  "files": {"run.json": "…", "gates/unit.json": "…"}
+}
+```
+
+**Coverage** is assembled exclusively from recorded artifacts — the same inputs as the
+verdict — so an unrecorded fact is absent here too, never inferred. It is present on
+every aggregation, including FAIL and BLOCKED; CI consumers can read `gates.missing`,
+`gates.blocked`, and `rebuttal {"required": true, "ran": false}` as the specific
+unknowns behind a BLOCKED verdict.
+
+**Attestation** is a reproducible SHA-256 over every recorded `*.json` artifact except
+`verdict.json` itself. Artifacts are canonicalized (sorted keys, compact separators),
+so cosmetic re-serialization is not tampering, while a file that fails UTF-8 decoding
+or JSON parsing hashes over its raw bytes instead of crashing the aggregator.
+Re-aggregating an untouched run reproduces the digest bit-for-bit, and anyone holding
+the run directory can verify it:
+
+```bash
+python scripts/aggregate.py --check-digest
+# exit 0 — intact.  Output: "attestation OK: sha256 1f58da91… over 27 artifacts"
+# exit 1 — drifted. One line per drifted artifact, e.g. "  DRIFT modified gates/deps.json"
+# exit 2 — nothing to verify yet (no verdict.json, or one computed before attestations existed)
+```
 
 ## Configuration
 
