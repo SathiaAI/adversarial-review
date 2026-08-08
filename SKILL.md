@@ -185,21 +185,27 @@ gh api repos/{owner}/{repo}/branches/{branch}/protection
 gh api repos/{owner}/{repo}/rules/branches/{branch}
 ```
 
-A **404 is not proof of "no protection."** The classic-protection endpoint returns 404
-both when no protection is configured *and* when the caller lacks permission to read it
-(and also when a ruleset, not classic protection, applies — check `rules/branches`
-before concluding anything). Never record a 404 as "confirmed absent." Treat protection
-as verified-absent only from an authenticated response you know has sufficient scope
-(e.g. an empty `[]` from `rules/branches` plus a 404 from the classic endpoint under a
-token with `admin:repo`); otherwise the honest status is BLOCKED, naming the ambiguity.
+A **404 is not proof of "no protection," and only a scope-confirmed check can prove
+absence.** The classic-protection endpoint returns 404 when no classic protection is
+configured, when a **ruleset** (not classic protection) applies instead, or when the
+token cannot see the repository at all; an insufficient-permission caller on a *visible*
+repo gets 403, not 404 — so neither a 404 nor a 403 proves protection is absent. The
+skill cannot introspect a token's grants; **you** confirm scope out of band. Record
+`enforcement` as verified-absent **only** when, under a token you have confirmed carries
+`admin:repo`, the classic endpoint 404s AND `rules/branches` returns an empty list. A
+non-empty `rules/branches` means ruleset protection is active — record that as present.
+If the token's `admin:repo` scope is not confirmed, or the `rules/branches` query itself
+fails or is ambiguous, the honest status is **BLOCKED regardless of what any endpoint
+returned** — a permission gap must never read as a clean bill of health.
 
 Record the result as a gate: exit 0 only if all required protections are verified
-present. If access is insufficient to verify — including a bare 404 whose cause you
-cannot disambiguate — record it as blocked; unknown is not pass and not fail:
+present under a scope-confirmed token. If access is insufficient to verify — including a
+404 whose cause you cannot disambiguate, or an unconfirmed token scope — record it as
+blocked; unknown is not pass and not fail:
 
 ```bash
 python <skill>/scripts/gate.py record --name enforcement --status BLOCKED \
-  --summary "branch-protection 404 is ambiguous: no ruleset returned and admin:repo scope unconfirmed"
+  --summary "branch-protection 404 not disambiguated: admin:repo scope unconfirmed, so absence unproven"
 ```
 
 That yields a BLOCKED verdict, which is correct. The same `--status BLOCKED` applies to
