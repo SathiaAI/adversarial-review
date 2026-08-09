@@ -85,7 +85,7 @@ vote.
 
 ### What the aggregator refuses to accept
 
-These are tested behaviors, not aspirations (see `tests/run_tests.py`, 46 scenarios):
+These are tested behaviors, not aspirations (see `tests/run_tests.py`, 55 scenarios):
 
 | Attempt | Outcome |
 |---|---|
@@ -164,7 +164,7 @@ export OPENROUTER_API_KEY=sk-or-...
 # from your repository root
 python <skill>/scripts/panel.py init --risk SENSITIVE --dev-providers anthropic \
     --diff-ref "main...HEAD" --product "my-service"
-python <skill>/scripts/gate.py plan --require build,lint,typecheck,unit,secrets,deps,sast
+python <skill>/scripts/gate.py plan --require build,lint,typecheck,unit,secrets,deps,sast,ai-defects
 python <skill>/scripts/gate.py run --name unit -- npm test        # one per gate
 python <skill>/scripts/panel.py assign
 python <skill>/scripts/panel.py run --context-file context.md      # your diff + context
@@ -178,6 +178,81 @@ validating findings afterward — is in [SKILL.md](SKILL.md).
 
 Expected on a first dry run with no gates recorded: **BLOCKED**. That is the system
 working — it does not guess.
+
+## Using the skill: step by step
+
+On an agent platform (Claude Code, Cowork, Codex, …) you just invoke the skill and it
+drives this whole flow for you — the steps below are what it runs under the hood, and how
+to run them by hand. Every command writes JSON into `.adversarial-review/<run-id>/`; only
+the last one emits a verdict.
+
+**1 · Install it.** Clone the one folder into your platform's skills directory (see
+[Installation](#installation) below), or run the scripts anywhere Python 3.9+ runs.
+
+**2 · Give it reviewer models.** Set `OPENROUTER_API_KEY` — or a key file, an
+OpenAI-compatible proxy, or a keyless MCP transport
+([Keys and transports](#keys-and-transports)). No key is fine for a first look: the panel
+is skipped and the run simply comes back BLOCKED for missing review coverage.
+
+**3 · Start a run.** From your repo root, classify the change and name the families that
+wrote it:
+
+```bash
+python <skill>/scripts/panel.py init --risk SENSITIVE \
+    --dev-providers anthropic --diff-ref "main...HEAD" --product "my-service"
+```
+
+`--dev-providers` is every model family that planned, wrote, or advised the change — they
+are barred from the panel. The risk tier sets how many reviewers and which gates are
+required ([Risk tiers and gates](#risk-tiers-and-gates)).
+
+**4 · Run your gates and record each honestly.** The skill never runs your build or tests
+for you; it records their results:
+
+```bash
+python <skill>/scripts/gate.py plan --require build,unit,secrets,deps,sast,ai-defects
+python <skill>/scripts/gate.py run  --name unit -- npm test          # runs it, records the exit code
+python <skill>/scripts/gate.py record --name sast --exit-code 0 --summary "semgrep: 0 findings"  # or ingest a CI result
+```
+
+A check that genuinely can't run is `--status BLOCKED`, or `--status NOT_APPLICABLE
+--authorized-by "<you>" --summary "<why>"` — never a silent pass.
+
+**5 · Assemble the review context.** Put the requirements and invariants, the full diff,
+and the relevant surrounding code into `context.md`. This is exactly what reviewers see —
+never include secrets or `.env` content. [SKILL.md](SKILL.md) has the checklist.
+
+**6 · Assign the panel and review.**
+
+```bash
+python <skill>/scripts/panel.py assign                        # independent reviewers from the live catalog
+python <skill>/scripts/panel.py run --context-file context.md
+```
+
+No local key? Swap the second command for `panel.py prepare` → run each request through
+your MCP transport → `panel.py ingest --role <role> --response-file <file>`. Same schema,
+same validation, same verdict path.
+
+**7 · Rebuttal, when it matters.** If the panel raised high/critical findings,
+`python <skill>/scripts/panel.py rebuttal` makes the reviewers confront each other's
+findings with evidence (required by policy on SENSITIVE/CRITICAL).
+
+**8 · Validate findings and fix.** For each high/critical or release-blocking finding:
+inspect the cited code, reproduce it, fix it, rerun the affected gates, and write a
+validation record. Dismissing a finding needs reproducible counter-evidence **and** an
+uninvolved reviewer's concurrence — your say-so alone never clears one.
+
+**9 · Get the verdict.** The only step that decides anything:
+
+```bash
+python <skill>/scripts/aggregate.py                  # PASS (0) / FAIL (1) / BLOCKED (2), with reasons
+python <skill>/scripts/aggregate.py --check-digest   # confirm no artifact changed since
+```
+
+Read `verdict.md` (human) or `verdict.json` (machine, carrying the coverage and
+attestation blocks). Wire the exit code into CI to gate the merge — and note the skill
+itself never merges, pushes, or deploys: the verdict gates those actions, a human
+authorizes them.
 
 ## Installation
 
@@ -263,9 +338,15 @@ using it for SENSITIVE/CRITICAL changes.
 
 | Tier | Panel | Gates |
 |---|---|---|
-| NORMAL | 3 reviewers | build, format, lint, typecheck, unit, integration, secrets (gitleaks), deps (osv-scanner), SAST (opengrep/semgrep), IaC (checkov) |
+| NORMAL | 3 reviewers | build, format, lint, typecheck, unit, integration, secrets (gitleaks), deps (osv-scanner), SAST (opengrep/semgrep), IaC (checkov), ai-defects |
 | SENSITIVE | 5 reviewers | + e2e, migration/rollback tests, changed-scope mutation testing |
 | CRITICAL | 5 + rebuttal always in scope | + authorized OWASP ZAP against staging, branch-protection enforcement check |
+
+The **ai-defects** gate is vendor-neutral and runs at every tier — it targets the failure
+modes specific to AI-written code: phantom references and invented package APIs, impossible
+dependency versions, and unfinished stubs left behind as if complete. It behaves like any
+other gate (unavailable tooling is recorded BLOCKED or waived on the record, never
+silenced); details in [`references/gates.md`](references/gates.md).
 
 Mutation testing is scoped to changed code (Stryker `--incremental`, PIT incremental
 analysis, path-scoped mutmut) so the gate survives real repositories. A minimum gate
@@ -401,12 +482,14 @@ and the exact resolved IDs are pinned into the run's `plan.json` for the audit r
 python tests/run_tests.py
 ```
 
-46 end-to-end scenarios against an in-process mock router — no network, no API keys:
+55 end-to-end scenarios against an in-process mock router — no network, no API keys:
 role assignment and collision-resolution under multi-provider exclusions, degraded-mode
 authorization, malformed-JSON retry, dead-provider substitution, the full verdict matrix,
-rebuttal policies, suppression expiry, the keyless MCP prepare/ingest path, and
-policy-file precedence, source recording, and malformed-policy refusal. CI runs
-the suite on Python 3.9 and 3.12.
+rebuttal policies, suppression expiry, the keyless MCP prepare/ingest path, policy-file
+precedence, source recording, and malformed-policy refusal, the coverage and attestation
+blocks, and the stdio MCP server end to end (protocol handshake, run-id and catalog_file
+hardening, the parse-error and subprocess-timeout paths, and all three verdict states).
+CI runs the suite on Python 3.9 and 3.12.
 
 ## Repository layout
 
@@ -421,13 +504,15 @@ scripts/
   panel.py            # catalog resolution, role assignment, reviewer calls, rebuttal, concurrence
   gate.py             # deterministic gate runner/recorder (tri-state: PASS/FAIL/BLOCKED)
   aggregate.py        # the only thing that can emit a verdict
+  mcp_server.py       # stdio JSON-RPC MCP server exposing the pipeline as MCP tools
+  _common.py          # shared stdlib-only helpers (router client, catalog, artifacts)
 references/
   config.md           # keys, transports, privacy, env vars
   gates.md            # gate matrix, thresholds, suppression rules, supply-chain hygiene
   roles.md            # role rubrics, prompt contract, injection defense
   schemas.md          # artifact schemas and blocking rules
   report.md           # final report template
-tests/                # mock router + 46-scenario suite
+tests/                # mock router + 55-scenario suite
 ```
 
 ## Security notes
