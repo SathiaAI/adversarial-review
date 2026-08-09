@@ -2,6 +2,8 @@
 
 **Multi-model adversarial code review with a deterministic, machine-computed release verdict.**
 
+![Adversarial Review — independent reviewer models from different providers converging on a single computed PASS / FAIL / BLOCKED verdict](docs/assets/hero-review.webp)
+
 [![tests](https://github.com/SathiaAI/adversarial-review/actions/workflows/ci.yml/badge.svg)](https://github.com/SathiaAI/adversarial-review/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)
@@ -253,6 +255,45 @@ Read `verdict.md` (human) or `verdict.json` (machine, carrying the coverage and
 attestation blocks). Wire the exit code into CI to gate the merge — and note the skill
 itself never merges, pushes, or deploys: the verdict gates those actions, a human
 authorizes them.
+
+## Use it on any platform
+
+The pipeline is identical everywhere — Claude Code, Claude (Cowork), OpenAI Codex, Cursor,
+Windsurf / Devin, Gemini CLI, GitHub Copilot, or any agent that reads `SKILL.md` or
+[`AGENTS.md`](AGENTS.md). Only **two** things change per platform: how you point the agent
+at the skill, and **which model family you exclude** — the family that wrote the code.
+
+```mermaid
+flowchart LR
+    Q["Who wrote<br/>the change?"]
+    Q --> C1["Claude Code / Cowork"]
+    Q --> C2["OpenAI Codex"]
+    Q --> C3["Gemini CLI / Jules"]
+    Q --> C4["Cursor · Windsurf / Devin · Copilot"]
+    C1 --> X1["--dev-providers<br/>anthropic"]
+    C2 --> X2["--dev-providers<br/>openai"]
+    C3 --> X3["--dev-providers<br/>google"]
+    C4 --> X4["--dev-providers<br/>the family you picked"]
+    X1 --> P["Panel drawn only from<br/>the families that did not write it"]
+    X2 --> P
+    X3 --> P
+    X4 --> P
+```
+
+| Platform | Wire it in | Exclude (`--dev-providers`) |
+|---|---|---|
+| Claude Code / Cowork | Native skill | `anthropic` |
+| OpenAI Codex | `AGENTS.md` or skills dir | `openai` |
+| Cursor | `AGENTS.md` | the family you selected |
+| Windsurf / Devin | `AGENTS.md` | the family Cascade used |
+| GitHub Copilot | `AGENTS.md` + Action | the family in use |
+| Gemini CLI / Jules | `AGENTS.md` | `google` |
+| Any other agent | `SKILL.md` / `AGENTS.md` | that model's family |
+
+Get the excluded family wrong and the author quietly grades its own work — the one mistake
+that turns the whole thing into theatre. **Full per-platform guide** — setup, when to reach
+for it, expected outcomes, and what to watch for — **→
+[docs/using-on-your-platform.md](docs/using-on-your-platform.md)**.
 
 ## Installation
 
