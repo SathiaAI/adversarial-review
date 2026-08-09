@@ -129,6 +129,34 @@ pipeline so it gates the merge, not a human's optimism:
     openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
 ```
 
+### Using the MCP server (`ar-mcp`) — for MCP hosts
+
+**When to reach for it.** If your host natively runs *skills* (Claude Code, Claude Cowork), use path A above — you don't need the MCP. Reach for `ar-mcp` when your host speaks **MCP** but not skills: **Claude Desktop**, MCP-native IDEs like **Cursor** and **Windsurf**, or **your own agent** (a LangChain / LlamaIndex / custom loop) that should drive the review as first-class tool calls instead of shell commands.
+
+**What it exposes.** Ten tools over newline-delimited **JSON-RPC 2.0 on stdio** — `ar_init`, `ar_gate_plan`, `ar_gate_record`, `ar_panel_assign`, `ar_panel_prepare` + `ar_panel_ingest` (or `ar_panel_run`), `ar_aggregate`, `ar_check_digest`, `ar_get_verdict`. It is stdlib-only, and the verdict is still computed **only** by `aggregate.py`. Crucially it is *not* a command-execution surface: it **records** the results of gates you run and never executes an arbitrary command itself — which is what makes it safe to hand to an autonomous agent.
+
+**How the host drives it.** `ar_init` -> `ar_gate_plan` -> run your gates and `ar_gate_record` each -> `ar_panel_assign` -> `ar_panel_prepare` + `ar_panel_ingest` (or `ar_panel_run`) -> `ar_aggregate` for the verdict. Launch the server with the repository under review as its working directory — it reads and writes `.adversarial-review/` in `cwd`.
+
+**Adding it to an MCP host.** A standard `mcpServers` entry:
+
+```json
+{
+  "mcpServers": {
+    "adversarial-review": {
+      "command": "ar-mcp",
+      "args": [],
+      "cwd": "/path/to/your/repo"
+    }
+  }
+}
+```
+
+Use `"command": "python", "args": [".../adversarial-review/scripts/mcp_server.py"]` if you did not install the console script. Add your router key to `env` only if you want the server to call reviewers itself (`ar_panel_run`); otherwise use the keyless `ar_panel_prepare` + `ar_panel_ingest` path and let the host's own transport make the calls. In **Claude Desktop** add it under Settings -> Extensions (or the config file); in **Cursor / Windsurf / Claude Code** use that tool's MCP config.
+
+**The Claude Cowork caveat.** Cowork's custom connectors are **remote-MCP only** — an HTTPS URL brokered through your Claude account, not a local stdio process — so `ar-mcp` is *not* the way into Cowork. There, use the **native skill** (path A). If you specifically need `ar-mcp` in Cowork, host it as a *remote* MCP endpoint (wrap the stdio server behind HTTP/SSE) and add its URL under Customize -> Connectors.
+
+**Standards.** `ar-mcp` conforms to the MCP specification: JSON-RPC 2.0 over stdio, the `initialize` -> `tools/list` -> `tools/call` lifecycle, and it negotiates the published protocol revisions (`2025-06-18`, `2025-03-26`, `2024-11-05`). MCP is now stewarded by the Linux Foundation's **[Agentic AI Foundation](https://www.linuxfoundation.org/press/linux-foundation-announces-the-formation-of-the-agentic-ai-foundation)** (Dec 2025) — a neutral-governance move, not a spec change — as is [`AGENTS.md`](https://agents.md), the other standard this guide leans on.
+
 ---
 
 ## Per-platform playbook
