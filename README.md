@@ -5,6 +5,7 @@
 ![Adversarial Review — independent reviewer models from different providers converging on a single computed PASS / FAIL / BLOCKED verdict](docs/assets/hero-review.webp)
 
 [![tests](https://github.com/SathiaAI/adversarial-review/actions/workflows/ci.yml/badge.svg)](https://github.com/SathiaAI/adversarial-review/actions/workflows/ci.yml)
+[![Guide](https://img.shields.io/badge/guide-live%20site-4db6ff)](https://sathiaai.github.io/adversarial-review/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)
 ![stdlib only](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen)
@@ -574,13 +575,6 @@ regression test. Substantive PRs are reviewed the only way this repo knows how: 
 independent multi-model panel, with the verdict computed. Security reports:
 [SECURITY.md](SECURITY.md) — prompt-injection bypasses of the review boundaries are
 explicitly in scope and especially welcome.
-
-## Star history
-
-If independent, computed verdicts are how you think AI code review should work, a ⭐
-helps other engineers find this.
-
-[![Star History Chart](https://api.star-history.com/svg?repos=SathiaAI/adversarial-review&type=Date)](https://star-history.com/#SathiaAI/adversarial-review&Date)
 
 ## License
 
