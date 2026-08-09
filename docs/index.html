@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>adversarial-review — run it on any coding agent</title>
+<meta name="description" content="A portable release gate: multi-model adversarial code review with a deterministic, machine-computed verdict. Run it on Claude Code, Cowork, Codex, Cursor, Windsurf/Devin, Gemini CLI, Copilot, or any agent that reads SKILL.md or AGENTS.md.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#090a0e;
+    --bg-2:#0c0e14;
+    --ink:#eef1f7;
+    --muted:#9aa1b2;
+    --faint:#6c7385;
+    --line:rgba(255,255,255,.09);
+    --line-2:rgba(255,255,255,.06);
+    --accent:#4db6ff;
+    --accent-soft:rgba(77,182,255,.14);
+    --accent-line:rgba(77,182,255,.42);
+    --cyan:#63dce6;
+    --ok:#57d08a;
+    --warn:#e6b25a;
+    --stop:#e8757f;
+    --shell:rgba(255,255,255,.035);
+    --card:#0f121a;
+    --radius:26px;
+    --ease:cubic-bezier(.32,.72,0,1);
+    --maxw:1180px;
+    --font:"Plus Jakarta Sans",system-ui,sans-serif;
+    --display:"Space Grotesk",system-ui,sans-serif;
+    --mono:"JetBrains Mono",ui-monospace,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--bg);color:var(--ink);font-family:var(--font);
+    line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden;
+    letter-spacing:-.01em;
+  }
+  /* ambient background */
+  .bg-fx{position:fixed;inset:0;z-index:-2;overflow:hidden;pointer-events:none}
+  .bg-fx::before,.bg-fx::after{content:"";position:absolute;border-radius:50%;filter:blur(120px);opacity:.5}
+  .bg-fx::before{width:52vw;height:52vw;left:-12vw;top:-14vw;background:radial-gradient(circle,rgba(77,182,255,.12),transparent 62%)}
+  .bg-fx::after{width:46vw;height:46vw;right:-10vw;top:34vh;background:radial-gradient(circle,rgba(99,220,230,.08),transparent 60%)}
+  .grain{position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.035;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
+
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+
+  /* nav */
+  nav{position:fixed;top:0;left:0;right:0;z-index:40;display:flex;justify-content:center;padding:18px 16px}
+  .navpill{display:flex;align-items:center;gap:26px;padding:9px 9px 9px 20px;
+    background:rgba(14,16,22,.72);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+    border:1px solid var(--line);border-radius:999px;box-shadow:0 8px 34px -18px rgba(0,0,0,.9),inset 0 1px 0 rgba(255,255,255,.05)}
+  .brand{display:flex;align-items:center;gap:10px;font-family:var(--mono);font-size:14px;font-weight:600;letter-spacing:-.02em;color:var(--ink);text-decoration:none;white-space:nowrap}
+  .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px var(--accent-soft)}
+  .navlinks{display:flex;gap:22px}
+  .navlinks a{color:var(--muted);text-decoration:none;font-size:13.5px;font-weight:500;transition:color .3s var(--ease)}
+  .navlinks a:hover{color:var(--ink)}
+  .btn{display:inline-flex;align-items:center;gap:10px;font-family:var(--font);font-weight:600;font-size:14px;
+    text-decoration:none;border:0;cursor:pointer;border-radius:999px;padding:10px 8px 10px 18px;
+    transition:transform .35s var(--ease),background .35s var(--ease)}
+  .btn .ic{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;transition:transform .35s var(--ease)}
+  .btn-primary{background:var(--ink);color:#0a0b0f}
+  .btn-primary .ic{background:rgba(0,0,0,.1)}
+  .btn-primary:hover{transform:translateY(-1px)}
+  .btn-primary:hover .ic{transform:translate(3px,-1px)}
+  .btn-primary:active{transform:scale(.98)}
+  .btn-ghost{background:var(--shell);color:var(--ink);border:1px solid var(--line)}
+  .btn-ghost .ic{background:rgba(255,255,255,.06)}
+  .btn-ghost:hover{transform:translateY(-1px);background:rgba(255,255,255,.06)}
+  .navtoggle{display:none;background:var(--shell);border:1px solid var(--line);border-radius:12px;width:40px;height:40px;cursor:pointer;color:var(--ink)}
+  .navtoggle span{display:block;width:16px;height:1.5px;background:var(--ink);margin:4px auto;transition:transform .4s var(--ease),opacity .3s var(--ease)}
+
+  /* section rhythm */
+  section{position:relative;padding:96px 0}
+  .eyebrow{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;font-weight:600;
+    text-transform:uppercase;letter-spacing:.24em;color:var(--accent);
+    padding:6px 14px;border:1px solid var(--accent-line);border-radius:999px;background:var(--accent-soft)}
+  h1,h2,h3{font-family:var(--display);font-weight:600;letter-spacing:-.03em;line-height:1.04}
+  h2{font-size:clamp(28px,4.6vw,46px)}
+  .lead{color:var(--muted);font-size:clamp(16px,1.6vw,19px);max-width:60ch;line-height:1.65}
+  .kicker{color:var(--faint);font-family:var(--mono);font-size:12.5px;letter-spacing:.02em}
+  code,.mono{font-family:var(--mono)}
+  .chip{font-family:var(--mono);font-size:12.5px;padding:3px 9px;border-radius:8px;background:var(--accent-soft);
+    color:var(--accent);border:1px solid var(--accent-line);white-space:nowrap}
+
+  /* hero */
+  header.hero{padding:150px 0 40px}
+  .hero-grid{display:grid;grid-template-columns:1.05fr .95fr;gap:40px;align-items:center}
+  .hero h1{font-size:clamp(38px,6vw,72px);letter-spacing:-.045em}
+  .hero h1 .g{color:var(--faint)}
+  .hero .lead{margin:22px 0 30px}
+  .hero-cta{display:flex;gap:14px;flex-wrap:wrap}
+  .verdict-strip{display:flex;gap:8px;margin-top:30px;flex-wrap:wrap}
+  .vtag{font-family:var(--mono);font-size:12px;padding:6px 12px;border-radius:999px;border:1px solid var(--line);color:var(--muted);display:flex;align-items:center;gap:7px}
+  .vtag i{width:7px;height:7px;border-radius:50%;display:inline-block}
+  .frame{position:relative;border-radius:calc(var(--radius) + 6px);padding:7px;background:var(--shell);
+    border:1px solid var(--line);box-shadow:0 40px 90px -50px rgba(0,0,0,.95),inset 0 1px 0 rgba(255,255,255,.06)}
+  .frame img{display:block;width:100%;border-radius:var(--radius);border:1px solid var(--line-2)}
+  .frame .cap{position:absolute;left:18px;bottom:16px;font-family:var(--mono);font-size:11px;color:var(--ink);
+    background:rgba(9,10,14,.6);backdrop-filter:blur(8px);padding:5px 11px;border-radius:8px;border:1px solid var(--line)}
+
+  .band{display:flex;gap:28px;flex-wrap:wrap;margin-top:44px;padding-top:26px;border-top:1px solid var(--line-2)}
+  .band div{display:flex;flex-direction:column}
+  .band b{font-family:var(--display);font-size:22px;font-weight:600}
+  .band span{color:var(--faint);font-size:13px;font-family:var(--mono)}
+
+  /* double-bezel card */
+  .shell{background:var(--shell);border:1px solid var(--line);border-radius:calc(var(--radius) + 4px);padding:7px;
+    transition:transform .5s var(--ease),border-color .5s var(--ease)}
+  .shell:hover{border-color:var(--accent-line);transform:translateY(-3px)}
+  .core{background:var(--card);border:1px solid var(--line-2);border-radius:var(--radius);padding:26px;height:100%;
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}
+  .core h3{font-size:20px;margin-bottom:8px}
+  .core p{color:var(--muted);font-size:14.5px}
+
+  .sec-head{max-width:64ch;margin-bottom:44px}
+  .sec-head h2{margin:18px 0 14px}
+
+  /* pipeline flow */
+  .flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;counter-reset:s}
+  .stage{flex:1 1 150px;min-width:140px;position:relative;padding:2px}
+  .stage .sc{background:var(--card);border:1px solid var(--line-2);border-radius:18px;padding:16px 14px;height:100%;
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.04);transition:border-color .5s var(--ease)}
+  .stage:hover .sc{border-color:var(--accent-line)}
+  .stage .n{counter-increment:s;font-family:var(--mono);font-size:11px;color:var(--accent)}
+  .stage .t{font-family:var(--display);font-weight:600;font-size:15px;margin:6px 0 4px}
+  .stage .d{color:var(--faint);font-size:11.5px;font-family:var(--mono);line-height:1.5}
+  .stage:not(:last-child)::after{content:"";position:absolute;right:-9px;top:50%;width:18px;height:1.5px;
+    background:linear-gradient(90deg,var(--accent-line),transparent);z-index:2}
+  .stage.final .sc{background:linear-gradient(180deg,rgba(77,182,255,.1),var(--card));border-color:var(--accent-line)}
+
+  /* exclusion map */
+  .exmap{display:grid;grid-template-columns:1fr;gap:12px}
+  .exrow{display:grid;grid-template-columns:1.2fr auto 1fr;align-items:center;gap:16px;
+    background:var(--card);border:1px solid var(--line-2);border-radius:16px;padding:16px 20px;
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.04);transition:border-color .5s var(--ease),transform .5s var(--ease)}
+  .exrow:hover{border-color:var(--accent-line);transform:translateX(3px)}
+  .exrow .who{font-family:var(--display);font-weight:600;font-size:16px}
+  .exrow .who small{display:block;color:var(--faint);font-size:12px;font-weight:400;font-family:var(--font)}
+  .exrow .arw{color:var(--faint);font-family:var(--mono);font-size:18px}
+  .exrow .fam{justify-self:end;text-align:right}
+  .exrow .fam .lbl{font-family:var(--mono);font-size:11px;color:var(--faint);display:block;margin-bottom:4px}
+  .exnote{margin-top:16px;display:flex;align-items:center;gap:12px;color:var(--muted);font-size:14px;
+    padding:16px 20px;border:1px dashed var(--line);border-radius:16px;background:rgba(77,182,255,.04)}
+  .exnote svg{flex:none}
+
+  /* bento wiring */
+  .bento{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+  .bento .shell:first-child{grid-column:span 2}
+  .method .tag{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;color:var(--accent);margin-bottom:10px}
+  .method .tag b{color:var(--ink);font-weight:600}
+  .snip{margin-top:14px;background:#0a0c11;border:1px solid var(--line-2);border-radius:12px;padding:12px 14px;
+    font-family:var(--mono);font-size:12.5px;color:#c7cede;overflow-x:auto;line-height:1.7}
+  .snip .c{color:var(--faint)}
+  .snip .k{color:var(--accent)}
+  .snip .s{color:var(--cyan)}
+
+  /* platforms grid */
+  .pgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+  .pgrid .shell:first-child{grid-column:1/-1}
+  .pcard .top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
+  .pcard h3{font-size:17px}
+  .pcard .when{color:var(--muted);font-size:13.5px;min-height:2.6em}
+  .pcard .meta{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px solid var(--line-2)}
+  .pcard .meta .m{font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+  .pcard .meta .m b{color:var(--muted);font-weight:500}
+  .featcard{display:grid;grid-template-columns:1.1fr 1fr;gap:24px;align-items:center}
+  .featcard .lead{font-size:15px}
+
+  /* split lists */
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:56px}
+  .lst .li{display:flex;gap:14px;padding:16px 0;border-top:1px solid var(--line-2)}
+  .lst .li:first-child{border-top:0}
+  .lst .li .ix{font-family:var(--mono);font-size:12px;color:var(--accent);flex:none;width:22px}
+  .lst .li p{font-size:14.5px;color:var(--muted)}
+  .lst .li b{color:var(--ink);font-weight:600;font-family:var(--font)}
+
+  /* footer cta */
+  .final-cta{text-align:center;padding:64px 24px;border-radius:calc(var(--radius) + 10px);
+    background:linear-gradient(180deg,rgba(77,182,255,.08),var(--bg-2));border:1px solid var(--line);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}
+  .final-cta h2{margin-bottom:16px}
+  .final-cta .lead{margin:0 auto 28px}
+  .final-cta .hero-cta{justify-content:center}
+  footer{padding:44px 0 60px;border-top:1px solid var(--line-2);margin-top:80px;color:var(--faint);font-size:13px}
+  .foot{display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap}
+  .foot a{color:var(--muted);text-decoration:none}
+  .foot a:hover{color:var(--ink)}
+  .foot .mono{font-family:var(--mono);font-size:12px}
+
+  /* reveal */
+  .reveal{opacity:0;transform:translateY(26px);filter:blur(6px);transition:opacity .8s var(--ease),transform .8s var(--ease),filter .8s var(--ease)}
+  .reveal.in{opacity:1;transform:none;filter:none}
+  .stagger>*{opacity:0;transform:translateY(22px);transition:opacity .7s var(--ease),transform .7s var(--ease)}
+  .stagger.in>*{opacity:1;transform:none}
+  .stagger.in>*:nth-child(2){transition-delay:.07s}
+  .stagger.in>*:nth-child(3){transition-delay:.14s}
+  .stagger.in>*:nth-child(4){transition-delay:.21s}
+  .stagger.in>*:nth-child(5){transition-delay:.28s}
+  .stagger.in>*:nth-child(6){transition-delay:.35s}
+  .stagger.in>*:nth-child(7){transition-delay:.42s}
+  .stagger.in>*:nth-child(8){transition-delay:.49s}
+
+  @media (max-width:920px){
+    .hero-grid{grid-template-columns:1fr;gap:30px}
+    .split{grid-template-columns:1fr;gap:0}
+    .featcard{grid-template-columns:1fr}
+    .bento{grid-template-columns:1fr}
+    .bento .shell:first-child{grid-column:span 1}
+    .exrow{grid-template-columns:1fr auto;grid-template-areas:"who fam" "arw arw";row-gap:8px}
+    .exrow .arw{display:none}
+    .navlinks{display:none}
+    .navtoggle{display:block}
+    .nav-cta{display:none}
+  }
+  @media (max-width:560px){
+    section{padding:64px 0}
+    header.hero{padding:120px 0 20px}
+    .stage:not(:last-child)::after{display:none}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *{transition:none!important;animation:none!important;scroll-behavior:auto!important}
+    .reveal,.stagger>*{opacity:1;transform:none;filter:none}
+  }
+
+  /* mobile menu overlay */
+  .menu{position:fixed;inset:0;z-index:39;background:rgba(9,10,14,.86);backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);
+    display:flex;flex-direction:column;justify-content:center;gap:6px;padding:40px;opacity:0;pointer-events:none;transition:opacity .4s var(--ease)}
+  .menu.open{opacity:1;pointer-events:auto}
+  .menu a{font-family:var(--display);font-size:30px;color:var(--ink);text-decoration:none;padding:12px 0;border-bottom:1px solid var(--line-2);transform:translateY(16px);opacity:0;transition:transform .5s var(--ease),opacity .5s var(--ease)}
+  .menu.open a{transform:none;opacity:1}
+  .menu.open a:nth-child(2){transition-delay:.05s}.menu.open a:nth-child(3){transition-delay:.1s}
+  .menu.open a:nth-child(4){transition-delay:.15s}.menu.open a:nth-child(5){transition-delay:.2s}
+</style>
+</head>
+<body>
+<div class="bg-fx"></div><div class="grain"></div>
+
+<nav>
+  <div class="navpill">
+    <a class="brand" href="#top"><span class="dot"></span>adversarial-review</a>
+    <div class="navlinks">
+      <a href="#idea">The idea</a>
+      <a href="#exclude">Exclusion</a>
+      <a href="#wire">Wiring</a>
+      <a href="#platforms">Platforms</a>
+      <a href="#outcomes">Outcomes</a>
+    </div>
+    <a class="btn btn-primary nav-cta" href="https://github.com/SathiaAI/adversarial-review">GitHub<span class="ic" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M4 12L12 4M12 4H5.5M12 4V10.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span></a>
+    <button class="navtoggle" aria-label="Menu" id="navToggle"><span></span><span></span><span></span></button>
+  </div>
+</nav>
+<div class="menu" id="menu">
+  <a href="#idea">The idea</a>
+  <a href="#exclude">Exclusion</a>
+  <a href="#wire">Wiring</a>
+  <a href="#platforms">Platforms</a>
+  <a href="#outcomes">Outcomes</a>
+</div>
+
+<a id="top"></a>
+<header class="hero wrap">
+  <div class="hero-grid">
+    <div class="reveal">
+      <span class="eyebrow">Portable release gate</span>
+      <h1>Run it on any agent.<br><span class="g">Exclude the one that<br>wrote the code.</span></h1>
+      <p class="lead">Adversarial-review is a folder of zero-dependency Python that any coding agent can operate. The pipeline is identical everywhere — deterministic gates, an independent multi-model panel, and a PASS / FAIL / BLOCKED verdict <b>computed by a script, never narrated by a model</b>. Only two things change per platform: how you point the agent at it, and which model family you exclude.</p>
+      <div class="hero-cta">
+        <a class="btn btn-primary" href="https://github.com/SathiaAI/adversarial-review">Get the skill<span class="ic" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M4 12L12 4M12 4H5.5M12 4V10.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span></a>
+        <a class="btn btn-ghost" href="#wire">See the four ways to wire it<span class="ic" aria-hidden="true"><svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></span></a>
+      </div>
+      <div class="verdict-strip">
+        <span class="vtag"><i style="background:var(--ok)"></i>PASS · exit 0</span>
+        <span class="vtag"><i style="background:var(--stop)"></i>FAIL · exit 1</span>
+        <span class="vtag"><i style="background:var(--warn)"></i>BLOCKED · exit 2</span>
+      </div>
+    </div>
+    <div class="reveal frame">
+      <img src="assets/hero-platforms.webp" alt="Many coding agents feeding one identical review pipeline that outputs a single computed verdict">
+      <span class="cap">one pipeline · every platform</span>
+    </div>
+  </div>
+  <div class="band stagger">
+    <div><b>3–5</b><span>independent families</span></div>
+    <div><b>0</b><span>third-party deps</span></div>
+    <div><b>~¢</b><span>reviewer tokens / run</span></div>
+    <div><b>Py 3.9+</b><span>anywhere it runs</span></div>
+  </div>
+</header>
+
+<section id="idea" class="wrap">
+  <div class="sec-head reveal">
+    <span class="eyebrow">The one idea</span>
+    <h2>One pipeline. Two dials.</h2>
+    <p class="lead">A model that reviews its own work is the fox auditing the henhouse. So correctness comes from deterministic tools with exit codes and from reviewer models whose provider families did <b>not</b> write the change — and the decision is computed from the recorded artifacts by <code>aggregate.py</code>, which you cannot argue with.</p>
+  </div>
+  <div class="flow stagger reveal">
+    <div class="stage"><div class="sc"><div class="n">01</div><div class="t">Agent writes</div><div class="d">Claude · Codex · Cursor · Devin · Gemini …</div></div></div>
+    <div class="stage"><div class="sc"><div class="n">02</div><div class="t">Deterministic gates</div><div class="d">build · unit · sast · secrets · deps · ai-defects</div></div></div>
+    <div class="stage"><div class="sc"><div class="n">03</div><div class="t">Independent panel</div><div class="d">author's family excluded</div></div></div>
+    <div class="stage"><div class="sc"><div class="n">04</div><div class="t">Validate &amp; fix</div><div class="d">reproduce · regress · rerun gates</div></div></div>
+    <div class="stage"><div class="sc"><div class="n">05</div><div class="t">aggregate.py</div><div class="d">the only verdict author</div></div></div>
+    <div class="stage final"><div class="sc"><div class="n">06</div><div class="t">Verdict</div><div class="d">PASS · FAIL · BLOCKED</div></div></div>
+  </div>
+</section>
+
+<section id="exclude" class="wrap">
+  <div class="sec-head reveal">
+    <span class="eyebrow">The thing people get wrong</span>
+    <h2>Exclude the family that wrote it.</h2>
+    <p class="lead">Match <code>--dev-providers</code> to whoever authored the change on your platform. Get this wrong and the author quietly grades its own work — the single mistake that turns the whole thing into theatre.</p>
+  </div>
+  <div class="exmap reveal stagger">
+    <div class="exrow"><div class="who">Claude Code / Cowork<small>Anthropic wrote it</small></div><div class="arw">→</div><div class="fam"><span class="lbl">--dev-providers</span><span class="chip">anthropic</span></div></div>
+    <div class="exrow"><div class="who">OpenAI Codex<small>GPT wrote it</small></div><div class="arw">→</div><div class="fam"><span class="lbl">--dev-providers</span><span class="chip">openai</span></div></div>
+    <div class="exrow"><div class="who">Gemini CLI / Jules<small>Google wrote it</small></div><div class="arw">→</div><div class="fam"><span class="lbl">--dev-providers</span><span class="chip">google</span></div></div>
+    <div class="exrow"><div class="who">Cursor · Windsurf / Devin · Copilot<small>whichever model you selected</small></div><div class="arw">→</div><div class="fam"><span class="lbl">--dev-providers</span><span class="chip">the family you picked</span></div></div>
+  </div>
+  <div class="exnote reveal">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="var(--accent)" stroke-width="1.5"/><path d="M12 8v5M12 16h.01" stroke="var(--accent)" stroke-width="1.6" stroke-linecap="round"/></svg>
+    <span>Two authors touched it? List every family: <code>--dev-providers anthropic,openai</code>. When in doubt, over-exclude — too few independent families comes back <b>BLOCKED</b> on purpose, never a soft pass. The panel is then drawn only from the families that did not write it.</span>
+  </div>
+</section>
+
+<section id="wire" class="wrap">
+  <div class="sec-head reveal">
+    <span class="eyebrow">Four ways to wire it in</span>
+    <h2>Pick one per platform.</h2>
+    <p class="lead">If your agent reads <code>AGENTS.md</code>, you are already 90% set up. Everything below drives the exact same pipeline.</p>
+  </div>
+  <div class="bento reveal stagger">
+    <div class="shell"><div class="core method featcard">
+      <div>
+        <div class="tag"><b>A · Native skill</b> — Claude Code, Cowork</div>
+        <p class="lead">Skills are first-class. Drop the one folder into your skills directory and invoke it; the agent reads <code>SKILL.md</code> and runs the pipeline for you.</p>
+      </div>
+      <div class="snip"><span class="c"># clone into your skills dir</span><br><span class="k">git clone</span> https://github.com/SathiaAI/adversarial-review \<br>&nbsp;&nbsp;~/.claude/skills/adversarial-review</div>
+    </div></div>
+    <div class="shell"><div class="core method">
+      <div class="tag"><b>B · AGENTS.md pointer</b></div>
+      <p class="lead">Codex, Cursor, Windsurf/Devin, Copilot, Gemini CLI, Aider, Zed, Warp, goose — and 60k+ repos' agents. Add a short release-gate block that tells the agent to run the review before it calls a change "done."</p>
+      <div class="snip"><span class="c">## Release gate</span><br>Run adversarial-review per its SKILL.md before<br>any change is "done": init (<span class="k">--dev-providers</span> =<br>this agent's family), gates, panel, aggregate.<br>Relay the verdict <span class="s">verbatim</span>.</div>
+    </div></div>
+    <div class="shell"><div class="core method">
+      <div class="tag"><b>C · MCP server</b></div>
+      <p class="lead">Any MCP host. Run <code>ar-mcp</code> with the repo under review as the working directory; the host drives the review through MCP tools. Stdlib-only, and deliberately not an arbitrary-command surface.</p>
+      <div class="snip"><span class="k">ar-mcp</span> <span class="c"># or: python scripts/mcp_server.py</span><br><span class="c"># ar_init → ar_gate_record → ar_panel_* → ar_aggregate</span></div>
+    </div></div>
+    <div class="shell"><div class="core method">
+      <div class="tag"><b>D · GitHub Action</b> — no agent at all</div>
+      <p class="lead">Wire the verdict's exit code into CI so it gates the merge, not a human's optimism.</p>
+      <div class="snip"><span class="k">- uses:</span> SathiaAI/adversarial-review@main<br>&nbsp;&nbsp;<span class="k">with:</span><br>&nbsp;&nbsp;&nbsp;&nbsp;<span class="k">fail-on:</span> fail<br>&nbsp;&nbsp;&nbsp;&nbsp;<span class="k">openrouter-api-key:</span> <span class="s">${{ secrets.OPENROUTER_API_KEY }}</span></div>
+    </div></div>
+  </div>
+</section>
+
+<section id="platforms" class="wrap">
+  <div class="sec-head reveal">
+    <span class="eyebrow">Per-platform playbook</span>
+    <h2>Where you code, and what to expect.</h2>
+    <p class="lead">Same verdict everywhere; the wiring and the excluded family change. Each card: when to reach for it, and the one thing to watch.</p>
+  </div>
+  <div class="pgrid reveal stagger">
+    <div class="shell"><div class="core pcard featcard">
+      <div>
+        <div class="top"><h3>Claude Code &amp; Claude (Cowork)</h3><span class="chip">exclude anthropic</span></div>
+        <p class="when">The reference experience. Gate a branch you and Claude just built before the PR — Cowork additionally hands a stakeholder a readable <code>verdict.md</code> + attested run directory, not just a green check.</p>
+      </div>
+      <div>
+        <div class="snip"><span class="c"># the author is also the operator —</span><br><span class="c"># independence comes from the panel,</span><br><span class="c"># and the verdict is computed, not narrated.</span></div>
+        <div class="meta"><span class="m"><b>wire</b> · A native skill</span><span class="m"><b>watch</b> · keep --dev-providers anthropic</span></div>
+      </div>
+    </div></div>
+
+    <div class="shell"><div class="core pcard">
+      <div class="top"><h3>OpenAI Codex</h3><span class="chip">exclude openai</span></div>
+      <p class="when">AGENTS.md-native. Gate a Codex-built change before merge; the most common miss is forgetting to exclude <code>openai</code> — then GPT reviews GPT.</p>
+      <div class="meta"><span class="m"><b>wire</b> · B / skills dir</span><span class="m"><b>watch</b> · give it the diff, not the repo</span></div>
+    </div></div>
+
+    <div class="shell"><div class="core pcard">
+      <div class="top"><h3>Windsurf / Devin</h3><span class="chip">the family used</span></div>
+      <p class="when">Now Devin Desktop; the Cascade agent reads AGENTS.md and runs commands, so it can gate its own autonomous work before opening a PR. The highest-leverage case.</p>
+      <div class="meta"><span class="m"><b>wire</b> · B AGENTS.md</span><span class="m"><b>watch</b> · pin the exclusion so it can't self-review</span></div>
+    </div></div>
+
+    <div class="shell"><div class="core pcard">
+      <div class="top"><h3>Cursor</h3><span class="chip">the family picked</span></div>
+      <p class="when">Model-agnostic IDE. Exclude whatever model you selected — easy to get wrong because you can switch models mid-session.</p>
+      <div class="meta"><span class="m"><b>wire</b> · B (.cursorrules ok)</span><span class="m"><b>watch</b> · switched models? exclude all of them</span></div>
+    </div></div>
+
+    <div class="shell"><div class="core pcard">
+      <div class="top"><h3>GitHub Copilot</h3><span class="chip">the family used</span></div>
+      <p class="when">PR-native. Let the Action compute the verdict in CI rather than trusting the agent's prose summary of its own change.</p>
+      <div class="meta"><span class="m"><b>wire</b> · B + D Action</span><span class="m"><b>watch</b> · required check = aggregator exit code</span></div>
+    </div></div>
+
+    <div class="shell"><div class="core pcard">
+      <div class="top"><h3>Gemini CLI / Jules</h3><span class="chip">exclude google</span></div>
+      <p class="when">AGENTS.md-native. Exclude Gemini, keep the panel diverse, gate on the exit code.</p>
+      <div class="meta"><span class="m"><b>wire</b> · B AGENTS.md</span><span class="m"><b>watch</b> · same pattern, boring on purpose</span></div>
+    </div></div>
+
+    <div class="shell"><div class="core pcard">
+      <div class="top"><h3>Any other agent</h3><span class="chip">that model's family</span></div>
+      <p class="when">Aider, Zed, Warp, goose, or open-weight (Hermes/Nous, Llama, Qwen). Reads AGENTS.md → path B; otherwise paste SKILL.md as instructions. Open models are also useful <em>on</em> the panel for provider diversity.</p>
+      <div class="meta"><span class="m"><b>wire</b> · B or SKILL.md</span><span class="m"><b>watch</b> · anything with Python 3.9+ and a shell works</span></div>
+    </div></div>
+  </div>
+</section>
+
+<section id="outcomes" class="wrap">
+  <div class="sec-head reveal">
+    <span class="eyebrow">Honest expectations</span>
+    <h2>What you get, and what to watch.</h2>
+  </div>
+  <div class="split reveal">
+    <div class="lst">
+      <div class="li"><span class="ix">↳</span><p><b>A computed verdict, not a vibe.</b> PASS / FAIL / BLOCKED from recorded artifacts, relayed verbatim.</p></div>
+      <div class="li"><span class="ix">↳</span><p><b>Real findings from models that didn't write the code</b> — and, when high/critical findings exist, a rebuttal round where reviewers confront each other with evidence.</p></div>
+      <div class="li"><span class="ix">↳</span><p><b>BLOCKED when review is incomplete.</b> Unknown is treated as unshippable, so a half-run never reads as confidence.</p></div>
+      <div class="li"><span class="ix">↳</span><p><b>A tamper-evident audit trail.</b> Coverage + attestation in every <code>verdict.json</code>, verifiable with <code>--check-digest</code>.</p></div>
+      <div class="li"><span class="ix">↳</span><p><b>A few cents of reviewer tokens per run</b> — it reports usage. Not a replacement for your scanners; the layer that makes their results and an independent review converge into one honest verdict.</p></div>
+    </div>
+    <div class="lst">
+      <div class="li"><span class="ix">01</span><p><b>Never let the authoring family review itself.</b> Setting <code>--dev-providers</code> correctly is 90% of the value.</p></div>
+      <div class="li"><span class="ix">02</span><p><b>The operator is a conflicted party.</b> Safe only because the verdict is computed by <code>aggregate.py</code>, not narrated by the model. Don't let an agent interpret a FAIL into a pass.</p></div>
+      <div class="li"><span class="ix">03</span><p><b>Transport privacy.</b> An MCP transport routes your code through that provider — fine for NORMAL, confirm before SENSITIVE/CRITICAL. Never put secrets or <code>.env</code> in <code>context.md</code>.</p></div>
+      <div class="li"><span class="ix">04</span><p><b>Feed it the diff, not the repo.</b> <code>main...HEAD</code> plus the surrounding code that matters — not a 200-file dump.</p></div>
+      <div class="li"><span class="ix">05</span><p><b>Don't move the goalposts.</b> Weakening a gate to get a pass defeats the point — and the aggregator resists it; waivers must be on the record with a named authorizer.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="wrap">
+  <div class="final-cta reveal">
+    <span class="eyebrow">Point it at one moment</span>
+    <h2>The instant an agent says "done."</h2>
+    <p class="lead">That claim is precisely what this exists to verify. Wire the verdict into a pre-push hook or a required check — a verdict nobody enforces is a comment.</p>
+    <div class="hero-cta">
+      <a class="btn btn-primary" href="https://github.com/SathiaAI/adversarial-review">Open the repo<span class="ic" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M4 12L12 4M12 4H5.5M12 4V10.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span></a>
+      <a class="btn btn-ghost" href="https://github.com/SathiaAI/adversarial-review/blob/main/docs/using-on-your-platform.md">Full written guide<span class="ic" aria-hidden="true"><svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></span></a>
+    </div>
+  </div>
+</section>
+
+<footer class="wrap">
+  <div class="foot">
+    <span class="mono">adversarial-review · MIT © 2026 SathiaAI</span>
+    <div style="display:flex;gap:22px">
+      <a href="https://github.com/SathiaAI/adversarial-review">GitHub</a>
+      <a href="https://github.com/SathiaAI/adversarial-review/blob/main/SKILL.md">SKILL.md</a>
+      <a href="https://github.com/SathiaAI/adversarial-review/blob/main/AGENTS.md">AGENTS.md</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // scroll reveals
+  var io=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}})},{threshold:.14,rootMargin:'0px 0px -8% 0px'});
+  document.querySelectorAll('.reveal,.stagger').forEach(function(el){io.observe(el)});
+  // mobile menu
+  var t=document.getElementById('navToggle'),m=document.getElementById('menu');
+  if(t){t.addEventListener('click',function(){m.classList.toggle('open')});
+    m.querySelectorAll('a').forEach(function(a){a.addEventListener('click',function(){m.classList.remove('open')})});}
+  // light magnetic pull on primary buttons
+  if(!matchMedia('(prefers-reduced-motion:reduce)').matches){
+    document.querySelectorAll('.btn-primary').forEach(function(b){
+      b.addEventListener('pointermove',function(e){var r=b.getBoundingClientRect();b.style.transform='translate('+((e.clientX-r.left-r.width/2)/6)+'px,'+((e.clientY-r.top-r.height/2)/6)+'px)'});
+      b.addEventListener('pointerleave',function(){b.style.transform=''});
+    });
+  }
+</script>
+</body>
+</html>
