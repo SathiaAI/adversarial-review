@@ -292,8 +292,9 @@ flowchart LR
 
 Get the excluded family wrong and the author quietly grades its own work — the one mistake
 that turns the whole thing into theatre. **Full per-platform guide** — setup, when to reach
-for it, expected outcomes, and what to watch for — **→
-[docs/using-on-your-platform.md](docs/using-on-your-platform.md)**.
+for it, expected outcomes, and what to watch for: the visual guide at
+**[sathiaai.github.io/adversarial-review](https://sathiaai.github.io/adversarial-review/)**,
+or the same content in [docs/using-on-your-platform.md](docs/using-on-your-platform.md).
 
 ## Installation
 
