@@ -1184,6 +1184,136 @@ def t_mcp_fail_verdict():
     assert res["structuredContent"]["verdict"] == "FAIL", res
 
 
+# --- MCP 2026-07-28 stateless dual-era support -----------------------------------
+# These assert the exact wire shapes the 2026-07-28 spec requires: per-request version
+# negotiation, server/discover, UnsupportedProtocolVersion (-32022), the required
+# resultType, and CacheableResult (ttlMs/cacheScope) on tools/list.
+
+def _modern_req(method, params=None, version="2026-07-28", caps=True):
+    """Dispatch a modern (2026-07-28) request: the protocol version — and, unless
+    caps=False, client capabilities — carried in params._meta, as the stateless spec
+    requires."""
+    p = dict(params or {})
+    meta = {"io.modelcontextprotocol/protocolVersion": version}
+    if caps:
+        meta["io.modelcontextprotocol/clientCapabilities"] = {}
+    p["_meta"] = meta
+    return mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": method, "params": p})
+
+
+def t_mcp_discover_advertises_versions():
+    # server/discover MUST be implemented; it advertises supported versions, capabilities,
+    # and identity in one round-trip (and is the stdio backward-compat probe).
+    res = _modern_req("server/discover")["result"]
+    assert res["resultType"] == "complete", res
+    assert "2026-07-28" in res["supportedVersions"], res
+    # legacy versions remain advertised too — this is a dual-era server
+    assert "2025-06-18" in res["supportedVersions"], res
+    assert "tools" in res["capabilities"], res
+    assert res["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "adversarial_review_mcp", res
+    assert isinstance(res["ttlMs"], int) and res["ttlMs"] > 0, res
+    assert res["cacheScope"] in ("public", "private"), res
+    # discovery answers even without client capabilities — it is the bootstrap probe
+    assert "2026-07-28" in _modern_req("server/discover", caps=False)["result"]["supportedVersions"]
+
+
+def t_mcp_modern_tools_list_is_cacheable():
+    # a modern tools/list carries resultType, server identity, and the CacheableResult hints
+    res = _modern_req("tools/list")["result"]
+    assert res["resultType"] == "complete", res
+    assert res["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "adversarial_review_mcp", res
+    assert isinstance(res["ttlMs"], int) and res["ttlMs"] > 0, res
+    assert res["cacheScope"] == "public", res
+    names = {t["name"] for t in res["tools"]}
+    assert "ar_init" in names and "ar_aggregate" in names, names
+
+
+def t_mcp_modern_unsupported_version_rejected():
+    # a version we do not implement returns UnsupportedProtocolVersionError (-32022) whose
+    # data names what we support and echoes what was requested
+    err = _modern_req("tools/list", version="1900-01-01")["error"]
+    assert err["code"] == -32022, err
+    assert "2026-07-28" in err["data"]["supported"], err
+    assert err["data"]["requested"] == "1900-01-01", err
+    # ...but server/discover still answers, so a client can still learn the supported set
+    assert "2026-07-28" in _modern_req("server/discover", version="1900-01-01")["result"]["supportedVersions"]
+
+
+def t_mcp_modern_missing_capabilities_is_invalid_params():
+    # clientCapabilities is a required per-request _meta field; omitting it on a modern
+    # request is malformed -> -32602 (Invalid params)
+    r = _modern_req("tools/list", caps=False)
+    assert r["error"]["code"] == -32602, r
+    assert "clientCapabilities" in r["error"]["message"], r
+
+
+def t_mcp_modern_tool_call_finalized():
+    # a modern tools/call is finalized too: even a tool-level error result is resultType
+    # "complete" (the RPC itself completed) and carries server identity
+    res = _modern_req("tools/call",
+                      {"name": "ar_get_verdict", "arguments": {"run": ""}})["result"]
+    assert res["resultType"] == "complete", res
+    assert res["isError"] and "invalid run id" in res["content"][0]["text"], res
+    assert res["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "adversarial_review_mcp", res
+
+
+def t_mcp_modern_successful_tool_call():
+    # a *successful* modern tools/call (not just the error path) is finalized: resultType
+    # complete, server _meta, and the real tool result present — proving success results,
+    # not only tool-level errors, get the modern decoration.
+    repo = fresh_repo()
+    cwd0 = os.getcwd()
+    try:
+        os.chdir(repo)
+        res = _modern_req("tools/call",
+                          {"name": "ar_init",
+                           "arguments": {"risk": "NORMAL", "dev_providers": ["anthropic"]}})["result"]
+    finally:
+        os.chdir(cwd0)
+    assert res["resultType"] == "complete", res
+    assert not res.get("isError"), res
+    assert res["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "adversarial_review_mcp", res
+    assert res["structuredContent"]["run_id"].startswith("run-"), res
+
+
+def t_mcp_legacy_responses_unchanged():
+    # dual-era must not leak modern fields into legacy responses: a legacy tools/list (no
+    # _meta) has neither resultType nor the CacheableResult hints, and initialize is intact
+    tl = mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]
+    assert "resultType" not in tl and "ttlMs" not in tl and "cacheScope" not in tl, tl
+    assert "_meta" not in tl, tl
+    init = mcpsrv.handle({"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                          "params": {"protocolVersion": "2025-06-18"}})["result"]
+    assert init["protocolVersion"] == "2025-06-18", init
+    assert "resultType" not in init, init
+
+
+def t_mcp_modern_ping_is_method_not_found():
+    # 2026-07-28 removed ping; a modern ping must not return a bare {} (which would omit the
+    # required resultType) — it is method-not-found. The legacy ping still returns {}.
+    assert _modern_req("ping")["error"]["code"] == -32601
+    assert mcpsrv.handle({"jsonrpc": "2.0", "id": 9, "method": "ping"})["result"] == {}
+
+
+def t_mcp_null_protocol_version_rejected():
+    # a modern request that carries the version key as null is a modern request with an
+    # unsupported version (-32022), not a legacy request served silently
+    r = mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                       "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": None,
+                                            "io.modelcontextprotocol/clientCapabilities": {}}}})
+    assert r["error"]["code"] == -32022, r
+    assert r["error"]["data"]["requested"] is None, r
+
+
+def t_mcp_initialize_notification_not_answered():
+    # an initialize sent as a notification (no id) must not be answered, per JSON-RPC;
+    # a normal initialize (with id) still is
+    assert mcpsrv.handle({"jsonrpc": "2.0", "method": "initialize",
+                          "params": {"protocolVersion": "2025-06-18"}}) is None
+    assert mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                          "params": {"protocolVersion": "2025-06-18"}})["result"]["protocolVersion"] == "2025-06-18"
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
