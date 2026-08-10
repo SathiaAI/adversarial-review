@@ -22,6 +22,12 @@ Design (deliberate, matching this repo's identity):
     the same honest-ingest path the CLI already supports for CI-run checks. A host
     reachable only through MCP therefore cannot use this server to run arbitrary
     commands.
+  * Dual-era protocol. It answers both the legacy `initialize` handshake (revisions
+    through 2025-06-18) and the stateless MCP 2026-07-28 revision, in which each request
+    carries its own protocol version in `_meta` and is negotiated independently — no
+    session. Legacy responses stay byte-for-byte identical; modern requests additionally
+    get `server/discover`, per-request version negotiation, and the spec-required
+    `resultType` and cache metadata.
 
 Operates on the .adversarial-review/ directory in the server's working directory,
 so launch it with the repository under review as the current directory.
@@ -37,9 +43,26 @@ from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 SERVER_NAME = "adversarial_review_mcp"
-# Protocol versions this server can speak. Newest first; we echo the client's if
-# we support it, else offer our latest (per the MCP lifecycle spec).
+# Legacy handshake versions (initialize / notifications/initialized). Newest first; the
+# initialize handler echoes the client's if we support it, else our latest — per the
+# pre-2026 MCP lifecycle spec.
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
+# Modern, stateless version (MCP 2026-07-28): no handshake — every request carries its
+# protocol version and capabilities in params._meta and is negotiated independently.
+# 2026-07-28 is the only revision that uses this path (2025-11-25 and earlier are "legacy"
+# and negotiate through initialize).
+MODERN_PROTOCOLS = ("2026-07-28",)
+# Every version this dual-era server can speak — advertised by server/discover and named
+# in an UnsupportedProtocolVersionError. Modern first.
+ALL_PROTOCOLS = MODERN_PROTOCOLS + SUPPORTED_PROTOCOLS
+# CacheableResult freshness hint (SEP-2549) for the static tool list and discovery result.
+# The tool set never changes within a process (listChanged: false), so a 1-hour hint is safe.
+CACHE_TTL_MS = 3_600_000
+
+# Reserved per-request / per-result _meta keys (MCP 2026-07-28).
+META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
+META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
+META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 
 # A run id is exactly what `panel.py init` mints: run-YYYYMMDD-HHMMSS with an
 # optional -N disambiguator. Constraining --run to this shape keeps an untrusted
@@ -484,20 +507,80 @@ def _ok(id_, result):
     return {"jsonrpc": "2.0", "id": id_, "result": result}
 
 
+_INSTRUCTIONS = (
+    "Drive an adversarial review: ar_init -> ar_gate_plan -> run your gates and "
+    "ar_gate_record each -> ar_panel_assign -> ar_panel_prepare+ar_panel_ingest "
+    "(or ar_panel_run) -> ar_aggregate for the verdict. Launch this server with the "
+    "repository under review as the working directory."
+)
+
+
+def _finalize_result(result, is_modern):
+    """Stamp the fields MCP 2026-07-28 requires on every modern result: resultType
+    ("complete") and the server identity in _meta. Legacy (pre-2026) results are returned
+    unchanged, so existing clients keep seeing byte-identical responses. isError tool
+    results are still "complete" — the RPC completed; the error is tool-level, not
+    protocol-level."""
+    if not is_modern:
+        return result
+    out = dict(result)
+    out.setdefault("resultType", "complete")
+    meta = dict(out.get("_meta") or {})
+    meta.setdefault(META_SERVER_INFO, {"name": SERVER_NAME, "version": VERSION})
+    out["_meta"] = meta
+    return out
+
+
+def _discover_result():
+    """DiscoverResult for server/discover (MCP 2026-07-28): the versions we speak, our
+    capabilities, and our identity in one round-trip. Servers MUST implement this RPC; it
+    also doubles as the stdio backward-compatibility probe."""
+    return {
+        "resultType": "complete",
+        "supportedVersions": list(ALL_PROTOCOLS),
+        "capabilities": {"tools": {"listChanged": False}},
+        "instructions": _INSTRUCTIONS,
+        "ttlMs": CACHE_TTL_MS,
+        "cacheScope": "public",
+        "_meta": {META_SERVER_INFO: {"name": SERVER_NAME, "version": VERSION}},
+    }
+
+
 def handle(msg):
     """Dispatch one parsed JSON-RPC message. Returns a response dict, or None for
-    notifications (no id) which must not be answered."""
+    notifications (no id) which must not be answered.
+
+    Dual-era (MCP versioning spec): an `initialize` request selects legacy handshake
+    semantics; a request whose params._meta carries io.modelcontextprotocol/protocolVersion
+    is served statelessly per the 2026-07-28 revision. Legacy responses are byte-identical
+    to before; modern responses additionally carry resultType and server identity."""
     if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
         return _error(msg.get("id") if isinstance(msg, dict) else None,
                       -32600, "invalid request")
     method = msg.get("method")
     id_ = msg.get("id")
     is_notification = "id" not in msg
+
+    # A one-way notification (no id) must never be answered — checked before any method
+    # handling, so even an `initialize` or `server/discover` sent without an id stays
+    # unanswered, per JSON-RPC.
+    if is_notification:
+        return None  # notifications/initialized, notifications/cancelled, etc.
+
     # params must be an object; a truthy non-dict (string/list/number) would otherwise
     # crash on params.get(...). Treat any non-dict as absent.
     params = msg.get("params")
     params = params if isinstance(params, dict) else {}
+    # A modern (2026-07-28) request declares its version in params._meta. The *presence*
+    # of that key — not a non-null value — is the modern/legacy signal: legacy requests
+    # never carry it, and a modern request that supplies it as null/blank is a modern
+    # request with an unsupported version (rejected below), not a legacy one.
+    meta = params.get("_meta")
+    meta = meta if isinstance(meta, dict) else {}
+    requested_version = meta.get(META_PROTOCOL_VERSION)
+    is_modern = META_PROTOCOL_VERSION in meta
 
+    # Legacy initialize handshake — selects legacy semantics regardless of _meta.
     if method == "initialize":
         requested = params.get("protocolVersion")
         version = requested if requested in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0]
@@ -505,21 +588,40 @@ def handle(msg):
             "protocolVersion": version,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": SERVER_NAME, "version": VERSION},
-            "instructions": "Drive an adversarial review: ar_init -> ar_gate_plan -> run "
-                            "your gates and ar_gate_record each -> ar_panel_assign -> "
-                            "ar_panel_prepare+ar_panel_ingest (or ar_panel_run) -> "
-                            "ar_aggregate for the verdict. Launch this server with the "
-                            "repository under review as the working directory.",
+            "instructions": _INSTRUCTIONS,
         })
 
-    if is_notification:
-        return None  # notifications/initialized, notifications/cancelled, etc.
+    # server/discover — servers MUST implement it. Answered in both eras: it advertises the
+    # versions we speak (so a modern client can pick one) and doubles as the stdio
+    # backward-compat probe. Kept ahead of version validation so a client can always learn
+    # supportedVersions instead of being turned away with only an error.
+    if method == "server/discover":
+        return _ok(id_, _discover_result())
 
-    if method == "ping":
+    # Modern per-request negotiation: reject an unsupported version with the spec's
+    # UnsupportedProtocolVersionError (-32022), and reject a modern request missing a
+    # required _meta field as Invalid params (-32602) — both before any work is done.
+    if is_modern:
+        if requested_version not in MODERN_PROTOCOLS:
+            return _error(id_, -32022, "Unsupported protocol version",
+                          {"supported": list(ALL_PROTOCOLS), "requested": requested_version})
+        if META_CLIENT_CAPABILITIES not in meta:
+            return _error(id_, -32602,
+                          "malformed request: missing required _meta field "
+                          f"'{META_CLIENT_CAPABILITIES}'")
+
+    # `ping` was removed in 2026-07-28. Answer it only on the legacy path; a modern ping
+    # falls through to method-not-found (-32601), since the modern revision has no ping and
+    # a bare {} result would omit the required resultType.
+    if method == "ping" and not is_modern:
         return _ok(id_, {})
 
     if method == "tools/list":
-        return _ok(id_, {"tools": [_public_tool(t) for t in TOOLS]})
+        result = {"tools": [_public_tool(t) for t in TOOLS]}
+        if is_modern:  # CacheableResult (SEP-2549): required on modern list results
+            result["ttlMs"] = CACHE_TTL_MS
+            result["cacheScope"] = "public"
+        return _ok(id_, _finalize_result(result, is_modern))
 
     if method == "tools/call":
         name = params.get("name")
@@ -530,12 +632,13 @@ def handle(msg):
         if not isinstance(arguments, dict):
             return _error(id_, -32602, "arguments must be an object")
         try:
-            return _ok(id_, tool["handler"](arguments))
+            return _ok(id_, _finalize_result(tool["handler"](arguments), is_modern))
         except ToolError as e:
-            return _ok(id_, _result(f"Error: {e}", is_error=True))
+            return _ok(id_, _finalize_result(_result(f"Error: {e}", is_error=True), is_modern))
         except Exception as e:  # pragma: no cover - defensive
             log(f"tool {name} crashed: {e}")
-            return _ok(id_, _result(f"Error: internal failure in {name}", is_error=True))
+            return _ok(id_, _finalize_result(
+                _result(f"Error: internal failure in {name}", is_error=True), is_modern))
 
     return _error(id_, -32601, f"method not found: {method}")
 
