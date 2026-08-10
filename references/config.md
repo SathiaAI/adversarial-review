@@ -76,7 +76,24 @@ required_gates:
   NORMAL: [build, unit, secrets, deps, sast]
   SENSITIVE: [build, unit, secrets, deps, sast, mutation]
 pins: {}                   # role: provider/model-slug
+mutation:                  # scoped/bounded mutation budget (all fields optional)
+  scope: changed           # changed | all
+  threshold: 60            # min kill-rate %
+  max_mutants: 500         # cap total mutants (budget)
+  sample_pct: 100          # % of eligible mutants to test
+  concurrency: 4           # parallel test runners (memory lever)
+  timeout_s: 60            # per-mutant timeout
+  exclude_files: []        # globs never mutated
+  exclude_tests: []        # tests dropped from the mutant run
 ```
+
+The `mutation:` block is a repo-tunable cost cap so mutation testing survives large or
+resource-constrained repos (see `references/gates.md`, *Scoped & bounded mutation*). Every
+field is optional and validated strictly; the configured budget is snapshotted into
+`policy.snapshot.json`, so a bounded run's coverage reduction is on the record, never
+silent. `scope` is `changed`/`all`; `max_mutants`/`concurrency`/`timeout_s` are positive
+integers; `sample_pct`/`threshold` are numbers in `[0, 100]`; `exclude_files`/
+`exclude_tests` are lists of path/glob strings.
 
 Precedence, everywhere: **CLI flag > env var > policy file > built-in default** —
 explicit beats ambient. The resolution is recorded in the run's artifacts so the
