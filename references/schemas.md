@@ -100,7 +100,9 @@ human-readable `verdict.md` is written alongside `verdict.json`.
 ## Verdict — `verdict.json` (written by aggregate.py only)
 
 ```json
-{"verdict": "PASS|FAIL|BLOCKED", "reasons": ["string"], "counts": {"gates": 0,
+{"verdict": "PASS|FAIL|BLOCKED", "reasons": ["string"],
+ "next_steps": ["plain-language guidance derived from the verdict; never alters it"],
+ "counts": {"gates": 0,
  "reviewers": 0, "findings_high_critical": 0, "confirmed": 0, "unresolved": 0},
  "coverage": {"risk": "TIER",
    "gates": {"plan_recorded": true, "required": [], "recorded": [], "passed": [],

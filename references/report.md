@@ -18,6 +18,15 @@ Attestation: `sha256 <attestation.digest>` over <attestation.inputs> recorded
 artifacts. Anyone holding the run directory can verify it is untouched with
 `aggregate.py --check-digest`.
 
+## Next steps
+
+<Copy the `next_steps` array from verdict.json verbatim as a bulleted list. aggregate.py
+generates it — plain-language "what this means and what to do now" for a reader who did
+not run the pipeline (e.g. a non-expert shipping vibe-coded changes): what each failing
+or unverified check proves and how to clear it, what a mutation score/threshold actually
+means, and which findings still need action. It is derived from the verdict and never
+alters it; do not rewrite the verdict here.>
+
 ## Change reviewed
 
 <What the change does, diff ref, size, acceptance criteria. Risk tier and why.>

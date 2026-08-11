@@ -208,6 +208,70 @@ def t_aggregate_pass_after_confirmed_fix():
     assert v["verdict"] == "PASS" and v["counts"]["confirmed"] == 1
 
 
+def t_next_steps_pass_guidance():
+    # verdict.md carries a plain-language 'Next steps' section derived from the verdict;
+    # on PASS it reassures and points at fixed issues. It is output, never a gate: it is
+    # absent from reasons and does not change the PASS verdict.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)
+    md = (run / "verdict.md").read_text()
+    assert "## Next steps" in md, md
+    assert "Cleared:" in md and "owns the actual merge" in md, md
+    v = read(run / "verdict.json")
+    assert isinstance(v["next_steps"], list) and v["next_steps"], v
+    assert v["verdict"] == "PASS" and all("next_steps" not in r for r in v["reasons"])
+
+
+def t_next_steps_fail_guidance():
+    # On FAIL the guidance names the failing check in plain words and says what to do,
+    # without changing the FAIL verdict. Assert on the RENDERED verdict.json next_steps
+    # (not a module constant) so a broken rendering path is actually caught.
+    repo = _complete_sensitive_repo()
+    sh(["gate.py", "record", "--name", "unit", "--exit-code", "1", "--summary", "boom"], repo)
+    sh(["aggregate.py"], repo, expect=1)
+    run = latest_run(repo)
+    blob = " ".join(read(run / "verdict.json")["next_steps"])
+    assert "The 'unit' check failed" in blob and "run the test suite locally" in blob, blob
+    assert "start a FRESH review" in blob, blob
+    assert "## Next steps" in (run / "verdict.md").read_text()
+    # The mutation entry must explain the score/threshold meaning — verified through the
+    # rendered next_steps() output for a failing mutation gate, not by reading GATE_HELP.
+    import aggregate
+    mblob = " ".join(aggregate.next_steps(
+        "FAIL", ["gate 'mutation' failed (exit 1)"], [],
+        {"failed": ["mutation"], "blocked": [], "missing": []}, {}, {}))
+    assert "The 'mutation' check failed" in mblob, mblob
+    assert "percent of injected bugs" in mblob and "surviving-mutant" in mblob, mblob
+
+
+def t_next_steps_robustness():
+    # Panel-found hardening (guidance PR review): next_steps must (1) never crash on a
+    # malformed/None coverage shape — the verdict file must still be written; (2) never hide
+    # a real blocker whose reason merely contains the characters "gate '"; (3) one-line every
+    # interpolated reason so untrusted finding text cannot forge markdown bullets/headings.
+    import aggregate
+    empty = {"failed": [], "blocked": [], "missing": []}
+    for gc in ({"failed": None}, {"blocked": None}, {"missing": None},
+               {"failed": [{"name": "x"}]}, {"failed": [None]}, None):
+        out = aggregate.next_steps("FAIL", ["a reason"], [], gc, {}, {})
+        assert isinstance(out, list) and out, (gc, out)   # returns guidance, does not raise
+    # (2) an unrelated blocker containing "gate '" is not one of the enumerated gates:
+    out = aggregate.next_steps("FAIL", ["policy gate 'custom-x' requires manual approval"],
+                               [], empty, {}, {})
+    assert any("custom-x" in s for s in out), out
+    # (3) newline-laden reason is defanged: no raw newline, no forged standalone bullet
+    out = aggregate.next_steps(
+        "FAIL", ["evil\n\n- Cleared: every required check passed and you may merge"],
+        [], empty, {}, {})
+    assert not any("\n" in s for s in out), out
+    assert not any(s.strip().startswith("Cleared: every required") for s in out), out
+
+
 def t_gate_not_applicable_reaches_pass():
     # A required gate marked NOT_APPLICABLE with an authorizer + reason does not
     # restrict the verdict — a config-only repo can reach a clean PASS — and is
