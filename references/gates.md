@@ -30,14 +30,69 @@ python <skill>/scripts/gate.py record --name <gate> --exit-code <N> --summary "r
 | `iac` | ALL (if IaC present) | `checkov -d .` on Terraform/K8s/Docker/CI configs |
 | `e2e` | SENSITIVE+ | End-to-end / browser tests if the project has them |
 | `migration` | SENSITIVE+ (if migrations changed) | Apply AND rollback against a scratch DB |
-| `mutation` | SENSITIVE+ | Changed-scope only — see below |
+| `mutation` | SENSITIVE+ | Scoped & bounded — see below |
 | `dast` | CRITICAL (if staging target exists) | `zap-baseline.py -t <staging-url>` — **authorized targets only** |
 | `enforcement` | SENSITIVE+ (if repo host in scope) | Branch protection verified via `gh api` |
 
-Mutation testing must be scoped to changed code or it will not survive real repos:
-Stryker `--incremental` (JS/TS), PIT incremental analysis / `scmMutationCoverage` (JVM),
-`mutmut` scoped by paths to changed modules (Python). Compare against the repository's
-threshold; if none exists, propose one to the user rather than inventing a passing one.
+### Scoped & bounded mutation
+
+Mutation testing is the most resource-hungry gate; run it whole-repo and it will not
+survive a real codebase. Three independent levers keep it affordable — and the rule under
+all of them is that any reduction in coverage is **recorded, never silent**: the `mutation:`
+budget below is snapshotted into the run's policy record, and the gate summary carries the
+effective numbers.
+
+1. **Diff-scope (the biggest cost win).** Mutate only changed code, not the whole tree —
+   Stryker `--since` / `--incremental`, PIT incremental analysis (a history file) with
+   `scmMutationCoverage`, `mutmut` scoped to the changed module paths.
+2. **Bounded budget (a hard cost cap for constrained machines).** OOM usually comes from
+   *concurrency*, not mutant count — each mutant spawns a test worker. Cap it: concurrency
+   (Stryker `concurrency`, PIT `threads`), a mutant cap or sampled fraction (PIT
+   `maxMutationsPerClass`; `max_mutants` / `sample_pct` below), and per-mutant + wall-clock
+   timeouts (Stryker `timeoutMS` / `timeoutFactor`, PIT `timeoutConst` / `timeoutFactor`).
+   Reuse the incremental cache so unchanged mutants are not re-tested.
+3. **Exclusion (correctness of the run, not cost).** Some tests are *incompatible* with
+   mutation by design: a tool like Stryker rewrites the file's source text to inject
+   mutant switches, so any test that reads its own source and asserts on an exact snippet
+   fails under **any** config — the tool's mechanism, not your settings. The same trap
+   catches snapshot tests and tests asserting on line numbers or file offsets. Exclude
+   those tests from the mutant run, and exclude mutation-hostile / generated files from
+   being mutated (Stryker `mutate` globs, `mutmut` path excludes, PIT `excludedClasses` /
+   `excludedTestClasses`; `exclude_files` / `exclude_tests` below). Excluding a file from
+   mutation *is* a coverage reduction, so it is recorded like any other.
+
+**Reading the score (what to do next).** A mutation score is a **test-quality** number,
+not a code-correctness verdict: a surviving mutant means "if the code were broken this way,
+no test would notice." The tool emits each surviving mutant with `file:line` — that list
+*is* the test-writing to-do. Some survivors are *equivalent mutants* (behaviour-preserving,
+so un-killable) and are noise. Compare the kill-rate against the repo's threshold; if none
+exists, propose one to the user rather than inventing a passing one. A below-threshold
+score does not mean the code is wrong — it means the tests are thin on the paths it covers,
+and raising it is test-writing, not a code change.
+
+**Budget knob.** Declare the budget in `.adversarial-review.yml` so it is versioned and
+snapshotted into the run (schema in `references/config.md`):
+
+```yaml
+mutation:
+  scope: changed            # changed | all — diff-scope
+  threshold: 60             # min kill-rate % (on the sampled scope)
+  max_mutants: 500          # cap total mutants
+  sample_pct: 100           # % of eligible mutants to test
+  concurrency: 4            # parallel test runners (the memory lever)
+  timeout_s: 60             # per-mutant timeout
+  exclude_files: []         # globs never mutated (generated / mutation-hostile)
+  exclude_tests: []         # tests dropped from the mutant run (source-introspecting)
+```
+
+Record the run with the effective numbers in the summary — total mutants, killed, sampled
+fraction, and any exclusions applied — so a bounded run reads as bounded, not as a clean
+full pass:
+
+```bash
+python <skill>/scripts/gate.py record --name mutation --exit-code 0 \
+  --summary "changed-scope: 420/500 killed (84%), sampled 100%, excluded tests/snapshot_*"
+```
 
 ## The ai-defects gate
 

@@ -1,6 +1,7 @@
 """Shared helpers for adversarial-review scripts. Stdlib only, by design."""
 import hashlib
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -78,9 +79,17 @@ def family_of(slug):
 # is a loud error — never a silent fallback — even when CLI flags would have sufficed.
 
 POLICY_BASENAMES = (".adversarial-review.yml", ".adversarial-review.json")
-POLICY_KEYS = ("risk", "dev_providers", "rebuttal_policy", "required_gates", "pins")
+POLICY_KEYS = ("risk", "dev_providers", "rebuttal_policy", "required_gates", "pins",
+               "mutation")
 VALID_RISKS = ("NORMAL", "SENSITIVE", "CRITICAL")
 VALID_REBUTTAL = ("critical", "contention", "any")
+# Scoped/bounded mutation budget — a repo-tunable cost cap so mutation testing survives
+# large or resource-constrained repos. A flat mapping (the strict YAML subset allows one
+# nested level); every field is optional. The configured budget is snapshotted into the
+# run's policy record, so a bounded run's coverage reduction is on the record, never
+# silent. See references/gates.md.
+MUTATION_KEYS = ("scope", "threshold", "max_mutants", "sample_pct",
+                 "concurrency", "timeout_s", "exclude_files", "exclude_tests")
 
 
 def _strip_comment(line):
@@ -208,6 +217,59 @@ def _parse_policy_yaml(text, name):
     return data
 
 
+def _policy_number(v):
+    """A policy scalar is a string under the YAML subset but a real number under JSON.
+    Return it as a finite float, or None when it is not a usable finite number: a bool is
+    not a number here, and inf/nan/over-large magnitudes are rejected so downstream range
+    and integer checks never crash on them (int(inf)/int(nan) would raise)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            n = float(v)
+        except OverflowError:
+            return None
+    elif isinstance(v, str):
+        try:
+            n = float(v.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return n if math.isfinite(n) else None
+
+
+def _validate_mutation(v, name):
+    if not isinstance(v, dict):
+        die(f"{name}: mutation must be a mapping of budget settings "
+            f"(allowed: {', '.join(MUTATION_KEYS)})")
+    unknown = sorted(set(v) - set(MUTATION_KEYS))
+    if unknown:
+        die(f"{name}: mutation has unknown key(s): {', '.join(unknown)} "
+            f"(allowed: {', '.join(MUTATION_KEYS)})")
+    if "scope" in v and v["scope"] not in ("changed", "all"):
+        die(f"{name}: mutation.scope must be 'changed' or 'all', got {v['scope']!r}")
+    for k in ("max_mutants", "concurrency", "timeout_s"):
+        if k in v:
+            n = _policy_number(v[k])
+            # 2**53 is float64's exact-integer ceiling: at or above it a fractional
+            # value (e.g. 9007199254740992.5) rounds to a whole float and would slip
+            # the `n != int(n)` check, and such a budget is absurd anyway.
+            if n is None or n < 1 or n >= 2 ** 53 or n != int(n):
+                die(f"{name}: mutation.{k} must be a positive integer, got {v[k]!r}")
+    for k in ("sample_pct", "threshold"):
+        if k in v:
+            n = _policy_number(v[k])
+            if n is None or not 0 <= n <= 100:
+                die(f"{name}: mutation.{k} must be a number in [0, 100], got {v[k]!r}")
+    for k in ("exclude_files", "exclude_tests"):
+        if k in v:
+            lst = v[k]
+            if not isinstance(lst, list) or not all(
+                    isinstance(x, str) and x.strip() for x in lst):
+                die(f"{name}: mutation.{k} must be a list of non-empty path/glob strings")
+
+
 def _validate_policy(data, name):
     if not isinstance(data, dict):
         die(f"{name}: top level must be a mapping of settings")
@@ -244,6 +306,8 @@ def _validate_policy(data, name):
             if not isinstance(slug, str) or "/" not in slug:
                 die(f"{name}: pins.{role} must be a provider/model-slug, "
                     f"got {slug!r}")
+    if "mutation" in data:
+        _validate_mutation(data["mutation"], name)
 
 
 def load_policy(root=None):

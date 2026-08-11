@@ -868,6 +868,73 @@ def t_policy_missing_is_identical():
     assert req["requested_source"] == "cli", req
 
 
+def t_policy_mutation_budget():
+    # A valid scoped-mutation budget parses, is captured in the attested policy snapshot
+    # (so a bounded run's coverage reduction is on the record), and structures correctly.
+    good = ("risk: SENSITIVE\ndev_providers: [anthropic]\n"
+            "mutation:\n"
+            "  scope: changed\n"
+            "  threshold: 60\n"
+            "  max_mutants: 500\n"
+            "  sample_pct: 100\n"
+            "  concurrency: 4\n"
+            "  timeout_s: 60\n"
+            "  exclude_files: [generated/pb2.py]\n"
+            "  exclude_tests: [tests/test_snapshot.py]\n")
+    repo = fresh_repo()
+    (repo / ".adversarial-review.yml").write_text(good)
+    sh(["panel.py", "init"], repo)  # parses clean with zero flags
+    snap = read(latest_run(repo) / "policy.snapshot.json")
+    assert "mutation:" in snap["text"] and "exclude_tests" in snap["text"], snap
+    import _common
+    pol = _common.load_policy(str(repo))["data"]["mutation"]
+    assert pol["scope"] == "changed", pol
+    assert pol["exclude_tests"] == ["tests/test_snapshot.py"], pol
+    # Malformed budgets die loudly even though risk/dev_providers are valid on the CLI —
+    # a policy is never silently ignored.
+    full = ["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"]
+    bad = [
+        ("mutation:\n  scope: sometimes\n", "mutation.scope"),
+        ("mutation:\n  max_mutants: 0\n", "positive integer"),
+        ("mutation:\n  max_mutants: 3.5\n", "positive integer"),
+        ("mutation:\n  max_mutants: 9007199254740992.5\n", "positive integer"),  # >=2**53 rounds to int
+        ("mutation:\n  max_mutants: inf\n", "positive integer"),   # non-finite must die, not crash
+        ("mutation:\n  concurrency: nan\n", "positive integer"),   # int(nan) would raise — regression
+        ("mutation:\n  sample_pct: inf\n", "[0, 100]"),
+        ("mutation:\n  sample_pct: 150\n", "[0, 100]"),
+        ("mutation:\n  threshold: high\n", "[0, 100]"),
+        ("mutation:\n  budget: 10\n", "unknown key"),
+        ("mutation: 10\n", "mapping"),
+        ("mutation:\n  exclude_files: notalist\n", "list of non-empty"),
+    ]
+    for text, needle in bad:
+        repo = fresh_repo()
+        (repo / ".adversarial-review.yml").write_text(text)
+        r = sh(full, repo, expect=1)
+        assert needle in r.stderr, f"{text!r}: expected {needle!r} in {r.stderr!r}"
+    # JSON policy variant (.adversarial-review.json): numbers/bools arrive as native
+    # types, exercising a different _policy_number path than the YAML string subset.
+    good_json = ('{"risk":"NORMAL","dev_providers":["anthropic"],'
+                 '"mutation":{"scope":"changed","max_mutants":500,"sample_pct":99.5,'
+                 '"exclude_files":["gen/pb2.py"]}}')
+    repo = fresh_repo()
+    (repo / ".adversarial-review.json").write_text(good_json)
+    sh(["panel.py", "init"], repo)  # native int/float budget parses clean
+    mut = _common.load_policy(str(repo))["data"]["mutation"]
+    assert mut["max_mutants"] == 500 and mut["sample_pct"] == 99.5, mut
+    bad_json = [
+        ('{"mutation":{"max_mutants":true}}', "positive integer"),   # native bool rejected
+        ('{"mutation":{"max_mutants":3.5}}', "positive integer"),    # native non-integral float
+        ('{"mutation":{"max_mutants":9007199254740992.5}}', "positive integer"),  # >=2**53
+        ('{"mutation":{"exclude_files":["  "]}}', "list of non-empty"),  # whitespace-only element
+    ]
+    for text, needle in bad_json:
+        repo = fresh_repo()
+        (repo / ".adversarial-review.json").write_text(text)
+        r = sh(full, repo, expect=1)
+        assert needle in r.stderr, f"{text!r}: expected {needle!r} in {r.stderr!r}"
+
+
 def t_policy_required_gates_missing_tier():
     # Policy present WITH required_gates, but not for this run's tier: that is
     # "not provided", and with no other source plan must die naming the tier.
