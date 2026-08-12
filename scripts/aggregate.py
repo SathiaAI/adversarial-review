@@ -17,6 +17,7 @@ Exit codes: 0 PASS, 1 FAIL, 2 BLOCKED.
 """
 import argparse
 import hashlib
+import html
 import json
 import sys
 from datetime import date
@@ -335,9 +336,12 @@ GATE_HELP = {
     "secrets": ("no credential, key, or token is committed",
                 "remove the secret from the diff AND its history, rotate the exposed credential, then re-review"),
     "deps": ("no dependency has a known security vulnerability",
-             "upgrade the flagged package to a patched version (or record an owner-signed, expiring accepted-risk)"),
+             "upgrade the flagged package to a patched version; a findings suppression will NOT clear a failed "
+             "gate — to ship without upgrading, the gate must be waived or recorded not-applicable by a named "
+             "authorizer"),
     "sast": ("a static analyzer found no likely security bug in the code",
-             "open the flagged line, fix the issue, or suppress it with a written, expiring justification"),
+             "open the flagged line and fix it; a findings suppression will NOT clear a failed gate — to ship "
+             "without fixing, the gate must be waived or recorded not-applicable by a named authorizer"),
     "mutation": ("your tests actually catch bugs rather than just run. The score is the percent of injected "
                  "bugs (\"mutants\") your tests killed; BELOW the threshold means the tests are thin on the code "
                  "they cover — it does NOT mean the code is wrong",
@@ -358,9 +362,11 @@ GATE_HELP = {
 
 
 def _oneline(s):
-    """Collapse whitespace/newlines so an untrusted reason string cannot forge extra
-    markdown bullets or headings when it is interpolated into the guidance."""
-    return " ".join(str(s).split())
+    """Collapse whitespace/newlines AND HTML-escape so an untrusted reason string cannot forge
+    extra markdown bullets/headings, nor inject raw HTML (which Markdown renderers pass through),
+    when it is interpolated into the guidance. Trade-off: a legitimate reason containing <, >, or
+    & renders as an entity — acceptable for a safety-first, audience-facing section."""
+    return html.escape(" ".join(str(s).split()), quote=False)
 
 
 def next_steps(verdict, fail, blocked, gcov, fcov, counts):
@@ -372,11 +378,18 @@ def next_steps(verdict, fail, blocked, gcov, fcov, counts):
     a specific gate line is passed through verbatim (one-lined) so a blocker is never hidden."""
     fail = [r for r in (fail or []) if isinstance(r, str)]
     blocked = [r for r in (blocked or []) if isinstance(r, str)]
-    gcov, fcov, counts = gcov or {}, fcov or {}, counts or {}
+    # Normalize by TYPE, not truthiness: a truthy-but-wrong-typed shape (gcov a list, or a
+    # coverage field carrying an int/str) must degrade to empty, not crash downstream.
+    gcov = gcov if isinstance(gcov, dict) else {}
+    fcov = fcov if isinstance(fcov, dict) else {}
+    counts = counts if isinstance(counts, dict) else {}
+
+    def _list(x):
+        return x if isinstance(x, list) else []
     steps = []
     if verdict == "PASS":
-        steps.append("Cleared: every required check passed and the independent reviewers signed off. "
-                     "A human still owns the actual merge decision.")
+        steps.append("Cleared: every required check passed and independent review ran with its blocking "
+                     "findings resolved. A human still owns the actual merge decision.")
         if counts.get("confirmed"):
             steps.append(f"{counts['confirmed']} issue(s) were caught during review and already fixed before "
                          "this passed — see the Findings section of the report for what changed.")
@@ -384,6 +397,9 @@ def next_steps(verdict, fail, blocked, gcov, fcov, counts):
         if mlu:
             steps.append(f"{mlu} lower-severity note(s) were left untriaged. They do not block release, but "
                          "skim them in the report before you merge.")
+        steps.append("Before you merge: if this change was pushed to a remote (branch or PR), verify the pushed "
+                     "bytes match what was reviewed here — a blob-sha or sha256 round-trip — because a "
+                     "success-reporting transport is not proof the bytes arrived.")
         return steps
 
     steps.append("Not ready to merge yet. Work through the items below, then start a FRESH review "
@@ -392,22 +408,24 @@ def next_steps(verdict, fail, blocked, gcov, fcov, counts):
     # or (defensively) carry non-string/dict elements — normalize before use so guidance
     # degrades rather than crashing.
     seen = set()
-    for g in (gcov.get("failed") or []):
+    for g in _list(gcov.get("failed")):
         if not isinstance(g, str):
             continue
         proves, action = GATE_HELP.get(
             g, ("a required check", "read its output above and fix what it reports"))
-        steps.append(f"The '{_oneline(g)}' check failed — it proves {proves}. What to do: {action}.")
+        # State the failure first, then what a PASSING check would prove — never
+        # "failed — it proves <success condition>", which reads as an inversion.
+        steps.append(f"The '{_oneline(g)}' check failed. Passing it proves {proves}. What to do: {action}.")
         seen.add(g)
-    blocked_names = [b["name"] for b in (gcov.get("blocked") or [])
+    blocked_names = [b["name"] for b in _list(gcov.get("blocked"))
                      if isinstance(b, dict) and isinstance(b.get("name"), str)]
-    missing = [g for g in (gcov.get("missing") or []) if isinstance(g, str)]
+    missing = [g for g in _list(gcov.get("missing")) if isinstance(g, str)]
     for g in blocked_names + missing:
         if g in seen:
             continue
         proves = GATE_HELP.get(g, ("a required check", ""))[0]
-        steps.append(f"The '{_oneline(g)}' check could not be verified — it proves {proves}. It must run and "
-                     "pass (or be recorded as not-applicable, with a reason) before release.")
+        steps.append(f"The '{_oneline(g)}' check could not be verified. Passing it proves {proves}. It must "
+                     "run and pass (or be recorded as not-applicable, with a reason) before release.")
         seen.add(g)
     if counts.get("unresolved"):
         steps.append(f"{counts['unresolved']} serious (high/critical) finding(s) are unresolved. Each must be "
