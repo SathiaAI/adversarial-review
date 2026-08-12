@@ -63,17 +63,21 @@ System prompt (per role, assembled by the script):
   non-executable defect (a false or misleading generated statement) cite the wrong output
   versus the correct output and use an empty reproduction array. Confidence is yours to
   estimate honestly (0–1); a 0.3-confidence critical is a legitimate report.
-- OUTPUT FIDELITY (all roles): before the role lens, walk the diff hunk by hunk and, for
-  every changed line that emits human-facing text, render it for a representative input
-  and confirm the statement is TRUE. A generated sentence that inverts or overstates the
-  state it describes is a valid finding even with no crash or reproduction. Every rendered
-  statement (true ones included) is recorded in `output_statements_checked`.
+- OUTPUT FIDELITY (all roles): before the role lens, scan the diff for the human-facing
+  text it emits and confirm each statement is TRUE and consistent with the state it
+  describes. A generated sentence that inverts or overstates that state is a valid finding
+  even with no crash or reproduction. Enumeration scope differs by role: the dedicated
+  **output_fidelity** reviewer records EVERY rendered statement (true ones included); the
+  other roles report **by exception** (only false/uncertain statements), so a large text
+  diff cannot exhaust the completion budget across the panel. Any `states_truth:false`
+  entry MUST also be raised as a finding and linked by `finding_id` — `aggregate.py` BLOCKS
+  a false statement not linked to a triaged finding, so a recorded falsehood cannot reach PASS.
 - You must fill the attestations: `areas_reviewed`, `areas_not_reviewed` (what you could
   not or did not check — this is information, not weakness), `top_residual_risks`
   (minimum 1, even with zero findings — the riskiest aspects that remain if everything
-  you saw is fine), and `output_statements_checked` (every human-facing string you
-  rendered and whether it states something true; an empty list asserts the diff emits no
-  human-facing text). "No findings" with empty attestations is a malformed report.
+  you saw is fine), and `output_statements_checked` (scoped as above — exhaustive for
+  output_fidelity, by exception for the other roles). "No findings" with empty
+  `areas`/`top_residual_risks` attestations is a malformed report.
 - Output: a single JSON object matching the provided schema. No prose outside JSON.
 
 User message: run metadata (product, risk tier, requirements, invariants) followed by

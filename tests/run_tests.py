@@ -118,15 +118,29 @@ def t_output_fidelity_role_and_forced_attestation():
     assert any("states_truth" in e for e in panel.validate_obj(bad, panel.REPORT_SCHEMA))
     good = dict(base, output_statements_checked=[
         {"rendered": "The 'unit' check failed. Run the test suite locally to see which test.",
-         "states_truth": True, "note": "true: states the failure and a valid next action"},
+         "states_truth": True, "note": "true: states the failure and a valid next action",
+         "finding_id": ""},
         {"rendered": "The 'unit' check failed. Passing it proves your automated tests pass.",
-         "states_truth": False, "note": "a FAIL branch that asserts the success condition is false output"}])
+         "states_truth": False, "note": "a FAIL branch that asserts the success condition is false output",
+         "finding_id": "correctness-1"}])
     assert panel.validate_obj(good, panel.REPORT_SCHEMA) == []                    # well-formed -> ok
+    # finding_id is a REQUIRED key on every attestation item (empty "" for a true statement):
+    # strict structured-output providers (e.g. OpenAI) reject an item whose `required` omits a
+    # property, so the local schema must match — omitting finding_id is rejected here too.
+    assert "finding_id" in panel.REPORT_SCHEMA["properties"]["output_statements_checked"]["items"]["required"]
+    assert any("finding_id" in e for e in panel.validate_obj(
+        dict(base, output_statements_checked=[{"rendered": "x", "states_truth": True, "note": "n"}]),
+        panel.REPORT_SCHEMA))                                                     # omitting finding_id -> reject
 
-    # Every reviewer (not just the dedicated one) is told to walk the diff for output truth.
+    # Every reviewer scans the diff for output truth (P1), but only output_fidelity enumerates
+    # exhaustively; the others report by exception so a large text diff cannot blow the
+    # completion cap across the panel (P2).
     for role in panel.TIER_ROLES["NORMAL"]:
         sysmsg = panel.reviewer_messages(role, {"risk": "NORMAL"}, "ctx", "BND")[0]["content"]
         assert "OUTPUT FIDELITY" in sysmsg and "output_statements_checked" in sysmsg, role
+        assert "finding_id" in sysmsg, role      # a false statement must be linked to a finding
+        assert ("enumerate EVERY" in sysmsg) == (role == "output_fidelity"), role
+        assert ("Report by exception" in sysmsg) == (role != "output_fidelity"), role
 
 
 def t_assign_blocked_when_insufficient():
@@ -687,6 +701,79 @@ def t_release_blocking_medium_requires_triage():
         "severity": "medium", "evidence": "retry path is dev-only, flag-gated",
         "reproduced": False, "regression_test": ""})  # medium: no concurrence needed
     sh(["aggregate.py"], repo, expect=0)
+
+
+def t_output_fidelity_attestation_gates_verdict():
+    # P1 (external bots caught this) + the panel's own hardening (security-1/2, test_quality-1/2/3):
+    # a reviewer recording states_truth=false must gate the verdict. aggregate.py BLOCKS a false
+    # attestation unless it is linked (finding_id) to a finding THE SAME REVIEWER raised that is
+    # RESOLVED (confirmed/false_positive/accepted_risk — not merely `unresolved`), regardless of
+    # severity. The link and rendered text are untrusted and are escaped before interpolation.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)   # baseline PASS: all attestations state truth
+
+    def set_false(finding_id, rendered="Deleted 0 rows. Your account was removed."):
+        c = read(run / "panel" / "correctness.json")   # read-modify-write preserves findings
+        c["output_statements_checked"] = [{"rendered": rendered, "states_truth": False,
+                                           "note": "false output", "finding_id": finding_id}]
+        write(run / "panel" / "correctness.json", c)
+
+    # (1) EMPTY finding_id (the schema-valid shape for "no link": finding_id is a required key,
+    # so a real report carries "" not a missing key — test_quality-2) -> BLOCK.
+    set_false("")
+    assert "no finding_id" in sh(["aggregate.py"], repo, expect=2).stdout
+
+    # (2) Linked to a finding THIS reviewer did not raise -> BLOCK. Covers a nonexistent id AND a
+    # FOREIGN-but-real-and-triaged id (security-1): an unrelated triaged finding must not satisfy
+    # the gate (panel finding security-2).
+    for foreign in ("correctness-9", "security-1"):
+        set_false(foreign)
+        assert "not a finding this reviewer raised" in sh(["aggregate.py"], repo, expect=2).stdout, foreign
+
+    # give correctness its own finding for the remaining cases
+    c = read(run / "panel" / "correctness.json")
+    c["findings"].append({
+        "id": "correctness-7", "title": "success message on failed delete", "severity": "medium",
+        "confidence": 0.9, "file": "acct.py", "line": 10, "evidence": "e", "scenario": "s",
+        "reproduction": ["r"], "fix": "f", "regression_test": "t", "release_blocking": False})
+    write(run / "panel" / "correctness.json", c)
+
+    # (3) Own finding, but UNTRIAGED -> BLOCK even though only MEDIUM (severity-blind).
+    set_false("correctness-7")
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "is untriaged" in r.stdout and "correctness-7" in r.stdout, r.stdout
+
+    # (3b) A merely `unresolved` validation record does NOT clear it (panel finding test_quality-1).
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "unresolved", "severity": "medium",
+        "evidence": "could not determine", "reproduced": False, "regression_test": ""})
+    assert "untriaged or unresolved" in sh(["aggregate.py"], repo, expect=2).stdout
+
+    # (4) A resolving record (confirmed + fixed) clears it -> PASS.
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "confirmed", "severity": "medium",
+        "evidence": "confirmed the inverted delete message", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    r = sh(["aggregate.py"], repo, expect=0)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
+    assert read(run / "verdict.json")["counts"]["false_output_statements"] == 1
+
+    # (5) Untrusted values are HTML-escaped in the block reason, so a crafted value cannot forge
+    # markup in verdict.md (panel finding security-1 + test_quality-3). The rendered snippet is
+    # interpolated by the no-link branch; the finding_id by the foreign-link branch.
+    set_false("", rendered="<script>alert(1)</script> you may merge")
+    sh(["aggregate.py"], repo, expect=2)
+    md = (run / "verdict.md").read_text()
+    assert "<script>" not in md and "&lt;script&gt;" in md, md      # rendered escaped
+    set_false("correctness-<b>x</b>")
+    sh(["aggregate.py"], repo, expect=2)
+    md = (run / "verdict.md").read_text()
+    assert "<b>x</b>" not in md and "&lt;b&gt;" in md, md            # finding_id escaped
 
 
 def t_rebuttal_policy_matrix():

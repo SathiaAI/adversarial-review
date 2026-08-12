@@ -38,20 +38,37 @@ preserved under `panel/raw/`).
   "injection_suspected": false,
   "output_statements_checked": [
     { "rendered": "a human-facing string the reviewer rendered from the diff",
-      "states_truth": true, "note": "why it holds — or how it misstates the real state" }
+      "states_truth": true, "note": "why it holds — or how it misstates the real state",
+      "finding_id": "" },
+    { "rendered": "a FAIL branch that asserts the success condition",
+      "states_truth": false, "note": "inverted claim", "finding_id": "output_fidelity-2" }
   ]
 }
 ```
 
-`output_statements_checked` is a **required, forced** attestation (every role must emit it):
-the reviewer walks the diff and records each human-facing string it emits — guidance, status
-lines, labels, error/log messages, docs — with a truth judgment, the true ones included. An
-empty list is a positive claim ("the diff emits no human-facing text I could find"), not a
-skip. It exists to catch output-semantics defects — a generated sentence whose claim inverts
-or overstates the state it describes (e.g. a FAIL branch that asserts the success condition) —
+`output_statements_checked` is a **required, forced** attestation (every role emits it). It
+exists to catch output-semantics defects — a generated sentence whose claim inverts or
+overstates the state it describes (e.g. a FAIL branch that asserts the success condition) —
 which have no crash or exploit and so slip past a purely threat/logic review. Such a finding is
 valid with an empty `reproduction`; cite the wrong output versus the correct output in
 `evidence` and `scenario`.
+
+**Enumeration scope.** The dedicated **output_fidelity** reviewer records EVERY human-facing
+string (true ones included) — for that role an empty list is a positive claim ("the diff emits
+no human-facing text"). The other roles report **by exception**: only statements they judge
+false, misleading, or uncertain, so a large text/localization diff cannot exhaust the
+completion cap across 4–6 reviewers and false-BLOCK a clean change.
+
+**Linkage that makes it a gate.** Every item carries `finding_id`: the id of the finding that
+reports a false statement, or an empty string `""` for a true one. It is a required key on every
+item — strict structured-output providers (e.g. OpenAI) reject a schema whose `required` omits
+any property, so an optional field would break those reviewers outright. `aggregate.py` BLOCKS
+the run on any false statement whose `finding_id` is empty, is **not a finding the same reviewer
+raised**, or names one that is **not resolved** (a `confirmed`/`false_positive`/`accepted_risk`
+triage decision — a bare `unresolved` record does not clear it) — regardless of that finding's
+severity — so a recorded falsehood can never silently reach PASS, and a garbled or foreign link
+fails safe to BLOCKED. The reviewer-supplied link and rendered text are HTML-escaped before they
+appear in any reason, so a crafted value cannot forge markup in the rendered verdict.
 
 ## Panel plan — `panel/plan.json`
 

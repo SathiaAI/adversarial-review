@@ -150,8 +150,12 @@ to distinct provider families with no collisions. NORMAL runs 4 reviewers (corre
 security, test quality, output_fidelity); SENSITIVE and CRITICAL run 6 (adds data/privacy,
 reliability). The output_fidelity reviewer walks the diff line by line and verifies that
 every human-facing string the code emits states something true — the output-semantics lens
-a purely threat/logic panel otherwise misses. Each role needs its own provider family, so
-this raises the independence bar by one. If too few independent families are available the
+a purely threat/logic panel otherwise misses. Every reviewer additionally attests to the
+output statements it checked, and any statement recorded as false must be raised as a finding:
+`aggregate.py` BLOCKS the run on a false statement not linked to a triaged finding, so false
+human-facing output gates the verdict deterministically rather than relying on a reviewer to
+also remember to file it. Each role needs its own provider family, so this raises the
+independence bar by one. If too few independent families are available the
 script exits BLOCKED — a smaller panel
 requires explicit user authorization (`--allow-degraded --authorized-by "<user>"`), which
 is recorded and surfaced in the report.

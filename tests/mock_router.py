@@ -56,8 +56,8 @@ def _report(role, model):
             "top_residual_risks": ["auth middleware unreviewed"],
             "injection_suspected": False,
             "output_statements_checked": [
-                {"rendered": "sample rendered user-facing line",
-                 "states_truth": True, "note": "consistent with the state it describes"}]}
+                {"rendered": "sample rendered user-facing line", "states_truth": True,
+                 "note": "consistent with the state it describes", "finding_id": ""}]}
 
 
 class Handler(BaseHTTPRequestHandler):

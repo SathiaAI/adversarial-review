@@ -319,6 +319,44 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
                  if f["severity"] not in HIGH and i not in covered]
     if untriaged:
         counts["medium_low_untriaged"] = len(untriaged)
+
+    # Output-fidelity attestation gate. A reviewer that recorded a human-facing statement as
+    # false (states_truth=false) must link it — via finding_id — to a finding IT raised that is
+    # RESOLVED (a triage decision was made: confirmed / false_positive / accepted_risk; a merely
+    # `unresolved` record does not clear it). An unlinked, foreign, dangling, or unresolved link
+    # is unverified false output reaching release, so it BLOCKS regardless of the linked finding's
+    # severity — this is what makes the forced attestation actually gate the verdict. Fail-safe by
+    # construction: a missing/garbled/foreign link blocks, never passes. finding_id and the
+    # rendered snippet are reviewer-supplied (untrusted) and are escaped before interpolation so a
+    # crafted value cannot forge markdown/HTML in the rendered verdict (panel finding security-1).
+    resolved = set()
+    for _, rec in records:
+        if rec.get("classification") in ("confirmed", "false_positive", "accepted_risk"):
+            resolved.update(rec.get("finding_ids", []))
+    false_stmts = 0
+    for role, rep in reports.items():
+        for it in rep.get("output_statements_checked") or []:
+            if not isinstance(it, dict) or it.get("states_truth") is not False:
+                continue
+            false_stmts += 1
+            fid = it.get("finding_id")
+            fid = fid.strip() if isinstance(fid, str) else ""
+            snip = _snippet(it.get("rendered", ""))
+            sfid = _snippet(fid)  # untrusted — escape before interpolating into a reason
+            if not fid:
+                blocked.append(f"reviewer '{role}' recorded false human-facing output "
+                               f"(\"{snip}\") with no finding_id — a false statement must be "
+                               "raised as a finding so it enters triage")
+            elif not fid.startswith(role + "-") or fid not in findings:
+                blocked.append(f"reviewer '{role}' linked false output to finding '{sfid}', "
+                               "which is not a finding this reviewer raised — a false statement "
+                               "must be linked to the reviewer's own finding, not an unrelated one")
+            elif fid not in resolved:
+                blocked.append(f"false-output finding '{sfid}' (reviewer '{role}') is untriaged "
+                               "or unresolved — a reviewer-attested false statement must be "
+                               "validated (confirmed/false_positive/accepted_risk) before release")
+    counts["false_output_statements"] = false_stmts
+
     return {"raised": len(findings),
             "triaged": sum(1 for i in findings if i in covered),
             "untriaged_release_blocking": len(flagged)}
@@ -367,6 +405,15 @@ def _oneline(s):
     when it is interpolated into the guidance. Trade-off: a legitimate reason containing <, >, or
     & renders as an entity — acceptable for a safety-first, audience-facing section."""
     return html.escape(" ".join(str(s).split()), quote=False)
+
+
+def _snippet(s, n=80):
+    """One-lined, length-capped, HTML-escaped excerpt of a reviewer-supplied string for safe
+    interpolation into a blocked reason (same injection concern as _oneline)."""
+    s = " ".join(str(s).split())
+    if len(s) > n:
+        s = s[:n - 1] + "…"
+    return html.escape(s, quote=False)
 
 
 def next_steps(verdict, fail, blocked, gcov, fcov, counts):

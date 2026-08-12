@@ -93,17 +93,24 @@ REPORT_SCHEMA = {
         "areas_not_reviewed": {"type": "array", "items": {"type": "string"}},
         "top_residual_risks": {"type": "array", "items": {"type": "string"}, "minItems": 1},
         "injection_suspected": {"type": "boolean"},
-        # Forced output-fidelity attestation: every human-facing string the reviewer
-        # rendered from the diff and whether it states something true. An empty list is a
+        # Forced output-fidelity attestation: the human-facing statements the reviewer
+        # rendered from the diff and whether each states something true. An empty list is a
         # positive claim — "the diff emits no human-facing text I could find" — not a skip.
+        # finding_id links a FALSE statement to the finding THIS reviewer raised for it (empty ""
+        # for a true one). aggregate.py BLOCKS any false statement whose finding_id is empty,
+        # foreign (not the reviewer's own finding), or unresolved — regardless of severity — so a
+        # recorded falsehood can never silently reach PASS. All four keys are required: strict
+        # structured-output providers (e.g. OpenAI) reject an item whose `required` omits any
+        # property, and an empty finding_id on a false statement still fails safe to BLOCKED.
         "output_statements_checked": {"type": "array", "items": {
             "type": "object", "additionalProperties": False,
             "properties": {
                 "rendered": {"type": "string"},
                 "states_truth": {"type": "boolean"},
                 "note": {"type": "string"},
+                "finding_id": {"type": "string"},
             },
-            "required": ["rendered", "states_truth", "note"],
+            "required": ["rendered", "states_truth", "note", "finding_id"],
         }},
     },
     "required": ["role", "model_id", "summary", "findings", "assumptions",
@@ -299,6 +306,22 @@ def cmd_assign(args):
 # ---------------------------------------------------------------- prompts / validation
 
 def reviewer_messages(role, meta, context_text, boundary):
+    # Output-fidelity enumeration scope (P2): only the dedicated output_fidelity reviewer
+    # enumerates every human-facing statement; the other roles report by exception (false or
+    # uncertain statements only), so a large text/localization diff cannot exhaust the
+    # completion cap across 4-6 reviewers and false-BLOCK a defect-free change.
+    exhaustive = role == "output_fidelity"
+    of_scope = (
+        "You are the output_fidelity reviewer and you OWN this lens: enumerate EVERY "
+        "human-facing statement the diff emits — render each for a representative input and "
+        "record it in output_statements_checked with states_truth, the true ones included; "
+        "an empty list asserts the diff emits no human-facing text."
+        if exhaustive else
+        "Report by exception: you need NOT enumerate every string. Put in "
+        "output_statements_checked only the human-facing statements you judge FALSE, "
+        "misleading, or uncertain; if every statement you saw is true, leave it empty. The "
+        "dedicated output_fidelity reviewer performs the exhaustive walk."
+    )
     system = (
         f"You are the {role} reviewer on an adversarial release-gate panel for "
         f"production software. You did not write this code; other models did. Your "
@@ -318,20 +341,21 @@ def reviewer_messages(role, meta, context_text, boundary):
         f"the wrong output versus the correct output instead and use an empty reproduction "
         f"array. Estimate confidence honestly (0-1); a low-confidence critical is a "
         f"legitimate report.\n\n"
-        f"OUTPUT FIDELITY (all roles): before your role lens, walk the diff hunk by hunk. "
-        f"For every changed line that emits human-facing text — a message, status line, "
-        f"label, guidance string, doc, log or error — render it for a representative input "
-        f"and check the produced statement is TRUE and consistent with the state it "
-        f"describes. A generated sentence that inverts or overstates that state (for "
-        f"example, a failure path that asserts the success condition) is a valid finding "
-        f"even with no crash, no exploit, and no reproduction. Record EVERY human-facing "
-        f"statement you rendered in output_statements_checked (with states_truth), the true "
-        f"ones included; an empty list asserts the diff emits no human-facing text.\n\n"
+        f"OUTPUT FIDELITY (all roles): before your role lens, scan the diff for the "
+        f"human-facing text it emits — a message, status line, label, guidance string, doc, "
+        f"log or error — and check each produced statement is TRUE and consistent with the "
+        f"state it describes. A generated sentence that inverts or overstates that state "
+        f"(for example, a failure path that asserts the success condition) is a valid finding "
+        f"even with no crash, no exploit, and no reproduction. {of_scope} If you mark any "
+        f"statement states_truth=false you MUST also raise a finding describing that false "
+        f"output and set that same item's finding_id to the finding's id (use an empty "
+        f"string \"\" for a true statement) — a recorded falsehood with no linked finding "
+        f"blocks the release.\n\n"
         f"You must fill the attestations: areas_reviewed, areas_not_reviewed (what you "
         f"could not or did not check — that is information, not weakness), "
         f"top_residual_risks (at least 1 even with zero findings: the riskiest aspects "
-        f"that remain if everything you saw is fine), and output_statements_checked (every "
-        f"human-facing string you rendered and whether it states something true).\n\n"
+        f"that remain if everything you saw is fine), and output_statements_checked as "
+        f"scoped above.\n\n"
         f"Respond with a single JSON object matching the provided schema, and nothing "
         f"else — no prose, no markdown fences."
     )
