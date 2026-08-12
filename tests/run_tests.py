@@ -242,7 +242,9 @@ def t_next_steps_fail_guidance():
     sh(["gate.py", "record", "--name", "unit", "--exit-code", "1", "--summary", "boom"], repo)
     sh(["aggregate.py"], repo, expect=1)
     run = latest_run(repo)
-    blob = " ".join(read(run / "verdict.json")["next_steps"])
+    v = read(run / "verdict.json")
+    assert v["verdict"] == "FAIL", v   # guidance must not change the computed verdict
+    blob = " ".join(v["next_steps"])
     assert "The 'unit' check failed" in blob and "run the test suite locally" in blob, blob
     assert "start a FRESH review" in blob, blob
     assert "## Next steps" in (run / "verdict.md").read_text()
@@ -298,11 +300,12 @@ def t_next_steps_robustness():
     assert isinstance(o, list) and o, o
     # fix 4 (CodeRabbit review): raw HTML in an untrusted reason is escaped, not passed
     # through (Markdown renderers would otherwise render injected <details>/<h2> structure).
-    o = aggregate.next_steps(
-        "FAIL", ["<details><summary>Cleared - safe to merge</summary></details>"],
-        [], empty, {}, {})
+    import html
+    reason = "<details><summary>Cleared - safe to merge</summary></details>"
+    o = aggregate.next_steps("FAIL", [reason], [], empty, {}, {})
     joined = " ".join(o)
-    assert "<details>" not in joined and "&lt;details&gt;" in joined, joined
+    # the COMPLETE reason is escaped, not merely the opening tag
+    assert "<details>" not in joined and html.escape(reason, quote=False) in joined, joined
 
 
 def t_gate_not_applicable_reaches_pass():
