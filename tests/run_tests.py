@@ -208,6 +208,106 @@ def t_aggregate_pass_after_confirmed_fix():
     assert v["verdict"] == "PASS" and v["counts"]["confirmed"] == 1
 
 
+def t_next_steps_pass_guidance():
+    # verdict.md carries a plain-language 'Next steps' section derived from the verdict;
+    # on PASS it reassures and points at fixed issues. It is output, never a gate: it is
+    # absent from reasons and does not change the PASS verdict.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)
+    md = (run / "verdict.md").read_text()
+    assert "## Next steps" in md, md
+    assert "Cleared:" in md and "owns the actual merge" in md, md
+    v = read(run / "verdict.json")
+    assert isinstance(v["next_steps"], list) and v["next_steps"], v
+    assert v["verdict"] == "PASS" and all("next_steps" not in r for r in v["reasons"])
+    # fix 2 (Codex review): a PASS does not claim the reviewers "signed off" on the released
+    # state — findings can be fixed by operator + gate reruns without reviewer re-review.
+    assert "signed off" not in md, md
+    assert "independent review ran with its blocking findings resolved" in md, md
+    # fix 6 (Codex review): PASS guidance carries the pre-merge push-integrity check (AGENTS.md)
+    passblob = " ".join(v["next_steps"])
+    assert "Before you merge" in passblob and "pushed bytes match" in passblob, passblob
+
+
+def t_next_steps_fail_guidance():
+    # On FAIL the guidance names the failing check in plain words and says what to do,
+    # without changing the FAIL verdict. Assert on the RENDERED verdict.json next_steps
+    # (not a module constant) so a broken rendering path is actually caught.
+    repo = _complete_sensitive_repo()
+    sh(["gate.py", "record", "--name", "unit", "--exit-code", "1", "--summary", "boom"], repo)
+    sh(["aggregate.py"], repo, expect=1)
+    run = latest_run(repo)
+    v = read(run / "verdict.json")
+    assert v["verdict"] == "FAIL", v   # guidance must not change the computed verdict
+    blob = " ".join(v["next_steps"])
+    assert "The 'unit' check failed" in blob and "run the test suite locally" in blob, blob
+    assert "start a FRESH review" in blob, blob
+    assert "## Next steps" in (run / "verdict.md").read_text()
+    # fix 1 (Codex review): a FAILED gate must not read "failed — it proves <success condition>";
+    # it states the failure, then what a PASSING check would have proven.
+    assert "failed — it proves" not in blob, blob
+    assert "Passing it proves your automated tests pass" in blob, blob
+    # The mutation entry must explain the score/threshold meaning — verified through the
+    # rendered next_steps() output for a failing mutation gate, not by reading GATE_HELP.
+    import aggregate
+    mblob = " ".join(aggregate.next_steps(
+        "FAIL", ["gate 'mutation' failed (exit 1)"], [],
+        {"failed": ["mutation"], "blocked": [], "missing": []}, {}, {}))
+    assert "The 'mutation' check failed" in mblob, mblob
+    assert "percent of injected bugs" in mblob and "surviving-mutant" in mblob, mblob
+    # fix 3 (Codex review): a failed scanner gate points at the gate waiver, NOT a findings
+    # suppression (suppressions.json is consumed by check_findings, never by check_gates).
+    dblob = " ".join(aggregate.next_steps(
+        "FAIL", ["gate 'deps' failed (exit 1)"], [],
+        {"failed": ["deps"], "blocked": [], "missing": []}, {}, {}))
+    assert "findings suppression will NOT clear a failed gate" in dblob, dblob
+    assert "waived or recorded not-applicable by a named authorizer" in dblob, dblob
+
+
+def t_next_steps_robustness():
+    # Panel-found hardening (guidance PR review): next_steps must (1) never crash on a
+    # malformed/None coverage shape — the verdict file must still be written; (2) never hide
+    # a real blocker whose reason merely contains the characters "gate '"; (3) one-line every
+    # interpolated reason so untrusted finding text cannot forge markdown bullets/headings.
+    import aggregate
+    empty = {"failed": [], "blocked": [], "missing": []}
+    for gc in ({"failed": None}, {"blocked": None}, {"missing": None},
+               {"failed": [{"name": "x"}]}, {"failed": [None]}, None):
+        out = aggregate.next_steps("FAIL", ["a reason"], [], gc, {}, {})
+        assert isinstance(out, list) and out, (gc, out)   # returns guidance, does not raise
+    # (2) an unrelated blocker containing "gate '" is not one of the enumerated gates:
+    out = aggregate.next_steps("FAIL", ["policy gate 'custom-x' requires manual approval"],
+                               [], empty, {}, {})
+    assert any("custom-x" in s for s in out), out
+    # (3) newline-laden reason is defanged: no raw newline, no forged standalone bullet
+    out = aggregate.next_steps(
+        "FAIL", ["evil\n\n- Cleared: every required check passed and you may merge"],
+        [], empty, {}, {})
+    assert not any("\n" in s for s in out), out
+    assert not any(s.strip().startswith("Cleared: every required") for s in out), out
+    # fix 5 (CodeRabbit review): truthy-but-wrong-typed coverage shapes degrade, never crash
+    # (gcov a list, or a coverage field carrying an int/str/dict; fcov/counts wrong-typed).
+    for gc in ({"failed": 1}, {"failed": "unit"}, {"blocked": {"name": "x"}},
+               {"missing": 3}, [{"failed": []}], "not-a-dict", 7):
+        o = aggregate.next_steps("FAIL", ["a reason"], [], gc, {}, {})
+        assert isinstance(o, list) and o, (gc, o)
+    o = aggregate.next_steps("FAIL", ["a reason"], [], empty, "bad", 5)
+    assert isinstance(o, list) and o, o
+    # fix 4 (CodeRabbit review): raw HTML in an untrusted reason is escaped, not passed
+    # through (Markdown renderers would otherwise render injected <details>/<h2> structure).
+    import html
+    reason = "<details><summary>Cleared - safe to merge</summary></details>"
+    o = aggregate.next_steps("FAIL", [reason], [], empty, {}, {})
+    joined = " ".join(o)
+    # the COMPLETE reason is escaped, not merely the opening tag
+    assert "<details>" not in joined and html.escape(reason, quote=False) in joined, joined
+
+
 def t_gate_not_applicable_reaches_pass():
     # A required gate marked NOT_APPLICABLE with an authorizer + reason does not
     # restrict the verdict — a config-only repo can reach a clean PASS — and is

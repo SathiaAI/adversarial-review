@@ -17,6 +17,7 @@ Exit codes: 0 PASS, 1 FAIL, 2 BLOCKED.
 """
 import argparse
 import hashlib
+import html
 import json
 import sys
 from datetime import date
@@ -323,6 +324,129 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
             "untriaged_release_blocking": len(flagged)}
 
 
+# Plain-language guidance for a non-expert reading the verdict ("what does this even
+# mean, and what do I do now?"). Each entry: (what the gate proves, what to do if it is
+# the blocker). The `mutation` entry deliberately explains what the score/threshold mean,
+# since that number is the most opaque to someone who did not write the pipeline.
+GATE_HELP = {
+    "build": ("the code compiles and imports cleanly",
+              "run the build locally, fix the syntax/import error it prints, and start a new review"),
+    "unit": ("your automated tests pass",
+             "run the test suite locally, fix the failing test (or the bug it caught), and re-review"),
+    "secrets": ("no credential, key, or token is committed",
+                "remove the secret from the diff AND its history, rotate the exposed credential, then re-review"),
+    "deps": ("no dependency has a known security vulnerability",
+             "upgrade the flagged package to a patched version; a findings suppression will NOT clear a failed "
+             "gate — to ship without upgrading, the gate must be waived or recorded not-applicable by a named "
+             "authorizer"),
+    "sast": ("a static analyzer found no likely security bug in the code",
+             "open the flagged line and fix it; a findings suppression will NOT clear a failed gate — to ship "
+             "without fixing, the gate must be waived or recorded not-applicable by a named authorizer"),
+    "mutation": ("your tests actually catch bugs rather than just run. The score is the percent of injected "
+                 "bugs (\"mutants\") your tests killed; BELOW the threshold means the tests are thin on the code "
+                 "they cover — it does NOT mean the code is wrong",
+                 "open the surviving-mutant list: each file:line is a spot where a bug would slip past every "
+                 "test. Add a test that would fail there, then re-run. Equivalent (behaviour-preserving) "
+                 "mutants can't be killed and are just noise"),
+    "iac": ("your infrastructure config (Terraform/K8s/Docker) has no misconfiguration",
+            "fix the flagged setting and re-review"),
+    "e2e": ("the app works end to end",
+            "reproduce the failing flow locally, fix it, and re-review"),
+    "migration": ("the schema change applies AND rolls back cleanly",
+                  "fix the migration so both directions succeed against a scratch database"),
+    "dast": ("a running staging instance shows no obvious vulnerability",
+             "triage the scanner report against staging and fix the real issues"),
+    "enforcement": ("the protected branch actually enforces this review (required checks, no force-push)",
+                    "enable the required branch protections, or grant access so they can be verified"),
+}
+
+
+def _oneline(s):
+    """Collapse whitespace/newlines AND HTML-escape so an untrusted reason string cannot forge
+    extra markdown bullets/headings, nor inject raw HTML (which Markdown renderers pass through),
+    when it is interpolated into the guidance. Trade-off: a legitimate reason containing <, >, or
+    & renders as an entity — acceptable for a safety-first, audience-facing section."""
+    return html.escape(" ".join(str(s).split()), quote=False)
+
+
+def next_steps(verdict, fail, blocked, gcov, fcov, counts):
+    """Plain-language 'what this means and what to do next', for someone who did not write
+    the pipeline. DERIVED ONLY from the already-computed verdict and coverage — it reads
+    them and never writes them, so it cannot change a gate, threshold, or verdict. Coverage
+    shapes are normalized defensively so malformed/None input degrades rather than crashing
+    (the verdict file must still be written), and every fail/blocked reason not rephrased as
+    a specific gate line is passed through verbatim (one-lined) so a blocker is never hidden."""
+    fail = [r for r in (fail or []) if isinstance(r, str)]
+    blocked = [r for r in (blocked or []) if isinstance(r, str)]
+    # Normalize by TYPE, not truthiness: a truthy-but-wrong-typed shape (gcov a list, or a
+    # coverage field carrying an int/str) must degrade to empty, not crash downstream.
+    gcov = gcov if isinstance(gcov, dict) else {}
+    fcov = fcov if isinstance(fcov, dict) else {}
+    counts = counts if isinstance(counts, dict) else {}
+
+    def _list(x):
+        return x if isinstance(x, list) else []
+    steps = []
+    if verdict == "PASS":
+        steps.append("Cleared: every required check passed and independent review ran with its blocking "
+                     "findings resolved. A human still owns the actual merge decision.")
+        if counts.get("confirmed"):
+            steps.append(f"{counts['confirmed']} issue(s) were caught during review and already fixed before "
+                         "this passed — see the Findings section of the report for what changed.")
+        mlu = counts.get("medium_low_untriaged", 0)
+        if mlu:
+            steps.append(f"{mlu} lower-severity note(s) were left untriaged. They do not block release, but "
+                         "skim them in the report before you merge.")
+        steps.append("Before you merge: if this change was pushed to a remote (branch or PR), verify the pushed "
+                     "bytes match what was reviewed here — a blob-sha or sha256 round-trip — because a "
+                     "success-reporting transport is not proof the bytes arrived.")
+        return steps
+
+    steps.append("Not ready to merge yet. Work through the items below, then start a FRESH review "
+                 "(a re-review is a new run — never an edit of this one).")
+    # A plain-language line per failing/unverified GATE. Coverage lists may be absent, None,
+    # or (defensively) carry non-string/dict elements — normalize before use so guidance
+    # degrades rather than crashing.
+    seen = set()
+    for g in _list(gcov.get("failed")):
+        if not isinstance(g, str):
+            continue
+        proves, action = GATE_HELP.get(
+            g, ("a required check", "read its output above and fix what it reports"))
+        # State the failure first, then what a PASSING check would prove — never
+        # "failed — it proves <success condition>", which reads as an inversion.
+        steps.append(f"The '{_oneline(g)}' check failed. Passing it proves {proves}. What to do: {action}.")
+        seen.add(g)
+    blocked_names = [b["name"] for b in _list(gcov.get("blocked"))
+                     if isinstance(b, dict) and isinstance(b.get("name"), str)]
+    missing = [g for g in _list(gcov.get("missing")) if isinstance(g, str)]
+    for g in blocked_names + missing:
+        if g in seen:
+            continue
+        proves = GATE_HELP.get(g, ("a required check", ""))[0]
+        steps.append(f"The '{_oneline(g)}' check could not be verified. Passing it proves {proves}. It must "
+                     "run and pass (or be recorded as not-applicable, with a reason) before release.")
+        seen.add(g)
+    if counts.get("unresolved"):
+        steps.append(f"{counts['unresolved']} serious (high/critical) finding(s) are unresolved. Each must be "
+                     "fixed and its checks re-run, or formally accepted via an owner-signed, expiring suppression.")
+    if any("confirmed finding not fixed" in r for r in fail):
+        steps.append("Confirmed issue(s) were not fixed (or their checks were not re-run). Fix each and re-run "
+                     "the affected checks — a confirmed issue cannot simply be left in place.")
+    if fcov.get("untriaged_release_blocking"):
+        steps.append(f"{fcov['untriaged_release_blocking']} finding(s) a reviewer marked release-blocking are "
+                     "untriaged. Inspect each and either fix it or record a decision — silence blocks release.")
+    # Never hide a blocker: show every raw reason verbatim EXCEPT one already rephrased above
+    # as a specific gate line. "Covered" means the reason names that exact gate ("gate '<g>'")
+    # — an exact match, so an unrelated blocker that merely contains the characters "gate '"
+    # is still shown. Each reason is one-lined so untrusted text cannot inject markdown.
+    for r in fail + blocked:
+        if any(f"gate '{g}'" in r for g in seen):
+            continue
+        steps.append(f"Also resolve: {_oneline(r)}.")
+    return steps
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run")
@@ -365,10 +489,14 @@ def main():
                 "areas_not_reviewed": sorted(areas)}
 
     verdict = "FAIL" if fail else ("BLOCKED" if blocked else "PASS")
+    # Plain-language next steps are derived from the verdict + coverage above; they are
+    # read-only over that state and cannot change it (guidance, not gate).
+    steps = next_steps(verdict, fail, blocked, gcov, fcov, counts)
     # Tamper-evident attestation over every recorded input, computed before the
     # verdict file exists so re-aggregating an untouched run reproduces it (#5).
     attestation = compute_attestation(run)
     out = {"verdict": verdict, "reasons": fail + blocked, "notes": notes,
+           "next_steps": steps,
            "counts": counts, "coverage": coverage, "attestation": attestation,
            "risk": meta["risk"], "run_id": meta["run_id"], "computed_at": now_iso()}
     write_json(run / "verdict.json", out)
@@ -378,6 +506,10 @@ def main():
     md += [f"- FAIL: {r}" for r in fail]
     md += [f"- BLOCKED: {r}" for r in blocked]
     md += [f"- note: {n}" for n in notes]
+    # Plain-language guidance up top, where a non-expert will actually read it — before
+    # the technical counts/coverage that follow.
+    md += ["", "## Next steps", ""]
+    md += [f"- {s}" for s in steps]
     md += ["", "Counts: " + ", ".join(f"{k}={v}" for k, v in counts.items())]
     reb = ("ran" if rcov["ran"] else
            ("required but missing" if rcov["required"] else "not required"))
