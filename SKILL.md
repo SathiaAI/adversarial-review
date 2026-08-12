@@ -80,7 +80,11 @@ failure modes; invariants that must remain true; applicable build/test/analysis 
 
 Assemble `context.md`: requirements + invariants, full diff (`git diff main...HEAD`),
 relevant surrounding code, tests, schemas/migrations, infra changes. Do not truncate the
-diff. Do not include secrets or `.env` content.
+diff. Do not include secrets or `.env` content. **If the change generates human-facing text
+(guidance, status lines, labels, error/log messages, docs, notifications), include a
+rendered sample of that output for representative states (e.g. a success and a failure
+case)** — reviewers judge whether a produced sentence is true far more reliably when they
+see the sentence than when they must mentally render it from a template.
 
 **Push integrity — review the artifact that actually exists, not the one you think you
 pushed.** The panel can only judge the bytes you hand it; if you assemble the context (or
@@ -142,9 +146,13 @@ python <skill>/scripts/panel.py assign
 
 This resolves the reviewer pool from the router's **live model catalog** (never a
 hardcoded list — catalogs churn), excludes every dev provider family, and assigns roles
-to distinct provider families with no collisions. NORMAL runs 3 reviewers (correctness,
-security, test quality); SENSITIVE and CRITICAL run 5 (adds data/privacy, reliability).
-If too few independent families are available the script exits BLOCKED — a smaller panel
+to distinct provider families with no collisions. NORMAL runs 4 reviewers (correctness,
+security, test quality, output_fidelity); SENSITIVE and CRITICAL run 6 (adds data/privacy,
+reliability). The output_fidelity reviewer walks the diff line by line and verifies that
+every human-facing string the code emits states something true — the output-semantics lens
+a purely threat/logic panel otherwise misses. Each role needs its own provider family, so
+this raises the independence bar by one. If too few independent families are available the
+script exits BLOCKED — a smaller panel
 requires explicit user authorization (`--allow-degraded --authorized-by "<user>"`), which
 is recorded and surfaced in the report.
 

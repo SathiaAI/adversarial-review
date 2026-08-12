@@ -72,8 +72,9 @@ def t_assign_normal_excludes_dev():
     sh(["panel.py", "assign"], repo)
     plan = read(latest_run(repo) / "panel" / "plan.json")
     fams = [v["family"] for v in plan["roles"].values()]
-    assert len(plan["roles"]) == 3, f"expected 3 roles, got {len(plan['roles'])}"
-    assert len(set(fams)) == 3, f"family collision: {fams}"
+    assert len(plan["roles"]) == 4, f"expected 4 roles, got {len(plan['roles'])}"
+    assert len(set(fams)) == 4, f"family collision: {fams}"
+    assert "output_fidelity" in plan["roles"], "output_fidelity role missing at NORMAL"
     assert "anthropic" not in fams, "dev family leaked into panel"
     slugs = [v["model"] for v in plan["roles"].values()]
     for s in slugs:
@@ -89,8 +90,43 @@ def t_assign_collision_free_under_multi_dev():
     sh(["panel.py", "assign"], repo)
     plan = read(latest_run(repo) / "panel" / "plan.json")
     fams = [v["family"] for v in plan["roles"].values()]
-    assert len(plan["roles"]) == 5 and len(set(fams)) == 5, f"collision: {fams}"
+    assert len(plan["roles"]) == 6 and len(set(fams)) == 6, f"collision: {fams}"
     assert not {"anthropic", "openai"} & set(fams)
+
+
+def t_output_fidelity_role_and_forced_attestation():
+    # The output-semantics lens (the class of bug an LLM panel misses but a line-by-line
+    # reviewer catches — e.g. a FAIL branch that asserts the success condition) is installed
+    # two ways: a dedicated output_fidelity reviewer at EVERY tier, and a forced schema
+    # attestation every reviewer must fill. Neither may silently regress.
+    import panel
+    assert "output_fidelity" in panel.ROLES
+    for tier in ("NORMAL", "SENSITIVE", "CRITICAL"):
+        assert "output_fidelity" in panel.TIER_ROLES[tier], tier
+    assert "output_fidelity" in panel.RUBRICS and "output_fidelity" in panel.ROLE_FAMILY_PRIORITY
+    assert "HUMAN-FACING OUTPUT" in panel.RUBRICS["output_fidelity"]
+
+    # Forced attestation: it is required, with required sub-fields, so an omission or a
+    # malformed entry is rejected at ingest exactly like any other schema violation.
+    base = {"role": "correctness", "model_id": "m", "summary": "s", "findings": [],
+            "assumptions": [], "additional_tests": [], "areas_reviewed": ["d"],
+            "areas_not_reviewed": [], "top_residual_risks": ["r"], "injection_suspected": False}
+    assert "output_statements_checked" in panel.REPORT_SCHEMA["required"]
+    assert any("output_statements_checked" in e
+               for e in panel.validate_obj(base, panel.REPORT_SCHEMA))          # omitted -> reject
+    bad = dict(base, output_statements_checked=[{"rendered": "x", "note": "y"}])  # no states_truth
+    assert any("states_truth" in e for e in panel.validate_obj(bad, panel.REPORT_SCHEMA))
+    good = dict(base, output_statements_checked=[
+        {"rendered": "The 'unit' check failed. Run the test suite locally to see which test.",
+         "states_truth": True, "note": "true: states the failure and a valid next action"},
+        {"rendered": "The 'unit' check failed. Passing it proves your automated tests pass.",
+         "states_truth": False, "note": "a FAIL branch that asserts the success condition is false output"}])
+    assert panel.validate_obj(good, panel.REPORT_SCHEMA) == []                    # well-formed -> ok
+
+    # Every reviewer (not just the dedicated one) is told to walk the diff for output truth.
+    for role in panel.TIER_ROLES["NORMAL"]:
+        sysmsg = panel.reviewer_messages(role, {"risk": "NORMAL"}, "ctx", "BND")[0]["content"]
+        assert "OUTPUT FIDELITY" in sysmsg and "output_statements_checked" in sysmsg, role
 
 
 def t_assign_blocked_when_insufficient():
@@ -457,7 +493,7 @@ def t_coverage_block_on_pass():
     assert set(cov["gates"]["passed"]) == {"build", "unit", "secrets", "deps", "sast"}
     assert cov["gates"]["missing"] == [] and cov["gates"]["failed"] == []
     assert [w["name"] for w in cov["gates"]["waived"]] == ["mutation"]
-    assert len(cov["panel"]["roles_filled"]) == 5
+    assert len(cov["panel"]["roles_filled"]) == 6
     assert sorted(cov["panel"]["roles_filled"]) == sorted(cov["panel"]["roles_required"])
     assert cov["rebuttal"] == {"policy": "contention", "required": True, "ran": True}
     assert cov["findings"]["raised"] >= 1 and cov["findings"]["triaged"] >= 1
@@ -477,7 +513,7 @@ def t_coverage_block_on_blocked():
     run = latest_run(repo)
     cov = read(run / "verdict.json")["coverage"]
     assert cov["gates"]["plan_recorded"] is False and cov["gates"]["required"] == []
-    assert len(cov["panel"]["roles_filled"]) == 3
+    assert len(cov["panel"]["roles_filled"]) == 4
     assert cov["panel"]["dev_families_excluded"] == ["anthropic"]
     assert cov["rebuttal"]["required"] is False and cov["rebuttal"]["ran"] is False
     # A recorded degraded authorization reappears in roles_required: dropped roles
@@ -490,7 +526,7 @@ def t_coverage_block_on_blocked():
     sh(["aggregate.py"], repo, expect=2)
     pcov = read(run / "verdict.json")["coverage"]["panel"]
     assert "reliability" in pcov["roles_required"], pcov
-    assert len(pcov["roles_required"]) == 4 and len(pcov["roles_filled"]) == 3
+    assert len(pcov["roles_required"]) == 5 and len(pcov["roles_filled"]) == 4
 
 
 def t_coverage_block_on_fail():

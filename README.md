@@ -67,19 +67,23 @@ digest over the entire recorded run
 
 ### The reviewer panel
 
-Roles: **security**, **correctness**, **data/privacy**, **test quality**, **reliability**
-(3 roles at NORMAL risk, all 5 at SENSITIVE/CRITICAL). Each role goes to a distinct
-provider family, assigned greedily with collision-free re-solving after any failure or
-substitution. Fewer independent families than required → **BLOCKED**, unless a degraded
-panel is explicitly authorized on the record.
+Roles: **security**, **correctness**, **data/privacy**, **test quality**, **reliability**,
+**output-fidelity** (4 roles at NORMAL risk, all 6 at SENSITIVE/CRITICAL). The
+output-fidelity reviewer walks the diff line by line and checks that every human-facing
+string the code emits states something true — the output-semantics lens (a FAIL message
+that claims success, a mislabeled value) that a purely threat/logic panel misses. Each role
+goes to a distinct provider family, assigned greedily with collision-free re-solving after
+any failure or substitution. Fewer independent families than required → **BLOCKED**, unless
+a degraded panel is explicitly authorized on the record.
 
 Reviewers get low temperature, strict JSON schemas (enforced via `response_format:
 json_schema` where the endpoint supports it, validated locally always), one retry on
 malformed output, and provider substitution on transport failure. Prompts wrap all
 repository content in randomized untrusted-data boundaries; content that tries to
 instruct the reviewers is itself reported as a high-severity finding. Every reviewer must
-attest what it reviewed, what it could not review, and its top residual risks — a lazy
-"LGTM" is malformed output.
+attest what it reviewed, what it could not review, its top residual risks, and every
+human-facing string it rendered from the diff with a truth judgment — a lazy "LGTM" is
+malformed output.
 
 When high/critical findings exist, a **rebuttal round** makes the panel adversarial
 rather than merely parallel: reviewers see each other's findings and must refute,
@@ -381,9 +385,9 @@ using it for SENSITIVE/CRITICAL changes.
 
 | Tier | Panel | Gates |
 |---|---|---|
-| NORMAL | 3 reviewers | build, format, lint, typecheck, unit, integration, secrets (gitleaks), deps (osv-scanner), SAST (opengrep/semgrep), IaC (checkov), ai-defects |
-| SENSITIVE | 5 reviewers | + e2e, migration/rollback tests, changed-scope mutation testing |
-| CRITICAL | 5 + rebuttal always in scope | + authorized OWASP ZAP against staging, branch-protection enforcement check |
+| NORMAL | 4 reviewers | build, format, lint, typecheck, unit, integration, secrets (gitleaks), deps (osv-scanner), SAST (opengrep/semgrep), IaC (checkov), ai-defects |
+| SENSITIVE | 6 reviewers | + e2e, migration/rollback tests, changed-scope mutation testing |
+| CRITICAL | 6 + rebuttal always in scope | + authorized OWASP ZAP against staging, branch-protection enforcement check |
 
 The **ai-defects** gate is vendor-neutral and runs at every tier — it targets the failure
 modes specific to AI-written code: phantom references and invented package APIs, impossible

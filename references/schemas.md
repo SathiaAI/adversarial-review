@@ -11,7 +11,7 @@ preserved under `panel/raw/`).
 
 ```json
 {
-  "role": "correctness|security|data_privacy|test_quality|reliability",
+  "role": "correctness|security|data_privacy|test_quality|reliability|output_fidelity",
   "model_id": "provider/model-slug",
   "summary": "string",
   "findings": [
@@ -35,9 +35,23 @@ preserved under `panel/raw/`).
   "areas_reviewed": ["string"],
   "areas_not_reviewed": ["string"],
   "top_residual_risks": ["string (min 1)"],
-  "injection_suspected": false
+  "injection_suspected": false,
+  "output_statements_checked": [
+    { "rendered": "a human-facing string the reviewer rendered from the diff",
+      "states_truth": true, "note": "why it holds — or how it misstates the real state" }
+  ]
 }
 ```
+
+`output_statements_checked` is a **required, forced** attestation (every role must emit it):
+the reviewer walks the diff and records each human-facing string it emits — guidance, status
+lines, labels, error/log messages, docs — with a truth judgment, the true ones included. An
+empty list is a positive claim ("the diff emits no human-facing text I could find"), not a
+skip. It exists to catch output-semantics defects — a generated sentence whose claim inverts
+or overstates the state it describes (e.g. a FAIL branch that asserts the success condition) —
+which have no crash or exploit and so slip past a purely threat/logic review. Such a finding is
+valid with an empty `reproduction`; cite the wrong output versus the correct output in
+`evidence` and `scenario`.
 
 ## Panel plan — `panel/plan.json`
 

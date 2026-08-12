@@ -54,7 +54,10 @@ def _report(role, model):
             "findings": findings, "assumptions": [], "additional_tests": [],
             "areas_reviewed": ["diff"], "areas_not_reviewed": ["infra"],
             "top_residual_risks": ["auth middleware unreviewed"],
-            "injection_suspected": False}
+            "injection_suspected": False,
+            "output_statements_checked": [
+                {"rendered": "sample rendered user-facing line",
+                 "states_truth": True, "note": "consistent with the state it describes"}]}
 
 
 class Handler(BaseHTTPRequestHandler):

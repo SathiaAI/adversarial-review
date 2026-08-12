@@ -260,7 +260,7 @@ Use `"command": "python", "args": [".../adversarial-review/scripts/mcp_server.py
 - **Gate an AI-written PR before merge.** The more of the change an agent wrote, the more
   you need a reviewer that *isn't* that agent. This is the core case.
 - **Risky changes → raise the tier.** Auth/authz, payments, personal data, tenant
-  isolation, migrations, infra → `--risk SENSITIVE` (5 reviewers); add irreversibility or
+  isolation, migrations, infra → `--risk SENSITIVE` (6 reviewers); add irreversibility or
   blast radius → `CRITICAL` (adds an always-on rebuttal round + enforcement checks).
 - **"Is it actually done?"** When you want *proof* rather than an agent's assurance — the
   attested run directory is the proof.
