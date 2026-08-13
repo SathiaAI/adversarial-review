@@ -754,11 +754,22 @@ def t_output_fidelity_attestation_gates_verdict():
         "evidence": "could not determine", "reproduced": False, "regression_test": ""})
     assert "untriaged or unresolved" in sh(["aggregate.py"], repo, expect=2).stdout
 
-    # (4) A resolving record (confirmed + fixed) clears it -> PASS.
+    # (4) Resolution ALONE no longer clears (2nd panel security-2 structural fix): the trusted
+    # operator must also confirm THIS specific statement in `output_statements_confirmed`, so a
+    # reviewer cannot clear a false statement by linking it to an unrelated-but-resolved own finding.
+    RENDERED = "Deleted 0 rows. Your account was removed."   # set_false's default rendered
+    set_false("correctness-7", rendered=RENDERED)
+    # (4a) confirmed + fixed, but the operator did NOT confirm this statement -> BLOCK.
     write(run / "validation" / "fmsg.json", {
         "finding_ids": ["correctness-7"], "classification": "confirmed", "severity": "medium",
         "evidence": "confirmed the inverted delete message", "reproduced": True,
         "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "no validation record confirms this specific statement" in r.stdout, r.stdout
+    # (4b) the same record now confirms the statement (whitespace-normalized match) -> PASS.
+    rec = read(run / "validation" / "fmsg.json")
+    rec["output_statements_confirmed"] = ["  Deleted 0 rows.\n  Your account was removed.  "]
+    write(run / "validation" / "fmsg.json", rec)
     r = sh(["aggregate.py"], repo, expect=0)
     assert "VERDICT: PASS" in r.stdout, r.stdout
     assert read(run / "verdict.json")["counts"]["false_output_statements"] == 1
@@ -774,6 +785,162 @@ def t_output_fidelity_attestation_gates_verdict():
     sh(["aggregate.py"], repo, expect=2)
     md = (run / "verdict.md").read_text()
     assert "<b>x</b>" not in md and "&lt;b&gt;" in md, md            # finding_id escaped
+
+    # (6) OWN-REPORT MEMBERSHIP, not global-map + prefix (2nd panel security-1/correctness-1).
+    # Another report can name a finding under THIS reviewer's prefix; a bare `fid in findings`
+    # against the cross-report map would then be satisfied, so a planted+resolved id could clear a
+    # false statement. Plant `correctness-42` in the SECURITY report and resolve it, then have
+    # correctness link its false statement to it: old code PASSes (prefix+global-map+resolved), the
+    # fix BLOCKs because it is not one of correctness's own findings.
+    s = read(run / "panel" / "security.json")
+    s["findings"].append({
+        "id": "correctness-42", "title": "planted under another role's prefix", "severity": "low",
+        "confidence": 0.9, "file": "x.py", "line": 1, "evidence": "e", "scenario": "s",
+        "reproduction": ["r"], "fix": "f", "regression_test": "t", "release_blocking": False})
+    write(run / "panel" / "security.json", s)
+    write(run / "validation" / "planted.json", {
+        "finding_ids": ["correctness-42"], "classification": "confirmed", "severity": "low",
+        "evidence": "resolved", "reproduced": True, "regression_test": "t",
+        "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    set_false("correctness-42")
+    assert "not a finding this reviewer raised" in sh(["aggregate.py"], repo, expect=2).stdout
+    s["findings"] = [f for f in s["findings"] if f["id"] != "correctness-42"]
+    write(run / "panel" / "security.json", s)
+    (run / "validation" / "planted.json").unlink()
+
+    # (7) A malformed (non-list) output_statements_checked must BLOCK and still WRITE a verdict,
+    # never crash the aggregator (2nd panel correctness-2 — a truthy non-list raised TypeError
+    # before the verdict was written; AC2 no-crash).
+    c = read(run / "panel" / "correctness.json")
+    c["output_statements_checked"] = 1
+    write(run / "panel" / "correctness.json", c)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "malformed" in r.stdout, r.stdout
+    assert (run / "verdict.json").exists()
+    c["output_statements_checked"] = []
+    write(run / "panel" / "correctness.json", c)
+
+    # (8) false_positive and accepted_risk are resolving classifications too — only `confirmed`
+    # was exercised before (2nd panel test_quality-2). correctness-7 is medium, so false_positive
+    # needs no concurrence; accepted_risk needs a matching suppression.
+    set_false("correctness-7", rendered=RENDERED)
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "false_positive", "severity": "medium",
+        "evidence": "on reflection the message is correct", "reproduced": False, "regression_test": "t",
+        "output_statements_confirmed": [RENDERED]})
+    assert "VERDICT: PASS" in sh(["aggregate.py"], repo, expect=0).stdout
+    write(run / "suppressions.json", [{"finding_id": "correctness-7", "evidence": "known copy",
+        "owner": "Paul", "expires": "2099-01-01"}])
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "accepted_risk", "severity": "medium",
+        "evidence": "accepted", "reproduced": True, "regression_test": "t",
+        "output_statements_confirmed": [RENDERED]})
+    assert "VERDICT: PASS" in sh(["aggregate.py"], repo, expect=0).stdout
+    (run / "suppressions.json").unlink()
+
+    # (9) The UNRESOLVED branch also interpolates the untrusted finding_id — it must be escaped
+    # too (2nd panel test_quality-3; only the no-link and foreign-link branches were checked).
+    c = read(run / "panel" / "correctness.json")
+    c["findings"].append({
+        "id": "correctness-<b>z</b>", "title": "t", "severity": "low", "confidence": 0.5,
+        "file": "x.py", "line": 1, "evidence": "e", "scenario": "s", "reproduction": ["r"],
+        "fix": "f", "regression_test": "t", "release_blocking": False})
+    write(run / "panel" / "correctness.json", c)
+    (run / "validation" / "fmsg.json").unlink()   # leave correctness-7/<b>z</b> unresolved
+    set_false("correctness-<b>z</b>")
+    sh(["aggregate.py"], repo, expect=2)
+    md = (run / "verdict.md").read_text()
+    assert "<b>z</b>" not in md and "&lt;b&gt;z&lt;/b&gt;" in md, md
+
+    # (10) The operator-confirmation requirement applies to EVERY resolving class, not just
+    # confirmed (3rd panel test_quality-1): false_positive / accepted_risk WITHOUT
+    # output_statements_confirmed must still BLOCK.
+    c = read(run / "panel" / "correctness.json")
+    c["findings"] = [f for f in c["findings"] if f["id"] != "correctness-<b>z</b>"]
+    write(run / "panel" / "correctness.json", c)
+    set_false("correctness-7", rendered=RENDERED)
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "false_positive", "severity": "medium",
+        "evidence": "e", "reproduced": False, "regression_test": "t"})   # no output_statements_confirmed
+    assert "no validation record confirms this specific statement" in sh(["aggregate.py"], repo, expect=2).stdout
+    write(run / "suppressions.json", [{"finding_id": "correctness-7", "evidence": "k",
+        "owner": "Paul", "expires": "2099-01-01"}])
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "accepted_risk", "severity": "medium",
+        "evidence": "e", "reproduced": True, "regression_test": "t"})   # no output_statements_confirmed
+    assert "no validation record confirms this specific statement" in sh(["aggregate.py"], repo, expect=2).stdout
+    (run / "suppressions.json").unlink()
+
+    # (11) Confirmation is EXACT (a substring of a confirmed statement must not clear it —
+    # 3rd panel test_quality-3); non-string entries in output_statements_confirmed are ignored
+    # but a co-listed exact string still clears (test_quality-4).
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "confirmed", "severity": "medium",
+        "evidence": "e", "reproduced": True, "regression_test": "t",
+        "resolution": {"fixed": True, "gates_rerun": ["unit"]},
+        "output_statements_confirmed": ["Deleted 0 rows."]})   # only a PREFIX of RENDERED
+    assert "no validation record confirms this specific statement" in sh(["aggregate.py"], repo, expect=2).stdout
+    rec = read(run / "validation" / "fmsg.json")
+    rec["output_statements_confirmed"] = [123, RENDERED]   # non-string ignored, exact string clears
+    write(run / "validation" / "fmsg.json", rec)
+    assert "VERDICT: PASS" in sh(["aggregate.py"], repo, expect=0).stdout
+
+
+def t_gate_fail_safe_on_malformed_artifacts():
+    # AC2 (no-crash) + AC1 (fail-safe) for the verdict emitter: a hand-recorded / ingest-bypassing
+    # artifact with a malformed shape must BLOCK and still WRITE a verdict, never crash and never
+    # fail-open (3rd panel: correctness-1 findings, correctness-2 finding_ids/confirmations,
+    # correctness-3 non-string rendered coercion, correctness-4 malformed attestation items,
+    # output_fidelity-1 non-list confirmations).
+    def check(mutate):
+        repo = _complete_sensitive_repo()
+        run = latest_run(repo)
+        write(run / "validation" / "idor.json", {
+            "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+            "evidence": "e", "reproduced": True, "regression_test": "t",
+            "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+        mutate(run)
+        r = sh(["aggregate.py"], repo, expect=2)          # never exit 0, never a crash traceback
+        assert (run / "verdict.json").exists(), "verdict must still be written (no crash)"
+        return r.stdout
+
+    def setf(run, **item):
+        c = read(run / "panel" / "correctness.json")
+        c["output_statements_checked"] = [item]
+        write(run / "panel" / "correctness.json", c)
+
+    # findings container / item malformed
+    def m_findings_nonlist(run):
+        c = read(run / "panel" / "correctness.json"); c["findings"] = 1
+        write(run / "panel" / "correctness.json", c)
+    assert "malformed" in check(m_findings_nonlist)
+    def m_findings_item(run):
+        c = read(run / "panel" / "correctness.json"); c["findings"] = [None]
+        write(run / "panel" / "correctness.json", c)
+    assert "malformed finding" in check(m_findings_item)
+    # validation record malformed
+    def m_finding_ids(run):
+        write(run / "validation" / "bad.json", {"finding_ids": 1, "classification": "confirmed"})
+    assert "finding_ids is malformed" in check(m_finding_ids)
+    # attestation container / item / field malformed
+    assert "malformed" in check(lambda run: setf(run, states_truth=False, rendered=1, finding_id=""))
+    assert "non-boolean states_truth" in check(lambda run: setf(run, states_truth="false", rendered="x", finding_id=""))
+    def m_osc_nonlist(run):
+        c = read(run / "panel" / "correctness.json"); c["output_statements_checked"] = 1
+        write(run / "panel" / "correctness.json", c)
+    assert "output_statements_checked is malformed" in check(m_osc_nonlist)
+    # non-list output_statements_confirmed on a resolving record must not crash and must not clear
+    def m_conf_nonlist(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"].append({"id": "correctness-9", "title": "t", "severity": "low", "confidence": 0.5,
+            "file": "x.py", "line": 1, "evidence": "e", "scenario": "s", "reproduction": ["r"],
+            "fix": "f", "regression_test": "t", "release_blocking": False})
+        c["output_statements_checked"] = [{"states_truth": False, "rendered": "boom", "finding_id": "correctness-9"}]
+        write(run / "panel" / "correctness.json", c)
+        write(run / "validation" / "c9.json", {"finding_ids": ["correctness-9"], "classification": "confirmed",
+            "severity": "low", "evidence": "e", "reproduced": True, "regression_test": "t",
+            "resolution": {"fixed": True, "gates_rerun": ["unit"]}, "output_statements_confirmed": 1})
+    assert "no validation record confirms this specific statement" in check(m_conf_nonlist)
 
 
 def t_rebuttal_policy_matrix():

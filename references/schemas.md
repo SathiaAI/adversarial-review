@@ -63,12 +63,21 @@ completion cap across 4–6 reviewers and false-BLOCK a clean change.
 reports a false statement, or an empty string `""` for a true one. It is a required key on every
 item — strict structured-output providers (e.g. OpenAI) reject a schema whose `required` omits
 any property, so an optional field would break those reviewers outright. `aggregate.py` BLOCKS
-the run on any false statement whose `finding_id` is empty, is **not a finding the same reviewer
-raised**, or names one that is **not resolved** (a `confirmed`/`false_positive`/`accepted_risk`
-triage decision — a bare `unresolved` record does not clear it) — regardless of that finding's
-severity — so a recorded falsehood can never silently reach PASS, and a garbled or foreign link
-fails safe to BLOCKED. The reviewer-supplied link and rendered text are HTML-escaped before they
-appear in any reason, so a crafted value cannot forge markup in the rendered verdict.
+the run on any false statement whose `finding_id` is empty, is **not a finding in the attesting
+reviewer's own report** (membership in that report's `findings`, not merely a role-prefix match
+against the cross-report id map — a finding another report planted under this reviewer's prefix
+does not count), or names one that is **not resolved** (a `confirmed`/`false_positive`/
+`accepted_risk` triage decision — a bare `unresolved` record does not clear it) — regardless of
+that finding's severity — so a recorded falsehood can never silently reach PASS, and a garbled or
+foreign link fails safe to BLOCKED. A malformed `output_statements_checked` that is present but
+not a list also BLOCKs (and never crashes the aggregator). The reviewer-supplied link and rendered
+text are HTML-escaped before they appear in any reason, so a crafted value cannot forge markup in
+the rendered verdict. Membership + resolution still do not prove the linked finding is *about* the
+statement, so a resolving record must additionally **confirm the specific statement**: its
+`output_statements_confirmed` must echo the rendered text (whitespace-normalized). Because that
+confirmation lives on the **trusted operator's** record — not the semi-trusted reviewer's link — a
+reviewer cannot clear a false statement by pointing `finding_id` at an unrelated but resolved own
+finding (2nd-panel `security-2`).
 
 ## Panel plan — `panel/plan.json`
 
@@ -106,9 +115,17 @@ skipped gate is never silent. Absent `status` falls back to the exit code.
   "reproduced": true,
   "regression_test": "path::test_name or why impractical",
   "resolution": {"fixed": true, "gates_rerun": ["unit", "sast"]},
-  "concurrence": {"model_id": "provider/slug", "agrees_false_positive": true, "reasoning": "..."}
+  "concurrence": {"model_id": "provider/slug", "agrees_false_positive": true, "reasoning": "..."},
+  "output_statements_confirmed": ["the exact rendered false statement this record triages"]
 }
 ```
+
+`output_statements_confirmed` (optional) is the operator's confirmation that this record triages a
+specific reviewer-attested false human-facing statement: list the `rendered` text of each such
+statement. The output-fidelity gate clears a `states_truth:false` attestation only when a resolving
+record covering its `finding_id` echoes the statement here (whitespace-normalized) — resolution of
+the linked finding alone is not enough (2nd-panel `security-2`). Omit it for records that triage
+ordinary findings with no false-output attestation.
 
 Field rules the aggregator enforces: `false_positive` on high/critical requires
 `evidence` AND `concurrence.agrees_false_positive == true` from a family different from
