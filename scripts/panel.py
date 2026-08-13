@@ -21,6 +21,7 @@ import secrets
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -155,13 +156,18 @@ def api_config():
 
 def http_json(url, payload=None, key=None, timeout=None):
     timeout = timeout or int(os.environ.get("AR_TIMEOUT_S", "240"))
+    # Restrict to HTTP(S): urllib also honors file://, ftp://, etc., so a misconfigured or
+    # untrusted AR_BASE_URL could otherwise read a local file or reach an unintended endpoint.
+    if urllib.parse.urlparse(url).scheme not in ("http", "https"):
+        die(f"refusing a non-HTTP(S) reviewer URL: {url!r} — set AR_BASE_URL to an http(s) router", 2)
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, headers=headers,
                                  method="POST" if data else "GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # scheme allowlisted to http(s) above
         return json.loads(resp.read().decode())
 
 

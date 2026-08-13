@@ -46,6 +46,16 @@ preserved under `panel/raw/`).
 }
 ```
 
+**Finding ids are unique across the panel.** Each `id` uses the reviewer's own `role-N` prefix.
+The aggregator builds one cross-report map keyed by `id`; a duplicate id from a later report is
+rejected (BLOCKED), never allowed to overwrite an earlier finding — otherwise a low finding
+reusing a high finding's id would hide it from the high/critical coverage check (4th-panel
+`security-2`). Malformed artifacts fail safe the same way: a non-list `findings`, a finding with a
+non-string `id` or invalid `severity`, a validation record that is not an object, a non-string
+`finding_ids` member, or a malformed `suppressions.json` (non-list, or a non-object entry) each
+BLOCKs with a specific reason and still writes a verdict — never a crash, never a silent PASS
+(4th-panel `security-1/3`, `correctness-1/2/3`).
+
 `output_statements_checked` is a **required, forced** attestation (every role emits it). It
 exists to catch output-semantics defects — a generated sentence whose claim inverts or
 overstates the state it describes (e.g. a FAIL branch that asserts the success condition) —

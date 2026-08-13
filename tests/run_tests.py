@@ -943,6 +943,146 @@ def t_gate_fail_safe_on_malformed_artifacts():
     assert "no validation record confirms this specific statement" in check(m_conf_nonlist)
 
 
+def t_gate_fail_safe_round4():
+    # 4th-panel regressions on the verdict emitter: the findings-map clobber (security-2), the
+    # own_ids unhashable-id crash (security-1/correctness-1), malformed suppressions.json
+    # (security-3/correctness-2), non-string finding_ids members (correctness-3), and the
+    # test-coverage gaps (test_quality-1..5). Every crafted / hand-recorded artifact must BLOCK
+    # with a SPECIFIC reason and still write a verdict — never crash, never fail-open
+    # (test_quality-5: assert the exact reason, not merely that it blocked).
+    def check(mutate):
+        repo = _complete_sensitive_repo()
+        run = latest_run(repo)
+        write(run / "validation" / "idor.json", {
+            "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+            "evidence": "e", "reproduced": True, "regression_test": "t",
+            "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+        mutate(run)
+        r = sh(["aggregate.py"], repo, expect=2)          # never exit 0, never a crash traceback
+        assert (run / "verdict.json").exists(), "verdict must still be written (no crash)"
+        return r.stdout
+
+    def corr_finding(fid, sev="low"):
+        return {"id": fid, "title": "t", "severity": sev, "confidence": 0.5, "file": "x.py",
+                "line": 1, "evidence": "e", "scenario": "s", "reproduction": ["r"], "fix": "f",
+                "regression_test": "t", "release_blocking": False}
+
+    # own_ids: an unhashable id ([]) on a dict finding + a false attestation previously raised
+    # TypeError before verdict.json; must BLOCK on the malformed finding and still write a verdict.
+    def m_unhashable_id(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"] = [{"id": [], "severity": "high"}]
+        c["output_statements_checked"] = [{"states_truth": False, "rendered": "x",
+                                           "finding_id": "correctness-1"}]
+        write(run / "panel" / "correctness.json", c)
+    assert "malformed finding (needs a string id" in check(m_unhashable_id)  # exact reason (tq-2)
+
+    # findings-map clobber: a second report reusing an existing id (security-1) must BLOCK, not
+    # silently overwrite and hide the earlier finding from the high/critical coverage check.
+    def m_duplicate_id(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"].append(corr_finding("security-1"))
+        write(run / "panel" / "correctness.json", c)
+    assert "duplicate finding id" in check(m_duplicate_id)
+
+    # test_quality-1: non-list findings WITH a false attestation — the container BLOCK and the
+    # empty-own_ids attestation BLOCK both fire, no crash.
+    def m_nonlist_findings_false(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"] = 1
+        c["output_statements_checked"] = [{"states_truth": False, "rendered": "boom",
+                                           "finding_id": "correctness-1"}]
+        write(run / "panel" / "correctness.json", c)
+    out = check(m_nonlist_findings_false)   # specific reasons, not a bare "malformed" (tq-3)
+    assert "findings is malformed (not a list)" in out and "not a finding this reviewer raised" in out, out
+
+    # test_quality-2: a validation record that is not a dict (a JSON list) must BLOCK, not crash.
+    def m_nondict_record(run):
+        (run / "validation" / "bad.json").write_text("[1, 2]")
+    assert "malformed record (not an object)" in check(m_nondict_record)
+
+    # test_quality-3: output_statements_confirmed as a list of ONLY non-strings confirms nothing,
+    # so a false statement linked to the resolved finding still BLOCKs.
+    def m_conf_all_nonstring(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"].append(corr_finding("correctness-9"))
+        c["output_statements_checked"] = [{"states_truth": False, "rendered": "boom",
+                                           "finding_id": "correctness-9"}]
+        write(run / "panel" / "correctness.json", c)
+        write(run / "validation" / "c9.json", {"finding_ids": ["correctness-9"],
+            "classification": "confirmed", "severity": "low", "evidence": "e", "reproduced": True,
+            "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]},
+            "output_statements_confirmed": [123, 456]})
+    assert "no validation record confirms this specific statement" in check(m_conf_all_nonstring)
+
+    # test_quality-4: a finding with a valid id but an invalid severity must BLOCK.
+    def m_bad_severity(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"] = [dict(corr_finding("correctness-1"), severity="bogus")]
+        write(run / "panel" / "correctness.json", c)
+    assert "malformed finding" in check(m_bad_severity)
+
+    # correctness-3: a non-string finding_ids member on a validation record must BLOCK (uniform
+    # malformed -> BLOCK, no silent drop).
+    def m_finding_ids_member(run):
+        write(run / "validation" / "bad2.json", {"finding_ids": ["security-1", 123],
+            "classification": "confirmed", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    assert "non-string member" in check(m_finding_ids_member)
+
+    # security-3/correctness-2: malformed suppressions.json (non-list, and a non-dict entry) must
+    # BLOCK, not crash.
+    assert "is malformed (not a list)" in check(lambda run: (run / "suppressions.json").write_text("{}"))
+    assert "malformed entry (not an object)" in check(lambda run: (run / "suppressions.json").write_text("[null]"))
+    # a non-dict, non-null entry (a bare string) must BLOCK the same way.
+    assert "malformed entry (not an object)" in check(
+        lambda run: write(run / "suppressions.json", ["oops"]))
+
+    # 5th-panel security-1/correctness-1: a suppression entry whose finding_id is UNHASHABLE ([]) is
+    # used as a dict key and previously crashed before verdict.json. Must BLOCK, not crash.
+    assert "non-string finding_id" in check(
+        lambda run: write(run / "suppressions.json", [{"finding_id": [], "evidence": "x"}]))
+
+    # 5th-panel test_quality-1: a WITHIN-report duplicate id (same id twice in ONE report) must
+    # BLOCK too, not only cross-report duplicates.
+    def m_dup_within(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"] = [corr_finding("correctness-1"), corr_finding("correctness-1", "high")]
+        write(run / "panel" / "correctness.json", c)
+    assert "duplicate finding id" in check(m_dup_within)
+
+    # 5th-panel test_quality-4: the duplicate-id guard must protect high/critical COVERAGE. A low
+    # finding reusing a real high finding's id (security-1, triaged by idor.json) must not hide it
+    # and reach PASS — the run must still BLOCK (check() asserts exit 2), and the high finding must
+    # remain counted as high/critical rather than silently downgraded to the low duplicate.
+    def m_dup_hides_high(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"].append(corr_finding("security-1", "low"))
+        write(run / "panel" / "correctness.json", c)
+        return run
+    repo = _complete_sensitive_repo(); run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+        "evidence": "e", "reproduced": True, "regression_test": "t",
+        "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    m_dup_hides_high(run)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "duplicate finding id" in r.stdout, r.stdout
+    v = read(run / "verdict.json")
+    assert v["counts"]["findings_high_critical"] >= 1, v["counts"]  # high not hidden/downgraded
+
+
+def t_http_json_scheme_allowlist():
+    # panel.http_json must refuse any non-HTTP(S) URL before urlopen, so a misconfigured or
+    # untrusted AR_BASE_URL cannot be steered to file:// (local-file read) or another scheme.
+    import panel
+    for bad in ("file:///etc/passwd", "ftp://example.com/x", "gopher://example.com/x"):
+        try:
+            panel.http_json(bad, timeout=1)
+            raise AssertionError(f"http_json should have refused {bad}")
+        except SystemExit as e:
+            assert e.code == 2, (bad, e.code)
+
+
 def t_rebuttal_policy_matrix():
     # contention (default): SENSITIVE + findings, no rebuttal -> BLOCKED
     repo = fresh_repo()
@@ -1053,11 +1193,13 @@ def t_prepare_ingest_mcp_path():
     plan = read(run / "panel" / "plan.json")
     for role in plan["roles"]:
         body = read(run / "panel" / "requests" / f"{role}.json")
+        # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-request-object.insecure-request-object
         req = urllib.request.Request(
-            f"http://127.0.0.1:{PORT}/v1/chat/completions",
+            f"http://127.0.0.1:{PORT}/v1/chat/completions",   # loopback test mock; https would break it
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
-        resp = urllib.request.urlopen(req, timeout=10).read().decode()
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+        resp = urllib.request.urlopen(req, timeout=10).read().decode()  # hardcoded 127.0.0.1 mock
         rf = run / f"mcp-response-{role}.json"
         rf.write_text(resp)
         sh(["panel.py", "ingest", "--role", role, "--response-file", str(rf)], repo)

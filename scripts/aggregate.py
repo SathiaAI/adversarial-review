@@ -251,6 +251,15 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
                 blocked.append(f"reviewer '{role}' has a malformed finding (needs a string id and a "
                                "valid severity) — cannot assess it")
                 continue
+            if f["id"] in findings:
+                # Last-write-wins previously let a later report reuse an id and overwrite (hide) an
+                # earlier finding — e.g. a low finding clobbering a real high one so it drops out of
+                # the high/critical coverage check and the run reaches PASS (4th-panel security-2,
+                # reproduced). ids are attacker-controllable and ingest has no cross-report namespace
+                # rule, so a collision must BLOCK rather than silently overwrite.
+                blocked.append(f"duplicate finding id '{_snippet(f['id'])}' (within or across reports) "
+                               "— an id must not be reused to overwrite (hide) an earlier finding")
+                continue
             findings[f["id"]] = f
             if f["severity"] in HIGH:
                 counts["findings_high_critical"] += 1
@@ -268,8 +277,28 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
     suppressions = {}
     spath = run / "suppressions.json"
     if spath.exists():
-        for s in read_json(spath):
-            suppressions[s.get("finding_id", "")] = s
+        # suppressions.json is operator-authored but may be hand-edited/malformed; a non-list
+        # document or a non-dict entry previously crashed here (TypeError / AttributeError) before
+        # verdict.json was written (4th-panel security-3/correctness-2). Malformed -> BLOCK, no crash.
+        sup_doc = read_json(spath)
+        if not isinstance(sup_doc, list):
+            blocked.append("suppressions.json is malformed (not a list) — cannot assess "
+                           "accepted-risk suppressions")
+        else:
+            for s in sup_doc:
+                if not isinstance(s, dict):
+                    blocked.append("suppressions.json has a malformed entry (not an object) "
+                                   "— cannot assess it")
+                    continue
+                fid = s.get("finding_id", "")
+                if not isinstance(fid, str):
+                    # finding_id becomes a dict key below; an unhashable value (e.g. []) crashed
+                    # here before verdict.json (5th-panel security-1/correctness-1). Guard the id
+                    # type, matching the own_ids/findings-map guards (malformed -> BLOCK, no crash).
+                    blocked.append("suppressions.json has an entry with a non-string finding_id "
+                                   "— malformed, cannot assess it")
+                    continue
+                suppressions[fid] = s
 
     covered = set()
     dev = set(meta.get("dev_providers", []))
@@ -282,7 +311,14 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
         if not isinstance(ids, list):
             blocked.append(f"validation/{name}: finding_ids is malformed (not a list)")
             continue
-        ids = [i for i in ids if isinstance(i, str)]
+        # A non-string member was previously filtered silently. That is fail-SAFE (a dropped id
+        # leaves its finding uncovered, which itself BLOCKs) — not the fail-open the reviewer
+        # described — but silence diverges from the sibling non-list guard above. Make malformed ->
+        # BLOCK uniform so a garbled record is surfaced, never quietly reinterpreted (4th-panel
+        # correctness-3).
+        if not all(isinstance(i, str) for i in ids):
+            blocked.append(f"validation/{name}: finding_ids has a non-string member — malformed")
+            continue
         cls = rec.get("classification")
         sev = rec.get("severity") or min(
             (findings[i]["severity"] for i in ids if i in findings),
@@ -397,7 +433,11 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
         # this role's prefix, which the global map would then satisfy (2nd panel finding
         # security-1/correctness-1 — a planted id let a false statement reach PASS).
         rfind = rep.get("findings")
-        own_ids = ({f.get("id") for f in rfind if isinstance(f, dict)}
+        # The id must be a str, not merely present: an unhashable id (e.g. []) on a dict finding
+        # crashed the set comprehension with TypeError before verdict.json (4th-panel
+        # security-1/correctness-1). Mirror the str guard the top findings loop already applies.
+        own_ids = ({f["id"] for f in rfind
+                    if isinstance(f, dict) and isinstance(f.get("id"), str)}
                    if isinstance(rfind, list) else set())
         for it in osc:
             if not isinstance(it, dict):
