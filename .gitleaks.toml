@@ -9,4 +9,6 @@ useDefault = true
 
 [allowlist]
 description = "detect-secrets baseline holds audited hashes, not live credentials"
-paths = ['''\.secrets\.baseline$''']
+# Anchored to the repository root so a nested file named `.secrets.baseline` in some subdirectory
+# is NOT silently exempted from scanning (6th-panel correctness-3).
+paths = ['''^\.secrets\.baseline$''']

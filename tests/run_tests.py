@@ -1081,6 +1081,130 @@ def t_http_json_scheme_allowlist():
             raise AssertionError(f"http_json should have refused {bad}")
         except SystemExit as e:
             assert e.code == 2, (bad, e.code)
+    # Positive path (6th-panel test_quality-3) + case/whitespace (test_quality-1 / correctness-2):
+    # urlparse lower-cases the scheme and strips surrounding whitespace, so "HTTP://" and "  http://"
+    # resolve to http and pass (still http — not a bypass). 7th-panel test_quality-2: use a port that
+    # is *guaranteed closed* (bind :0, read the assigned port, close it) instead of the discard port 9
+    # which may actually be listening on some hosts and mask a removed scheme check. Each accepted URL
+    # must therefore raise a real connection error (URLError), NOT the exit-2 scheme refusal.
+    # 8th-panel correctness-1: do NOT assert a specific exception type here. A whitespace-padded URL
+    # reaches the connection stage on this build as a URLError, but stricter urllib builds can raise
+    # http.client.InvalidURL (NOT a URLError subclass) instead. What this positive path must prove is
+    # only that the scheme check ACCEPTS these (no exit-2 refusal) and that they are not a silent pass
+    # — the guaranteed-closed port ensures any accepted URL fails at connect rather than returning.
+    import socket
+    _s = socket.socket(); _s.bind(("127.0.0.1", 0)); _closed = _s.getsockname()[1]; _s.close()
+    for good in (f"http://127.0.0.1:{_closed}/x", f"https://127.0.0.1:{_closed}/x",
+                 f"HTTP://127.0.0.1:{_closed}/x", f"  https://127.0.0.1:{_closed}/x  "):
+        try:
+            panel.http_json(good, timeout=1)
+        except SystemExit:
+            raise AssertionError(f"{good!r} normalizes to http(s) and must pass the allowlist")
+        except Exception:
+            continue  # scheme accepted; connection to the closed port failed (URLError / InvalidURL)
+        raise AssertionError(f"{good!r} should reach the connection stage and fail there")
+    # a non-http(s) scheme is still refused regardless of case or padding
+    for bad in ("FILE:///etc/passwd", "  ftp://x/y"):
+        try:
+            panel.http_json(bad, timeout=1)
+            raise AssertionError(f"{bad!r} must be refused")
+        except SystemExit as e:
+            assert e.code == 2, (bad, e.code)
+
+
+def t_http_json_refuses_all_redirects():
+    # 7th-panel security-1/2, correctness-1, test_quality-1/4/5 + 8th-panel test_quality-1/2/4/5:
+    # drive the REAL production fetch path (panel.http_json -> _HTTPS_OPENER.open) through a loopback
+    # http.server. Proves: (a) the opener performs a real http fetch and returns the parsed body
+    # (default HTTP handler present); (b) EVERY redirect is refused with the refusal HTTPError, across
+    # methods (GET+302, POST+307) and Location kinds (relative, protocol-relative, cross-host absolute,
+    # non-http(s)); (c) the Bearer key IS sent on the first hop but is NEVER forwarded to a redirect
+    # target. Fails if a regression reverted http_json to urllib.request.urlopen, dropped _NoRedirect
+    # from the opener, or re-allowed any redirect.
+    import panel, threading, http.server, urllib.error
+
+    sink_auth = []     # Authorization seen at a redirect TARGET => a key leak (must stay empty)
+    initial_auth = []  # Authorization seen on the FIRST hop => proves the key was actually sent
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass  # keep test output clean
+
+        def _json(self, body):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _redirect(self, code, location):
+            initial_auth.append(self.headers.get("Authorization"))  # key present on the first hop
+            self.send_response(code)
+            self.send_header("Location", location)
+            self.end_headers()
+
+        def _route(self):
+            host = f"127.0.0.1:{self.server.server_address[1]}"
+            p = self.path
+            if p == "/ok":            self._json(b'{"ok": true}')                 # positive path
+            elif p == "/sink":        (sink_auth.append(self.headers.get("Authorization")),
+                                       self._json(b'{"leaked": true}'))           # leak target
+            elif p == "/redirect":    self._redirect(302, "/sink")               # same-host relative
+            elif p == "/protorel":    self._redirect(302, f"//{host}/sink")      # protocol-relative
+            elif p == "/crosshost":   self._redirect(302, "http://127.0.0.2:9/sink")  # cross-host absolute
+            elif p == "/ftpredir":    self._redirect(302, "ftp://127.0.0.1/x")   # non-http(s) target
+            elif p == "/postredir":   self._redirect(307, "/sink")               # 307 preserves POST
+            else:                     (self.send_response(404), self.end_headers())
+
+        do_GET = _route
+        do_POST = _route
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)  # loopback only; ephemeral port
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        # positive path — the opener really routes http and returns the parsed body (default handlers)
+        assert panel.http_json(base + "/ok", timeout=5) == {"ok": True}
+        # every GET redirect is refused with the REFUSAL HTTPError (not some other 30x/4xx), across
+        # Location kinds: relative, protocol-relative, cross-host absolute, and non-http(s).
+        for path in ("/redirect", "/protorel", "/crosshost", "/ftpredir"):
+            try:
+                panel.http_json(base + path, key="CANARY-SECRET", timeout=5)
+                raise AssertionError(f"{path}: a redirect must be refused, not followed")
+            except urllib.error.HTTPError as e:
+                assert "refus" in str(e.reason).lower(), (path, e.reason)
+        # a POST that 307-redirects (method + body preserved by urllib) must also be refused
+        try:
+            panel.http_json(base + "/postredir", payload={"x": 1}, key="CANARY-SECRET", timeout=5)
+            raise AssertionError("/postredir: a POST redirect must be refused")
+        except urllib.error.HTTPError as e:
+            assert "refus" in str(e.reason).lower(), e.reason
+        # the key WAS sent on the first hop (so a leak would be observable) but NEVER forwarded onward
+        assert initial_auth and all(a == "Bearer CANARY-SECRET" for a in initial_auth), initial_auth
+        assert sink_auth == [], f"Bearer key leaked to a redirect target: {sink_auth}"
+    finally:
+        srv.shutdown(); srv.server_close()
+
+
+def t_gitleaks_baseline_allowlist_anchored():
+    # 6th-panel correctness-3 / test_quality-5 + 7th-panel test_quality-3: EVERY gitleaks path
+    # allowlist entry must be anchored to the repository root (^...$) so a nested file named
+    # `.secrets.baseline` is NOT silently exempted. The prior test only inspected the FIRST
+    # triple-quoted pattern, so a later-added unanchored entry could slip through; parse the TOML
+    # and check the whole allowlist.paths list instead.
+    import tomllib
+    cfg = tomllib.loads((SKILL / ".gitleaks.toml").read_text())
+    paths = cfg.get("allowlist", {}).get("paths", [])
+    assert paths, "no allowlist path patterns found in .gitleaks.toml"
+    for pat in paths:
+        assert pat.startswith("^") and pat.endswith("$"), \
+            f"every allowlist path regex must anchor to repo root (^...$), got {pat!r}"
+    compiled = [re.compile(p) for p in paths]
+    # the repo-root baseline stays exempted; a nested lookalike must NOT be exempted by ANY pattern
+    assert any(rx.search(".secrets.baseline") for rx in compiled), \
+        "root .secrets.baseline should match the allowlist"
+    assert not any(rx.search("evil/.secrets.baseline") for rx in compiled), \
+        "nested .secrets.baseline must NOT be exempted by any allowlist path"
 
 
 def t_rebuttal_policy_matrix():

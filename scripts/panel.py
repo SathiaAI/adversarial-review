@@ -154,10 +154,36 @@ def api_config():
     return base, key
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse EVERY redirect on the authenticated reviewer transport. http_json POSTs to a fixed
+    chat-completions endpoint that never legitimately 30x's, so any redirect is either a
+    misconfiguration or hostile. Following one is unsafe two ways, and an http(s)-only *scheme*
+    check on the redirect target (the 6th-panel handler) stopped neither:
+      - urllib's HTTPRedirectHandler copies request headers (all but content-length/-type) onto the
+        redirected Request, so `Authorization: Bearer <key>` is forwarded to whatever host issued the
+        Location — a cross-host http(s) 302 exfiltrates the operator key (7th-panel security-1).
+      - any http(s) Location is fetched from the machine running the panel, turning it into an SSRF
+        pivot to loopback/link-local/RFC1918 endpoints such as cloud IMDS (7th-panel security-2).
+    Refusing all redirects closes the credential leak, the SSRF, and the ftp:// / file:// / schemeless
+    (relative) redirect escapes at once. An operator who needs http->https must set the https
+    AR_BASE_URL directly rather than rely on an auto-followed upgrade (which would leak the key)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            newurl, code,
+            "refusing to follow a redirect on the authenticated reviewer transport", headers, fp)
+
+
+_HTTPS_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def http_json(url, payload=None, key=None, timeout=None):
     timeout = timeout or int(os.environ.get("AR_TIMEOUT_S", "240"))
-    # Restrict to HTTP(S): urllib also honors file://, ftp://, etc., so a misconfigured or
-    # untrusted AR_BASE_URL could otherwise read a local file or reach an unintended endpoint.
+    # Restrict the INITIAL URL to HTTP(S): urllib also honors file://, ftp://, etc., so a
+    # misconfigured or untrusted AR_BASE_URL could otherwise read a local file or reach an
+    # unintended endpoint. Redirects are handled separately by _HTTPS_OPENER (_NoRedirect above),
+    # which refuses every redirect — the initial-URL scheme check alone is insufficient because a
+    # cross-host http(s) 302 would forward the Bearer key and enable SSRF.
     if urllib.parse.urlparse(url).scheme not in ("http", "https"):
         die(f"refusing a non-HTTP(S) reviewer URL: {url!r} — set AR_BASE_URL to an http(s) router", 2)
     headers = {"Content-Type": "application/json"}
@@ -166,8 +192,7 @@ def http_json(url, payload=None, key=None, timeout=None):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, headers=headers,
                                  method="POST" if data else "GET")
-    # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # scheme allowlisted to http(s) above
+    with _HTTPS_OPENER.open(req, timeout=timeout) as resp:  # initial scheme allowlisted; all redirects refused
         return json.loads(resp.read().decode())
 
 
