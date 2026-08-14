@@ -49,7 +49,7 @@ This skill enforces three structural rules instead:
 flowchart LR
     A[init\nrisk tier, dev providers] --> B[Deterministic gates\ngate.py: build, tests,\nSAST, secrets, deps, mutation]
     A --> C[Panel assign\nlive catalog, exclude dev\nfamilies, collision-free roles]
-    C --> D[Independent reviews\n3-5 models, strict JSON,\ninjection-hardened prompts]
+    C --> D[Independent reviews\n4-6 models, strict JSON,\ninjection-hardened prompts]
     D --> E[Rebuttal round\nrefute / corroborate / extend\nwith evidence]
     E --> F[Validate findings\nreproduce, fix, concurrence\nfor dismissals]
     B --> G[aggregate.py\ncomputed verdict]
@@ -67,19 +67,28 @@ digest over the entire recorded run
 
 ### The reviewer panel
 
-Roles: **security**, **correctness**, **data/privacy**, **test quality**, **reliability**
-(3 roles at NORMAL risk, all 5 at SENSITIVE/CRITICAL). Each role goes to a distinct
-provider family, assigned greedily with collision-free re-solving after any failure or
-substitution. Fewer independent families than required → **BLOCKED**, unless a degraded
-panel is explicitly authorized on the record.
+Roles: **security**, **correctness**, **data/privacy**, **test quality**, **reliability**,
+**output-fidelity** (4 roles at NORMAL risk, all 6 at SENSITIVE/CRITICAL). The
+output-fidelity reviewer walks the diff line by line and checks that every human-facing
+string the code emits states something true — the output-semantics lens (a FAIL message
+that claims success, a mislabeled value) that a purely threat/logic panel misses. Each role
+goes to a distinct provider family, assigned greedily with collision-free re-solving after
+any failure or substitution. Fewer independent families than required → **BLOCKED**, unless
+a degraded panel is explicitly authorized on the record.
 
 Reviewers get low temperature, strict JSON schemas (enforced via `response_format:
 json_schema` where the endpoint supports it, validated locally always), one retry on
 malformed output, and provider substitution on transport failure. Prompts wrap all
 repository content in randomized untrusted-data boundaries; content that tries to
 instruct the reviewers is itself reported as a high-severity finding. Every reviewer must
-attest what it reviewed, what it could not review, and its top residual risks — a lazy
-"LGTM" is malformed output.
+attest what it reviewed, what it could not review, its top residual risks, and the
+human-facing statements it checked with a truth judgment — a lazy "LGTM" is malformed
+output. The output-fidelity reviewer enumerates every such statement; the other roles
+report by exception, so a large text diff cannot exhaust the completion cap across the
+panel. Any statement a reviewer records as false must be raised as a finding and linked to
+it: `aggregate.py` blocks the verdict on a false statement not linked to a triaged finding,
+so false human-facing output gates the release deterministically rather than depending on a
+reviewer to also remember to file it.
 
 When high/critical findings exist, a **rebuttal round** makes the panel adversarial
 rather than merely parallel: reviewers see each other's findings and must refute,
@@ -149,7 +158,7 @@ with zero pushback, because the verdict is computed, not negotiated.
 | | "Are you sure?" self-review | CI scanners alone | Single-model AI PR bots | **adversarial-review** |
 |---|---|---|---|---|
 | Reviewer independent of the code's author | ✗ same model | n/a | ✗/partial — one vendor, often the authoring family | ✓ computed from model IDs; authoring families excluded |
-| Multiple model perspectives | ✗ | ✗ | ✗ | ✓ 3–5 distinct provider families, per-role rubrics |
+| Multiple model perspectives | ✗ | ✗ | ✗ | ✓ 4–6 distinct provider families, per-role rubrics |
 | Deterministic floor AI cannot override | ✗ | ✓ | ✗ advisory comments | ✓ gates recorded as artifacts; FAIL is FAIL |
 | Final verdict | vibes | per-tool exit codes | prose | ✓ one machine-computed PASS / FAIL / BLOCKED |
 | "Couldn't verify" distinct from "passed" | ✗ | ✗ | ✗ | ✓ tri-state; unknown = BLOCKED = unshippable |
@@ -381,9 +390,9 @@ using it for SENSITIVE/CRITICAL changes.
 
 | Tier | Panel | Gates |
 |---|---|---|
-| NORMAL | 3 reviewers | build, format, lint, typecheck, unit, integration, secrets (gitleaks), deps (osv-scanner), SAST (opengrep/semgrep), IaC (checkov), ai-defects |
-| SENSITIVE | 5 reviewers | + e2e, migration/rollback tests, changed-scope mutation testing |
-| CRITICAL | 5 + rebuttal always in scope | + authorized OWASP ZAP against staging, branch-protection enforcement check |
+| NORMAL | 4 reviewers | build, format, lint, typecheck, unit, integration, secrets (gitleaks), deps (osv-scanner), SAST (opengrep/semgrep), IaC (checkov), ai-defects |
+| SENSITIVE | 6 reviewers | + e2e, migration/rollback tests, changed-scope mutation testing |
+| CRITICAL | 6 + rebuttal always in scope | + authorized OWASP ZAP against staging, branch-protection enforcement check |
 
 The **ai-defects** gate is vendor-neutral and runs at every tier — it targets the failure
 modes specific to AI-written code: phantom references and invented package APIs, impossible

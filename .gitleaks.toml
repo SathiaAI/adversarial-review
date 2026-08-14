@@ -1,0 +1,14 @@
+# gitleaks configuration.
+#
+# Keep the full default ruleset, but do not scan `.secrets.baseline`. That file is a
+# detect-secrets baseline — a catalog of already-audited secret *hashes* (for this repo,
+# the hash of the "test-key" test placeholder in tests/run_tests.py), not a live secret
+# store. gitleaks flagging a hash inside it is a false positive, so the path is allowlisted.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "detect-secrets baseline holds audited hashes, not live credentials"
+# Anchored to the repository root so a nested file named `.secrets.baseline` in some subdirectory
+# is NOT silently exempted from scanning (6th-panel correctness-3).
+paths = ['''^\.secrets\.baseline$''']

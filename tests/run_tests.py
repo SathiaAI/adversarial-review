@@ -72,8 +72,9 @@ def t_assign_normal_excludes_dev():
     sh(["panel.py", "assign"], repo)
     plan = read(latest_run(repo) / "panel" / "plan.json")
     fams = [v["family"] for v in plan["roles"].values()]
-    assert len(plan["roles"]) == 3, f"expected 3 roles, got {len(plan['roles'])}"
-    assert len(set(fams)) == 3, f"family collision: {fams}"
+    assert len(plan["roles"]) == 4, f"expected 4 roles, got {len(plan['roles'])}"
+    assert len(set(fams)) == 4, f"family collision: {fams}"
+    assert "output_fidelity" in plan["roles"], "output_fidelity role missing at NORMAL"
     assert "anthropic" not in fams, "dev family leaked into panel"
     slugs = [v["model"] for v in plan["roles"].values()]
     for s in slugs:
@@ -89,8 +90,57 @@ def t_assign_collision_free_under_multi_dev():
     sh(["panel.py", "assign"], repo)
     plan = read(latest_run(repo) / "panel" / "plan.json")
     fams = [v["family"] for v in plan["roles"].values()]
-    assert len(plan["roles"]) == 5 and len(set(fams)) == 5, f"collision: {fams}"
+    assert len(plan["roles"]) == 6 and len(set(fams)) == 6, f"collision: {fams}"
     assert not {"anthropic", "openai"} & set(fams)
+
+
+def t_output_fidelity_role_and_forced_attestation():
+    # The output-semantics lens (the class of bug an LLM panel misses but a line-by-line
+    # reviewer catches — e.g. a FAIL branch that asserts the success condition) is installed
+    # two ways: a dedicated output_fidelity reviewer at EVERY tier, and a forced schema
+    # attestation every reviewer must fill. Neither may silently regress.
+    import panel
+    assert "output_fidelity" in panel.ROLES
+    for tier in ("NORMAL", "SENSITIVE", "CRITICAL"):
+        assert "output_fidelity" in panel.TIER_ROLES[tier], tier
+    assert "output_fidelity" in panel.RUBRICS and "output_fidelity" in panel.ROLE_FAMILY_PRIORITY
+    assert "HUMAN-FACING OUTPUT" in panel.RUBRICS["output_fidelity"]
+
+    # Forced attestation: it is required, with required sub-fields, so an omission or a
+    # malformed entry is rejected at ingest exactly like any other schema violation.
+    base = {"role": "correctness", "model_id": "m", "summary": "s", "findings": [],
+            "assumptions": [], "additional_tests": [], "areas_reviewed": ["d"],
+            "areas_not_reviewed": [], "top_residual_risks": ["r"], "injection_suspected": False}
+    assert "output_statements_checked" in panel.REPORT_SCHEMA["required"]
+    assert any("output_statements_checked" in e
+               for e in panel.validate_obj(base, panel.REPORT_SCHEMA))          # omitted -> reject
+    bad = dict(base, output_statements_checked=[{"rendered": "x", "note": "y"}])  # no states_truth
+    assert any("states_truth" in e for e in panel.validate_obj(bad, panel.REPORT_SCHEMA))
+    good = dict(base, output_statements_checked=[
+        {"rendered": "The 'unit' check failed. Run the test suite locally to see which test.",
+         "states_truth": True, "note": "true: states the failure and a valid next action",
+         "finding_id": ""},
+        {"rendered": "The 'unit' check failed. Passing it proves your automated tests pass.",
+         "states_truth": False, "note": "a FAIL branch that asserts the success condition is false output",
+         "finding_id": "correctness-1"}])
+    assert panel.validate_obj(good, panel.REPORT_SCHEMA) == []                    # well-formed -> ok
+    # finding_id is a REQUIRED key on every attestation item (empty "" for a true statement):
+    # strict structured-output providers (e.g. OpenAI) reject an item whose `required` omits a
+    # property, so the local schema must match — omitting finding_id is rejected here too.
+    assert "finding_id" in panel.REPORT_SCHEMA["properties"]["output_statements_checked"]["items"]["required"]
+    assert any("finding_id" in e for e in panel.validate_obj(
+        dict(base, output_statements_checked=[{"rendered": "x", "states_truth": True, "note": "n"}]),
+        panel.REPORT_SCHEMA))                                                     # omitting finding_id -> reject
+
+    # Every reviewer scans the diff for output truth (P1), but only output_fidelity enumerates
+    # exhaustively; the others report by exception so a large text diff cannot blow the
+    # completion cap across the panel (P2).
+    for role in panel.TIER_ROLES["NORMAL"]:
+        sysmsg = panel.reviewer_messages(role, {"risk": "NORMAL"}, "ctx", "BND")[0]["content"]
+        assert "OUTPUT FIDELITY" in sysmsg and "output_statements_checked" in sysmsg, role
+        assert "finding_id" in sysmsg, role      # a false statement must be linked to a finding
+        assert ("enumerate EVERY" in sysmsg) == (role == "output_fidelity"), role
+        assert ("Report by exception" in sysmsg) == (role != "output_fidelity"), role
 
 
 def t_assign_blocked_when_insufficient():
@@ -457,7 +507,7 @@ def t_coverage_block_on_pass():
     assert set(cov["gates"]["passed"]) == {"build", "unit", "secrets", "deps", "sast"}
     assert cov["gates"]["missing"] == [] and cov["gates"]["failed"] == []
     assert [w["name"] for w in cov["gates"]["waived"]] == ["mutation"]
-    assert len(cov["panel"]["roles_filled"]) == 5
+    assert len(cov["panel"]["roles_filled"]) == 6
     assert sorted(cov["panel"]["roles_filled"]) == sorted(cov["panel"]["roles_required"])
     assert cov["rebuttal"] == {"policy": "contention", "required": True, "ran": True}
     assert cov["findings"]["raised"] >= 1 and cov["findings"]["triaged"] >= 1
@@ -477,7 +527,7 @@ def t_coverage_block_on_blocked():
     run = latest_run(repo)
     cov = read(run / "verdict.json")["coverage"]
     assert cov["gates"]["plan_recorded"] is False and cov["gates"]["required"] == []
-    assert len(cov["panel"]["roles_filled"]) == 3
+    assert len(cov["panel"]["roles_filled"]) == 4
     assert cov["panel"]["dev_families_excluded"] == ["anthropic"]
     assert cov["rebuttal"]["required"] is False and cov["rebuttal"]["ran"] is False
     # A recorded degraded authorization reappears in roles_required: dropped roles
@@ -490,7 +540,7 @@ def t_coverage_block_on_blocked():
     sh(["aggregate.py"], repo, expect=2)
     pcov = read(run / "verdict.json")["coverage"]["panel"]
     assert "reliability" in pcov["roles_required"], pcov
-    assert len(pcov["roles_required"]) == 4 and len(pcov["roles_filled"]) == 3
+    assert len(pcov["roles_required"]) == 5 and len(pcov["roles_filled"]) == 4
 
 
 def t_coverage_block_on_fail():
@@ -653,6 +703,510 @@ def t_release_blocking_medium_requires_triage():
     sh(["aggregate.py"], repo, expect=0)
 
 
+def t_output_fidelity_attestation_gates_verdict():
+    # P1 (external bots caught this) + the panel's own hardening (security-1/2, test_quality-1/2/3):
+    # a reviewer recording states_truth=false must gate the verdict. aggregate.py BLOCKS a false
+    # attestation unless it is linked (finding_id) to a finding THE SAME REVIEWER raised that is
+    # RESOLVED (confirmed/false_positive/accepted_risk — not merely `unresolved`), regardless of
+    # severity. The link and rendered text are untrusted and are escaped before interpolation.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)   # baseline PASS: all attestations state truth
+
+    def set_false(finding_id, rendered="Deleted 0 rows. Your account was removed."):
+        c = read(run / "panel" / "correctness.json")   # read-modify-write preserves findings
+        c["output_statements_checked"] = [{"rendered": rendered, "states_truth": False,
+                                           "note": "false output", "finding_id": finding_id}]
+        write(run / "panel" / "correctness.json", c)
+
+    # (1) EMPTY finding_id (the schema-valid shape for "no link": finding_id is a required key,
+    # so a real report carries "" not a missing key — test_quality-2) -> BLOCK.
+    set_false("")
+    assert "no finding_id" in sh(["aggregate.py"], repo, expect=2).stdout
+
+    # (2) Linked to a finding THIS reviewer did not raise -> BLOCK. Covers a nonexistent id AND a
+    # FOREIGN-but-real-and-triaged id (security-1): an unrelated triaged finding must not satisfy
+    # the gate (panel finding security-2).
+    for foreign in ("correctness-9", "security-1"):
+        set_false(foreign)
+        assert "not a finding this reviewer raised" in sh(["aggregate.py"], repo, expect=2).stdout, foreign
+
+    # give correctness its own finding for the remaining cases
+    c = read(run / "panel" / "correctness.json")
+    c["findings"].append({
+        "id": "correctness-7", "title": "success message on failed delete", "severity": "medium",
+        "confidence": 0.9, "file": "acct.py", "line": 10, "evidence": "e", "scenario": "s",
+        "reproduction": ["r"], "fix": "f", "regression_test": "t", "release_blocking": False})
+    write(run / "panel" / "correctness.json", c)
+
+    # (3) Own finding, but UNTRIAGED -> BLOCK even though only MEDIUM (severity-blind).
+    set_false("correctness-7")
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "is untriaged" in r.stdout and "correctness-7" in r.stdout, r.stdout
+
+    # (3b) A merely `unresolved` validation record does NOT clear it (panel finding test_quality-1).
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "unresolved", "severity": "medium",
+        "evidence": "could not determine", "reproduced": False, "regression_test": ""})
+    assert "untriaged or unresolved" in sh(["aggregate.py"], repo, expect=2).stdout
+
+    # (4) Resolution ALONE no longer clears (2nd panel security-2 structural fix): the trusted
+    # operator must also confirm THIS specific statement in `output_statements_confirmed`, so a
+    # reviewer cannot clear a false statement by linking it to an unrelated-but-resolved own finding.
+    RENDERED = "Deleted 0 rows. Your account was removed."   # set_false's default rendered
+    set_false("correctness-7", rendered=RENDERED)
+    # (4a) confirmed + fixed, but the operator did NOT confirm this statement -> BLOCK.
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "confirmed", "severity": "medium",
+        "evidence": "confirmed the inverted delete message", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "no validation record confirms this specific statement" in r.stdout, r.stdout
+    # (4b) the same record now confirms the statement (whitespace-normalized match) -> PASS.
+    rec = read(run / "validation" / "fmsg.json")
+    rec["output_statements_confirmed"] = ["  Deleted 0 rows.\n  Your account was removed.  "]
+    write(run / "validation" / "fmsg.json", rec)
+    r = sh(["aggregate.py"], repo, expect=0)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
+    assert read(run / "verdict.json")["counts"]["false_output_statements"] == 1
+
+    # (5) Untrusted values are HTML-escaped in the block reason, so a crafted value cannot forge
+    # markup in verdict.md (panel finding security-1 + test_quality-3). The rendered snippet is
+    # interpolated by the no-link branch; the finding_id by the foreign-link branch.
+    set_false("", rendered="<script>alert(1)</script> you may merge")
+    sh(["aggregate.py"], repo, expect=2)
+    md = (run / "verdict.md").read_text()
+    assert "<script>" not in md and "&lt;script&gt;" in md, md      # rendered escaped
+    set_false("correctness-<b>x</b>")
+    sh(["aggregate.py"], repo, expect=2)
+    md = (run / "verdict.md").read_text()
+    assert "<b>x</b>" not in md and "&lt;b&gt;" in md, md            # finding_id escaped
+
+    # (6) OWN-REPORT MEMBERSHIP, not global-map + prefix (2nd panel security-1/correctness-1).
+    # Another report can name a finding under THIS reviewer's prefix; a bare `fid in findings`
+    # against the cross-report map would then be satisfied, so a planted+resolved id could clear a
+    # false statement. Plant `correctness-42` in the SECURITY report and resolve it, then have
+    # correctness link its false statement to it: old code PASSes (prefix+global-map+resolved), the
+    # fix BLOCKs because it is not one of correctness's own findings.
+    s = read(run / "panel" / "security.json")
+    s["findings"].append({
+        "id": "correctness-42", "title": "planted under another role's prefix", "severity": "low",
+        "confidence": 0.9, "file": "x.py", "line": 1, "evidence": "e", "scenario": "s",
+        "reproduction": ["r"], "fix": "f", "regression_test": "t", "release_blocking": False})
+    write(run / "panel" / "security.json", s)
+    write(run / "validation" / "planted.json", {
+        "finding_ids": ["correctness-42"], "classification": "confirmed", "severity": "low",
+        "evidence": "resolved", "reproduced": True, "regression_test": "t",
+        "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    set_false("correctness-42")
+    assert "not a finding this reviewer raised" in sh(["aggregate.py"], repo, expect=2).stdout
+    s["findings"] = [f for f in s["findings"] if f["id"] != "correctness-42"]
+    write(run / "panel" / "security.json", s)
+    (run / "validation" / "planted.json").unlink()
+
+    # (7) A malformed (non-list) output_statements_checked must BLOCK and still WRITE a verdict,
+    # never crash the aggregator (2nd panel correctness-2 — a truthy non-list raised TypeError
+    # before the verdict was written; AC2 no-crash).
+    c = read(run / "panel" / "correctness.json")
+    c["output_statements_checked"] = 1
+    write(run / "panel" / "correctness.json", c)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "malformed" in r.stdout, r.stdout
+    assert (run / "verdict.json").exists()
+    c["output_statements_checked"] = []
+    write(run / "panel" / "correctness.json", c)
+
+    # (8) false_positive and accepted_risk are resolving classifications too — only `confirmed`
+    # was exercised before (2nd panel test_quality-2). correctness-7 is medium, so false_positive
+    # needs no concurrence; accepted_risk needs a matching suppression.
+    set_false("correctness-7", rendered=RENDERED)
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "false_positive", "severity": "medium",
+        "evidence": "on reflection the message is correct", "reproduced": False, "regression_test": "t",
+        "output_statements_confirmed": [RENDERED]})
+    assert "VERDICT: PASS" in sh(["aggregate.py"], repo, expect=0).stdout
+    write(run / "suppressions.json", [{"finding_id": "correctness-7", "evidence": "known copy",
+        "owner": "Paul", "expires": "2099-01-01"}])
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "accepted_risk", "severity": "medium",
+        "evidence": "accepted", "reproduced": True, "regression_test": "t",
+        "output_statements_confirmed": [RENDERED]})
+    assert "VERDICT: PASS" in sh(["aggregate.py"], repo, expect=0).stdout
+    (run / "suppressions.json").unlink()
+
+    # (9) The UNRESOLVED branch also interpolates the untrusted finding_id — it must be escaped
+    # too (2nd panel test_quality-3; only the no-link and foreign-link branches were checked).
+    c = read(run / "panel" / "correctness.json")
+    c["findings"].append({
+        "id": "correctness-<b>z</b>", "title": "t", "severity": "low", "confidence": 0.5,
+        "file": "x.py", "line": 1, "evidence": "e", "scenario": "s", "reproduction": ["r"],
+        "fix": "f", "regression_test": "t", "release_blocking": False})
+    write(run / "panel" / "correctness.json", c)
+    (run / "validation" / "fmsg.json").unlink()   # leave correctness-7/<b>z</b> unresolved
+    set_false("correctness-<b>z</b>")
+    sh(["aggregate.py"], repo, expect=2)
+    md = (run / "verdict.md").read_text()
+    assert "<b>z</b>" not in md and "&lt;b&gt;z&lt;/b&gt;" in md, md
+
+    # (10) The operator-confirmation requirement applies to EVERY resolving class, not just
+    # confirmed (3rd panel test_quality-1): false_positive / accepted_risk WITHOUT
+    # output_statements_confirmed must still BLOCK.
+    c = read(run / "panel" / "correctness.json")
+    c["findings"] = [f for f in c["findings"] if f["id"] != "correctness-<b>z</b>"]
+    write(run / "panel" / "correctness.json", c)
+    set_false("correctness-7", rendered=RENDERED)
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "false_positive", "severity": "medium",
+        "evidence": "e", "reproduced": False, "regression_test": "t"})   # no output_statements_confirmed
+    assert "no validation record confirms this specific statement" in sh(["aggregate.py"], repo, expect=2).stdout
+    write(run / "suppressions.json", [{"finding_id": "correctness-7", "evidence": "k",
+        "owner": "Paul", "expires": "2099-01-01"}])
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "accepted_risk", "severity": "medium",
+        "evidence": "e", "reproduced": True, "regression_test": "t"})   # no output_statements_confirmed
+    assert "no validation record confirms this specific statement" in sh(["aggregate.py"], repo, expect=2).stdout
+    (run / "suppressions.json").unlink()
+
+    # (11) Confirmation is EXACT (a substring of a confirmed statement must not clear it —
+    # 3rd panel test_quality-3); non-string entries in output_statements_confirmed are ignored
+    # but a co-listed exact string still clears (test_quality-4).
+    write(run / "validation" / "fmsg.json", {
+        "finding_ids": ["correctness-7"], "classification": "confirmed", "severity": "medium",
+        "evidence": "e", "reproduced": True, "regression_test": "t",
+        "resolution": {"fixed": True, "gates_rerun": ["unit"]},
+        "output_statements_confirmed": ["Deleted 0 rows."]})   # only a PREFIX of RENDERED
+    assert "no validation record confirms this specific statement" in sh(["aggregate.py"], repo, expect=2).stdout
+    rec = read(run / "validation" / "fmsg.json")
+    rec["output_statements_confirmed"] = [123, RENDERED]   # non-string ignored, exact string clears
+    write(run / "validation" / "fmsg.json", rec)
+    assert "VERDICT: PASS" in sh(["aggregate.py"], repo, expect=0).stdout
+
+
+def t_gate_fail_safe_on_malformed_artifacts():
+    # AC2 (no-crash) + AC1 (fail-safe) for the verdict emitter: a hand-recorded / ingest-bypassing
+    # artifact with a malformed shape must BLOCK and still WRITE a verdict, never crash and never
+    # fail-open (3rd panel: correctness-1 findings, correctness-2 finding_ids/confirmations,
+    # correctness-3 non-string rendered coercion, correctness-4 malformed attestation items,
+    # output_fidelity-1 non-list confirmations).
+    def check(mutate):
+        repo = _complete_sensitive_repo()
+        run = latest_run(repo)
+        write(run / "validation" / "idor.json", {
+            "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+            "evidence": "e", "reproduced": True, "regression_test": "t",
+            "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+        mutate(run)
+        r = sh(["aggregate.py"], repo, expect=2)          # never exit 0, never a crash traceback
+        assert (run / "verdict.json").exists(), "verdict must still be written (no crash)"
+        return r.stdout
+
+    def setf(run, **item):
+        c = read(run / "panel" / "correctness.json")
+        c["output_statements_checked"] = [item]
+        write(run / "panel" / "correctness.json", c)
+
+    # findings container / item malformed
+    def m_findings_nonlist(run):
+        c = read(run / "panel" / "correctness.json"); c["findings"] = 1
+        write(run / "panel" / "correctness.json", c)
+    assert "malformed" in check(m_findings_nonlist)
+    def m_findings_item(run):
+        c = read(run / "panel" / "correctness.json"); c["findings"] = [None]
+        write(run / "panel" / "correctness.json", c)
+    assert "malformed finding" in check(m_findings_item)
+    # validation record malformed
+    def m_finding_ids(run):
+        write(run / "validation" / "bad.json", {"finding_ids": 1, "classification": "confirmed"})
+    assert "finding_ids is malformed" in check(m_finding_ids)
+    # attestation container / item / field malformed
+    assert "malformed" in check(lambda run: setf(run, states_truth=False, rendered=1, finding_id=""))
+    assert "non-boolean states_truth" in check(lambda run: setf(run, states_truth="false", rendered="x", finding_id=""))
+    def m_osc_nonlist(run):
+        c = read(run / "panel" / "correctness.json"); c["output_statements_checked"] = 1
+        write(run / "panel" / "correctness.json", c)
+    assert "output_statements_checked is malformed" in check(m_osc_nonlist)
+    # non-list output_statements_confirmed on a resolving record must not crash and must not clear
+    def m_conf_nonlist(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"].append({"id": "correctness-9", "title": "t", "severity": "low", "confidence": 0.5,
+            "file": "x.py", "line": 1, "evidence": "e", "scenario": "s", "reproduction": ["r"],
+            "fix": "f", "regression_test": "t", "release_blocking": False})
+        c["output_statements_checked"] = [{"states_truth": False, "rendered": "boom", "finding_id": "correctness-9"}]
+        write(run / "panel" / "correctness.json", c)
+        write(run / "validation" / "c9.json", {"finding_ids": ["correctness-9"], "classification": "confirmed",
+            "severity": "low", "evidence": "e", "reproduced": True, "regression_test": "t",
+            "resolution": {"fixed": True, "gates_rerun": ["unit"]}, "output_statements_confirmed": 1})
+    assert "no validation record confirms this specific statement" in check(m_conf_nonlist)
+
+
+def t_gate_fail_safe_round4():
+    # 4th-panel regressions on the verdict emitter: the findings-map clobber (security-2), the
+    # own_ids unhashable-id crash (security-1/correctness-1), malformed suppressions.json
+    # (security-3/correctness-2), non-string finding_ids members (correctness-3), and the
+    # test-coverage gaps (test_quality-1..5). Every crafted / hand-recorded artifact must BLOCK
+    # with a SPECIFIC reason and still write a verdict — never crash, never fail-open
+    # (test_quality-5: assert the exact reason, not merely that it blocked).
+    def check(mutate):
+        repo = _complete_sensitive_repo()
+        run = latest_run(repo)
+        write(run / "validation" / "idor.json", {
+            "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+            "evidence": "e", "reproduced": True, "regression_test": "t",
+            "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+        mutate(run)
+        r = sh(["aggregate.py"], repo, expect=2)          # never exit 0, never a crash traceback
+        assert (run / "verdict.json").exists(), "verdict must still be written (no crash)"
+        return r.stdout
+
+    def corr_finding(fid, sev="low"):
+        return {"id": fid, "title": "t", "severity": sev, "confidence": 0.5, "file": "x.py",
+                "line": 1, "evidence": "e", "scenario": "s", "reproduction": ["r"], "fix": "f",
+                "regression_test": "t", "release_blocking": False}
+
+    # own_ids: an unhashable id ([]) on a dict finding + a false attestation previously raised
+    # TypeError before verdict.json; must BLOCK on the malformed finding and still write a verdict.
+    def m_unhashable_id(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"] = [{"id": [], "severity": "high"}]
+        c["output_statements_checked"] = [{"states_truth": False, "rendered": "x",
+                                           "finding_id": "correctness-1"}]
+        write(run / "panel" / "correctness.json", c)
+    assert "malformed finding (needs a string id" in check(m_unhashable_id)  # exact reason (tq-2)
+
+    # findings-map clobber: a second report reusing an existing id (security-1) must BLOCK, not
+    # silently overwrite and hide the earlier finding from the high/critical coverage check.
+    def m_duplicate_id(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"].append(corr_finding("security-1"))
+        write(run / "panel" / "correctness.json", c)
+    assert "duplicate finding id" in check(m_duplicate_id)
+
+    # test_quality-1: non-list findings WITH a false attestation — the container BLOCK and the
+    # empty-own_ids attestation BLOCK both fire, no crash.
+    def m_nonlist_findings_false(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"] = 1
+        c["output_statements_checked"] = [{"states_truth": False, "rendered": "boom",
+                                           "finding_id": "correctness-1"}]
+        write(run / "panel" / "correctness.json", c)
+    out = check(m_nonlist_findings_false)   # specific reasons, not a bare "malformed" (tq-3)
+    assert "findings is malformed (not a list)" in out and "not a finding this reviewer raised" in out, out
+
+    # test_quality-2: a validation record that is not a dict (a JSON list) must BLOCK, not crash.
+    def m_nondict_record(run):
+        (run / "validation" / "bad.json").write_text("[1, 2]")
+    assert "malformed record (not an object)" in check(m_nondict_record)
+
+    # test_quality-3: output_statements_confirmed as a list of ONLY non-strings confirms nothing,
+    # so a false statement linked to the resolved finding still BLOCKs.
+    def m_conf_all_nonstring(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"].append(corr_finding("correctness-9"))
+        c["output_statements_checked"] = [{"states_truth": False, "rendered": "boom",
+                                           "finding_id": "correctness-9"}]
+        write(run / "panel" / "correctness.json", c)
+        write(run / "validation" / "c9.json", {"finding_ids": ["correctness-9"],
+            "classification": "confirmed", "severity": "low", "evidence": "e", "reproduced": True,
+            "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]},
+            "output_statements_confirmed": [123, 456]})
+    assert "no validation record confirms this specific statement" in check(m_conf_all_nonstring)
+
+    # test_quality-4: a finding with a valid id but an invalid severity must BLOCK.
+    def m_bad_severity(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"] = [dict(corr_finding("correctness-1"), severity="bogus")]
+        write(run / "panel" / "correctness.json", c)
+    assert "malformed finding" in check(m_bad_severity)
+
+    # correctness-3: a non-string finding_ids member on a validation record must BLOCK (uniform
+    # malformed -> BLOCK, no silent drop).
+    def m_finding_ids_member(run):
+        write(run / "validation" / "bad2.json", {"finding_ids": ["security-1", 123],
+            "classification": "confirmed", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    assert "non-string member" in check(m_finding_ids_member)
+
+    # security-3/correctness-2: malformed suppressions.json (non-list, and a non-dict entry) must
+    # BLOCK, not crash.
+    assert "is malformed (not a list)" in check(lambda run: (run / "suppressions.json").write_text("{}"))
+    assert "malformed entry (not an object)" in check(lambda run: (run / "suppressions.json").write_text("[null]"))
+    # a non-dict, non-null entry (a bare string) must BLOCK the same way.
+    assert "malformed entry (not an object)" in check(
+        lambda run: write(run / "suppressions.json", ["oops"]))
+
+    # 5th-panel security-1/correctness-1: a suppression entry whose finding_id is UNHASHABLE ([]) is
+    # used as a dict key and previously crashed before verdict.json. Must BLOCK, not crash.
+    assert "non-string finding_id" in check(
+        lambda run: write(run / "suppressions.json", [{"finding_id": [], "evidence": "x"}]))
+
+    # 5th-panel test_quality-1: a WITHIN-report duplicate id (same id twice in ONE report) must
+    # BLOCK too, not only cross-report duplicates.
+    def m_dup_within(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"] = [corr_finding("correctness-1"), corr_finding("correctness-1", "high")]
+        write(run / "panel" / "correctness.json", c)
+    assert "duplicate finding id" in check(m_dup_within)
+
+    # 5th-panel test_quality-4: the duplicate-id guard must protect high/critical COVERAGE. A low
+    # finding reusing a real high finding's id (security-1, triaged by idor.json) must not hide it
+    # and reach PASS — the run must still BLOCK (check() asserts exit 2), and the high finding must
+    # remain counted as high/critical rather than silently downgraded to the low duplicate.
+    def m_dup_hides_high(run):
+        c = read(run / "panel" / "correctness.json")
+        c["findings"].append(corr_finding("security-1", "low"))
+        write(run / "panel" / "correctness.json", c)
+        return run
+    repo = _complete_sensitive_repo(); run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+        "evidence": "e", "reproduced": True, "regression_test": "t",
+        "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    m_dup_hides_high(run)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "duplicate finding id" in r.stdout, r.stdout
+    v = read(run / "verdict.json")
+    assert v["counts"]["findings_high_critical"] >= 1, v["counts"]  # high not hidden/downgraded
+
+
+def t_http_json_scheme_allowlist():
+    # panel.http_json must refuse any non-HTTP(S) URL before urlopen, so a misconfigured or
+    # untrusted AR_BASE_URL cannot be steered to file:// (local-file read) or another scheme.
+    import panel
+    for bad in ("file:///etc/passwd", "ftp://example.com/x", "gopher://example.com/x"):
+        try:
+            panel.http_json(bad, timeout=1)
+            raise AssertionError(f"http_json should have refused {bad}")
+        except SystemExit as e:
+            assert e.code == 2, (bad, e.code)
+    # Positive path (6th-panel test_quality-3) + case/whitespace (test_quality-1 / correctness-2):
+    # urlparse lower-cases the scheme and strips surrounding whitespace, so "HTTP://" and "  http://"
+    # resolve to http and pass (still http — not a bypass). 7th-panel test_quality-2: use a port that
+    # is *guaranteed closed* (bind :0, read the assigned port, close it) instead of the discard port 9
+    # which may actually be listening on some hosts and mask a removed scheme check. Each accepted URL
+    # must therefore raise a real connection error (URLError), NOT the exit-2 scheme refusal.
+    # 8th-panel correctness-1: do NOT assert a specific exception type here. A whitespace-padded URL
+    # reaches the connection stage on this build as a URLError, but stricter urllib builds can raise
+    # http.client.InvalidURL (NOT a URLError subclass) instead. What this positive path must prove is
+    # only that the scheme check ACCEPTS these (no exit-2 refusal) and that they are not a silent pass
+    # — the guaranteed-closed port ensures any accepted URL fails at connect rather than returning.
+    import socket
+    _s = socket.socket(); _s.bind(("127.0.0.1", 0)); _closed = _s.getsockname()[1]; _s.close()
+    for good in (f"http://127.0.0.1:{_closed}/x", f"https://127.0.0.1:{_closed}/x",
+                 f"HTTP://127.0.0.1:{_closed}/x", f"  https://127.0.0.1:{_closed}/x  "):
+        try:
+            panel.http_json(good, timeout=1)
+        except SystemExit:
+            raise AssertionError(f"{good!r} normalizes to http(s) and must pass the allowlist")
+        except Exception:
+            continue  # scheme accepted; connection to the closed port failed (URLError / InvalidURL)
+        raise AssertionError(f"{good!r} should reach the connection stage and fail there")
+    # a non-http(s) scheme is still refused regardless of case or padding
+    for bad in ("FILE:///etc/passwd", "  ftp://x/y"):
+        try:
+            panel.http_json(bad, timeout=1)
+            raise AssertionError(f"{bad!r} must be refused")
+        except SystemExit as e:
+            assert e.code == 2, (bad, e.code)
+
+
+def t_http_json_refuses_all_redirects():
+    # 7th-panel security-1/2, correctness-1, test_quality-1/4/5 + 8th-panel test_quality-1/2/4/5:
+    # drive the REAL production fetch path (panel.http_json -> _HTTPS_OPENER.open) through a loopback
+    # http.server. Proves: (a) the opener performs a real http fetch and returns the parsed body
+    # (default HTTP handler present); (b) EVERY redirect is refused with the refusal HTTPError, across
+    # methods (GET+302, POST+307) and Location kinds (relative, protocol-relative, cross-host absolute,
+    # non-http(s)); (c) the Bearer key IS sent on the first hop but is NEVER forwarded to a redirect
+    # target. Fails if a regression reverted http_json to urllib.request.urlopen, dropped _NoRedirect
+    # from the opener, or re-allowed any redirect.
+    import panel, threading, http.server, urllib.error
+
+    sink_auth = []     # Authorization seen at a redirect TARGET => a key leak (must stay empty)
+    initial_auth = []  # Authorization seen on the FIRST hop => proves the key was actually sent
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass  # keep test output clean
+
+        def _json(self, body):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _redirect(self, code, location):
+            initial_auth.append(self.headers.get("Authorization"))  # key present on the first hop
+            self.send_response(code)
+            self.send_header("Location", location)
+            self.end_headers()
+
+        def _route(self):
+            host = f"127.0.0.1:{self.server.server_address[1]}"
+            p = self.path
+            if p == "/ok":            self._json(b'{"ok": true}')                 # positive path
+            elif p == "/sink":        (sink_auth.append(self.headers.get("Authorization")),
+                                       self._json(b'{"leaked": true}'))           # leak target
+            elif p == "/redirect":    self._redirect(302, "/sink")               # same-host relative
+            elif p == "/protorel":    self._redirect(302, f"//{host}/sink")      # protocol-relative
+            elif p == "/crosshost":   self._redirect(302, "http://127.0.0.2:9/sink")  # cross-host absolute
+            elif p == "/ftpredir":    self._redirect(302, "ftp://127.0.0.1/x")   # non-http(s) target
+            elif p == "/postredir":   self._redirect(307, "/sink")               # 307 preserves POST
+            else:                     (self.send_response(404), self.end_headers())
+
+        do_GET = _route
+        do_POST = _route
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)  # loopback only; ephemeral port
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        # positive path — the opener really routes http and returns the parsed body (default handlers)
+        assert panel.http_json(base + "/ok", timeout=5) == {"ok": True}
+        # every GET redirect is refused with the REFUSAL HTTPError (not some other 30x/4xx), across
+        # Location kinds: relative, protocol-relative, cross-host absolute, and non-http(s).
+        for path in ("/redirect", "/protorel", "/crosshost", "/ftpredir"):
+            try:
+                panel.http_json(base + path, key="CANARY-SECRET", timeout=5)
+                raise AssertionError(f"{path}: a redirect must be refused, not followed")
+            except urllib.error.HTTPError as e:
+                assert "refus" in str(e.reason).lower(), (path, e.reason)
+        # a POST that 307-redirects (method + body preserved by urllib) must also be refused
+        try:
+            panel.http_json(base + "/postredir", payload={"x": 1}, key="CANARY-SECRET", timeout=5)
+            raise AssertionError("/postredir: a POST redirect must be refused")
+        except urllib.error.HTTPError as e:
+            assert "refus" in str(e.reason).lower(), e.reason
+        # the key WAS sent on the first hop (so a leak would be observable) but NEVER forwarded onward
+        assert initial_auth and all(a == "Bearer CANARY-SECRET" for a in initial_auth), initial_auth
+        assert sink_auth == [], f"Bearer key leaked to a redirect target: {sink_auth}"
+    finally:
+        srv.shutdown(); srv.server_close()
+
+
+def t_gitleaks_baseline_allowlist_anchored():
+    # 6th-panel correctness-3 / test_quality-5 + 7th-panel test_quality-3: EVERY gitleaks path
+    # allowlist entry must be anchored to the repository root (^...$) so a nested file named
+    # `.secrets.baseline` is NOT silently exempted. The prior test only inspected the FIRST
+    # triple-quoted pattern (pats[0]); check the WHOLE list. Stdlib-only on purpose — the CI matrix
+    # includes Python 3.9, where tomllib (3.11+) is unavailable, so parse the triple-quoted path
+    # patterns directly rather than importing tomllib.
+    cfg = (SKILL / ".gitleaks.toml").read_text()
+    paths = re.findall(r"'''(.*?)'''", cfg)  # all triple-quoted allowlist path patterns
+    assert paths, "no allowlist path patterns found in .gitleaks.toml"
+    for pat in paths:
+        assert pat.startswith("^") and pat.endswith("$"), \
+            f"every allowlist path regex must anchor to repo root (^...$), got {pat!r}"
+    compiled = [re.compile(p) for p in paths]
+    # the repo-root baseline stays exempted; a nested lookalike must NOT be exempted by ANY pattern
+    assert any(rx.search(".secrets.baseline") for rx in compiled), \
+        "root .secrets.baseline should match the allowlist"
+    assert not any(rx.search("evil/.secrets.baseline") for rx in compiled), \
+        "nested .secrets.baseline must NOT be exempted by any allowlist path"
+
+
 def t_rebuttal_policy_matrix():
     # contention (default): SENSITIVE + findings, no rebuttal -> BLOCKED
     repo = fresh_repo()
@@ -763,11 +1317,13 @@ def t_prepare_ingest_mcp_path():
     plan = read(run / "panel" / "plan.json")
     for role in plan["roles"]:
         body = read(run / "panel" / "requests" / f"{role}.json")
+        # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-request-object.insecure-request-object
         req = urllib.request.Request(
-            f"http://127.0.0.1:{PORT}/v1/chat/completions",
+            f"http://127.0.0.1:{PORT}/v1/chat/completions",   # loopback test mock; https would break it
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
-        resp = urllib.request.urlopen(req, timeout=10).read().decode()
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+        resp = urllib.request.urlopen(req, timeout=10).read().decode()  # hardcoded 127.0.0.1 mock
         rf = run / f"mcp-response-{role}.json"
         rf.write_text(resp)
         sh(["panel.py", "ingest", "--role", role, "--response-file", str(rf)], repo)

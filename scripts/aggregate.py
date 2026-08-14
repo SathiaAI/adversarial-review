@@ -234,8 +234,32 @@ def author_families(finding_ids, plan):
 
 def check_findings(run, meta, plan, reports, fail, blocked, counts):
     findings = {}
+    # Reports are semi-trusted; ingest normally validates them, but a hand-recorded or
+    # bypassed artifact can carry malformed shapes. Guard every container/item here so a
+    # crafted report degrades to a BLOCK reason rather than crashing before verdict.json is
+    # written (3rd-panel correctness-1: `findings` null/non-list/[null] raised TypeError).
     for role, rep in reports.items():
-        for f in rep.get("findings", []):
+        rfind = rep.get("findings")
+        if rfind is None:
+            continue
+        if not isinstance(rfind, list):
+            blocked.append(f"reviewer '{role}' findings is malformed (not a list) — cannot assess findings")
+            continue
+        for f in rfind:
+            if (not isinstance(f, dict) or not isinstance(f.get("id"), str)
+                    or f.get("severity") not in ("critical", "high", "medium", "low")):
+                blocked.append(f"reviewer '{role}' has a malformed finding (needs a string id and a "
+                               "valid severity) — cannot assess it")
+                continue
+            if f["id"] in findings:
+                # Last-write-wins previously let a later report reuse an id and overwrite (hide) an
+                # earlier finding — e.g. a low finding clobbering a real high one so it drops out of
+                # the high/critical coverage check and the run reaches PASS (4th-panel security-2,
+                # reproduced). ids are attacker-controllable and ingest has no cross-report namespace
+                # rule, so a collision must BLOCK rather than silently overwrite.
+                blocked.append(f"duplicate finding id '{_snippet(f['id'])}' (within or across reports) "
+                               "— an id must not be reused to overwrite (hide) an earlier finding")
+                continue
             findings[f["id"]] = f
             if f["severity"] in HIGH:
                 counts["findings_high_critical"] += 1
@@ -253,14 +277,48 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
     suppressions = {}
     spath = run / "suppressions.json"
     if spath.exists():
-        for s in read_json(spath):
-            suppressions[s.get("finding_id", "")] = s
+        # suppressions.json is operator-authored but may be hand-edited/malformed; a non-list
+        # document or a non-dict entry previously crashed here (TypeError / AttributeError) before
+        # verdict.json was written (4th-panel security-3/correctness-2). Malformed -> BLOCK, no crash.
+        sup_doc = read_json(spath)
+        if not isinstance(sup_doc, list):
+            blocked.append("suppressions.json is malformed (not a list) — cannot assess "
+                           "accepted-risk suppressions")
+        else:
+            for s in sup_doc:
+                if not isinstance(s, dict):
+                    blocked.append("suppressions.json has a malformed entry (not an object) "
+                                   "— cannot assess it")
+                    continue
+                fid = s.get("finding_id", "")
+                if not isinstance(fid, str):
+                    # finding_id becomes a dict key below; an unhashable value (e.g. []) crashed
+                    # here before verdict.json (5th-panel security-1/correctness-1). Guard the id
+                    # type, matching the own_ids/findings-map guards (malformed -> BLOCK, no crash).
+                    blocked.append("suppressions.json has an entry with a non-string finding_id "
+                                   "— malformed, cannot assess it")
+                    continue
+                suppressions[fid] = s
 
     covered = set()
     dev = set(meta.get("dev_providers", []))
     sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     for name, rec in records:
-        ids = rec.get("finding_ids", [])
+        if not isinstance(rec, dict):
+            blocked.append(f"validation/{name}: malformed record (not an object)")
+            continue
+        ids = rec.get("finding_ids")
+        if not isinstance(ids, list):
+            blocked.append(f"validation/{name}: finding_ids is malformed (not a list)")
+            continue
+        # A non-string member was previously filtered silently. That is fail-SAFE (a dropped id
+        # leaves its finding uncovered, which itself BLOCKs) — not the fail-open the reviewer
+        # described — but silence diverges from the sibling non-list guard above. Make malformed ->
+        # BLOCK uniform so a garbled record is surfaced, never quietly reinterpreted (4th-panel
+        # correctness-3).
+        if not all(isinstance(i, str) for i in ids):
+            blocked.append(f"validation/{name}: finding_ids has a non-string member — malformed")
+            continue
         cls = rec.get("classification")
         sev = rec.get("severity") or min(
             (findings[i]["severity"] for i in ids if i in findings),
@@ -319,6 +377,115 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
                  if f["severity"] not in HIGH and i not in covered]
     if untriaged:
         counts["medium_low_untriaged"] = len(untriaged)
+
+    # Output-fidelity attestation gate. A reviewer that recorded a human-facing statement as
+    # false (states_truth=false) must link it — via finding_id — to a finding in ITS OWN report
+    # (membership in this reviewer's findings, not a role-prefix match against the cross-report
+    # map) that is RESOLVED (a triage decision was made: confirmed / false_positive /
+    # accepted_risk; a merely `unresolved` record does not clear it). An unlinked, foreign,
+    # dangling, or unresolved link is unverified false output reaching release, so it BLOCKS
+    # regardless of the linked finding's severity — this is what makes the forced attestation
+    # actually gate the verdict. Fail-safe by construction: a missing/garbled/foreign link (or a
+    # malformed non-list container) blocks, never passes. finding_id and the rendered snippet are
+    # reviewer-supplied (untrusted) and are escaped before interpolation so a crafted value cannot
+    # forge markdown/HTML in the rendered verdict.
+    # Membership + resolution still do not prove the linked finding is ABOUT this statement — a
+    # reviewer could link a false statement to an unrelated, real, resolved finding of its own (2nd
+    # panel security-2). Rather than content-match the reviewer's own text (fragile, false-blocks
+    # paraphrases), the clear requires the TRUSTED operator to name this specific statement: the
+    # resolving validation record for the linked finding must echo the rendered text (whitespace-
+    # normalized) in `output_statements_confirmed`. The binding thus lives on the trusted side —
+    # the party a semi-trusted reviewer cannot forge — so a recorded falsehood cannot clear on a
+    # reviewer-chosen link alone.
+    resolved = set()
+    confirmed_by_fid = {}   # finding_id -> {operator-confirmed rendered statements, normalized}
+    for _, rec in records:
+        if not isinstance(rec, dict) or rec.get("classification") not in (
+                "confirmed", "false_positive", "accepted_risk"):
+            continue
+        rfids = rec.get("finding_ids")
+        fids = [i for i in rfids if isinstance(i, str)] if isinstance(rfids, list) else []
+        resolved.update(fids)
+        # A malformed (non-list) output_statements_confirmed yields no confirmations, so any
+        # false statement linked to this finding fails safe to BLOCK on the unconfirmed branch
+        # below — never crashes, never fail-opens (3rd-panel correctness-2/output_fidelity-1).
+        oconf = rec.get("output_statements_confirmed")
+        stmts = ({" ".join(s.split()) for s in oconf if isinstance(s, str)}
+                 if isinstance(oconf, list) else set())
+        for f in fids:
+            confirmed_by_fid.setdefault(f, set()).update(stmts)
+    false_stmts = 0
+    for role, rep in reports.items():
+        osc = rep.get("output_statements_checked")
+        if osc is None:
+            continue
+        if not isinstance(osc, list):
+            # Malformed attestation from an artifact that bypassed ingest validation.
+            # Fail safe (BLOCK) rather than crash so a verdict is still written — a truthy
+            # non-list here previously raised TypeError before verdict.json existed, the
+            # same no-crash contract the areas_not_reviewed gather already honors (2nd panel
+            # finding correctness-2).
+            blocked.append(f"reviewer '{role}' output_statements_checked is malformed "
+                           "(not a list) — output fidelity cannot be verified")
+            continue
+        # Ownership is membership in THIS reviewer's own report, not a role-prefix match
+        # against the cross-report findings map: another report can name a finding under
+        # this role's prefix, which the global map would then satisfy (2nd panel finding
+        # security-1/correctness-1 — a planted id let a false statement reach PASS).
+        rfind = rep.get("findings")
+        # The id must be a str, not merely present: an unhashable id (e.g. []) on a dict finding
+        # crashed the set comprehension with TypeError before verdict.json (4th-panel
+        # security-1/correctness-1). Mirror the str guard the top findings loop already applies.
+        own_ids = ({f["id"] for f in rfind
+                    if isinstance(f, dict) and isinstance(f.get("id"), str)}
+                   if isinstance(rfind, list) else set())
+        for it in osc:
+            if not isinstance(it, dict):
+                blocked.append(f"reviewer '{role}' has a malformed output_statements_checked item "
+                               "(not an object) — output fidelity cannot be verified")
+                continue
+            st = it.get("states_truth")
+            if not isinstance(st, bool):
+                # Not the exact boolean False vs a malformed value: a non-bool (string 'false',
+                # None, missing) must BLOCK, not be silently skipped as if it were a true statement
+                # (3rd-panel correctness-4 — malformed items were fail-open).
+                blocked.append(f"reviewer '{role}' output attestation has a non-boolean states_truth "
+                               "— malformed, cannot verify output fidelity")
+                continue
+            if st is not False:
+                continue   # a genuine true statement; nothing to gate
+            false_stmts += 1
+            rendered = it.get("rendered")
+            if not isinstance(rendered, str):
+                # No str() coercion: a non-string rendered (e.g. int 1) must not be coerced to
+                # match a confirmed "1" (3rd-panel correctness-3). Malformed -> BLOCK.
+                blocked.append(f"reviewer '{role}' recorded a false output statement with a "
+                               "non-string rendered value — malformed, cannot verify")
+                continue
+            fid = it.get("finding_id")
+            fid = fid.strip() if isinstance(fid, str) else ""
+            snip = _snippet(rendered)
+            sfid = _snippet(fid)  # untrusted — escape before interpolating into a reason
+            if not fid:
+                blocked.append(f"reviewer '{role}' recorded false human-facing output "
+                               f"(\"{snip}\") with no finding_id — a false statement must be "
+                               "raised as a finding so it enters triage")
+            elif not fid.startswith(role + "-") or fid not in own_ids:
+                blocked.append(f"reviewer '{role}' linked false output to finding '{sfid}', "
+                               "which is not a finding this reviewer raised — a false statement "
+                               "must be linked to the reviewer's own finding, not an unrelated one")
+            elif fid not in resolved:
+                blocked.append(f"false-output finding '{sfid}' (reviewer '{role}') is untriaged "
+                               "or unresolved — a reviewer-attested false statement must be "
+                               "validated (confirmed/false_positive/accepted_risk) before release")
+            elif " ".join(rendered.split()) not in confirmed_by_fid.get(fid, set()):
+                blocked.append(f"false-output finding '{sfid}' (reviewer '{role}') is resolved but no "
+                               f"validation record confirms this specific statement (\"{snip}\") in "
+                               "output_statements_confirmed — resolving an own finding does not prove "
+                               "it is about this statement; the operator must confirm it (2nd panel "
+                               "security-2)")
+    counts["false_output_statements"] = false_stmts
+
     return {"raised": len(findings),
             "triaged": sum(1 for i in findings if i in covered),
             "untriaged_release_blocking": len(flagged)}
@@ -367,6 +534,15 @@ def _oneline(s):
     when it is interpolated into the guidance. Trade-off: a legitimate reason containing <, >, or
     & renders as an entity — acceptable for a safety-first, audience-facing section."""
     return html.escape(" ".join(str(s).split()), quote=False)
+
+
+def _snippet(s, n=80):
+    """One-lined, length-capped, HTML-escaped excerpt of a reviewer-supplied string for safe
+    interpolation into a blocked reason (same injection concern as _oneline)."""
+    s = " ".join(str(s).split())
+    if len(s) > n:
+        s = s[:n - 1] + "…"
+    return html.escape(s, quote=False)
 
 
 def next_steps(verdict, fail, blocked, gcov, fcov, counts):
