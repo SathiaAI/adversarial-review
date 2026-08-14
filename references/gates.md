@@ -13,6 +13,22 @@ python <skill>/scripts/gate.py run --name <gate> [--tier-required NORMAL] -- <co
 python <skill>/scripts/gate.py record --name <gate> --exit-code <N> --summary "ran in CI: <link>"
 ```
 
+## Run gates on the project's supported runtimes
+
+Execution gates — `build`, `unit`, `integration`, `e2e`, and anything else that *runs* the
+code — must run on the project's **minimum declared runtime**, and ideally across its whole
+CI matrix, not merely whatever interpreter/toolchain you happen to have. A gate that is
+green only on a runtime newer than the project supports is a **false green**: a Python
+suite that imports `tomllib` passes locally on 3.11 but fails a project whose
+`requires-python` (and CI matrix) includes 3.9, where that stdlib module does not exist. The
+same trap catches any newer language/stdlib feature on Node, the JVM, Go, or Rust. Read the
+supported set from where the project declares it — `requires-python` / `engines` /
+`rust-version` / `go` directive / the `.github/workflows` matrix — and run the execution
+gates against at least the floor. Where a version manager is available, pin it explicitly
+(`uv run --python 3.9 …`, `nvm exec 20 …`, `rustup run 1.74 …`) and **record which
+runtime(s) the gate ran on in the summary**, so a single-version pass is never mistaken for
+matrix-wide coverage.
+
 ## Gate matrix
 
 | Gate name | Tier | What / typical command |
