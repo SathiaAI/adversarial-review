@@ -1190,11 +1190,11 @@ def t_gitleaks_baseline_allowlist_anchored():
     # 6th-panel correctness-3 / test_quality-5 + 7th-panel test_quality-3: EVERY gitleaks path
     # allowlist entry must be anchored to the repository root (^...$) so a nested file named
     # `.secrets.baseline` is NOT silently exempted. The prior test only inspected the FIRST
-    # triple-quoted pattern, so a later-added unanchored entry could slip through; parse the TOML
-    # and check the whole allowlist.paths list instead.
-    import tomllib
-    cfg = tomllib.loads((SKILL / ".gitleaks.toml").read_text())
-    paths = cfg.get("allowlist", {}).get("paths", [])
+    # triple-quoted pattern (pats[0]); check the WHOLE list. Stdlib-only on purpose — the CI matrix
+    # includes Python 3.9, where tomllib (3.11+) is unavailable, so parse the triple-quoted path
+    # patterns directly rather than importing tomllib.
+    cfg = (SKILL / ".gitleaks.toml").read_text()
+    paths = re.findall(r"'''(.*?)'''", cfg)  # all triple-quoted allowlist path patterns
     assert paths, "no allowlist path patterns found in .gitleaks.toml"
     for pat in paths:
         assert pat.startswith("^") and pat.endswith("$"), \
