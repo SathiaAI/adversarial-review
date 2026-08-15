@@ -18,7 +18,7 @@ python <skill>/scripts/gate.py record --name <gate> --exit-code <N> --summary "r
 Execution gates — `build`, `unit`, `integration`, `e2e`, and anything else that *runs* the
 code — must run on the project's **minimum declared runtime**, and ideally across its whole
 CI matrix, not merely whatever interpreter/toolchain you happen to have. A gate that is
-green only on a runtime newer than the project supports is a **false green**: a Python
+green only on a runtime newer than the project's minimum declared runtime is a **false green**: a Python
 suite that imports `tomllib` passes locally on 3.11 but fails a project whose
 `requires-python` (and CI matrix) includes 3.9, where that stdlib module does not exist. The
 same trap catches any newer language/stdlib feature on Node, the JVM, Go, or Rust. Read the
