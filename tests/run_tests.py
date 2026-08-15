@@ -1942,6 +1942,11 @@ def t_mcp_discover_advertises_versions():
     # new in this revision and version-agnostic, so it is served in both eras (per docstring).
     leg = mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})["result"]
     assert "2026-07-28" in leg["supportedVersions"] and leg["resultType"] == "complete", leg
+    # ...and a modern discovery declaring an UNSUPPORTED version is still answered with a
+    # complete DiscoverResult advertising the supported set (discovery bypasses version
+    # validation by design, so a stale client can always learn what to negotiate to).
+    uns = _modern_req("server/discover", version="1900-01-01", caps=False)["result"]
+    assert uns["resultType"] == "complete" and "2026-07-28" in uns["supportedVersions"], uns
 
 
 def t_mcp_modern_tools_list_is_cacheable():
