@@ -25,9 +25,12 @@ Design (deliberate, matching this repo's identity):
   * Dual-era protocol. It answers both the legacy `initialize` handshake (revisions
     through 2025-06-18) and the stateless MCP 2026-07-28 revision, in which each request
     carries its own protocol version in `_meta` and is negotiated independently — no
-    session. Legacy responses stay byte-for-byte identical; modern requests additionally
-    get `server/discover`, per-request version negotiation, and the spec-required
-    `resultType` and cache metadata.
+    session. Responses to the pre-existing legacy methods (`initialize`, `tools/list`,
+    `tools/call`, `ping`) stay byte-for-byte identical; modern requests additionally get
+    per-request version negotiation and the spec-required `resultType` and cache metadata.
+    `server/discover` is new in this revision and is answered in both eras — it is
+    version-agnostic (the bootstrap probe by which a client learns the supported set), so
+    it is deliberately not gated by per-request version validation.
 
 Operates on the .adversarial-review/ directory in the server's working directory,
 so launch it with the repository under review as the current directory.
