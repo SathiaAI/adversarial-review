@@ -125,6 +125,31 @@ missing tier entry simply means "not provided" and resolution falls through to t
 next source. Tier floors from `references/gates.md` are always unioned in regardless
 of source — a policy file can add gates, never remove floors.
 
+## Model capability profiles
+
+Some model quirks the live catalog can't express — a model that *rejects* `temperature`, one
+with *mandatory* reasoning that needs a larger completion budget, or a slow tier — can be
+declared per model. A profile has: `temperature` (`supported`/`forbidden`/`default`),
+`structured_outputs` (bool), `reasoning` (`none`/`optional`/`mandatory`), `max_tokens_floor`
+(positive int or null), `latency_class` (`fast`/`slow`/null), and `notes`.
+
+Defaults are derived from the catalog's `supported_parameters`. Override them in an optional
+`.adversarial-review.capabilities.yml` (or `.json`) at the repo root, keyed by model slug,
+and/or via `AR_CAP_OVERRIDES=<path>`. Precedence is **catalog < file < env** (env wins per
+key). The file uses the same strict YAML subset as the policy file; unknown keys or bad
+values fail loudly.
+
+```yaml
+# .adversarial-review.capabilities.yml
+openai/gpt-5.6-luna-pro:
+  temperature: forbidden        # this model rejects the temperature parameter
+qwen/qwen3.8-2.4t-a95b:
+  reasoning: mandatory
+  max_tokens_floor: 32000       # reasoning models need headroom before they emit JSON
+```
+
+Profiles are resolved and recorded here; request-building consumes them in a later change.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -144,6 +169,7 @@ of source — a policy file can add gates, never remove floors.
 | `AR_REQUIRE` | — | Comma list of gates for `plan` (below `--require`, above policy) |
 | `AR_PINS` | — | Comma list `role=model-slug` to pin specific models |
 | `AR_REBUTTAL` | `contention` | Rebuttal policy at init: `critical`, `contention`, `any` |
+| `AR_CAP_OVERRIDES` | — | Path to a capability-overrides file (see *Model capability profiles*) |
 
 An empty env var counts as unset. Note one precedence fix shipped with the policy
 feature: `--pin` now beats `AR_PINS` for the same role (previously the env var

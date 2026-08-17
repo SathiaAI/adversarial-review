@@ -353,3 +353,134 @@ def resolve_setting(cli_value, env_var, pol, key, default=None):
     if default is not None:
         return default, "default"
     return None, "unset"
+
+
+# --- Model capability profiles (E0-S2) ---------------------------------------------
+# A per-model profile governs how a request is shaped. Catalog-derived defaults (from
+# `supported_parameters`) merge with an optional repo file
+# `.adversarial-review.capabilities.yml`/`.json` and an `AR_CAP_OVERRIDES` env path, so
+# quirks the catalog can't express (temperature-forbidden, mandatory reasoning, a
+# min-token floor) are declared once and recorded. Precedence: catalog < file < env.
+# NOTE: this only resolves the profile; wiring it into request-building is a later story.
+CAP_BASENAMES = (".adversarial-review.capabilities.yml", ".adversarial-review.capabilities.json")
+CAP_KEYS = ("temperature", "structured_outputs", "reasoning", "max_tokens_floor",
+            "latency_class", "notes")
+CAP_ENUMS = {"temperature": ("supported", "forbidden", "default"),
+             "reasoning": ("none", "optional", "mandatory"),
+             "latency_class": ("fast", "slow")}
+
+
+def capability_defaults(catalog_entry):
+    """Per-model capability profile derived from the live catalog entry alone."""
+    sp = (catalog_entry or {}).get("supported_parameters") or []
+    return {"temperature": "supported" if "temperature" in sp else "default",
+            "structured_outputs": "structured_outputs" in sp,
+            "reasoning": "none", "max_tokens_floor": None,
+            "latency_class": None, "notes": ""}
+
+
+def _cap_bool(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+        return v.strip().lower() == "true"
+    return None
+
+
+def _cap_pos_int(v):
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v if v > 0 else None
+    if isinstance(v, str) and v.strip().isdigit():
+        n = int(v.strip())
+        return n if n > 0 else None
+    return None
+
+
+def _validate_cap_block(slug, block, name):
+    if not isinstance(block, dict):
+        die(f"{name}: capabilities['{slug}'] must be a mapping of capability settings")
+    unknown = sorted(set(block) - set(CAP_KEYS))
+    if unknown:
+        die(f"{name}: capabilities['{slug}'] has unknown keys {unknown} "
+            f"(allowed: {', '.join(CAP_KEYS)})")
+    out = {}
+    for k, allowed in CAP_ENUMS.items():
+        if k in block:
+            v = block[k]
+            # latency_class is nullable (its catalog default is None); an explicit
+            # null resets it rather than tripping the enum check below.
+            if k == "latency_class" and v in (None, "", "null"):
+                out[k] = None
+                continue
+            if v not in allowed:
+                die(f"{name}: capabilities['{slug}'].{k}={v!r} not in {list(allowed)}")
+            out[k] = v
+    if "structured_outputs" in block:
+        b = _cap_bool(block["structured_outputs"])
+        if b is None:
+            die(f"{name}: capabilities['{slug}'].structured_outputs must be true/false")
+        out["structured_outputs"] = b
+    if "max_tokens_floor" in block:
+        # An explicit null resets the floor (its catalog default is None); any other
+        # value must be a positive integer.
+        if block["max_tokens_floor"] in (None, "", "null"):
+            out["max_tokens_floor"] = None
+        else:
+            n = _cap_pos_int(block["max_tokens_floor"])
+            if n is None:
+                die(f"{name}: capabilities['{slug}'].max_tokens_floor must be a positive integer")
+            out["max_tokens_floor"] = n
+    if "notes" in block:
+        out["notes"] = str(block["notes"])
+    return out
+
+
+def _load_cap_file(path):
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    if p.suffix == ".json":
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            die(f"{p.name}: invalid JSON: {e}")
+    else:
+        data = _parse_policy_yaml(text, p.name)
+    if not isinstance(data, dict):
+        die(f"{p.name}: top level must be a mapping of model-slug -> capability settings")
+    out = {}
+    for slug, block in data.items():
+        if not isinstance(slug, str) or "/" not in slug:
+            die(f"{p.name}: capability key must be a provider/model-slug, got {slug!r}")
+        out[slug] = _validate_cap_block(slug, block, p.name)
+    return out
+
+
+def load_capabilities(root=None):
+    """Merged capability overrides {model_slug: {...}} from the repo file and the
+    AR_CAP_OVERRIDES env path (env wins per key). Empty dict when neither is present.
+    Malformed input dies loudly, exactly like the policy loader."""
+    root = Path(root) if root else Path.cwd()
+    found = [root / n for n in CAP_BASENAMES if (root / n).is_file()]
+    if len(found) > 1:
+        die(f"both {' and '.join(CAP_BASENAMES)} exist — keep exactly one")
+    overrides = _load_cap_file(found[0]) if found else {}
+    env_path = os.environ.get("AR_CAP_OVERRIDES", "")
+    if env_path:
+        if not Path(env_path).is_file():
+            die(f"AR_CAP_OVERRIDES points to a missing file: {env_path}")
+        for slug, block in _load_cap_file(env_path).items():
+            overrides.setdefault(slug, {}).update(block)  # env wins per key
+    return overrides
+
+
+def capability_of(model_slug, catalog_entry, overrides=None):
+    """Effective profile for a model: catalog defaults with file/env overrides applied.
+    Returns (profile, source) where source is 'catalog' (no override) or 'override'."""
+    prof = capability_defaults(catalog_entry)
+    ov = (overrides or {}).get(model_slug)
+    if not ov:
+        return prof, "catalog"
+    prof.update(ov)
+    return prof, "override"
