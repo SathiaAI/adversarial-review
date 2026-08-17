@@ -326,7 +326,9 @@ written to the job summary:
     openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
 ```
 
-Starter workflow: [`examples/adversarial-review.yml`](examples/adversarial-review.yml).
+Starter workflow: [`examples/adversarial-review.yml`](examples/adversarial-review.yml). On
+GitLab, use [`examples/.gitlab-ci.yml`](examples/.gitlab-ci.yml) — same gate-recording and
+machine-computed verdict.
 Without a key the panel is skipped and the verdict is BLOCKED for missing
 panel coverage — the honest verdict for an un-reviewed change, downgradable
 to a warning via `fail-on: fail` while wiring up. High/critical findings

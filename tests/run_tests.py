@@ -2196,6 +2196,73 @@ def t_mock_router_reset():
     assert mock_router.STATE["response_provider"] is None
 
 
+def t_pyproject_metadata_complete():
+    # PyPI-listing metadata must stay present (E2-S2). Pure offline file read.
+    pp = (SKILL / "pyproject.toml").read_text(encoding="utf-8")
+    for key in ("name =", "version =", "description =", "readme =", "license =",
+                "requires-python =", "keywords =", "classifiers =", "[project.urls]",
+                "[project.scripts]", "Changelog ="):
+        assert key in pp, f"pyproject.toml missing {key!r}"
+
+
+def _workflow_job_block(wf_text, job):
+    # Return the lines of one job under `jobs:` (the `  <job>:` line and everything indented
+    # beneath it), with full-line comments dropped. The suite is stdlib-only, so this is a small
+    # indentation scanner rather than a YAML import — enough to assert that a setting lives in a
+    # specific job, not merely somewhere in the file or inside a comment.
+    lines = wf_text.splitlines()
+    in_jobs = capturing = False
+    out = []
+    for ln in lines:
+        stripped = ln.strip()
+        indent = len(ln) - len(ln.lstrip(" "))
+        if not in_jobs:
+            if stripped == "jobs:" and indent == 0:
+                in_jobs = True
+            continue
+        if not capturing:
+            if indent == 2 and stripped == f"{job}:":
+                capturing = True
+            continue
+        # Stop at the next sibling job (indent 2, "name:") or a new top-level key (indent 0).
+        if stripped and not stripped.startswith("#"):
+            if indent == 0:
+                break
+            if indent == 2 and stripped.endswith(":") and not stripped.startswith("-"):
+                break
+        out.append(ln)
+    return [ln for ln in out if not ln.strip().startswith("#")]
+
+
+def t_release_workflow_uses_trusted_publishing():
+    # The release workflow must publish on v* tags via OIDC Trusted Publishing with NO stored
+    # token, and the OIDC permission + pypi environment + publish step must live in the publish
+    # JOB — not merely somewhere in the file or in a comment. Substring-only checks would pass if
+    # a token were moved into a comment or an unrelated job, so this parses per-job structure and
+    # also guards the version==tag gate and the 3.9 wheel smoke (E2-S2).
+    wf = (SKILL / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    assert re.search(r'(?m)^\s*tags:\s*\[\s*"v\*"\s*\]', wf), "release.yml must trigger on v* tags"
+    assert "PYPI_API_TOKEN" not in wf and re.search(r'(?m)^\s*password:\s*\S', wf) is None, \
+        "no stored PyPI token — Trusted Publishing only"
+
+    publish = "\n".join(_workflow_job_block(wf, "publish"))
+    assert publish, "release.yml has no publish job"
+    assert re.search(r'(?m)^\s*environment:\s*pypi\b', publish), \
+        "publish job must run in the protected 'pypi' environment"
+    assert re.search(r'(?m)^\s*id-token:\s*write\b', publish), \
+        "publish job must request job-scoped id-token: write (OIDC)"
+    assert "pypa/gh-action-pypi-publish" in publish, "publish job must use the PyPA publish action"
+
+    build = "\n".join(_workflow_job_block(wf, "build"))
+    assert "GITHUB_REF_NAME" in build and "does not match the pushed tag" in build, \
+        "build job must fail when the built version disagrees with the pushed tag"
+
+    smoke = "\n".join(_workflow_job_block(wf, "smoke"))
+    assert '"3.9"' in smoke, "smoke job must exercise the installed wheel on the declared 3.9 floor"
+    assert "ar-mcp" in smoke and "--help" in smoke, \
+        "smoke job must run the console entry points, not just test their executable bit"
+
+
 def t_version_matches_changelog():
     # The pyproject version must equal the NEWEST released CHANGELOG heading, and
     # `## [Unreleased]` must sit above every release heading — guards the release ritual

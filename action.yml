@@ -155,8 +155,11 @@ runs:
         AR_SCRIPTS: ${{ github.action_path }}/scripts
       run: |
         set -uo pipefail
-        python "$AR_SCRIPTS/aggregate.py"
-        code=$?
+        # GitHub runs composite steps with bash -e; capture aggregate.py's exit code
+        # explicitly (|| code=$?) so a FAIL/BLOCKED verdict maps through fail-on and writes
+        # the step summary below, instead of aborting this step at the aggregate call.
+        code=0
+        python "$AR_SCRIPTS/aggregate.py" || code=$?
         case "$code" in
           0) verdict=PASS ;;
           1) verdict=FAIL ;;

@@ -1,0 +1,113 @@
+# GitLab CI template for adversarial-review — the same gate-recording + machine-computed
+# verdict as the GitHub Action, on GitLab. Copy into your repo's .gitlab-ci.yml (or `include:` it).
+# The job result is aggregate.py's verdict: exit 0 PASS / 1 FAIL / 2 BLOCKED.
+#
+# Configure these as CI/CD variables (Settings → CI/CD → Variables):
+#   OPENROUTER_API_KEY   masked — runs the independent reviewer panel. Without it the verdict
+#                        is BLOCKED (no panel coverage), the honest result for an un-reviewed change.
+#   AR_UNIT_CMD          your test command, e.g. "python -m pytest -q". A floor gate with no
+#   AR_SECRETS_CMD       command is recorded BLOCKED (unknown is not pass), so this template can
+#   AR_DEPS_CMD          never fabricate a PASS. Suggested tools: gitleaks (secrets),
+#   AR_SAST_CMD          osv-scanner (deps), opengrep/semgrep (sast). AR_BUILD_CMD defaults to a
+#                        Python compile check — override it for your stack.
+#   AR_RISK,             OPTIONAL. Leave unset so your .adversarial-review.yml policy resolves the
+#   AR_DEV_PROVIDERS     risk tier and developer families. Setting them here overrides consumer
+#                        policy and can weaken privacy routing and reviewer independence — only do
+#                        so deliberately. dev_providers must list every family that wrote/advised
+#                        the change, or the panel is not independent.
+#   AR_REF               the adversarial-review version to run. PIN to a tag or immutable commit
+#                        SHA (defaults to the v0.1.0 release); never a moving branch, so a future
+#                        upstream commit cannot execute against your checkout and OPENROUTER_API_KEY.
+#
+# For incremental adoption, treat BLOCKED as a warning by uncommenting `allow_failure` below.
+adversarial-review:
+  image: python:3.12-slim
+  variables:
+    GIT_DEPTH: "0"                                        # the panel reviews a real git range
+    AR_REF: "v0.1.0"                                      # PINNED — do not track a moving branch
+    AR_BUILD_CMD: "python -m py_compile $(git ls-files '*.py')"
+    AR_UNIT_CMD: ""                                       # e.g. "python -m pytest -q"
+    AR_SECRETS_CMD: ""                                    # e.g. "gitleaks detect --no-banner"
+    AR_DEPS_CMD: ""                                       # e.g. "osv-scanner scan ."
+    AR_SAST_CMD: ""                                       # e.g. "opengrep scan --config auto ."
+  # Only run where there is a real change to review. On the default branch HEAD and
+  # origin/DEFAULT are the same commit, so that range is empty — skip it rather than
+  # produce review evidence for no change.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      variables:
+        AR_DIFF: "$CI_MERGE_REQUEST_DIFF_BASE_SHA...HEAD"
+    - if: '$CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+      variables:
+        AR_DIFF: "origin/$CI_DEFAULT_BRANCH...HEAD"
+    - when: never
+  # allow_failure:                 # incremental adoption: make BLOCKED a warning, still fail on FAIL
+  #   exit_codes: 2
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git >/dev/null
+    - git fetch --no-tags -q origin "$CI_DEFAULT_BRANCH" || true   # make the diff base available
+    - git clone --depth 1 --branch "$AR_REF" https://github.com/SathiaAI/adversarial-review /tmp/ar
+  script:
+    # Risk tier and developer families resolve from your .adversarial-review.yml (or AR_RISK /
+    # AR_DEV_PROVIDERS) — not hardcoded here, so consumer policy stays authoritative.
+    - python /tmp/ar/scripts/panel.py init --diff-ref "$AR_DIFF"
+    - python /tmp/ar/scripts/gate.py plan --require build,unit,secrets,deps,sast
+    - |
+      # Deterministic floor gates. A failing command is RECORDED, not fatal (|| true) — the
+      # aggregator owns the verdict, and hiding a failure would defeat the pipeline. A gate with
+      # no configured command is recorded BLOCKED so the job can never fabricate a PASS.
+      run_gate() {  # $1 = gate name, $2 = command ("" -> BLOCKED, needs configuration)
+        if [ -n "$2" ]; then
+          python /tmp/ar/scripts/gate.py run --name "$1" -- sh -c "$2" || true
+        else
+          python /tmp/ar/scripts/gate.py record --name "$1" --status BLOCKED \
+            --summary "gate '$1' has no command configured — set AR_$(echo "$1" | tr a-z A-Z)_CMD"
+        fi
+      }
+      run_gate build "$AR_BUILD_CMD"
+      run_gate unit  "$AR_UNIT_CMD"
+      run_gate deps  "$AR_DEPS_CMD"
+      run_gate sast  "$AR_SAST_CMD"
+      # secrets is a floor gate AND the guard for reviewer transmission (below).
+      if [ -n "$AR_SECRETS_CMD" ]; then
+        python /tmp/ar/scripts/gate.py run --name secrets -- sh -c "$AR_SECRETS_CMD" && SECRETS_OK=1 || SECRETS_OK=0
+      else
+        python /tmp/ar/scripts/gate.py record --name secrets --status BLOCKED \
+          --summary "no secrets scan configured — set AR_SECRETS_CMD (e.g. gitleaks detect)"
+        SECRETS_OK=0
+      fi
+      # Independent panel: only with a key, and only after a CLEAN secrets scan, so a freshly
+      # committed credential in the diff is never transmitted to remote reviewers.
+      if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+        if [ "${SECRETS_OK:-0}" != "1" ]; then
+          echo "adversarial-review: skipping panel — set AR_SECRETS_CMD and ensure it passes before sending the diff to reviewers" >&2
+        else
+          # Assemble the context the skill expects: requirements + invariants, the diff, and the
+          # surrounding code reviewers need. A diff-only review misses broken invariants in
+          # unchanged callers — fill in the TODOs so review coverage is not overstated.
+          {
+            echo "# Change under review (CI)"; echo
+            echo "## Requirements, acceptance criteria, and invariants"
+            echo "TODO: state the intended behavior and the invariants that must remain true."; echo
+            echo "## Diff"; echo '```diff'; git diff "$AR_DIFF"; echo '```'; echo
+            echo "## Full contents of changed files (surrounding code the diff depends on)"
+            for f in $(git diff --name-only "$AR_DIFF"); do
+              [ -f "$f" ] || continue
+              echo; echo "### $f"; echo '```'; cat "$f"; echo '```'
+            done
+            echo
+            echo "TODO: also include unchanged callers, schemas, permission wiring, and rendered"
+            echo "samples of any human-facing text this change affects."
+          } > /tmp/ctx.md
+          python /tmp/ar/scripts/panel.py assign
+          python /tmp/ar/scripts/panel.py run --context-file /tmp/ctx.md
+        fi
+      fi
+    # aggregate.py is the LAST command, so its exit code (0 PASS / 1 FAIL / 2 BLOCKED) is the
+    # job result — reached even when a gate above failed, because those were recorded, not fatal.
+    - python /tmp/ar/scripts/aggregate.py
+  artifacts:
+    when: always                 # keep the evidence even on FAIL/BLOCKED, where it matters most
+    paths:
+      - .adversarial-review/     # gate records, reviewer reports, verdict.json + attestation
+    expire_in: 30 days
