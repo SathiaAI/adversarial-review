@@ -35,7 +35,11 @@ CATALOG = {"data": [
     {"id": "openrouter/auto", "created": 999, "context_length": 100},
 ]}
 
-STATE = {"fail_models": set(), "malformed_once": set(), "calls": {}, "concur_agrees": True}
+STATE = {"fail_models": set(), "malformed_once": set(), "calls": {}, "concur_agrees": True,
+         # Optional hook: Callable[[dict], dict|None]. Called per chat/completions request with
+         # {kind, role, model, request_body}; a non-None return replaces the default content.
+         # Lets suites inject per-scenario reviewer responses without forking the handler (E0-S1).
+         "response_provider": None}
 
 
 def _report(role, model):
@@ -88,18 +92,29 @@ class Handler(BaseHTTPRequestHandler):
 
         text = json.dumps(body["messages"])
         if "rebuttal round" in text:
+            kind, role = "rebuttal", re.search(r"the (\w+) reviewer", text).group(1)
+        elif "arbiter" in text:
+            kind, role = "concur", None
+        else:
+            kind, role = "report", re.search(r"Your role: (\w+)", text).group(1)
+
+        override = None
+        if STATE.get("response_provider"):
+            override = STATE["response_provider"](
+                {"kind": kind, "role": role, "model": model, "request_body": body})
+        if override is not None:
+            content = override
+        elif kind == "rebuttal":
             user = json.loads(body["messages"][-1]["content"])
-            content = {"role": re.search(r"the (\w+) reviewer", text).group(1),
-                       "model_id": model,
+            content = {"role": role, "model_id": model,
                        "responses": [{"finding_id": f["id"], "position": "corroborate",
                                       "evidence": "reproduced the cross-tenant read"}
                                      for f in user["findings_to_contest"]]}
-        elif "arbiter" in text:
+        elif kind == "concur":
             content = {"agrees_false_positive": STATE["concur_agrees"],
                        "reasoning": "evidence conclusive" if STATE["concur_agrees"]
                        else "evidence does not refute the finding"}
         else:
-            role = re.search(r"Your role: (\w+)", text).group(1)
             content = _report(role, model)
 
         if model in STATE["malformed_once"] and STATE["calls"][model] == 1:
@@ -116,3 +131,12 @@ def start(port=8811):
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     return srv
+
+
+def reset():
+    """Reset mutable STATE between tests — fault injections and the response provider."""
+    STATE["fail_models"] = set()
+    STATE["malformed_once"] = set()
+    STATE["calls"] = {}
+    STATE["concur_agrees"] = True
+    STATE["response_provider"] = None

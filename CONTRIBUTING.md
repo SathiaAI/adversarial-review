@@ -49,6 +49,18 @@ the verdict computed by `aggregate.py`. You can see what that looks like in prac
 seven findings against the fix and six forced changes. Expect your PR to be reviewed by
 models that have no stake in being nice to it. Docs-only changes go through CI alone.
 
+## Cutting a release
+
+Releases are tags; PyPI publishes from them via Trusted Publishing (no stored token).
+
+1. Ensure `main` is green and the change is merged.
+2. Bump `version` in `pyproject.toml` (SemVer).
+3. In `CHANGELOG.md`, rename the `## [Unreleased]` section to `## [X.Y.Z]`, add a fresh
+   empty `## [Unreleased]`, and update the compare/link footer.
+4. Confirm `t_version_matches_changelog` passes (the `pyproject` version must have a matching
+   `## [X.Y.Z]` heading in the changelog).
+5. Tag `vX.Y.Z` and push the tag; the release workflow builds and publishes to PyPI.
+
 ## Commit and PR style
 
 - Small, focused PRs merge fastest. One concern per PR.

@@ -2093,6 +2093,149 @@ def t_mcp_notification_never_answered_for_any_method():
         os.chdir(cwd0)
 
 
+def t_capability_defaults_from_catalog():
+    # Catalog `supported_parameters` alone yields the default profile (E0-S2).
+    from _common import capability_defaults, capability_of
+    d = capability_defaults({"id": "x/y", "supported_parameters": ["structured_outputs", "temperature"]})
+    assert d["structured_outputs"] is True and d["temperature"] == "supported"
+    e2 = {"id": "z/w", "supported_parameters": ["structured_outputs"]}
+    d2 = capability_defaults(e2)
+    assert d2["structured_outputs"] is True and d2["temperature"] == "default" and d2["reasoning"] == "none"
+    prof, src = capability_of("z/w", e2, {})
+    assert src == "catalog" and prof["max_tokens_floor"] is None
+
+
+def t_capability_profile_precedence():
+    # catalog < file < env, with env winning per key; numeric fields coerce from strings (E0-S2).
+    from _common import load_capabilities, capability_of
+    repo = Path(tempfile.mkdtemp(prefix="ar-cap-"))
+    (repo / ".adversarial-review.capabilities.yml").write_text(
+        "openai/gpt-5.6-luna-pro:\n  temperature: forbidden\n"
+        "qwen/qwen3.8-max:\n  reasoning: mandatory\n  max_tokens_floor: 16000\n")
+    envf = repo / "env-caps.json"
+    envf.write_text(json.dumps({"openai/gpt-5.6-luna-pro": {"latency_class": "slow"}}))
+    old = os.environ.get("AR_CAP_OVERRIDES")
+    os.environ["AR_CAP_OVERRIDES"] = str(envf)
+    try:
+        ov = load_capabilities(repo)
+    finally:
+        if old is None:
+            os.environ.pop("AR_CAP_OVERRIDES", None)
+        else:
+            os.environ["AR_CAP_OVERRIDES"] = old
+    assert ov["openai/gpt-5.6-luna-pro"]["temperature"] == "forbidden"   # from file
+    assert ov["openai/gpt-5.6-luna-pro"]["latency_class"] == "slow"      # from env, merged in
+    assert ov["qwen/qwen3.8-max"]["reasoning"] == "mandatory"
+    assert ov["qwen/qwen3.8-max"]["max_tokens_floor"] == 16000           # coerced str -> int
+    cat = {"id": "openai/gpt-5.6-luna-pro", "supported_parameters": ["structured_outputs"]}
+    prof, src = capability_of("openai/gpt-5.6-luna-pro", cat, ov)
+    assert src == "override" and prof["temperature"] == "forbidden" and prof["structured_outputs"] is True
+
+
+def t_capability_profile_malformed_rejected():
+    # Unknown key and bad enum both die loudly (exit 1), like the policy loader (E0-S2).
+    from _common import load_capabilities
+    repo = Path(tempfile.mkdtemp(prefix="ar-cap-"))
+    f = repo / ".adversarial-review.capabilities.yml"
+    f.write_text("x/y:\n  bogus: 1\n")
+    try:
+        load_capabilities(repo)
+        assert False, "unknown key should have died"
+    except SystemExit as e:
+        assert e.code == 1
+    f.write_text("x/y:\n  temperature: hot\n")
+    try:
+        load_capabilities(repo)
+        assert False, "bad enum should have died"
+    except SystemExit as e:
+        assert e.code == 1
+
+
+def t_mock_router_response_provider_override():
+    # A response_provider override is served in place of the default canned report and flows
+    # through panel run + ingest (E0-S1); default behavior is preserved when it returns None.
+    mock_router.reset()
+    sentinel = "SENTINEL-OVERRIDE-9f3c"
+
+    def provider(meta):
+        if meta["kind"] == "report" and meta["role"] == "security":
+            rep = mock_router._report("security", meta["model"])
+            rep["summary"] = sentinel
+            return rep
+        return None
+
+    mock_router.STATE["response_provider"] = provider
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo)
+        run = latest_run(repo)
+        assert read(run / "panel" / "security.json")["summary"] == sentinel
+        # a non-overridden role still gets the default canned report
+        assert read(run / "panel" / "correctness.json")["summary"] != sentinel
+    finally:
+        mock_router.reset()
+
+
+def t_mock_router_reset():
+    # reset() restores STATE to defaults, including clearing the response provider (E0-S1).
+    mock_router.STATE["fail_models"].add("x/y")
+    mock_router.STATE["calls"]["z"] = 3
+    mock_router.STATE["concur_agrees"] = False
+    mock_router.STATE["response_provider"] = lambda meta: None
+    mock_router.reset()
+    assert mock_router.STATE["fail_models"] == set()
+    assert mock_router.STATE["calls"] == {}
+    assert mock_router.STATE["concur_agrees"] is True
+    assert mock_router.STATE["response_provider"] is None
+
+
+def t_version_matches_changelog():
+    # The pyproject version and the newest released CHANGELOG heading must agree, and an
+    # `## [Unreleased]` section must exist — guards the release ritual (E0-S3).
+    pyproj = (SKILL / "pyproject.toml").read_text(encoding="utf-8")
+    m = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"', pyproj)
+    assert m, "no version in pyproject.toml"
+    version = m.group(1)
+    changelog = (SKILL / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "## [Unreleased]" in changelog, "CHANGELOG missing ## [Unreleased]"
+    assert f"## [{version}]" in changelog, f"CHANGELOG has no section for pyproject version {version}"
+
+
+def t_docs_gate_matrix_matches_code():
+    # Every floor gate in gate.py's MINIMUM_GATES must be documented in references/gates.md at
+    # a tier that includes the run tier — guards code/doc drift (E5-S3). Doc-vs-code, not doc-vs-doc.
+    import gate as _gate
+    gates_md = (SKILL / "references" / "gates.md").read_text(encoding="utf-8")
+    documented = {mo.group(1): mo.group(2)
+                  for mo in re.finditer(r'(?m)^\|\s*`([a-z0-9_-]+)`\s*\|\s*([^|]+?)\s*\|', gates_md)}
+
+    def tiers_for(cell):
+        t = cell.upper()
+        if t.startswith("ALL"):
+            return {"NORMAL", "SENSITIVE", "CRITICAL"}
+        if "SENSITIVE+" in t:
+            return {"SENSITIVE", "CRITICAL"}
+        if "CRITICAL" in t:
+            return {"CRITICAL"}
+        return set()
+
+    for tier, gates in _gate.MINIMUM_GATES.items():
+        for g in gates:
+            assert g in documented, f"gate '{g}' (MINIMUM_GATES[{tier}]) is not in the gates.md matrix"
+            covered = tiers_for(documented[g])
+            assert tier in covered, (f"gate '{g}' documented as '{documented[g].strip()}' in gates.md "
+                                     f"does not cover run tier {tier}")
+
+
+def t_docs_no_hardcoded_scenario_counts():
+    # The README must not hardcode a test-scenario count — it drifts (see the de-hardcode history).
+    readme = (SKILL / "README.md").read_text(encoding="utf-8")
+    m = re.search(r"\b\d+\s+(?:end-to-end\s+)?scenarios\b", readme)
+    assert not m, f"README hardcodes a scenario count: {m.group(0)!r} — describe it without a number"
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
