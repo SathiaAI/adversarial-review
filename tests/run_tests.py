@@ -1938,6 +1938,15 @@ def t_mcp_discover_advertises_versions():
     assert res["cacheScope"] in ("public", "private"), res
     # discovery answers even without client capabilities — it is the bootstrap probe
     assert "2026-07-28" in _modern_req("server/discover", caps=False)["result"]["supportedVersions"]
+    # ...and it is answered on the LEGACY path too (no _meta at all): server/discover is
+    # new in this revision and version-agnostic, so it is served in both eras (per docstring).
+    leg = mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})["result"]
+    assert "2026-07-28" in leg["supportedVersions"] and leg["resultType"] == "complete", leg
+    # ...and a modern discovery declaring an UNSUPPORTED version is still answered with a
+    # complete DiscoverResult advertising the supported set (discovery bypasses version
+    # validation by design, so a stale client can always learn what to negotiate to).
+    uns = _modern_req("server/discover", version="1900-01-01", caps=False)["result"]
+    assert uns["resultType"] == "complete" and "2026-07-28" in uns["supportedVersions"], uns
 
 
 def t_mcp_modern_tools_list_is_cacheable():
@@ -2035,6 +2044,53 @@ def t_mcp_initialize_notification_not_answered():
                           "params": {"protocolVersion": "2025-06-18"}}) is None
     assert mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                           "params": {"protocolVersion": "2025-06-18"}})["result"]["protocolVersion"] == "2025-06-18"
+
+
+def t_mcp_modern_invalid_tools_call_rejected_before_side_effects():
+    # A modern tools/call for a state-changing tool (ar_init) must be rejected by protocol
+    # validation BEFORE the handler runs — neither an unsupported version nor missing
+    # clientCapabilities may create a run on disk. The existing t_mcp_modern_*_rejected tests
+    # only exercise the non-side-effecting tools/list, so this pins validate-before-dispatch.
+    repo = fresh_repo()
+    cwd0 = os.getcwd()
+    try:
+        os.chdir(repo)
+        call = {"name": "ar_init", "arguments": {"risk": "NORMAL", "dev_providers": ["anthropic"]}}
+        assert _modern_req("tools/call", call, version="1900-01-01")["error"]["code"] == -32022
+        assert _modern_req("tools/call", call, caps=False)["error"]["code"] == -32602
+        # the handler never ran: no run directory was created
+        assert list((repo / ".adversarial-review").glob("run-*")) == []
+    finally:
+        os.chdir(cwd0)
+
+
+def t_mcp_notification_never_answered_for_any_method():
+    # A JSON-RPC notification (no id) is never answered for ANY method — the check sits at the
+    # top of handle(), ahead of method dispatch — so a side-effecting tools/call notification
+    # must return nothing AND not execute its handler. Existing coverage is initialize-only;
+    # this guards against the notification check being moved below method handling.
+    for method in ("tools/list", "server/discover", "ping", "nonexistent/method"):
+        assert mcpsrv.handle({"jsonrpc": "2.0", "method": method, "params": {}}) is None, method
+    # ...and MODERN-shaped notifications (protocol _meta present) are equally unanswered, even
+    # when the declared version is unsupported or clientCapabilities is missing — the
+    # top-of-dispatch check must win over the modern -32022/-32602 validation, not the reverse.
+    _mbad = {"io.modelcontextprotocol/protocolVersion": "1900-01-01"}
+    _mnocaps = {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}
+    for meta in (_mbad, _mnocaps):
+        assert mcpsrv.handle({"jsonrpc": "2.0", "method": "tools/list", "params": {"_meta": meta}}) is None, meta
+    repo = fresh_repo()
+    cwd0 = os.getcwd()
+    try:
+        os.chdir(repo)
+        args = {"name": "ar_init", "arguments": {"risk": "NORMAL", "dev_providers": ["anthropic"]}}
+        # a legacy-shaped AND a modern-shaped (unsupported version) tools/call notification both
+        # return nothing and run no handler, so no review run is ever created on disk.
+        assert mcpsrv.handle({"jsonrpc": "2.0", "method": "tools/call", "params": args}) is None
+        assert mcpsrv.handle({"jsonrpc": "2.0", "method": "tools/call",
+                              "params": {**args, "_meta": _mbad}}) is None
+        assert list((repo / ".adversarial-review").glob("run-*")) == []
+    finally:
+        os.chdir(cwd0)
 
 
 def main():
