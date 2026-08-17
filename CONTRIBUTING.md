@@ -57,9 +57,14 @@ Releases are tags; PyPI publishes from them via Trusted Publishing (no stored to
 2. Bump `version` in `pyproject.toml` (SemVer).
 3. In `CHANGELOG.md`, rename the `## [Unreleased]` section to `## [X.Y.Z]`, add a fresh
    empty `## [Unreleased]`, and update the compare/link footer.
-4. Confirm `t_version_matches_changelog` passes (the `pyproject` version must have a matching
+4. Confirm `t_version_matches_changelog` passes (the `pyproject` version must equal the newest
    `## [X.Y.Z]` heading in the changelog).
-5. Tag `vX.Y.Z` and push the tag; the release workflow builds and publishes to PyPI.
+5. Commit the version bump and changelog and merge them to `main` (a release PR), so the tag
+   points at a commit that actually contains the bump.
+6. Tag `vX.Y.Z` on that merged commit and push the tag. On tag push the release workflow
+   (`.github/workflows/release.yml`) builds and publishes to PyPI via Trusted Publishing —
+   confirm that workflow is present on `main` first; until it is, a pushed tag publishes
+   nothing.
 
 ## Commit and PR style
 

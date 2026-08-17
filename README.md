@@ -564,7 +564,7 @@ references/
   roles.md            # role rubrics, prompt contract, injection defense
   schemas.md          # artifact schemas and blocking rules
   report.md           # final report template
-tests/                # mock router + 55-scenario suite
+tests/                # mock router + end-to-end suite (see tests/run_tests.py)
 ```
 
 ## Security notes

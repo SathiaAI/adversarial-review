@@ -2110,10 +2110,12 @@ def t_capability_profile_precedence():
     from _common import load_capabilities, capability_of
     repo = Path(tempfile.mkdtemp(prefix="ar-cap-"))
     (repo / ".adversarial-review.capabilities.yml").write_text(
-        "openai/gpt-5.6-luna-pro:\n  temperature: forbidden\n"
+        "openai/gpt-5.6-luna-pro:\n  temperature: forbidden\n  max_tokens_floor: 8000\n"
         "qwen/qwen3.8-max:\n  reasoning: mandatory\n  max_tokens_floor: 16000\n")
     envf = repo / "env-caps.json"
-    envf.write_text(json.dumps({"openai/gpt-5.6-luna-pro": {"latency_class": "slow"}}))
+    # env wins per key: latency_class is added, and an explicit null clears the file's floor.
+    envf.write_text(json.dumps({"openai/gpt-5.6-luna-pro":
+                                {"latency_class": "slow", "max_tokens_floor": None}}))
     old = os.environ.get("AR_CAP_OVERRIDES")
     os.environ["AR_CAP_OVERRIDES"] = str(envf)
     try:
@@ -2125,8 +2127,10 @@ def t_capability_profile_precedence():
             os.environ["AR_CAP_OVERRIDES"] = old
     assert ov["openai/gpt-5.6-luna-pro"]["temperature"] == "forbidden"   # from file
     assert ov["openai/gpt-5.6-luna-pro"]["latency_class"] == "slow"      # from env, merged in
+    assert "max_tokens_floor" in ov["openai/gpt-5.6-luna-pro"]           # key retained...
+    assert ov["openai/gpt-5.6-luna-pro"]["max_tokens_floor"] is None     # ...env null clears file's 8000
     assert ov["qwen/qwen3.8-max"]["reasoning"] == "mandatory"
-    assert ov["qwen/qwen3.8-max"]["max_tokens_floor"] == 16000           # coerced str -> int
+    assert ov["qwen/qwen3.8-max"]["max_tokens_floor"] == 16000           # coerced str -> int (file, no env override)
     cat = {"id": "openai/gpt-5.6-luna-pro", "supported_parameters": ["structured_outputs"]}
     prof, src = capability_of("openai/gpt-5.6-luna-pro", cat, ov)
     assert src == "override" and prof["temperature"] == "forbidden" and prof["structured_outputs"] is True
@@ -2172,8 +2176,9 @@ def t_mock_router_response_provider_override():
         sh(["panel.py", "run", "--context-file", "context.md"], repo)
         run = latest_run(repo)
         assert read(run / "panel" / "security.json")["summary"] == sentinel
-        # a non-overridden role still gets the default canned report
-        assert read(run / "panel" / "correctness.json")["summary"] != sentinel
+        # a non-overridden role still gets the default canned report verbatim
+        correctness = read(run / "panel" / "correctness.json")
+        assert correctness == mock_router._report("correctness", correctness["model_id"])
     finally:
         mock_router.reset()
 
@@ -2192,15 +2197,23 @@ def t_mock_router_reset():
 
 
 def t_version_matches_changelog():
-    # The pyproject version and the newest released CHANGELOG heading must agree, and an
-    # `## [Unreleased]` section must exist — guards the release ritual (E0-S3).
+    # The pyproject version must equal the NEWEST released CHANGELOG heading, and
+    # `## [Unreleased]` must sit above every release heading — guards the release ritual
+    # (E0-S3). A weaker "version appears somewhere" check would pass on a stale heading.
     pyproj = (SKILL / "pyproject.toml").read_text(encoding="utf-8")
     m = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"', pyproj)
     assert m, "no version in pyproject.toml"
     version = m.group(1)
     changelog = (SKILL / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert "## [Unreleased]" in changelog, "CHANGELOG missing ## [Unreleased]"
-    assert f"## [{version}]" in changelog, f"CHANGELOG has no section for pyproject version {version}"
+    headings = re.findall(r'(?m)^##\s+\[([^\]]+)\]', changelog)
+    assert headings, "CHANGELOG has no '## [..]' headings"
+    assert headings[0] == "Unreleased", (
+        f"first CHANGELOG heading must be '## [Unreleased]', got {headings[0]!r}")
+    releases = [h for h in headings if h != "Unreleased"]
+    assert releases, "CHANGELOG has no released section under ## [Unreleased]"
+    assert releases[0] == version, (
+        f"pyproject version {version!r} must match the newest CHANGELOG release "
+        f"heading {releases[0]!r}")
 
 
 def t_docs_gate_matrix_matches_code():
@@ -2232,7 +2245,7 @@ def t_docs_gate_matrix_matches_code():
 def t_docs_no_hardcoded_scenario_counts():
     # The README must not hardcode a test-scenario count — it drifts (see the de-hardcode history).
     readme = (SKILL / "README.md").read_text(encoding="utf-8")
-    m = re.search(r"\b\d+\s+(?:end-to-end\s+)?scenarios\b", readme)
+    m = re.search(r"\b\d+[\s-]+(?:end-to-end[\s-]+)?scenarios?\b", readme)
     assert not m, f"README hardcodes a scenario count: {m.group(0)!r} — describe it without a number"
 
 

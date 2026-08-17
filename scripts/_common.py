@@ -408,19 +408,30 @@ def _validate_cap_block(slug, block, name):
     out = {}
     for k, allowed in CAP_ENUMS.items():
         if k in block:
-            if block[k] not in allowed:
-                die(f"{name}: capabilities['{slug}'].{k}={block[k]!r} not in {list(allowed)}")
-            out[k] = block[k]
+            v = block[k]
+            # latency_class is nullable (its catalog default is None); an explicit
+            # null resets it rather than tripping the enum check below.
+            if k == "latency_class" and v in (None, "", "null"):
+                out[k] = None
+                continue
+            if v not in allowed:
+                die(f"{name}: capabilities['{slug}'].{k}={v!r} not in {list(allowed)}")
+            out[k] = v
     if "structured_outputs" in block:
         b = _cap_bool(block["structured_outputs"])
         if b is None:
             die(f"{name}: capabilities['{slug}'].structured_outputs must be true/false")
         out["structured_outputs"] = b
-    if "max_tokens_floor" in block and block["max_tokens_floor"] not in (None, "", "null"):
-        n = _cap_pos_int(block["max_tokens_floor"])
-        if n is None:
-            die(f"{name}: capabilities['{slug}'].max_tokens_floor must be a positive integer")
-        out["max_tokens_floor"] = n
+    if "max_tokens_floor" in block:
+        # An explicit null resets the floor (its catalog default is None); any other
+        # value must be a positive integer.
+        if block["max_tokens_floor"] in (None, "", "null"):
+            out["max_tokens_floor"] = None
+        else:
+            n = _cap_pos_int(block["max_tokens_floor"])
+            if n is None:
+                die(f"{name}: capabilities['{slug}'].max_tokens_floor must be a positive integer")
+            out["max_tokens_floor"] = n
     if "notes" in block:
         out["notes"] = str(block["notes"])
     return out
@@ -438,7 +449,12 @@ def _load_cap_file(path):
         data = _parse_policy_yaml(text, p.name)
     if not isinstance(data, dict):
         die(f"{p.name}: top level must be a mapping of model-slug -> capability settings")
-    return {slug: _validate_cap_block(slug, block, p.name) for slug, block in data.items()}
+    out = {}
+    for slug, block in data.items():
+        if not isinstance(slug, str) or "/" not in slug:
+            die(f"{p.name}: capability key must be a provider/model-slug, got {slug!r}")
+        out[slug] = _validate_cap_block(slug, block, p.name)
+    return out
 
 
 def load_capabilities(root=None):
