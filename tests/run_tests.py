@@ -2071,14 +2071,23 @@ def t_mcp_notification_never_answered_for_any_method():
     # this guards against the notification check being moved below method handling.
     for method in ("tools/list", "server/discover", "ping", "nonexistent/method"):
         assert mcpsrv.handle({"jsonrpc": "2.0", "method": method, "params": {}}) is None, method
+    # ...and MODERN-shaped notifications (protocol _meta present) are equally unanswered, even
+    # when the declared version is unsupported or clientCapabilities is missing — the
+    # top-of-dispatch check must win over the modern -32022/-32602 validation, not the reverse.
+    _mbad = {"io.modelcontextprotocol/protocolVersion": "1900-01-01"}
+    _mnocaps = {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}
+    for meta in (_mbad, _mnocaps):
+        assert mcpsrv.handle({"jsonrpc": "2.0", "method": "tools/list", "params": {"_meta": meta}}) is None, meta
     repo = fresh_repo()
     cwd0 = os.getcwd()
     try:
         os.chdir(repo)
-        note = {"jsonrpc": "2.0", "method": "tools/call",
-                "params": {"name": "ar_init",
-                           "arguments": {"risk": "NORMAL", "dev_providers": ["anthropic"]}}}
-        assert mcpsrv.handle(note) is None
+        args = {"name": "ar_init", "arguments": {"risk": "NORMAL", "dev_providers": ["anthropic"]}}
+        # a legacy-shaped AND a modern-shaped (unsupported version) tools/call notification both
+        # return nothing and run no handler, so no review run is ever created on disk.
+        assert mcpsrv.handle({"jsonrpc": "2.0", "method": "tools/call", "params": args}) is None
+        assert mcpsrv.handle({"jsonrpc": "2.0", "method": "tools/call",
+                              "params": {**args, "_meta": _mbad}}) is None
         assert list((repo / ".adversarial-review").glob("run-*")) == []
     finally:
         os.chdir(cwd0)

@@ -25,9 +25,12 @@ Design (deliberate, matching this repo's identity):
   * Dual-era protocol. It answers both the legacy `initialize` handshake (revisions
     through 2025-06-18) and the stateless MCP 2026-07-28 revision, in which each request
     carries its own protocol version in `_meta` and is negotiated independently — no
-    session. Responses to the pre-existing legacy methods (`initialize`, `tools/list`,
-    `tools/call`, `ping`) stay byte-for-byte identical; modern requests additionally get
-    per-request version negotiation and the spec-required `resultType` and cache metadata.
+    session. Responses to ID-bearing legacy requests for the pre-existing methods
+    (`initialize`, `tools/list`, `tools/call`, `ping`) stay byte-for-byte identical; modern
+    requests additionally get per-request version negotiation and the spec-required
+    `resultType` and cache metadata. The one intentional wire change is that a legacy
+    *notification* (no `id`) is now correctly left unanswered per JSON-RPC — including an
+    `initialize` notification, which older builds answered with a null-`id` result.
     `server/discover` is new in this revision and is answered in both eras — it is
     version-agnostic (the bootstrap probe by which a client learns the supported set), so
     it is deliberately not gated by per-request version validation.
