@@ -26,6 +26,7 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/SathiaAI/adversarial-review"
 Issues = "https://github.com/SathiaAI/adversarial-review/issues"
+Changelog = "https://github.com/SathiaAI/adversarial-review/blob/main/CHANGELOG.md"
 
 [project.scripts]
 ar-panel = "adversarial_review.panel:main"

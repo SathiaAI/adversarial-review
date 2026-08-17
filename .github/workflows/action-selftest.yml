@@ -1,0 +1,54 @@
+# Self-test the composite action (action.yml): run it, keyless, on this repo's own trivial
+# gate and assert the honest keyless verdict is BLOCKED *for missing panel coverage* with
+# fail-on=fail tolerating it so the job stays green. Guards the action against regressions (E2-S1).
+name: action-selftest
+
+on:
+  # The composite action invokes scripts/*.py directly, so a regression in those scripts must
+  # trigger this self-test too — not only an action.yml edit.
+  pull_request:
+    paths:
+      - "action.yml"
+      - "scripts/**.py"
+      - ".github/workflows/action-selftest.yml"
+  push:
+    branches: [main]
+    paths:
+      - "action.yml"
+      - "scripts/**.py"
+      - ".github/workflows/action-selftest.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run the action (keyless) — expect BLOCKED, tolerated by fail-on=fail
+        id: ar
+        uses: ./
+        with:
+          risk: NORMAL
+          dev-providers: anthropic
+          gates: |
+            build=python -m py_compile scripts/aggregate.py
+          fail-on: fail    # keyless => BLOCKED (no panel); tolerate so this self-test stays green
+          diff-ref: ${{ github.event.pull_request.base.sha || 'HEAD~1' }}...HEAD
+      - name: Assert BLOCKED specifically for the missing panel
+        run: |
+          # BLOCKED alone is ambiguous — the un-recorded floor gates also block. Assert the
+          # SPECIFIC missing-panel reason in verdict.json, so a regression that stops the
+          # aggregator from blocking on a missing panel fails here instead of hiding behind
+          # the gate reasons.
+          got='${{ steps.ar.outputs.verdict }}'
+          test "$got" = "BLOCKED" || { echo "expected BLOCKED, got '$got'"; exit 1; }
+          vj="$(ls -t .adversarial-review/*/verdict.json | head -1)"
+          test -n "$vj" || { echo "no verdict.json found"; exit 1; }
+          python -c "import json,sys; d=json.load(open(sys.argv[1])); rs=[r.lower() for r in d.get('reasons',[])]; assert d['verdict']=='BLOCKED', d['verdict']; assert any('panel plan missing' in r for r in rs), d.get('reasons'); print('action self-test OK: keyless BLOCKED includes the missing-panel reason (exit ${{ steps.ar.outputs.exit-code }})')" "$vj"
