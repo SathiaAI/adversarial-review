@@ -2316,6 +2316,138 @@ def t_docs_no_hardcoded_scenario_counts():
     assert not m, f"README hardcodes a scenario count: {m.group(0)!r} — describe it without a number"
 
 
+def t_corpus_cases_valid_and_cover_categories():
+    # Every committed corpus case validates, and the seed corpus covers each defect category
+    # plus >=2 clean cases — so the offline meta-eval harness (E1-S3) has something to run on
+    # day one. Cases are data; this guards the format without touching harness code.
+    sys.path.insert(0, str(SKILL / "evals"))
+    import corpus_schema as cs
+    corpus = str(SKILL / "evals" / "corpus")
+    n, errs = cs.validate_corpus(corpus)
+    assert not errs, "corpus invalid:\n" + "\n".join(errs)
+    assert n >= 6, f"expected >=6 seed cases, found {n}"
+    cats = {}
+    for d in sorted(os.listdir(corpus)):
+        cd = os.path.join(corpus, d)
+        if not os.path.isdir(cd):
+            continue
+        meta = json.loads(Path(cd, "meta.json").read_text(encoding="utf-8"))
+        cats[meta["category"]] = cats.get(meta["category"], 0) + 1
+    for required in ("security", "correctness", "test_quality", "output_fidelity"):
+        assert cats.get(required), f"corpus missing a {required} case"
+    assert cats.get("clean", 0) >= 2, f"corpus needs >=2 clean cases, has {cats.get('clean', 0)}"
+
+
+def t_corpus_validator_rejects_malformed():
+    # The validator must reject each class of corruption — silence is not validation
+    # (mirrors the strict policy-file parsing in _common.py).
+    sys.path.insert(0, str(SKILL / "evals"))
+    import corpus_schema as cs
+    d = Path(tempfile.mkdtemp(prefix="ar-corpus-bad-"))
+    try:
+        bad = d / "bad-case"
+        bad.mkdir()
+        (bad / "meta.json").write_text(json.dumps({
+            "id": "WRONG", "title": "x", "tier": "NORMAL", "category": "nope",
+            "language": "python", "source": "seeded", "extra": 1}))
+        (bad / "context.md").write_text("x")
+        (bad / "expected.json").write_text(json.dumps({
+            "defects": [{"defect_id": "d", "must_detect": True,
+                         "locators": [{"file": "a", "line_range": [9, 2]}],
+                         "root_cause_tags": ["t"], "severity_floor": "HIGH"}],
+            "fp_budget": -1}))
+        errs = cs.validate_case(str(bad))
+        joined = " | ".join(errs)
+        assert any("category" in e for e in errs), joined
+        assert any("directory name" in e for e in errs), joined
+        assert any("unexpected field" in e for e in errs), joined
+        assert any("severity_floor" in e for e in errs), joined
+        assert any("start > end" in e for e in errs), joined
+        assert any("fp_budget" in e for e in errs), joined
+
+        empty = d / "empty-case"
+        empty.mkdir()
+        assert cs.validate_case(str(empty)), "missing-file case should be rejected"
+
+        incoh = d / "incoh"
+        incoh.mkdir()
+        (incoh / "meta.json").write_text(json.dumps({
+            "id": "incoh", "title": "x", "tier": "NORMAL", "category": "clean",
+            "language": "python", "source": "seeded"}))
+        (incoh / "context.md").write_text("x")
+        (incoh / "expected.json").write_text(json.dumps({
+            "defects": [{"defect_id": "d", "must_detect": True,
+                         "locators": [{"file": "a", "line_range": [1, 2]}],
+                         "root_cause_tags": ["t"], "severity_floor": "high"}],
+            "fp_budget": 0}))
+        assert any("clean" in e for e in cs.validate_case(str(incoh))), \
+            "clean-category-with-defect should be rejected"
+
+        # non-object JSON root (valid JSON, but an array/scalar is malformed, not skipped)
+        nonobj = d / "nonobj"
+        nonobj.mkdir()
+        (nonobj / "meta.json").write_text("[]")
+        (nonobj / "context.md").write_text("x")
+        (nonobj / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1}))
+        assert any("expected object" in e for e in cs.validate_case(str(nonobj))), \
+            "non-object meta.json root should be rejected"
+
+        # unknown top-level field in expected.json (strict EXPECTED_SCHEMA)
+        stray = d / "stray"
+        stray.mkdir()
+        (stray / "meta.json").write_text(json.dumps({
+            "id": "stray", "title": "x", "tier": "NORMAL", "category": "clean",
+            "language": "python", "source": "seeded"}))
+        (stray / "context.md").write_text("x")
+        (stray / "expected.json").write_text(json.dumps({
+            "defects": [], "fp_budget": 1, "bogus_key": 1}))
+        assert any("unexpected field" in e for e in cs.validate_case(str(stray))), \
+            "unknown top-level expected field should be rejected"
+
+        # clean category carrying ANY defect (even non-must_detect) is contradictory ground truth
+        cleandef = d / "cleandef"
+        cleandef.mkdir()
+        (cleandef / "meta.json").write_text(json.dumps({
+            "id": "cleandef", "title": "x", "tier": "NORMAL", "category": "clean",
+            "language": "python", "source": "seeded"}))
+        (cleandef / "context.md").write_text("some context")
+        (cleandef / "expected.json").write_text(json.dumps({
+            "defects": [{"defect_id": "d", "must_detect": False,
+                         "locators": [{"file": "a", "line_range": [1, 2]}],
+                         "root_cause_tags": ["t"], "severity_floor": "low"}],
+            "fp_budget": 1}))
+        assert any("empty defects" in e for e in cs.validate_case(str(cleandef))), \
+            "clean category with any defect should be rejected"
+
+        # non-positive (non-1-indexed) locator line
+        nonpos = d / "nonpos"
+        nonpos.mkdir()
+        (nonpos / "meta.json").write_text(json.dumps({
+            "id": "nonpos", "title": "x", "tier": "NORMAL", "category": "security",
+            "language": "python", "source": "seeded"}))
+        (nonpos / "context.md").write_text("some context")
+        (nonpos / "expected.json").write_text(json.dumps({
+            "defects": [{"defect_id": "d", "must_detect": True,
+                         "locators": [{"file": "a", "line_range": [0, 5]}],
+                         "root_cause_tags": ["t"], "severity_floor": "high"}],
+            "fp_budget": 1}))
+        assert any("1-indexed" in e for e in cs.validate_case(str(nonpos))), \
+            "non-positive locator line should be rejected"
+
+        # whitespace-only context.md (non-zero bytes, but no substantive content)
+        blankctx = d / "blankctx"
+        blankctx.mkdir()
+        (blankctx / "meta.json").write_text(json.dumps({
+            "id": "blankctx", "title": "x", "tier": "NORMAL", "category": "clean",
+            "language": "python", "source": "seeded"}))
+        (blankctx / "context.md").write_text("   \n\t\n")
+        (blankctx / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1}))
+        assert any("blank" in e for e in cs.validate_case(str(blankctx))), \
+            "whitespace-only context.md should be rejected"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

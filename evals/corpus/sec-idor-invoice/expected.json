@@ -1,0 +1,25 @@
+{
+  "defects": [
+    {
+      "defect_id": "idor-1",
+      "must_detect": true,
+      "locators": [
+        {
+          "file": "api/invoices.py",
+          "line_range": [
+            10,
+            12
+          ]
+        }
+      ],
+      "root_cause_tags": [
+        "idor",
+        "authz",
+        "missing-ownership-check",
+        "broken-object-level-authorization"
+      ],
+      "severity_floor": "high"
+    }
+  ],
+  "fp_budget": 1
+}

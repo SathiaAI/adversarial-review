@@ -21,6 +21,12 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   (catalog defaults merged with an optional `.adversarial-review.capabilities.yml` and an
   `AR_CAP_OVERRIDES` env override), laying the groundwork for capability-driven request
   building.
+- Reviewer meta-evaluation corpus (E1-S1): a versioned, self-describing case format under
+  `evals/corpus/<case-id>/` (`meta.json` / `context.md` / `expected.json`) with a stdlib
+  validator (`evals/corpus_schema.py`) that reuses the panel's schema checker, seed cases
+  across every defect category plus clean cases, an `evals/README.md`, and CI coverage. This
+  is the groundwork for measuring the panel's true-positive / false-negative / false-positive
+  rates (scoring lands in E1-S2).
 - Distribution: a `release` workflow publishes to PyPI on a `v*` tag via **Trusted Publishing**
   (OIDC, no stored token); an `action-selftest` workflow exercises the composite action keyless
   and asserts the honest BLOCKED verdict; a GitLab CI template (`examples/.gitlab-ci.yml`); and a

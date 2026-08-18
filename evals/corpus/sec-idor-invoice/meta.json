@@ -1,0 +1,9 @@
+{
+  "id": "sec-idor-invoice",
+  "title": "Invoice endpoint returns any invoice by id (missing ownership check)",
+  "tier": "SENSITIVE",
+  "category": "security",
+  "language": "python",
+  "source": "seeded",
+  "cwe": "CWE-639"
+}

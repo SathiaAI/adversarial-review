@@ -1,0 +1,8 @@
+{
+  "id": "clean-refactor-total",
+  "title": "Rename loop var and add docstring (no behavior change)",
+  "tier": "NORMAL",
+  "category": "clean",
+  "language": "python",
+  "source": "seeded"
+}

@@ -1,0 +1,8 @@
+{
+  "id": "out-inverted-finalize",
+  "title": "Failure branch logs 'finalized successfully'",
+  "tier": "NORMAL",
+  "category": "output_fidelity",
+  "language": "python",
+  "source": "seeded"
+}

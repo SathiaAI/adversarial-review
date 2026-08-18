@@ -1,0 +1,9 @@
+{
+  "id": "corr-offbyone-pagination",
+  "title": "Pagination slice overshoots by one, leaking the next page's first row",
+  "tier": "NORMAL",
+  "category": "correctness",
+  "language": "python",
+  "source": "seeded",
+  "cwe": "CWE-193"
+}
