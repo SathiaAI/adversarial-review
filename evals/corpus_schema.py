@@ -27,7 +27,11 @@ if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 from panel import validate_obj  # noqa: E402  (path set above)
 
-CATEGORIES = ["security", "correctness", "test_quality", "output_fidelity", "clean"]
+# Mirrors scripts/panel.py:ROLES (all six reviewer lenses) plus "clean" for no-defect cases,
+# so the corpus can classify coverage for every role the panel runs — including the
+# SENSITIVE/CRITICAL-only data_privacy and reliability reviewers.
+CATEGORIES = ["security", "correctness", "data_privacy", "test_quality", "reliability",
+              "output_fidelity", "clean"]
 TIERS = ["NORMAL", "SENSITIVE", "CRITICAL"]
 SEVERITIES = ["critical", "high", "medium", "low"]
 SOURCES = ["seeded", "historical", "cve"]
@@ -101,8 +105,12 @@ def validate_case(case_dir):
     if missing:
         return [f"{case_id}: missing {name}" for name in missing]
 
-    if os.path.getsize(paths["context.md"]) == 0:
-        errs.append(f"{case_id}: context.md is empty (a reviewer needs something to review)")
+    try:  # context.md must be readable UTF-8 with substantive (non-whitespace) content
+        ctx_text = open(paths["context.md"], encoding="utf-8").read()
+        if not ctx_text.strip():
+            errs.append(f"{case_id}: context.md is blank (a reviewer needs something to review)")
+    except (UnicodeDecodeError, OSError) as exc:
+        errs.append(f"{case_id}: context.md is not readable UTF-8 text: {exc}")
 
     meta, meta_ok = None, False
     try:
@@ -146,15 +154,19 @@ def _expected_semantics(case_id, meta, exp):
             lr = loc["line_range"]
             if len(lr) != 2:
                 errs.append(f"{case_id}: defects[{i}].locators[{j}].line_range must be [start, end]")
-            elif all(isinstance(x, int) and not isinstance(x, bool) for x in lr) and lr[0] > lr[1]:
-                errs.append(f"{case_id}: defects[{i}].locators[{j}].line_range start > end")
+            elif all(isinstance(x, int) and not isinstance(x, bool) for x in lr):
+                if lr[0] < 1 or lr[1] < 1:
+                    errs.append(
+                        f"{case_id}: defects[{i}].locators[{j}].line_range lines are 1-indexed (>= 1)")
+                elif lr[0] > lr[1]:
+                    errs.append(f"{case_id}: defects[{i}].locators[{j}].line_range start > end")
 
     # Category/label coherence: a 'clean' case asserts no defect to find; any other category
     # must carry at least one must_detect defect, else the case can never score a true positive.
     if isinstance(meta, dict):
         has_must = any(isinstance(d, dict) and d.get("must_detect") for d in defects)
-        if meta.get("category") == "clean" and has_must:
-            errs.append(f"{case_id}: 'clean' category must contain no must_detect defects")
+        if meta.get("category") == "clean" and defects:
+            errs.append(f"{case_id}: 'clean' category must have an empty defects list")
         if meta.get("category") not in (None, "clean") and not has_must:
             errs.append(
                 f"{case_id}: category {meta.get('category')!r} needs >= 1 must_detect defect")

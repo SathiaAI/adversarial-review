@@ -2336,6 +2336,47 @@ def t_corpus_validator_rejects_malformed():
             "defects": [], "fp_budget": 1, "bogus_key": 1}))
         assert any("unexpected field" in e for e in cs.validate_case(str(stray))), \
             "unknown top-level expected field should be rejected"
+
+        # clean category carrying ANY defect (even non-must_detect) is contradictory ground truth
+        cleandef = d / "cleandef"
+        cleandef.mkdir()
+        (cleandef / "meta.json").write_text(json.dumps({
+            "id": "cleandef", "title": "x", "tier": "NORMAL", "category": "clean",
+            "language": "python", "source": "seeded"}))
+        (cleandef / "context.md").write_text("some context")
+        (cleandef / "expected.json").write_text(json.dumps({
+            "defects": [{"defect_id": "d", "must_detect": False,
+                         "locators": [{"file": "a", "line_range": [1, 2]}],
+                         "root_cause_tags": ["t"], "severity_floor": "low"}],
+            "fp_budget": 1}))
+        assert any("empty defects" in e for e in cs.validate_case(str(cleandef))), \
+            "clean category with any defect should be rejected"
+
+        # non-positive (non-1-indexed) locator line
+        nonpos = d / "nonpos"
+        nonpos.mkdir()
+        (nonpos / "meta.json").write_text(json.dumps({
+            "id": "nonpos", "title": "x", "tier": "NORMAL", "category": "security",
+            "language": "python", "source": "seeded"}))
+        (nonpos / "context.md").write_text("some context")
+        (nonpos / "expected.json").write_text(json.dumps({
+            "defects": [{"defect_id": "d", "must_detect": True,
+                         "locators": [{"file": "a", "line_range": [0, 5]}],
+                         "root_cause_tags": ["t"], "severity_floor": "high"}],
+            "fp_budget": 1}))
+        assert any("1-indexed" in e for e in cs.validate_case(str(nonpos))), \
+            "non-positive locator line should be rejected"
+
+        # whitespace-only context.md (non-zero bytes, but no substantive content)
+        blankctx = d / "blankctx"
+        blankctx.mkdir()
+        (blankctx / "meta.json").write_text(json.dumps({
+            "id": "blankctx", "title": "x", "tier": "NORMAL", "category": "clean",
+            "language": "python", "source": "seeded"}))
+        (blankctx / "context.md").write_text("   \n\t\n")
+        (blankctx / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1}))
+        assert any("blank" in e for e in cs.validate_case(str(blankctx))), \
+            "whitespace-only context.md should be rejected"
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
