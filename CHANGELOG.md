@@ -21,6 +21,10 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   (catalog defaults merged with an optional `.adversarial-review.capabilities.yml` and an
   `AR_CAP_OVERRIDES` env override), laying the groundwork for capability-driven request
   building.
+- Distribution: a `release` workflow publishes to PyPI on a `v*` tag via **Trusted Publishing**
+  (OIDC, no stored token); an `action-selftest` workflow exercises the composite action keyless
+  and asserts the honest BLOCKED verdict; a GitLab CI template (`examples/.gitlab-ci.yml`); and a
+  `Changelog` project URL.
 
 ## [0.1.0]
 
