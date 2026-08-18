@@ -10,7 +10,7 @@ in E1-S3 (`evals/run.py`). This story (E1-S1) defines the **case format** and it
 
 ## Layout
 
-```
+```text
 evals/corpus/<case-id>/
   meta.json      # identity + classification
   context.md     # the diff + surrounding code, exactly as a reviewer receives it

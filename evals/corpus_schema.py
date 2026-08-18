@@ -69,10 +69,11 @@ DEFECT_SCHEMA = {
 }
 
 # The nested defect/locator objects are STRICT (additionalProperties: False) so a typo'd label
-# is caught. The top level intentionally is NOT strict: E1-S3 will add an optional `scripts`
-# block (scripted reviewer outputs for offline harness mode) without a format change here.
+# is caught. The top level is STRICT too (additionalProperties: False) so a typo'd or stray
+# expected-result field fails loudly. When E1-S3 adds its optional `scripts` block (scripted
+# reviewer outputs for offline harness mode), it adds that to `properties` here in the same change.
 EXPECTED_SCHEMA = {
-    "type": "object",
+    "type": "object", "additionalProperties": False,
     "properties": {
         "defects": {"type": "array", "items": DEFECT_SCHEMA},
         # Max tolerated findings before an extra one scores as a false positive. Clean cases
@@ -103,24 +104,27 @@ def validate_case(case_dir):
     if os.path.getsize(paths["context.md"]) == 0:
         errs.append(f"{case_id}: context.md is empty (a reviewer needs something to review)")
 
-    meta = None
+    meta, meta_ok = None, False
     try:
         meta = _read_json(paths["meta.json"])
+        meta_ok = True
     except (ValueError, OSError) as exc:
         errs.append(f"{case_id}: meta.json is not valid JSON: {exc}")
-    if isinstance(meta, dict):
+    if meta_ok:  # validate even a non-object root — a JSON array/scalar is malformed, not skipped
         errs += ["%s/meta.json %s" % (case_id, e) for e in validate_obj(meta, META_SCHEMA)]
-        if meta.get("id") != case_id:
+        if isinstance(meta, dict) and meta.get("id") != case_id:
             errs.append(f"{case_id}: meta.json id {meta.get('id')!r} != directory name {case_id!r}")
 
-    exp = None
+    exp, exp_ok = None, False
     try:
         exp = _read_json(paths["expected.json"])
+        exp_ok = True
     except (ValueError, OSError) as exc:
         errs.append(f"{case_id}: expected.json is not valid JSON: {exc}")
-    if isinstance(exp, dict):
+    if exp_ok:
         errs += ["%s/expected.json %s" % (case_id, e) for e in validate_obj(exp, EXPECTED_SCHEMA)]
-        errs += _expected_semantics(case_id, meta, exp)
+        if isinstance(exp, dict):
+            errs += _expected_semantics(case_id, meta, exp)
     return errs
 
 

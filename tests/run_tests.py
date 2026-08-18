@@ -2315,6 +2315,27 @@ def t_corpus_validator_rejects_malformed():
             "fp_budget": 0}))
         assert any("clean" in e for e in cs.validate_case(str(incoh))), \
             "clean-category-with-defect should be rejected"
+
+        # non-object JSON root (valid JSON, but an array/scalar is malformed, not skipped)
+        nonobj = d / "nonobj"
+        nonobj.mkdir()
+        (nonobj / "meta.json").write_text("[]")
+        (nonobj / "context.md").write_text("x")
+        (nonobj / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1}))
+        assert any("expected object" in e for e in cs.validate_case(str(nonobj))), \
+            "non-object meta.json root should be rejected"
+
+        # unknown top-level field in expected.json (strict EXPECTED_SCHEMA)
+        stray = d / "stray"
+        stray.mkdir()
+        (stray / "meta.json").write_text(json.dumps({
+            "id": "stray", "title": "x", "tier": "NORMAL", "category": "clean",
+            "language": "python", "source": "seeded"}))
+        (stray / "context.md").write_text("x")
+        (stray / "expected.json").write_text(json.dumps({
+            "defects": [], "fp_budget": 1, "bogus_key": 1}))
+        assert any("unexpected field" in e for e in cs.validate_case(str(stray))), \
+            "unknown top-level expected field should be rejected"
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
