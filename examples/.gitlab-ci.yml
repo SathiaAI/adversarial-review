@@ -2,12 +2,14 @@
 # verdict as the GitHub Action, on GitLab. Copy into your repo's .gitlab-ci.yml (or `include:` it).
 #
 # Two jobs by design, so repository-controlled code never runs in the same job as the router key:
-#   ar-gates   runs your gate/test commands (untrusted code) with NO key present, and saves the
-#              recorded gates as an artifact.
-#   ar-panel   runs the independent reviewer panel + aggregate.py. It has the key, fetches a FRESH
-#              pinned copy of the tooling, and never executed repository commands — so a malicious
-#              change cannot tamper with panel.py/python or read OPENROUTER_API_KEY. The job result
-#              is aggregate.py's verdict: exit 0 PASS / 1 FAIL / 2 BLOCKED.
+#   ar-gates   runs your gate/test commands (untrusted code) with NO key present — build, unit,
+#              deps, sast, but NOT secrets — and saves the recorded gates as an artifact.
+#   ar-panel   runs the secrets scan (the transmission gate), the independent reviewer panel, and
+#              aggregate.py. It has the key and a FRESH pinned copy of the tooling, and runs no
+#              repository-provided commands — the only thing it executes against the checkout is the
+#              consumer's pinned secrets scanner (a CI/CD variable, not MR-author-controlled) — so a
+#              malicious change cannot tamper with panel.py/python, forge the secrets gate, or read
+#              OPENROUTER_API_KEY. The job result is aggregate.py's verdict: 0 PASS / 1 FAIL / 2 BLOCKED.
 #
 # Configure as CI/CD variables (Settings → CI/CD → Variables):
 #   OPENROUTER_API_KEY   masked AND protected — runs the reviewer panel. Mark it *protected* so it
@@ -15,9 +17,14 @@
 #                        MR. Without it the verdict is BLOCKED (no panel coverage), the honest
 #                        result for an un-reviewed change.
 #   AR_UNIT_CMD          your test command, e.g. "python -m pytest -q". A floor gate with no command
-#   AR_SECRETS_CMD       is recorded BLOCKED (unknown is not pass), so this template can never
-#   AR_DEPS_CMD          fabricate a PASS. Suggested tools: gitleaks (secrets), osv-scanner (deps),
-#   AR_SAST_CMD          opengrep/semgrep (sast). AR_BUILD_CMD defaults to a Python compile check.
+#   AR_DEPS_CMD          is recorded BLOCKED (unknown is not pass), so this template can never
+#   AR_SAST_CMD          fabricate a PASS. Suggested tools: osv-scanner (deps), opengrep/semgrep
+#                        (sast). AR_BUILD_CMD defaults to a Python compile check.
+#   AR_SECRETS_CMD       the secrets scanner (e.g. gitleaks). Runs in the KEYED ar-panel job, not
+#                        ar-gates: it authorizes transmitting the diff to reviewers, so it must run
+#                        where repository code cannot forge its result. Pin its config OUTSIDE the
+#                        repo (e.g. gitleaks --config <pinned>) so a committed allowlist can't hide a
+#                        planted secret. No command → BLOCKED (nothing is transmitted).
 #   AR_REQUIRE           required gates for `gate.py plan` (default = the NORMAL floor). If your
 #                        .adversarial-review.yml declares `required_gates`, set AR_REQUIRE="" so that
 #                        policy list is honored — a non-empty value OVERRIDES it. The floor is always
@@ -66,7 +73,6 @@ ar-gates:
     AR_REQUIRE: "build,unit,secrets,deps,sast"   # set "" to use your policy's required_gates
     AR_BUILD_CMD: "python -m py_compile $(git ls-files '*.py')"
     AR_UNIT_CMD: ""                               # e.g. "python -m pytest -q"
-    AR_SECRETS_CMD: ""                            # e.g. "gitleaks detect --no-banner"
     AR_DEPS_CMD: ""                               # e.g. "osv-scanner scan ."
     AR_SAST_CMD: ""                               # e.g. "opengrep scan --config auto ."
   script:
@@ -89,29 +95,45 @@ ar-gates:
       }
       run_gate build   "$AR_BUILD_CMD"
       run_gate unit    "$AR_UNIT_CMD"
-      run_gate secrets "$AR_SECRETS_CMD"
       run_gate deps    "$AR_DEPS_CMD"
       run_gate sast    "$AR_SAST_CMD"
+      # 'secrets' is intentionally NOT run here: it is the gate that authorizes transmitting the
+      # diff to reviewers, so it runs in the keyed ar-panel job where repo code can't forge a PASS.
   artifacts:
     when: always
     paths:
       - .adversarial-review/     # gate records carried to ar-panel and preserved for inspection
     expire_in: 30 days
 
-# Job 2 — independent panel + verdict. Has the key; runs a fresh pinned tooling copy; consumes the
-# recorded gates from ar-gates. This job never executes repository commands.
+# Job 2 — independent panel + verdict. Has the key and a fresh pinned tooling copy; consumes the
+# recorded gates from ar-gates. It runs no repository-provided commands — the only thing it runs
+# against the checkout is the consumer's pinned secrets scanner (a CI/CD variable an MR author
+# cannot change), reading repo content as data. Crucially, the secrets authorization is (re)computed
+# HERE, never trusted from the ar-gates artifact (which repository code could overwrite).
 ar-panel:
   extends: .ar-common
   stage: review
   needs: [ar-gates]              # inherits the .adversarial-review/ artifact (recorded gates)
+  variables:
+    AR_SECRETS_CMD: ""           # secrets scanner; runs HERE (keyed job). Pin its config off-repo.
   script:
     - |
-      # Run the panel only after a CLEAN secrets scan (read from the recorded gate, not re-run) so a
-      # freshly committed credential in the diff is never transmitted to remote reviewers.
+      # SECRETS AUTHORIZATION IS COMPUTED IN THIS JOB — never read from the ar-gates artifact.
+      # ar-gates runs repository-controlled commands that could overwrite a recorded secrets gate
+      # with a forged PASS. So here, in the keyed job, we re-run the scan with the pinned recorder
+      # and the consumer-configured scanner; that rewrites secrets.json with the trusted result, so
+      # neither the transmission decision below nor aggregate.py can be fooled into leaking a freshly
+      # committed credential. Pin the scanner's config off-repo so a committed allowlist can't hide one.
+      if [ -n "$AR_SECRETS_CMD" ]; then
+        python /tmp/ar/scripts/gate.py run --name secrets -- sh -c "$AR_SECRETS_CMD" || true
+      else
+        python /tmp/ar/scripts/gate.py record --name secrets --status BLOCKED \
+          --summary "secrets gate has no command configured — set AR_SECRETS_CMD to a pinned scanner" || true
+      fi
       SECRETS_OK=$(python3 -c 'import json,glob; f=sorted(glob.glob(".adversarial-review/run-*/gates/secrets.json")); print("1" if f and json.load(open(f[-1])).get("status")=="PASS" else "0")')
       if [ -n "${OPENROUTER_API_KEY:-}" ]; then
         if [ "$SECRETS_OK" != "1" ]; then
-          echo "adversarial-review: skipping panel — configure AR_SECRETS_CMD so the recorded secrets gate passes before sending the diff to reviewers" >&2
+          echo "adversarial-review: skipping panel — the secrets scan run in THIS job did not pass; not transmitting the diff to reviewers" >&2
         else
           # Diff-only context (no working-tree file reads, so a changed symlink can't exfiltrate a
           # file outside the checkout). Fill in the TODOs with the surrounding code/invariants a real
