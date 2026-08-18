@@ -1,47 +1,44 @@
 # GitLab CI template for adversarial-review — the same gate-recording + machine-computed
 # verdict as the GitHub Action, on GitLab. Copy into your repo's .gitlab-ci.yml (or `include:` it).
-# The job result is aggregate.py's verdict: exit 0 PASS / 1 FAIL / 2 BLOCKED.
 #
-# Configure these as CI/CD variables (Settings → CI/CD → Variables):
-#   OPENROUTER_API_KEY   masked — runs the independent reviewer panel. Without it the verdict
-#                        is BLOCKED (no panel coverage), the honest result for an un-reviewed change.
-#                        The key is withheld from every gate/test command (which run repository-
-#                        controlled code) and handed only to panel.py — see the key handling below.
-#   AR_UNIT_CMD          your test command, e.g. "python -m pytest -q". A floor gate with no
-#   AR_SECRETS_CMD       command is recorded BLOCKED (unknown is not pass), so this template can
-#   AR_DEPS_CMD          never fabricate a PASS. Suggested tools: gitleaks (secrets),
-#   AR_SAST_CMD          osv-scanner (deps), opengrep/semgrep (sast). AR_BUILD_CMD defaults to a
-#                        Python compile check — override it for your stack.
-#   AR_REQUIRE           required gates for `gate.py plan`. Defaults to the NORMAL floor. If your
-#                        .adversarial-review.yml declares `required_gates`, set AR_REQUIRE="" so
-#                        that policy list is honored — a non-empty value OVERRIDES it and a custom
-#                        gate (e.g. integration, iac) would then be silently dropped. The floor
-#                        (build,unit,secrets,deps,sast) is always enforced regardless.
-#   AR_RISK,             OPTIONAL. Leave unset so your .adversarial-review.yml policy resolves the
-#   AR_DEV_PROVIDERS     risk tier and developer families. Setting them here overrides consumer
-#                        policy and can weaken privacy routing and reviewer independence — only do
-#                        so deliberately. dev_providers must list every family that wrote/advised
-#                        the change, or the panel is not independent.
-#   AR_REF               the adversarial-review version to run. PIN to a tag or a FULL 40-char
-#                        commit SHA (defaults to the v0.1.0 release); it is fetched then checked
-#                        out, so both work. Never a moving branch — a future upstream commit must
-#                        not be able to execute against your checkout and key.
+# Two jobs by design, so repository-controlled code never runs in the same job as the router key:
+#   ar-gates   runs your gate/test commands (untrusted code) with NO key present, and saves the
+#              recorded gates as an artifact.
+#   ar-panel   runs the independent reviewer panel + aggregate.py. It has the key, fetches a FRESH
+#              pinned copy of the tooling, and never executed repository commands — so a malicious
+#              change cannot tamper with panel.py/python or read OPENROUTER_API_KEY. The job result
+#              is aggregate.py's verdict: exit 0 PASS / 1 FAIL / 2 BLOCKED.
 #
-# For incremental adoption, treat BLOCKED as a warning by uncommenting `allow_failure` below.
-adversarial-review:
+# Configure as CI/CD variables (Settings → CI/CD → Variables):
+#   OPENROUTER_API_KEY   masked AND protected — runs the reviewer panel. Mark it *protected* so it
+#                        is exposed only on protected branches / trusted pipelines, never to a fork
+#                        MR. Without it the verdict is BLOCKED (no panel coverage), the honest
+#                        result for an un-reviewed change.
+#   AR_UNIT_CMD          your test command, e.g. "python -m pytest -q". A floor gate with no command
+#   AR_SECRETS_CMD       is recorded BLOCKED (unknown is not pass), so this template can never
+#   AR_DEPS_CMD          fabricate a PASS. Suggested tools: gitleaks (secrets), osv-scanner (deps),
+#   AR_SAST_CMD          opengrep/semgrep (sast). AR_BUILD_CMD defaults to a Python compile check.
+#   AR_REQUIRE           required gates for `gate.py plan` (default = the NORMAL floor). If your
+#                        .adversarial-review.yml declares `required_gates`, set AR_REQUIRE="" so that
+#                        policy list is honored — a non-empty value OVERRIDES it. The floor is always
+#                        enforced regardless.
+#   AR_RISK,             OPTIONAL. Leave unset so your .adversarial-review.yml resolves the risk tier
+#   AR_DEV_PROVIDERS     and developer families; setting them here overrides consumer policy.
+#   AR_REF               tooling version to run. PIN to a tag or a FULL 40-char commit SHA (defaults
+#                        to v0.1.0); fetched then checked out, so both work. Never a moving branch.
+#
+# For incremental adoption, add `allow_failure: { exit_codes: 2 }` to ar-panel to make BLOCKED a
+# warning while still failing on FAIL.
+
+stages: [gates, review]
+
+# Shared setup: image, the "only review a real change" rules, and a pinned fetch of the tooling.
+# On the default branch HEAD and origin/DEFAULT are the same commit (empty range) — skip it.
+.ar-common:
   image: python:3.12-slim
   variables:
-    GIT_DEPTH: "0"                                        # the panel reviews a real git range
-    AR_REF: "v0.1.0"                                      # PINNED — tag or full SHA, not a branch
-    AR_REQUIRE: "build,unit,secrets,deps,sast"            # set "" to use your policy's required_gates
-    AR_BUILD_CMD: "python -m py_compile $(git ls-files '*.py')"
-    AR_UNIT_CMD: ""                                       # e.g. "python -m pytest -q"
-    AR_SECRETS_CMD: ""                                    # e.g. "gitleaks detect --no-banner"
-    AR_DEPS_CMD: ""                                       # e.g. "osv-scanner scan ."
-    AR_SAST_CMD: ""                                       # e.g. "opengrep scan --config auto ."
-  # Only run where there is a real change to review. On the default branch HEAD and
-  # origin/DEFAULT are the same commit, so that range is empty — skip it rather than
-  # produce review evidence for no change.
+    GIT_DEPTH: "0"                 # the panel reviews a real git range
+    AR_REF: "v0.1.0"               # PINNED — tag or full SHA, not a branch
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       variables:
@@ -50,36 +47,38 @@ adversarial-review:
       variables:
         AR_DIFF: "origin/$CI_DEFAULT_BRANCH...HEAD"
     - when: never
-  # allow_failure:                 # incremental adoption: make BLOCKED a warning, still fail on FAIL
-  #   exit_codes: 2
   before_script:
     - apt-get update -qq && apt-get install -y -qq git >/dev/null
     - git fetch --no-tags -q origin "$CI_DEFAULT_BRANCH" || true   # make the diff base available
-    # Pin the gate implementation: fetch the tag or full commit SHA in AR_REF, then check it out.
-    # `git clone --branch` cannot resolve a raw SHA, so fetch+checkout is used to support both.
+    # Pin the tooling: `git clone --branch` can't resolve a raw SHA, so fetch the tag or full SHA
+    # and check it out. In ar-panel this copy is FRESH — that job never ran repository code.
     - git init -q /tmp/ar
     - git -C /tmp/ar remote add origin https://github.com/SathiaAI/adversarial-review
     - git -C /tmp/ar fetch -q --depth 1 origin "$AR_REF"
     - git -C /tmp/ar checkout -q FETCH_HEAD
+
+# Job 1 — deterministic gates. Runs repository-controlled commands; the router key is NOT present
+# in this job at all (don't add OPENROUTER_API_KEY to it).
+ar-gates:
+  extends: .ar-common
+  stage: gates
+  variables:
+    AR_REQUIRE: "build,unit,secrets,deps,sast"   # set "" to use your policy's required_gates
+    AR_BUILD_CMD: "python -m py_compile $(git ls-files '*.py')"
+    AR_UNIT_CMD: ""                               # e.g. "python -m pytest -q"
+    AR_SECRETS_CMD: ""                            # e.g. "gitleaks detect --no-banner"
+    AR_DEPS_CMD: ""                               # e.g. "osv-scanner scan ."
+    AR_SAST_CMD: ""                               # e.g. "opengrep scan --config auto ."
   script:
     - |
-      # Withhold the router key from every repository-controlled command: gate/test commands run
-      # untrusted code on merge-request pipelines. Hold it in an UNEXPORTED shell variable (so it
-      # is not in the environment child processes inherit) and hand it only to panel.py below.
-      AR_KEY="${OPENROUTER_API_KEY:-}"; unset OPENROUTER_API_KEY
-      # init is the one hard prerequisite (aggregate needs run.json); everything after it is
-      # tolerated so the aggregator always runs and computes the verdict from what was recorded.
+      # init is the one hard prerequisite (the run dir carries to ar-panel); the rest is tolerated
+      # so a failing gate is recorded, not fatal — aggregate.py (in ar-panel) owns the verdict.
       python /tmp/ar/scripts/panel.py init --diff-ref "$AR_DIFF" || { echo "adversarial-review: init failed" >&2; exit 1; }
-      # Risk tier and developer families resolve from your .adversarial-review.yml (or AR_RISK /
-      # AR_DEV_PROVIDERS) — not hardcoded here, so consumer policy stays authoritative.
       if [ -n "$AR_REQUIRE" ]; then
         python /tmp/ar/scripts/gate.py plan --require "$AR_REQUIRE" || true
       else
-        python /tmp/ar/scripts/gate.py plan || true    # resolve required_gates from your policy file
+        python /tmp/ar/scripts/gate.py plan || true   # resolve required_gates from your policy file
       fi
-      # Deterministic floor gates. A failing command is RECORDED, not fatal (|| true) — the
-      # aggregator owns the verdict, and hiding a failure would defeat the pipeline. A gate with
-      # no configured command is recorded BLOCKED so the job can never fabricate a PASS.
       run_gate() {  # $1 = gate name, $2 = command ("" -> BLOCKED, needs configuration)
         if [ -n "$2" ]; then
           python /tmp/ar/scripts/gate.py run --name "$1" -- sh -c "$2" || true
@@ -88,53 +87,53 @@ adversarial-review:
             --summary "gate '$1' has no command configured — set AR_$(echo "$1" | tr a-z A-Z)_CMD" || true
         fi
       }
-      run_gate build "$AR_BUILD_CMD"
-      run_gate unit  "$AR_UNIT_CMD"
-      run_gate deps  "$AR_DEPS_CMD"
-      run_gate sast  "$AR_SAST_CMD"
-      # secrets is a floor gate AND the guard for reviewer transmission (below).
-      if [ -n "$AR_SECRETS_CMD" ]; then
-        python /tmp/ar/scripts/gate.py run --name secrets -- sh -c "$AR_SECRETS_CMD" && SECRETS_OK=1 || SECRETS_OK=0
-      else
-        python /tmp/ar/scripts/gate.py record --name secrets --status BLOCKED \
-          --summary "no secrets scan configured — set AR_SECRETS_CMD (e.g. gitleaks detect)" || true
-        SECRETS_OK=0
-      fi
-      # Independent panel: only with a key, and only after a CLEAN secrets scan, so a freshly
-      # committed credential in the diff is never transmitted to remote reviewers.
-      if [ -n "$AR_KEY" ]; then
-        if [ "${SECRETS_OK:-0}" != "1" ]; then
-          echo "adversarial-review: skipping panel — set AR_SECRETS_CMD and ensure it passes before sending the diff to reviewers" >&2
+      run_gate build   "$AR_BUILD_CMD"
+      run_gate unit    "$AR_UNIT_CMD"
+      run_gate secrets "$AR_SECRETS_CMD"
+      run_gate deps    "$AR_DEPS_CMD"
+      run_gate sast    "$AR_SAST_CMD"
+  artifacts:
+    when: always
+    paths:
+      - .adversarial-review/     # gate records carried to ar-panel and preserved for inspection
+    expire_in: 30 days
+
+# Job 2 — independent panel + verdict. Has the key; runs a fresh pinned tooling copy; consumes the
+# recorded gates from ar-gates. This job never executes repository commands.
+ar-panel:
+  extends: .ar-common
+  stage: review
+  needs: [ar-gates]              # inherits the .adversarial-review/ artifact (recorded gates)
+  script:
+    - |
+      # Run the panel only after a CLEAN secrets scan (read from the recorded gate, not re-run) so a
+      # freshly committed credential in the diff is never transmitted to remote reviewers.
+      SECRETS_OK=$(python3 -c 'import json,glob; f=sorted(glob.glob(".adversarial-review/run-*/gates/secrets.json")); print("1" if f and json.load(open(f[-1])).get("status")=="PASS" else "0")')
+      if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+        if [ "$SECRETS_OK" != "1" ]; then
+          echo "adversarial-review: skipping panel — configure AR_SECRETS_CMD so the recorded secrets gate passes before sending the diff to reviewers" >&2
         else
-          # Assemble the context the skill expects: requirements + invariants, the diff, and the
-          # surrounding code reviewers need. A diff-only review misses broken invariants in
-          # unchanged callers — fill in the TODOs so review coverage is not overstated.
+          # Diff-only context (no working-tree file reads, so a changed symlink can't exfiltrate a
+          # file outside the checkout). Fill in the TODOs with the surrounding code/invariants a real
+          # review needs — a diff-only review can miss a broken invariant in an unchanged caller.
           {
             echo "# Change under review (CI)"; echo
             echo "## Requirements, acceptance criteria, and invariants"
             echo "TODO: state the intended behavior and the invariants that must remain true."; echo
             echo "## Diff"; echo '```diff'; git diff "$AR_DIFF"; echo '```'; echo
-            echo "## Full contents of changed files (surrounding code the diff depends on)"
-            # NUL-delimited + exact paths: word-splitting/globbing a `git diff --name-only` list
-            # drops files with spaces and mis-expands wildcard-like names. Python reads the exact
-            # changed paths (single line so it stays valid inside this YAML block) and emits each body.
-            git diff --name-only -z "$AR_DIFF" | python3 -c 'import os,sys; [sys.stdout.write("\n### "+f+"\n```\n"+open(f,encoding="utf-8",errors="replace").read()+"```\n") for f in (r.decode("utf-8","surrogateescape") for r in sys.stdin.buffer.read().split(b"\x00")) if f and os.path.isfile(f)]'
-            echo
             echo "TODO: also include unchanged callers, schemas, permission wiring, and rendered"
             echo "samples of any human-facing text this change affects."
           } > /tmp/ctx.md
-          # Expose the key ONLY to panel.py (not to any gate/test command). Tolerate a BLOCKED
-          # panel (too few families, a role that fails) so the aggregator still runs below.
-          OPENROUTER_API_KEY="$AR_KEY" python /tmp/ar/scripts/panel.py assign || true
-          OPENROUTER_API_KEY="$AR_KEY" python /tmp/ar/scripts/panel.py run --context-file /tmp/ctx.md || true
+          # --force so any panel report a gate job may have written is discarded and replaced by a
+          # real reviewer call; assign rewrites the plan. Tolerate a BLOCKED panel so aggregate runs.
+          python /tmp/ar/scripts/panel.py assign || true
+          python /tmp/ar/scripts/panel.py run --force --context-file /tmp/ctx.md || true
         fi
       fi
-    # aggregate.py is the LAST command, so its exit code (0 PASS / 1 FAIL / 2 BLOCKED) is the
-    # job result — reached even when a gate or the panel above failed, because those were
-    # recorded/tolerated, not fatal.
+    # aggregate.py is the LAST command, so its exit (0 PASS / 1 FAIL / 2 BLOCKED) is the job result.
     - python /tmp/ar/scripts/aggregate.py
   artifacts:
-    when: always                 # keep the evidence even on FAIL/BLOCKED, where it matters most
+    when: always
     paths:
-      - .adversarial-review/     # gate records, reviewer reports, verdict.json + attestation
+      - .adversarial-review/     # reviewer reports, verdict.json + attestation, alongside the gates
     expire_in: 30 days
