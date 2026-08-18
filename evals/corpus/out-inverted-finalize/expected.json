@@ -1,0 +1,25 @@
+{
+  "defects": [
+    {
+      "defect_id": "inverted-1",
+      "must_detect": true,
+      "locators": [
+        {
+          "file": "orders/finalize.py",
+          "line_range": [
+            12,
+            14
+          ]
+        }
+      ],
+      "root_cause_tags": [
+        "inverted-output",
+        "false-statement",
+        "output-fidelity",
+        "status-message"
+      ],
+      "severity_floor": "medium"
+    }
+  ],
+  "fp_budget": 1
+}

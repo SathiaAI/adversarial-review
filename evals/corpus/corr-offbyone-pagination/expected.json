@@ -1,0 +1,24 @@
+{
+  "defects": [
+    {
+      "defect_id": "offbyone-1",
+      "must_detect": true,
+      "locators": [
+        {
+          "file": "core/paging.py",
+          "line_range": [
+            3,
+            4
+          ]
+        }
+      ],
+      "root_cause_tags": [
+        "off-by-one",
+        "boundary",
+        "slice-bound"
+      ],
+      "severity_floor": "medium"
+    }
+  ],
+  "fp_budget": 1
+}

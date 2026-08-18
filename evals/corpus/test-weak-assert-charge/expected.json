@@ -1,0 +1,25 @@
+{
+  "defects": [
+    {
+      "defect_id": "weakassert-1",
+      "must_detect": true,
+      "locators": [
+        {
+          "file": "tests/test_billing.py",
+          "line_range": [
+            1,
+            4
+          ]
+        }
+      ],
+      "root_cause_tags": [
+        "weak-assertion",
+        "mocked-success",
+        "no-failure-path",
+        "asserts-mock-not-outcome"
+      ],
+      "severity_floor": "medium"
+    }
+  ],
+  "fp_budget": 1
+}

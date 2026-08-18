@@ -1,0 +1,8 @@
+{
+  "id": "clean-clamp-helper",
+  "title": "Add clamp() bounded helper with boundary tests (no defect)",
+  "tier": "NORMAL",
+  "category": "clean",
+  "language": "python",
+  "source": "seeded"
+}

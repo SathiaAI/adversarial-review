@@ -1,0 +1,8 @@
+{
+  "id": "test-weak-assert-charge",
+  "title": "Test asserts the mock was called, not that the customer was charged correctly",
+  "tier": "NORMAL",
+  "category": "test_quality",
+  "language": "python",
+  "source": "seeded"
+}
