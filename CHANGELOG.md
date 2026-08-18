@@ -27,6 +27,10 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   across every defect category plus clean cases, an `evals/README.md`, and CI coverage. This
   is the groundwork for measuring the panel's true-positive / false-negative / false-positive
   rates (scoring lands in E1-S2).
+- Distribution: a `release` workflow publishes to PyPI on a `v*` tag via **Trusted Publishing**
+  (OIDC, no stored token); an `action-selftest` workflow exercises the composite action keyless
+  and asserts the honest BLOCKED verdict; a GitLab CI template (`examples/.gitlab-ci.yml`); and a
+  `Changelog` project URL.
 
 ## [0.1.0]
 
