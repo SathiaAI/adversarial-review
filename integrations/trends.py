@@ -27,6 +27,7 @@ import html
 import json
 import math
 import os
+import re
 import sys
 
 VERDICTS = ("PASS", "FAIL", "BLOCKED")
@@ -109,12 +110,17 @@ def _extract(run_id, v):
 
 def _candidate_dirs(root):
     """Dirs ``collect_runs`` inspects: ``root`` itself when it holds ``verdict.json``, otherwise
-    every immediate, non-hidden subdirectory (sorted). ``[]`` when ``root`` is not a directory."""
+    every immediate, non-hidden subdirectory (sorted). ``[]`` when ``root`` is not a directory or
+    cannot be listed (e.g. unreadable) — the tool tolerates such roots rather than crashing."""
     if not os.path.isdir(root):
         return []
     if os.path.isfile(os.path.join(root, "verdict.json")):
         return [root]
-    return [os.path.join(root, name) for name in sorted(os.listdir(root))
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    return [os.path.join(root, name) for name in names
             if os.path.isdir(os.path.join(root, name)) and not name.startswith(".")]
 
 
@@ -272,16 +278,16 @@ def render_html(records, summary, skipped, generated_at=""):
                      % (len(skipped), "".join("<li>%s</li>" % _esc(s) for s in skipped)))
     empty = "" if records else '<p class="empty">No runs with a readable verdict.json were found.</p>'
     gen = ('<span class="gen">generated %s</span>' % _esc(generated_at)) if generated_at else ""
-    # str.replace (not %/.format) because the inline CSS is full of literal % and {} that would
-    # otherwise be read as format directives.
+    # A single regex pass over the @@TOKEN@@ placeholders (not %/.format — the inline CSS is full of
+    # literal % and {} — and not a sequential str.replace loop, which would re-scan each substituted
+    # value for later tokens: a crafted run_id like "@@SKIPS@@" survives _esc, since html.escape does
+    # not touch "@", and a later pass would corrupt it). One pass replaces each placeholder exactly
+    # once from the map and never re-reads inserted values.
     subs = {
         "@@TILES@@": tile_html, "@@VBAR@@": _verdict_bar(summary), "@@CHARTS@@": charts,
         "@@ROWS@@": _rows(records), "@@SKIPS@@": skip_html, "@@EMPTY@@": empty, "@@GEN@@": gen,
     }
-    out = _TEMPLATE
-    for token, value in subs.items():
-        out = out.replace(token, value)
-    return out
+    return re.sub(r"@@[A-Z]+@@", lambda m: subs.get(m.group(0), m.group(0)), _TEMPLATE)
 
 
 _TEMPLATE = """<!doctype html>
@@ -341,11 +347,12 @@ def _guard_readonly_out_dir(root, out_dir):
     A run dir is any directory holding ``verdict.json``; writing ``trends.*`` into one (or a
     subdirectory of one) would mutate an immutable audit artifact. ``out_dir`` is rejected with
     ``ValueError`` when it resolves to, or under, any run dir discovered beneath ``root``. Paths are
-    resolved through symlinks first so the check can't be sidestepped via a link.
+    resolved through symlinks and normcased first, so the check can't be sidestepped via a link or a
+    case variation on a case-insensitive filesystem (Windows, default macOS).
     """
-    out_real = os.path.realpath(out_dir)
+    out_real = os.path.normcase(os.path.realpath(out_dir))
     for rd in _run_dirs(root):
-        rd_real = os.path.realpath(rd)
+        rd_real = os.path.normcase(os.path.realpath(rd))
         if out_real == rd_real or out_real.startswith(rd_real + os.sep):
             raise ValueError(
                 "refusing to write trends output into run dir '%s': audit artifacts are "

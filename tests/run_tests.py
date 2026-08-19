@@ -2281,11 +2281,13 @@ def t_cost_cap_rejects_invalid_values():
             pass
         finally:
             os.environ.pop("AR_MAX_COST_USD", None)
-    os.environ["AR_MAX_COST_USD"] = "none"           # documented disable token
-    assert panel.cost_cap() == (None, "env")
-    os.environ["AR_MAX_COST_USD"] = "12.5"           # finite value + its source
-    assert panel.cost_cap() == (12.5, "env")
-    os.environ.pop("AR_MAX_COST_USD", None)
+    try:
+        os.environ["AR_MAX_COST_USD"] = "none"       # documented disable token
+        assert panel.cost_cap() == (None, "env")
+        os.environ["AR_MAX_COST_USD"] = "12.5"        # finite value + its source
+        assert panel.cost_cap() == (12.5, "env")
+    finally:
+        os.environ.pop("AR_MAX_COST_USD", None)       # never leak the env var if an assert fails
     for bad in (float("nan"), float("inf"), -1, "nan", "-2"):
         try:
             _common._validate_policy({"max_cost_usd": bad}, "policy")
@@ -2786,7 +2788,7 @@ def t_trends_rejects_nonfinite_cost():
                           '"computed_at": "2026-08-13T10:00:00Z", "coverage": {"cost_usd": %s}}'
                           % ("9" * 400))
 
-        records, summary, skipped = trends.build(str(runs), str(root / "out"))
+        records, summary, _ = trends.build(str(runs), str(root / "out"))
         by_id = {r["run_id"]: r for r in records}
         assert by_id["run-nan"]["cost_usd"] is None, by_id["run-nan"]
         assert by_id["run-inf"]["cost_usd"] is None, by_id["run-inf"]
@@ -2822,7 +2824,7 @@ def t_trends_aggregate_cost_overflow():
         mkrun("run-b", 1e308, "2026-08-11T10:00:00Z")   # sum(1e308, 1e308) -> inf
 
         out = root / "out"
-        records, summary, skipped = trends.build(str(runs), str(out))
+        records, summary, _ = trends.build(str(runs), str(out))
         assert len(records) == 2 and summary["runs_with_cost"] == 2, summary  # both counted
         assert summary["total_cost_usd"] is None, summary                     # overflow degraded
         raw = (out / "trends.json").read_text(encoding="utf-8")
@@ -2849,7 +2851,7 @@ def t_trends_tolerates_unencodable_text():
              "computed_at": "2026-08-10T10:00:00Z", "coverage": {"cost_usd": 0.1}}))
 
         out = root / "out"
-        records, summary, skipped = trends.build(str(runs), str(out))  # must not raise
+        records, summary, _ = trends.build(str(runs), str(out))  # must not raise
         assert len(records) == 1, records
         # both outputs fully written and re-readable as UTF-8 (no lone surrogate survived)
         assert (out / "trends.json").read_text(encoding="utf-8")
@@ -2897,6 +2899,62 @@ def t_trends_refuses_write_into_run_dir():
         out = root / "out"
         records, _, _ = trends.build(str(runs), str(out))
         assert (out / "trends.json").is_file() and len(records) == 1, records
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_trends_template_token_injection_safe():
+    # E5-S2 hardening: render_html substitutes @@TOKEN@@ placeholders in ONE regex pass. A crafted
+    # run_id like "@@SKIPS@@" survives _esc (html.escape leaves "@" alone); a sequential
+    # str.replace loop would re-scan the substituted ROWS value and strip/rewrite it. One pass
+    # replaces each placeholder exactly once and never re-reads inserted values.
+    sys.path.insert(0, str(SKILL / "integrations"))
+    import trends
+
+    root = Path(tempfile.mkdtemp(prefix="ar-trends-tok-"))
+    try:
+        runs = root / "runs"
+        d = runs / "run-a"
+        d.mkdir(parents=True)
+        (d / "verdict.json").write_text(json.dumps(
+            {"verdict": "PASS", "run_id": "run@@SKIPS@@x", "computed_at": "2026-08-10T10:00:00Z",
+             "coverage": {"cost_usd": 0.1}}))
+        out = root / "out"
+        records, _, _ = trends.build(str(runs), str(out))
+        assert records[0]["run_id"] == "run@@SKIPS@@x", records[0]
+        htmltext = (out / "trends.html").read_text(encoding="utf-8")
+        # the literal token from the run_id survives (the template's own @@SKIPS@@ is gone);
+        # under the old sequential-replace loop it would have been stripped to "run x".
+        assert "run@@SKIPS@@x" in htmltext, "token in run_id was re-substituted"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_trends_tolerates_unreadable_root():
+    # E5-S2 hardening: an unreadable run root must degrade to an empty report, not crash — the
+    # tool's "never crashes on partial/malformed input" contract. os.listdir can raise OSError
+    # (permissions); build() must tolerate it. (Simulated: chmod is a no-op under root/CI.)
+    sys.path.insert(0, str(SKILL / "integrations"))
+    import trends
+
+    root = Path(tempfile.mkdtemp(prefix="ar-trends-perm-"))
+    try:
+        runs = root / "runs"
+        runs.mkdir()
+        real_listdir = os.listdir
+
+        def boom(path):
+            if str(path) == str(runs):
+                raise PermissionError(13, "Permission denied")
+            return real_listdir(path)
+
+        os.listdir = boom
+        try:
+            records, summary, _ = trends.build(str(runs), str(root / "out"))  # must not raise
+        finally:
+            os.listdir = real_listdir
+        assert records == [] and summary["total_runs"] == 0, (records, summary)
+        assert (root / "out" / "trends.json").is_file()
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
