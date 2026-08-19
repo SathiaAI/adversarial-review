@@ -39,8 +39,10 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   under a run dir, so it can never overwrite an audit artifact. It skips malformed runs, tolerates
   runs predating cost accounting, and hardens every value it reads from an artifact so one poisoned
   run can neither corrupt the rollup nor abort the report: unconvertible costs degrade to unknown
-  (`NaN`/`Infinity`, which `json.load` accepts, and ints too large for `float()`), and lone-surrogate
-  text is sanitized before the UTF-8 write. It is a source-checkout tool, not a packaged console script.
+  (`NaN`/`Infinity`, which `json.load` accepts, and ints too large for `float()`), a per-run-finite
+  cost total that overflows to `inf` on summation degrades to unknown rather than emitting a
+  non-standard `Infinity` token, and lone-surrogate text is sanitized before the UTF-8 write. It is
+  a source-checkout tool, not a packaged console script.
 
 ## [0.1.0]
 

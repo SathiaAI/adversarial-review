@@ -2564,6 +2564,37 @@ def t_trends_rejects_nonfinite_cost():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def t_trends_aggregate_cost_overflow():
+    # E5-S2 hardening: individual costs pass _finite_cost yet their SUM can overflow to inf;
+    # round(inf) stays inf and json.dump would emit non-standard `Infinity`. The rollup must
+    # degrade total_cost_usd to None while still counting the runs, and trends.json must parse.
+    sys.path.insert(0, str(SKILL / "integrations"))
+    import trends
+
+    root = Path(tempfile.mkdtemp(prefix="ar-trends-ovf-"))
+    try:
+        runs = root / "runs"
+
+        def mkrun(rid, cost, at):
+            d = runs / rid
+            d.mkdir(parents=True)
+            (d / "verdict.json").write_text(json.dumps(
+                {"verdict": "PASS", "run_id": rid, "computed_at": at,
+                 "coverage": {"cost_usd": cost}}))
+
+        mkrun("run-a", 1e308, "2026-08-10T10:00:00Z")   # finite individually
+        mkrun("run-b", 1e308, "2026-08-11T10:00:00Z")   # sum(1e308, 1e308) -> inf
+
+        out = root / "out"
+        records, summary, skipped = trends.build(str(runs), str(out))
+        assert len(records) == 2 and summary["runs_with_cost"] == 2, summary  # both counted
+        assert summary["total_cost_usd"] is None, summary                     # overflow degraded
+        raw = (out / "trends.json").read_text(encoding="utf-8")
+        assert "Infinity" not in raw, raw                                     # standard JSON only
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def t_trends_tolerates_unencodable_text():
     # E5-S2 hardening: json.load accepts lone surrogates (e.g. "\ud800") in text fields; str() and
     # html.escape() preserve them, and the UTF-8 write of the HTML report then raises

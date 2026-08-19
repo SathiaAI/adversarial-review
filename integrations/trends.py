@@ -157,11 +157,15 @@ def summarize(records):
         by_verdict[r["verdict"]] += 1
     costs = [r["cost_usd"] for r in records if r["cost_usd"] is not None]
     total = len(records)
+    # Each cost is finite (see _finite_cost), but summing many large ones can still overflow to
+    # inf; round(inf) stays inf and json.dump would emit a non-standard `Infinity` token. Degrade
+    # an overflowing total to None (unknown) while the runs themselves still count.
+    cost_sum = sum(costs)
     return {
         "total_runs": total,
         "by_verdict": by_verdict,
         "pass_rate": round(by_verdict["PASS"] / total, 4) if total else None,
-        "total_cost_usd": round(sum(costs), 6) if costs else None,
+        "total_cost_usd": round(cost_sum, 6) if costs and math.isfinite(cost_sum) else None,
         "runs_with_cost": len(costs),
         "total_findings_high_critical": sum(r["findings_high_critical"] for r in records),
         "total_unresolved": sum(r["unresolved"] for r in records),
