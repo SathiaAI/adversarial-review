@@ -2520,6 +2520,84 @@ def t_trends_dashboard():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def t_trends_rejects_nonfinite_cost():
+    # E5-S2 hardening: json.load() parses NaN/Infinity by default. A non-finite cost_usd must
+    # degrade to "unknown" (None) and never enter the rollup — otherwise sum()/round() poison
+    # every cost figure on the dashboard.
+    sys.path.insert(0, str(SKILL / "integrations"))
+    import trends
+
+    root = Path(tempfile.mkdtemp(prefix="ar-trends-nan-"))
+    try:
+        runs = root / "runs"
+
+        def mkrun(rid, verdict_text):
+            d = runs / rid
+            d.mkdir(parents=True)
+            (d / "verdict.json").write_text(verdict_text)
+
+        mkrun("run-ok", json.dumps({"verdict": "PASS", "run_id": "run-ok",
+                                    "computed_at": "2026-08-10T10:00:00Z",
+                                    "coverage": {"cost_usd": 0.50}}))
+        # raw JSON tokens json.load accepts but that must not reach the rollup
+        mkrun("run-nan", '{"verdict": "PASS", "run_id": "run-nan", '
+                         '"computed_at": "2026-08-11T10:00:00Z", "coverage": {"cost_usd": NaN}}')
+        mkrun("run-inf", '{"verdict": "PASS", "run_id": "run-inf", '
+                         '"computed_at": "2026-08-12T10:00:00Z", "coverage": {"cost_usd": Infinity}}')
+
+        records, summary, skipped = trends.build(str(runs), str(root / "out"))
+        by_id = {r["run_id"]: r for r in records}
+        assert by_id["run-nan"]["cost_usd"] is None, by_id["run-nan"]
+        assert by_id["run-inf"]["cost_usd"] is None, by_id["run-inf"]
+        assert by_id["run-ok"]["cost_usd"] == 0.50, by_id["run-ok"]
+        # only the finite cost is counted; the total stays finite and exact (NaN would fail ==)
+        assert summary["runs_with_cost"] == 1, summary
+        assert summary["total_cost_usd"] == 0.5, summary
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_trends_refuses_write_into_run_dir():
+    # E5-S2 hardening: the tool guarantees it is read-only over run dirs. build() must REFUSE
+    # (ValueError, before creating anything) when --out-dir resolves to a run dir or under one,
+    # so it can never overwrite an immutable audit artifact.
+    sys.path.insert(0, str(SKILL / "integrations"))
+    import trends
+
+    root = Path(tempfile.mkdtemp(prefix="ar-trends-ro-"))
+    try:
+        runs = root / "runs"
+        rd = runs / "run-a"
+        rd.mkdir(parents=True)
+        (rd / "verdict.json").write_text(json.dumps(
+            {"verdict": "PASS", "run_id": "run-a", "computed_at": "2026-08-10T10:00:00Z",
+             "coverage": {"cost_usd": 0.1}}))
+        before = (rd / "verdict.json").read_bytes()
+
+        def refuses(root_arg, out_arg, why):
+            try:
+                trends.build(root_arg, out_arg)
+            except ValueError:
+                return
+            raise AssertionError("expected ValueError: " + why)
+
+        refuses(str(runs), str(rd), "out-dir == the run dir itself")
+        refuses(str(runs), str(rd / "sub"), "out-dir nested under the run dir")
+        refuses(str(rd), str(rd), "root is the single run dir and out-dir == root")
+
+        # nothing was written into the artifact; verdict.json is byte-identical
+        assert not (rd / "trends.json").exists() and not (rd / "trends.html").exists()
+        assert not (rd / "sub").exists()
+        assert (rd / "verdict.json").read_bytes() == before
+
+        # the sibling collection dir (holds run dirs but is not one) remains a legal target
+        out = root / "out"
+        records, _, _ = trends.build(str(runs), str(out))
+        assert (out / "trends.json").is_file() and len(records) == 1, records
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

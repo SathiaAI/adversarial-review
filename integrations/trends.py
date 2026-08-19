@@ -25,6 +25,7 @@ subdirectory containing ``verdict.json`` (and ``RUN_ROOT`` itself is accepted if
 import argparse
 import html
 import json
+import math
 import os
 import sys
 
@@ -60,7 +61,10 @@ def _extract(run_id, v):
         verdict = "BLOCKED"  # an unrecognized verdict is treated as not-a-pass, never as PASS
 
     cost = coverage.get("cost_usd")
-    cost = float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None
+    # Accept a real, finite number only. json.load() parses NaN/Infinity by default, and a
+    # non-finite cost would poison the rollup's sum/round — so those degrade to None (unknown).
+    cost = (float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool)
+            and math.isfinite(cost) else None)
 
     def _len(seq):
         return len(seq) if isinstance(seq, list) else 0
@@ -84,6 +88,17 @@ def _extract(run_id, v):
     }
 
 
+def _candidate_dirs(root):
+    """Dirs ``collect_runs`` inspects: ``root`` itself when it holds ``verdict.json``, otherwise
+    every immediate, non-hidden subdirectory (sorted). ``[]`` when ``root`` is not a directory."""
+    if not os.path.isdir(root):
+        return []
+    if os.path.isfile(os.path.join(root, "verdict.json")):
+        return [root]
+    return [os.path.join(root, name) for name in sorted(os.listdir(root))
+            if os.path.isdir(os.path.join(root, name)) and not name.startswith(".")]
+
+
 def collect_runs(root):
     """Walk ``root`` for run dirs and return ``(records, skipped)``.
 
@@ -96,16 +111,7 @@ def collect_runs(root):
     if not os.path.isdir(root):
         return records, [f"{root}: not a directory"]
 
-    candidates = []
-    if os.path.isfile(os.path.join(root, "verdict.json")):
-        candidates.append(root)
-    else:
-        for name in sorted(os.listdir(root)):
-            d = os.path.join(root, name)
-            if os.path.isdir(d) and not name.startswith("."):
-                candidates.append(d)
-
-    for d in candidates:
+    for d in _candidate_dirs(root):
         vpath = os.path.join(d, "verdict.json")
         run_id = os.path.basename(d.rstrip("/"))
         if not os.path.isfile(vpath):
@@ -300,9 +306,34 @@ h2{font-size:15px;margin:0 0 8px}
 """
 
 
+def _run_dirs(root):
+    """The subset of candidate dirs that are real run dirs (hold a ``verdict.json``)."""
+    return [d for d in _candidate_dirs(root)
+            if os.path.isfile(os.path.join(d, "verdict.json"))]
+
+
+def _guard_readonly_out_dir(root, out_dir):
+    """Enforce the read-only-over-artifacts guarantee before any write.
+
+    A run dir is any directory holding ``verdict.json``; writing ``trends.*`` into one (or a
+    subdirectory of one) would mutate an immutable audit artifact. ``out_dir`` is rejected with
+    ``ValueError`` when it resolves to, or under, any run dir discovered beneath ``root``. Paths are
+    resolved through symlinks first so the check can't be sidestepped via a link.
+    """
+    out_real = os.path.realpath(out_dir)
+    for rd in _run_dirs(root):
+        rd_real = os.path.realpath(rd)
+        if out_real == rd_real or out_real.startswith(rd_real + os.sep):
+            raise ValueError(
+                "refusing to write trends output into run dir '%s': audit artifacts are "
+                "read-only; choose an --out-dir outside the run directories" % rd)
+
+
 def build(root, out_dir, generated_at=""):
     """Collect, summarize, and write ``trends.json`` + ``trends.html`` into ``out_dir`` (created if
-    needed, and never inside a run dir). Returns ``(records, summary, skipped)``."""
+    needed). Refuses to write into a run dir — audit artifacts are read-only — raising ``ValueError``
+    before any file is created. Returns ``(records, summary, skipped)``."""
+    _guard_readonly_out_dir(root, out_dir)
     records, skipped = collect_runs(root)
     summary = summarize(records)
     os.makedirs(out_dir, exist_ok=True)
@@ -325,7 +356,11 @@ def main(argv=None):
     ap.add_argument("--stamp", default="",
                     help="optional generation label shown in the HTML header (kept out of the JSON)")
     args = ap.parse_args(argv)
-    records, summary, skipped = build(args.root, args.out_dir, args.stamp)
+    try:
+        records, summary, skipped = build(args.root, args.out_dir, args.stamp)
+    except ValueError as exc:
+        print("trends: %s" % exc, file=sys.stderr)
+        return 2
     print("trends: %d run(s), %d skipped -> %s"
           % (len(records), len(skipped), os.path.join(args.out_dir, "trends.html")))
     if not records and skipped:

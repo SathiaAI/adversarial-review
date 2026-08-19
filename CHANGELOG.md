@@ -34,8 +34,11 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
 - Cross-run trends dashboard (E5-S2): `integrations/trends.py` reads a directory of immutable run
   artifacts and emits a deterministic `trends.json` rollup plus a single self-contained
   `trends.html` (inline CSS + SVG, no dependencies, no external network calls) — verdict
-  distribution, pass rate, finding and cost trends, and a per-run table. Read-only over the run
-  dirs; it skips malformed runs and tolerates runs predating cost accounting.
+  distribution, pass rate, finding and cost trends, and a per-run table. The read-only guarantee
+  is enforced, not just documented: `build()` refuses (raises) an `--out-dir` that resolves to or
+  under a run dir, so it can never overwrite an audit artifact. It skips malformed runs, tolerates
+  runs predating cost accounting, and rejects non-finite (`NaN`/`Infinity`) costs — which
+  `json.load` accepts by default — so a single poisoned artifact can't corrupt the rollup totals.
 
 ## [0.1.0]
 

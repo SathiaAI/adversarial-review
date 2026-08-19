@@ -573,7 +573,8 @@ integrations/
 
 Cross-run trends: `python integrations/trends.py .adversarial-review --out-dir .` reads a directory
 of immutable run dirs and writes a self-contained `trends.html` (plus a `trends.json` rollup) —
-verdict distribution, pass rate, finding/cost trends, per-run table. It never writes into a run dir.
+verdict distribution, pass rate, finding/cost trends, per-run table. It never writes into a run dir
+— an `--out-dir` that resolves inside one is refused, so an audit artifact can't be overwritten.
 
 ## Security notes
 
