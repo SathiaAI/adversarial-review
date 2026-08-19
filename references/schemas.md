@@ -170,6 +170,7 @@ human-readable `verdict.md` is written alongside `verdict.json`.
              "degraded": null, "dev_families_excluded": []},
    "rebuttal": {"policy": "contention", "required": false, "ran": false},
    "findings": {"raised": 0, "triaged": 0, "untriaged_release_blocking": 0},
+   "cost_usd": 0.0, "cost_aborted": false, "cost_cap_usd": 20.0, "cost_cap_source": "default",
    "areas_not_reviewed": ["union of reviewer attestations"]},
  "attestation": {"algorithm": "sha256-canonical-json-v1", "inputs": 0,
    "digest": "hex", "files": {"run.json": "hex", "gates/unit.json": "hex"}},
@@ -200,10 +201,20 @@ artifacts that bypassed ingest). Consumers gating in CI should treat `gates.miss
 and a `rebuttal` of `{"required": true, "ran": false}` as the specific unknowns behind
 a BLOCKED verdict.
 
+The cost fields (E4-S2) meter reviewer spend from the recorded `panel/meta/*.json`. `cost_usd`
+is the finite USD total across the panel, rebuttal, and concurrence phases — a missing, non-finite,
+or negative per-reviewer `cost` is metered as `$0`, and the MCP-ingest path's nested `usage.cost`
+is read when no top-level `cost` was recorded. `cost_cap_usd` and `cost_cap_source` echo the
+ceiling `panel.py run` actually enforced and where it was resolved from (`env`, `policy`, or
+`default`); both are `null` when the cap is disabled or the run predates cost accounting.
+`cost_aborted` is `true` when `panel.py` stopped a phase on the cap and wrote `cost_abort.json`,
+which drives a **BLOCKED** verdict with an explicit cost reason. Because the cap is a pre-call
+gate, `cost_usd` may exceed `cost_cap_usd` by up to the in-flight reviewer's cost.
+
 Definitions: **PASS** — all tier-required gates recorded and passing, panel complete and
 independent, every high/critical finding validated with a compliant record. **FAIL** — a
 recorded gate failed, or a confirmed-unfixed / unresolved / non-suppressed-accepted
 high/critical finding exists. **BLOCKED** — required verification is missing or
 incomplete (absent gates, incomplete panel, unvalidated findings, missing concurrence,
-expired suppressions, missing rebuttal at CRITICAL). BLOCKED is not "probably fine" —
-it means you do not know.
+expired suppressions, missing rebuttal at CRITICAL, or a panel aborted on the cost cap).
+BLOCKED is not "probably fine" — it means you do not know.

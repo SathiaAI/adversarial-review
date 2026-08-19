@@ -15,6 +15,7 @@ Stdlib only. Exit codes: 0 ok, 1 error, 2 BLOCKED.
 """
 import argparse
 import json
+import math
 import os
 import re
 import secrets
@@ -28,8 +29,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (RUN_ROOT, VALID_REBUTTAL, VALID_RISKS, capability_of, die,
-                     family_of, load_capabilities, load_policy, now_iso, read_json,
-                     resolve_run, resolve_setting, write_json)
+                     family_of, load_capabilities, load_policy, merge_usage, meta_cost,
+                     now_iso, read_json, resolve_run, resolve_setting, write_json)
 
 DEFAULT_BASE = "https://openrouter.ai/api/v1"
 
@@ -435,17 +436,20 @@ def build_request(model_slug, messages, schema, schema_name, supports_structured
     cap = capability or {}
     base_max = int(os.environ.get("AR_MAX_TOKENS", "8000"))
     floor = cap.get("max_tokens_floor") or 0
-    body = {
-        "model": model_slug,
-        "messages": messages,
-        "max_tokens": max(base_max, floor),
-    }
+    # Preserve the pre-E4 key insertion order for the default profile — `temperature` before
+    # `max_tokens` — so an all-default request serializes byte-for-byte as it did before (http_json
+    # dumps in insertion order). Profiles that forbid temperature simply omit it; that is not a
+    # default request and carries no byte-identity promise.
+    body = {"model": model_slug, "messages": messages}
     if cap.get("temperature") != "forbidden":
         body["temperature"] = float(os.environ.get("AR_TEMPERATURE", "0.1"))
+    body["max_tokens"] = max(base_max, floor)
     if cap.get("reasoning") == "mandatory":
         body["reasoning"] = {"effort": os.environ.get("AR_REASONING_EFFORT", "high")}
     prefs, mode = privacy_provider_prefs(risk)
-    if supports_structured:
+    # A capability profile can override the catalog's structured-output flag in either direction
+    # (correct a catalog that wrongly advertises support, or enable it for an incomplete catalog).
+    if cap.get("structured_outputs", supports_structured):
         body["response_format"] = {"type": "json_schema", "json_schema": {
             "name": schema_name, "strict": True, "schema": schema}}
         prefs["require_parameters"] = True
@@ -571,13 +575,15 @@ def FAMILY_OR_SELF(p):
     return FAMILY_ALIASES.get(p.strip().lower(), p.strip().lower())
 
 
-def call_reviewer(base, key, body, schema, corrective=None):
-    """One HTTP attempt (+1 retry on malformed JSON). Returns (obj, raw, usage, provider)."""
+def call_reviewer(base, key, body, schema, corrective=None, prior_usage=None):
+    """One HTTP attempt (+1 retry on malformed JSON). Returns (obj, raw, usage, provider).
+    ``usage`` accumulates across the retry (``prior_usage``) so a malformed-JSON retry — which is
+    a second billed call — is fully counted against the cost cap, not just the final attempt."""
     resp = http_json(f"{base}/chat/completions", payload=body, key=key)
     if "error" in resp and "choices" not in resp:
         raise RuntimeError(str(resp["error"]))
     content = resp["choices"][0]["message"]["content"]
-    usage = resp.get("usage", {})
+    usage = merge_usage(prior_usage, resp.get("usage", {}))
     provider = resp.get("provider")
     try:
         obj = extract_json(content)
@@ -590,7 +596,7 @@ def call_reviewer(base, key, body, schema, corrective=None):
             {"role": "assistant", "content": content if isinstance(content, str) else json.dumps(content)},
             {"role": "user", "content": "Your output failed validation:\n- "
              + "\n- ".join(errs[:20]) + "\nRespond again with ONLY the corrected JSON object."}]
-        return call_reviewer(base, key, retry_body, schema, corrective=errs)
+        return call_reviewer(base, key, retry_body, schema, corrective=errs, prior_usage=usage)
     if errs:
         raise ValueError("reviewer output failed validation after retry: " + "; ".join(errs[:10]))
     return obj, content, usage, provider
@@ -626,29 +632,44 @@ def run_one_role(run, meta, plan, role, context_text, base, key):
 
 
 def cost_cap():
-    """Resolved per-run USD cost ceiling (E4-S2): AR_MAX_COST_USD > policy max_cost_usd > $20.
-    A value of 0 / '' / 'none' / 'off' disables the cap (returns None)."""
-    raw, _ = resolve_setting(None, "AR_MAX_COST_USD", load_policy(), "max_cost_usd", "20")
+    """Resolved per-run USD ceiling and its source (E4-S2): AR_MAX_COST_USD > policy
+    max_cost_usd > $20. A value of 0 / '' / 'none' / 'off' / 'unlimited' disables the cap.
+    Returns ``(cap_or_None, source)``. Non-finite or negative values are rejected loudly, so a
+    configuration typo can never silently remove the spending guard."""
+    raw, src = resolve_setting(None, "AR_MAX_COST_USD", load_policy(), "max_cost_usd", "20")
     s = str(raw).strip().lower()
     if s in ("", "0", "none", "off", "unlimited"):
-        return None
+        return None, src
     try:
         v = float(s)
     except ValueError:
-        die(f"max_cost_usd must be a number or 'none', got {raw!r}")
-    return v if v > 0 else None
+        die(f"max_cost_usd must be a number or 'none'/'off', got {raw!r}")
+    if not math.isfinite(v) or v < 0:
+        die(f"max_cost_usd must be a finite, non-negative number or 'none'/'off', got {raw!r}")
+    return (v if v > 0 else None), src
 
 
 def panel_cost(run):
-    """USD spent so far, summed from recorded reviewer meta (panel + rebuttal). A missing or
-    non-numeric cost counts as 0 — a provider that omits cost cannot be charged against the cap."""
+    """USD spent so far, summed from recorded reviewer meta (panel + rebuttal + concurrence).
+    A missing, non-finite, or negative cost counts as 0 (see ``meta_cost``) — a provider that
+    omits or corrupts cost can neither be charged against the cap nor drive the total down."""
     total, mdir = 0.0, run / "panel" / "meta"
     if mdir.is_dir():
         for p in sorted(mdir.glob("*.json")):
-            c = read_json(p).get("cost")
-            if isinstance(c, (int, float)) and not isinstance(c, bool):
-                total += float(c)
+            total += meta_cost(read_json(p))
     return total
+
+
+def _cost_abort(run, plan, cap, spent, phase):
+    """Record ``cost_abort.json`` and die BLOCKED — the shared stop for any paid phase that would
+    cross the cap. The aggregator BLOCKS on the missing coverage; naming the ``phase`` keeps the
+    cost reason distinct from an ordinary incomplete panel."""
+    not_run = [r for r in plan["roles"] if not (run / "panel" / f"{r}.json").exists()]
+    write_json(run / "cost_abort.json",
+               {"cap_usd": cap, "spent_usd": round(spent, 6), "phase": phase,
+                "not_run": not_run, "at": now_iso()})
+    die(f"BLOCKED: panel cost cap ${cap:.2f} reached (spent ${spent:.4f}) in {phase}; "
+        f"{len(not_run)} reviewer(s) not run: {', '.join(not_run) or 'none'}", 2)
 
 
 def cmd_run(args):
@@ -661,25 +682,24 @@ def cmd_run(args):
         die("no API key found (OPENROUTER_API_KEY / AR_API_KEY / AR_KEY_FILE). "
             "For keyless MCP transport use `panel.py prepare` + `panel.py ingest`.", 2)
 
-    cap = cost_cap()
+    cap, cap_src = cost_cap()
+    # Persist the effective ceiling and its source in the run record so the audit shows which cap
+    # was actually enforced — not just total spend — even if AR_MAX_COST_USD changes between runs.
+    write_json(run / "cost_policy.json",
+               {"cap_usd": cap, "source": cap_src, "recorded_at": now_iso()})
     failed = []
     for role in plan["roles"]:
         if (run / "panel" / f"{role}.json").exists() and not args.force:
             print(f"  {role}: already complete, skipping (use --force to redo)")
             continue
-        # Hard cost ceiling: if the reviewers recorded so far already reached the cap, abort the
-        # rest with a recorded reason. The aggregator then BLOCKS on the missing coverage — a
-        # verbose model can raise the bill but can never buy a silent partial PASS (E4-S2).
+        # Cost ceiling: if the reviewers recorded so far already reached the cap, abort the rest
+        # with a recorded reason. The aggregator then BLOCKS on the missing coverage — a verbose
+        # model can raise the bill but can never buy a silent partial PASS (E4-S2). This is a
+        # pre-call gate, not a reservation: a reviewer already in flight can still overshoot.
         if cap is not None:
             spent = panel_cost(run)
             if spent >= cap:
-                not_run = [r for r in plan["roles"]
-                           if not (run / "panel" / f"{r}.json").exists()]
-                write_json(run / "cost_abort.json",
-                           {"cap_usd": cap, "spent_usd": round(spent, 6),
-                            "not_run": not_run, "at": now_iso()})
-                die(f"BLOCKED: panel cost cap ${cap:.2f} reached (spent ${spent:.4f}); "
-                    f"{len(not_run)} reviewer(s) not run: {', '.join(not_run)}", 2)
+                _cost_abort(run, plan, cap, spent, "panel")
         print(f"  {role}: calling {plan['roles'][role]['model']} ...")
         if run_one_role(run, meta, plan, role, context_text, base, key):
             continue
@@ -788,6 +808,7 @@ def cmd_rebuttal(args):
         print("no high/critical findings — rebuttal round not required, marker written")
         return
     base, key = api_config()
+    cap, _ = cost_cap()  # same ceiling as the panel phase; rebuttal is billed too
     failed = []
     for role, info in plan["roles"].items():
         others = [d for d in digest if d["author_role"] != role]
@@ -816,6 +837,10 @@ def cmd_rebuttal(args):
         if not key:
             die("no API key; use `panel.py rebuttal --prepare` + "
                 "`panel.py ingest --phase rebuttal`", 2)
+        if cap is not None:
+            spent = panel_cost(run)
+            if spent >= cap:
+                _cost_abort(run, plan, cap, spent, "rebuttal")
         try:
             t0 = time.monotonic()
             obj, raw, usage, provider = call_reviewer(base, key, body, REBUTTAL_SCHEMA)
@@ -871,8 +896,22 @@ def cmd_concur(args):
     base, key = api_config()
     if not key:
         die("no API key; use --prepare for MCP transport", 2)
+    cap, _ = cost_cap()
+    if cap is not None:
+        spent = panel_cost(run)
+        if spent >= cap:
+            die(f"BLOCKED: cost cap ${cap:.2f} reached (spent ${spent:.4f}); "
+                "concurrence not run", 2)
+    t0 = time.monotonic()
     obj, _, usage, provider = call_reviewer(base, key, body, CONCUR_SCHEMA)
     obj["model_id"], obj["family"] = model["slug"], fam
+    # Record concurrence cost under panel/meta so it counts toward panel_cost() and the verdict's
+    # coverage.cost_usd. A unique token keeps repeated concurrence calls from clobbering each other.
+    write_json(run / "panel" / "meta" / f"concurrence.{secrets.token_hex(4)}.json",
+               {"model": model["slug"], "family": fam, "phase": "concurrence",
+                "usage": usage, "cost": meta_cost({"usage": usage}),
+                "latency_ms": int((time.monotonic() - t0) * 1000),
+                "provider": provider, "completed_at": now_iso()})
     print(json.dumps(obj, indent=2))
 
 
