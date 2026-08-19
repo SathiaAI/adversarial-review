@@ -40,7 +40,10 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   pre-E4 key order (`temperature` before `max_tokens`) is preserved, not just the values. A per-run
   cost ceiling (`AR_MAX_COST_USD`, or policy `max_cost_usd`, default `$20`) is enforced as a
   pre-call gate across **every** paid phase — panel, rebuttal, and concurrence — aborting the
-  remaining calls once reached, recording a BLOCKED cost reason, and surfacing the run's total
+  remaining calls once reached (each phase records its own skipped work), recording a BLOCKED cost
+  reason, and surfacing the run's total. The cap the run records in `cost_policy.json` is
+  authoritative for the whole run: rebuttal and concurrence reuse it rather than re-resolving live
+  settings, so changing `AR_MAX_COST_USD` mid-run can neither disable nor raise it. Also surfaced:
   `cost_usd` plus the enforced `cost_cap_usd`/`cost_cap_source` on the verdict; a verbose model can
   raise the bill but never buy a silent partial PASS. Cost accounting is hardened end to end: a
   malformed-JSON retry (a second billed call) is fully counted, the MCP-ingest path's nested

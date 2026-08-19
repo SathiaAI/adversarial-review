@@ -206,7 +206,9 @@ is the finite USD total across the panel, rebuttal, and concurrence phases — a
 or negative per-reviewer `cost` is metered as `$0`, and the MCP-ingest path's nested `usage.cost`
 is read when no top-level `cost` was recorded. `cost_cap_usd` and `cost_cap_source` echo the
 ceiling `panel.py run` actually enforced and where it was resolved from (`env`, `policy`, or
-`default`); both are `null` when the cap is disabled or the run predates cost accounting.
+`default`). `cost_cap_usd` is `null` when the cap is disabled (e.g. `AR_MAX_COST_USD=none`) —
+`cost_cap_source` still records where that setting came from; both are `null` only when the run
+predates cost accounting (no `cost_policy.json`).
 `cost_aborted` is `true` when `panel.py` stopped a phase on the cap and wrote `cost_abort.json`,
 which drives a **BLOCKED** verdict with an explicit cost reason. Because the cap is a pre-call
 gate, `cost_usd` may exceed `cost_cap_usd` by up to the in-flight reviewer's cost.

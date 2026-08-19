@@ -2336,7 +2336,37 @@ def t_cost_cap_enforced_in_rebuttal():
         # rebuttal is required (security raised a high finding) but the cap is already exceeded
         r = sh(["panel.py", "rebuttal"], repo, expect=2, env=env)
         assert "cost cap" in r.stderr.lower(), r.stderr
-        assert read(run / "cost_abort.json")["phase"] == "rebuttal"
+        abort = read(run / "cost_abort.json")
+        assert abort["phase"] == "rebuttal"
+        # skipped work is the unrun REBUTTAL roles, not an empty panel list (all reports exist)
+        assert abort["not_run"], abort
+    finally:
+        mock_router.reset()
+
+
+def t_cost_cap_persisted_across_phases():
+    # The run's cost ceiling is authoritative for later phases: rebuttal reads the cap panel.py
+    # persisted to cost_policy.json, so changing AR_MAX_COST_USD after the panel can neither
+    # disable nor raise it out from under the run (E4-S2).
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.20
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        # $1.10 cap: the 6-reviewer panel finishes at $1.20 (last check saw $1.00 < $1.10)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo,
+           env={**ENV, "AR_MAX_COST_USD": "1.10"})
+        run = latest_run(repo)
+        assert not (run / "cost_abort.json").exists()
+        assert read(run / "cost_policy.json")["cap_usd"] == 1.10
+        # DISABLE the cap in the environment; rebuttal must still honor the persisted $1.10
+        r = sh(["panel.py", "rebuttal"], repo, expect=2, env={**ENV, "AR_MAX_COST_USD": "none"})
+        assert "cost cap" in r.stderr.lower(), r.stderr
+        abort = read(run / "cost_abort.json")
+        assert abort["phase"] == "rebuttal" and abort["cap_usd"] == 1.10, abort
+        # the persisted policy was not overwritten by the later 'none'
+        assert read(run / "cost_policy.json")["cap_usd"] == 1.10
     finally:
         mock_router.reset()
 

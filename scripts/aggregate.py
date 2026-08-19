@@ -671,9 +671,9 @@ def main():
     cost_abort = read_json(run / "cost_abort.json") if (run / "cost_abort.json").exists() else None
     if isinstance(cost_abort, dict):
         blocked.append(
-            f"panel aborted on cost cap ${cost_abort.get('cap_usd')} "
-            f"(spent ${cost_abort.get('spent_usd')}); reviewers not run: "
-            f"{', '.join(str(r) for r in (cost_abort.get('not_run') or []))}")
+            f"{cost_abort.get('phase') or 'panel'} phase aborted on cost cap "
+            f"${cost_abort.get('cap_usd')} (spent ${cost_abort.get('spent_usd')}); not run: "
+            f"{', '.join(str(r) for r in (cost_abort.get('not_run') or [])) or 'none'}")
     # Surface the enforced ceiling + its source (recorded by panel.py at run time) so the audit
     # shows which cap actually applied, not just total spend.
     cpol = read_json(run / "cost_policy.json") if (run / "cost_policy.json").exists() else None

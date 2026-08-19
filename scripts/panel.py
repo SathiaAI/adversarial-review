@@ -660,16 +660,32 @@ def panel_cost(run):
     return total
 
 
-def _cost_abort(run, plan, cap, spent, phase):
+def run_cost_cap(run):
+    """The per-run USD ceiling, authoritative for the whole run. Returns ``(cap, source)``. Prefers
+    the value ``panel.py run`` persisted in ``cost_policy.json`` so a later paid phase (rebuttal,
+    concurrence) honors the SAME cap even if ``AR_MAX_COST_USD`` / policy change between phases; if
+    no record exists yet (a phase invoked before ``run``, or an older run), it resolves live and
+    persists it so the run has one stable, recorded ceiling from that point on."""
+    p = run / "cost_policy.json"
+    if p.exists():
+        rec = read_json(p)
+        if isinstance(rec, dict) and "cap_usd" in rec:
+            return rec.get("cap_usd"), rec.get("source")
+    cap, src = cost_cap()
+    write_json(p, {"cap_usd": cap, "source": src, "recorded_at": now_iso()})
+    return cap, src
+
+
+def _cost_abort(run, cap, spent, phase, not_run):
     """Record ``cost_abort.json`` and die BLOCKED — the shared stop for any paid phase that would
-    cross the cap. The aggregator BLOCKS on the missing coverage; naming the ``phase`` keeps the
-    cost reason distinct from an ordinary incomplete panel."""
-    not_run = [r for r in plan["roles"] if not (run / "panel" / f"{r}.json").exists()]
+    cross the cap. The aggregator BLOCKS on the missing coverage; ``phase`` plus the phase-specific
+    ``not_run`` (unrun panel reviewers, rebuttal roles, or the concurrence call) keep the cost
+    reason distinct from an ordinary incomplete panel and count the skipped work of *this* phase."""
     write_json(run / "cost_abort.json",
                {"cap_usd": cap, "spent_usd": round(spent, 6), "phase": phase,
                 "not_run": not_run, "at": now_iso()})
-    die(f"BLOCKED: panel cost cap ${cap:.2f} reached (spent ${spent:.4f}) in {phase}; "
-        f"{len(not_run)} reviewer(s) not run: {', '.join(not_run) or 'none'}", 2)
+    die(f"BLOCKED: cost cap ${cap:.2f} reached (spent ${spent:.4f}) in {phase}; "
+        f"{len(not_run)} item(s) not run: {', '.join(not_run) or 'none'}", 2)
 
 
 def cmd_run(args):
@@ -682,11 +698,9 @@ def cmd_run(args):
         die("no API key found (OPENROUTER_API_KEY / AR_API_KEY / AR_KEY_FILE). "
             "For keyless MCP transport use `panel.py prepare` + `panel.py ingest`.", 2)
 
-    cap, cap_src = cost_cap()
-    # Persist the effective ceiling and its source in the run record so the audit shows which cap
-    # was actually enforced — not just total spend — even if AR_MAX_COST_USD changes between runs.
-    write_json(run / "cost_policy.json",
-               {"cap_usd": cap, "source": cap_src, "recorded_at": now_iso()})
+    # Establish (and persist, on first call) the run's cost ceiling; it stays authoritative for
+    # rebuttal and concurrence too, so the audit shows which cap was actually enforced.
+    cap, cap_src = run_cost_cap(run)
     failed = []
     for role in plan["roles"]:
         if (run / "panel" / f"{role}.json").exists() and not args.force:
@@ -699,7 +713,8 @@ def cmd_run(args):
         if cap is not None:
             spent = panel_cost(run)
             if spent >= cap:
-                _cost_abort(run, plan, cap, spent, "panel")
+                not_run = [r for r in plan["roles"] if not (run / "panel" / f"{r}.json").exists()]
+                _cost_abort(run, cap, spent, "panel", not_run)
         print(f"  {role}: calling {plan['roles'][role]['model']} ...")
         if run_one_role(run, meta, plan, role, context_text, base, key):
             continue
@@ -808,7 +823,7 @@ def cmd_rebuttal(args):
         print("no high/critical findings — rebuttal round not required, marker written")
         return
     base, key = api_config()
-    cap, _ = cost_cap()  # same ceiling as the panel phase; rebuttal is billed too
+    cap, _ = run_cost_cap(run)  # the run's persisted ceiling; rebuttal is billed under the same cap
     failed = []
     for role, info in plan["roles"].items():
         others = [d for d in digest if d["author_role"] != role]
@@ -840,7 +855,9 @@ def cmd_rebuttal(args):
         if cap is not None:
             spent = panel_cost(run)
             if spent >= cap:
-                _cost_abort(run, plan, cap, spent, "rebuttal")
+                not_run = [r for r in plan["roles"]
+                           if not (run / "rebuttal" / f"{r}.json").exists()]
+                _cost_abort(run, cap, spent, "rebuttal", not_run)
         try:
             t0 = time.monotonic()
             obj, raw, usage, provider = call_reviewer(base, key, body, REBUTTAL_SCHEMA)
@@ -896,12 +913,11 @@ def cmd_concur(args):
     base, key = api_config()
     if not key:
         die("no API key; use --prepare for MCP transport", 2)
-    cap, _ = cost_cap()
+    cap, _ = run_cost_cap(run)  # the run's persisted ceiling governs concurrence too
     if cap is not None:
         spent = panel_cost(run)
         if spent >= cap:
-            die(f"BLOCKED: cost cap ${cap:.2f} reached (spent ${spent:.4f}); "
-                "concurrence not run", 2)
+            _cost_abort(run, cap, spent, "concurrence", ["concurrence"])
     t0 = time.monotonic()
     obj, _, usage, provider = call_reviewer(base, key, body, CONCUR_SCHEMA)
     obj["model_id"], obj["family"] = model["slug"], fam
