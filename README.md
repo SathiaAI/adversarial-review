@@ -567,7 +567,13 @@ references/
   schemas.md          # artifact schemas and blocking rules
   report.md           # final report template
 tests/                # mock router + end-to-end suite (see tests/run_tests.py)
+integrations/
+  trends.py           # cross-run trends dashboard: run dirs -> self-contained HTML + JSON rollup
 ```
+
+Cross-run trends: `python integrations/trends.py .adversarial-review --out-dir .` reads a directory
+of immutable run dirs and writes a self-contained `trends.html` (plus a `trends.json` rollup) —
+verdict distribution, pass rate, finding/cost trends, per-run table. It never writes into a run dir.
 
 ## Security notes
 

@@ -2448,6 +2448,78 @@ def t_corpus_validator_rejects_malformed():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def t_trends_dashboard():
+    # E5-S2: the cross-run trends tool reads a directory of immutable run artifacts and emits a
+    # self-contained HTML dashboard + a deterministic JSON rollup. It must skip malformed runs,
+    # tolerate old runs missing cost accounting, never write into a run dir, carry no external
+    # network references, and produce the same rollup regardless of the (HTML-only) stamp.
+    sys.path.insert(0, str(SKILL / "integrations"))
+    import trends
+
+    root = Path(tempfile.mkdtemp(prefix="ar-trends-"))
+    try:
+        runs = root / "runs"
+
+        def mkrun(rid, body):
+            d = runs / rid
+            d.mkdir(parents=True)
+            (d / "verdict.json").write_text(json.dumps(body))
+
+        mkrun("run-a", {"verdict": "PASS", "risk": "NORMAL", "run_id": "run-a",
+                        "computed_at": "2026-08-10T10:00:00Z",
+                        "counts": {"findings_high_critical": 0, "unresolved": 0},
+                        "coverage": {"findings": {"raised": 1, "triaged": 1},
+                                     "gates": {"passed": [1, 2, 3], "required": [1, 2, 3]},
+                                     "cost_usd": 0.21}})
+        mkrun("run-b", {"verdict": "FAIL", "risk": "SENSITIVE", "run_id": "run-b",
+                        "computed_at": "2026-08-12T10:00:00Z",
+                        "counts": {"findings_high_critical": 2, "unresolved": 1},
+                        "coverage": {"findings": {"raised": 5, "triaged": 4},
+                                     "gates": {"passed": [1, 2], "required": [1, 2, 3]},
+                                     "cost_usd": 0.63}})
+        # run-c predates cost accounting (E4) — no cost_usd; it must still chart, cost = unknown.
+        mkrun("run-c", {"verdict": "BLOCKED", "risk": "CRITICAL", "run_id": "run-c",
+                        "computed_at": "2026-08-14T10:00:00Z",
+                        "counts": {"findings_high_critical": 1},
+                        "coverage": {"findings": {"raised": 1, "triaged": 1}}})
+        bad = runs / "run-bad"
+        bad.mkdir()
+        (bad / "verdict.json").write_text("not json {{{")
+
+        before = {str(p): p.read_bytes() for p in runs.rglob("verdict.json")}
+
+        out = root / "out"
+        records, summary, skipped = trends.build(str(runs), str(out), generated_at="test")
+
+        assert len(records) == 3, [r["run_id"] for r in records]
+        assert any("run-bad" in s for s in skipped), skipped
+        assert summary["by_verdict"] == {"PASS": 1, "FAIL": 1, "BLOCKED": 1}, summary
+        assert summary["pass_rate"] == round(1 / 3, 4), summary
+        assert abs(summary["total_cost_usd"] - 0.84) < 1e-9, summary
+        assert summary["runs_with_cost"] == 2, summary
+        # sorted chronologically by computed_at; run-c carries no cost (unknown, not zero)
+        assert records[0]["run_id"] == "run-a" and records[-1]["run_id"] == "run-c"
+        assert records[-1]["cost_usd"] is None, records[-1]
+
+        assert (out / "trends.json").is_file() and (out / "trends.html").is_file()
+        assert not any((runs / r / "trends.json").exists() for r in ("run-a", "run-b", "run-c"))
+
+        htmltext = (out / "trends.html").read_text(encoding="utf-8")
+        for needle in ("http://", "https://", "src=", "cdn", "<script"):
+            assert needle not in htmltext, f"HTML not self-contained: found {needle!r}"
+        assert "run-a" in htmltext and "FAIL" in htmltext
+
+        after = {str(p): p.read_bytes() for p in runs.rglob("verdict.json")}
+        assert before == after, "trends must not modify run dirs (audit integrity)"
+
+        out2 = root / "out2"
+        trends.build(str(runs), str(out2), generated_at="DIFFERENT-STAMP")
+        assert (out / "trends.json").read_text() == (out2 / "trends.json").read_text(), \
+            "rollup must be deterministic (stamp lives only in HTML)"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

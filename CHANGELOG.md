@@ -31,6 +31,11 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   (OIDC, no stored token); an `action-selftest` workflow exercises the composite action keyless
   and asserts the honest BLOCKED verdict; a GitLab CI template (`examples/.gitlab-ci.yml`); and a
   `Changelog` project URL.
+- Cross-run trends dashboard (E5-S2): `integrations/trends.py` reads a directory of immutable run
+  artifacts and emits a deterministic `trends.json` rollup plus a single self-contained
+  `trends.html` (inline CSS + SVG, no dependencies, no external network calls) — verdict
+  distribution, pass rate, finding and cost trends, and a per-run table. Read-only over the run
+  dirs; it skips malformed runs and tolerates runs predating cost accounting.
 
 ## [0.1.0]
 
