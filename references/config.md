@@ -148,7 +148,28 @@ qwen/qwen3.8-2.4t-a95b:
   max_tokens_floor: 32000       # reasoning models need headroom before they emit JSON
 ```
 
-Profiles are resolved and recorded here; request-building consumes them in a later change.
+Profiles are resolved at `assign` and recorded on `panel/plan.json`; `build_request` consumes
+them: a `temperature: forbidden` model is sent no `temperature`, `max_tokens` is floored at the
+profile's `max_tokens_floor`, and a `reasoning: mandatory` model receives a `reasoning` budget
+(`AR_REASONING_EFFORT`, default `high`). A model with an all-default profile is sent exactly the
+request it was before.
+
+## Per-run cost cap
+
+`panel.py run` enforces a per-run USD ceiling as a **pre-call gate** — not a reservation. Before
+each paid reviewer call — across the panel, rebuttal, and concurrence phases — the cost recorded so
+far (summed from `panel/meta/*.json`) is compared against the cap; once it is reached the remaining
+calls are **not run**, a `cost_abort.json` is recorded, and the run exits BLOCKED. Because the check
+runs *before* each call and a call's cost is only known *after* it returns, a reviewer already in
+flight can overshoot: the recorded total can exceed the cap by up to one reviewer's cost (e.g. a
+`$0.60` cap may record ~`$1.00` before aborting). The cap bounds how many further calls are made,
+not the exact dollar total. The incomplete panel makes `aggregate.py` report BLOCKED with an
+explicit cost reason, and the run's total `cost_usd` — together with the enforced `cost_cap_usd`
+and `cost_cap_source` — is surfaced on the verdict coverage: a verbose model can raise the bill but
+can never buy a silent partial PASS. Precedence is `AR_MAX_COST_USD` > policy `max_cost_usd` >
+default **`$20`**; set any of them to `0`, `none`, `off`, or `unlimited` to disable. A non-finite or
+negative value is rejected loudly (it would otherwise silently remove the guard). A provider that
+omits `cost` is metered as `$0`.
 
 ## Environment variables
 
@@ -161,7 +182,9 @@ Profiles are resolved and recorded here; request-building consumes them in a lat
 | `AR_TRANSPORT` | auto | `http` or `mcp` |
 | `AR_PRIVACY` | by tier | `default`, `deny`, or `zdr` |
 | `AR_TEMPERATURE` | `0.1` | Reviewer sampling temperature |
-| `AR_MAX_TOKENS` | `8000` | Reviewer response cap |
+| `AR_MAX_TOKENS` | `8000` | Reviewer response cap (floored per model by `max_tokens_floor`) |
+| `AR_REASONING_EFFORT` | `high` | Reasoning budget for models whose profile marks `reasoning: mandatory` |
+| `AR_MAX_COST_USD` | `20` | Per-run USD ceiling (pre-call gate across panel/rebuttal/concurrence; BLOCKS the remaining calls once reached and may overshoot by the in-flight call). `0`/`none`/`off`/`unlimited` disables; non-finite/negative is rejected. Also settable via the policy key `max_cost_usd`. |
 | `AR_TIMEOUT_S` | `240` | Per-request timeout |
 | `AR_RUN_DIR` | `.adversarial-review` | Artifact root |
 | `AR_RISK` | — | Default risk tier for `init` (below `--risk`, above policy) |

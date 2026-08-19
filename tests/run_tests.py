@@ -1309,25 +1309,35 @@ def t_critical_requires_rebuttal():
 
 def t_prepare_ingest_mcp_path():
     import urllib.request
-    repo = fresh_repo()
-    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
-    sh(["panel.py", "assign"], repo)
-    sh(["panel.py", "prepare", "--context-file", "context.md"], repo)
-    run = latest_run(repo)
-    plan = read(run / "panel" / "plan.json")
-    for role in plan["roles"]:
-        body = read(run / "panel" / "requests" / f"{role}.json")
-        # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-request-object.insecure-request-object
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{PORT}/v1/chat/completions",   # loopback test mock; https would break it
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"})
-        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-        resp = urllib.request.urlopen(req, timeout=10).read().decode()  # hardcoded 127.0.0.1 mock
-        rf = run / f"mcp-response-{role}.json"
-        rf.write_text(resp)
-        sh(["panel.py", "ingest", "--role", role, "--response-file", str(rf)], repo)
-        assert (run / "panel" / f"{role}.json").exists()
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.03   # router reports cost only under usage.cost
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        sh(["panel.py", "prepare", "--context-file", "context.md"], repo)
+        run = latest_run(repo)
+        plan = read(run / "panel" / "plan.json")
+        for role in plan["roles"]:
+            body = read(run / "panel" / "requests" / f"{role}.json")
+            # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-request-object.insecure-request-object
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{PORT}/v1/chat/completions",   # loopback test mock; https would break it
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"})
+            # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+            resp = urllib.request.urlopen(req, timeout=10).read().decode()  # hardcoded 127.0.0.1 mock
+            rf = run / f"mcp-response-{role}.json"
+            rf.write_text(resp)
+            sh(["panel.py", "ingest", "--role", role, "--response-file", str(rf)], repo)
+            assert (run / "panel" / f"{role}.json").exists()
+        # ingest records cost only under usage; aggregate must read the nested usage.cost so an
+        # MCP-transport run isn't metered as $0 (E4-S2). 4 NORMAL reviewers * $0.03 = $0.12.
+        sh(["aggregate.py"], repo, expect=None)
+        cov = read(run / "verdict.json")["coverage"]
+        assert abs(cov["cost_usd"] - 0.12) < 1e-6, cov["cost_usd"]
+    finally:
+        mock_router.reset()
 
 
 def t_prepared_requests_inline_schema():
@@ -2153,6 +2163,232 @@ def t_capability_profile_malformed_rejected():
         assert False, "bad enum should have died"
     except SystemExit as e:
         assert e.code == 1
+
+
+def t_build_request_capability_shaping():
+    # build_request omits temperature when a model forbids it, floors max_tokens (never
+    # lowers it), and emits a reasoning budget only for mandatory-reasoning models. A None
+    # profile reproduces today's one-size-fits-all body exactly (E4-S1).
+    import panel
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "u"}]
+    base = int(os.environ.get("AR_MAX_TOKENS", "8000"))
+    effort = os.environ.get("AR_REASONING_EFFORT", "high")
+
+    def mk(cap):
+        return panel.build_request("x/y", msgs, panel.REPORT_SCHEMA, "reviewer_report",
+                                   True, "NORMAL", cap)[0]
+    b = mk(None)
+    assert "temperature" in b and b["max_tokens"] == base and "reasoning" not in b
+    assert "temperature" not in mk({"temperature": "forbidden"})
+    assert mk({"reasoning": "mandatory"}).get("reasoning") == {"effort": effort}
+    assert "reasoning" not in mk({"reasoning": "none"})
+    assert mk({"max_tokens_floor": base + 50000})["max_tokens"] == base + 50000
+    assert mk({"max_tokens_floor": 1})["max_tokens"] == base   # a low floor never lowers it
+    # Default profile keeps the pre-E4 key order (temperature before max_tokens) so an all-default
+    # request serializes byte-for-byte as before — http_json dumps dicts in insertion order.
+    assert [k for k in b if k in ("temperature", "max_tokens")] == ["temperature", "max_tokens"]
+    # A capability profile overrides the catalog's structured-output flag in both directions.
+    assert "response_format" not in mk({"structured_outputs": False})   # catalog True, override wins
+    over_true = panel.build_request("x/y", msgs, panel.REPORT_SCHEMA, "reviewer_report",
+                                    False, "NORMAL", {"structured_outputs": True})[0]
+    assert "response_format" in over_true                               # catalog False, override wins
+
+
+def t_capability_driven_request_flow():
+    # assign records each role's capability profile, and prepare shapes the request from it:
+    # a temperature-forbidden pin drops `temperature`; a mandatory-reasoning pin gets a
+    # reasoning budget + raised max_tokens; an un-overridden role keeps the defaults (E4-S1).
+    repo = fresh_repo()
+    (repo / ".adversarial-review.capabilities.yml").write_text(
+        "openai/gpt-5.6-luna-pro:\n  temperature: forbidden\n"
+        "qwen/qwen3.8-max:\n  reasoning: mandatory\n  max_tokens_floor: 20000\n")
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+    sh(["panel.py", "assign",
+        "--pin", "correctness=openai/gpt-5.6-luna-pro",
+        "--pin", "security=qwen/qwen3.8-max"], repo)
+    run = latest_run(repo)
+    plan = read(run / "panel" / "plan.json")
+    assert plan["roles"]["correctness"]["capability"]["temperature"] == "forbidden"
+    assert plan["roles"]["correctness"]["capability_source"] == "override"
+    assert plan["roles"]["security"]["capability"]["reasoning"] == "mandatory"
+    sh(["panel.py", "prepare", "--context-file", "context.md"], repo)
+    corr = read(run / "panel" / "requests" / "correctness.json")
+    assert "temperature" not in corr, corr
+    sec = read(run / "panel" / "requests" / "security.json")
+    assert sec.get("reasoning") and sec["max_tokens"] >= 20000, sec
+    # an un-pinned, un-overridden role keeps the default temperature and base max_tokens
+    tq = read(run / "panel" / "requests" / "test_quality.json")
+    assert "temperature" in tq, tq
+
+
+def t_cost_cap_aborts_panel():
+    # A hard per-run cost ceiling aborts the remaining reviewers and BLOCKS — a verbose model
+    # can raise the bill but never buy a silent partial PASS (E4-S2).
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.50   # $0.50 per reviewer
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        env = {**ENV, "AR_MAX_COST_USD": "0.60"}   # trips after the 2nd reviewer ($1.00 >= $0.60)
+        r = sh(["panel.py", "run", "--context-file", "context.md"], repo, expect=2, env=env)
+        assert "cost cap" in r.stderr.lower(), r.stderr
+        run = latest_run(repo)
+        abort = read(run / "cost_abort.json")
+        assert abort["cap_usd"] == 0.60 and abort["not_run"], abort
+        sh(["aggregate.py"], repo, expect=2, env=env)   # BLOCKED
+        vj = read(run / "verdict.json")
+        assert vj["verdict"] == "BLOCKED"
+        assert vj["coverage"]["cost_aborted"] is True
+        assert any("cost cap" in reason.lower() for reason in vj["reasons"]), vj["reasons"]
+    finally:
+        mock_router.reset()
+
+
+def t_cost_accounting_surfaced():
+    # Total reviewer cost is summed from meta and surfaced in the verdict coverage; a run under
+    # the cap is not aborted (E4-S2).
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.02
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo)   # default $20 cap, no trip
+        run = latest_run(repo)
+        sh(["aggregate.py"], repo, expect=None)   # verdict may BLOCK on the canned finding; cost still surfaces
+        cov = read(run / "verdict.json")["coverage"]
+        assert abs(cov["cost_usd"] - 0.08) < 1e-6, cov["cost_usd"]   # 4 NORMAL reviewers * $0.02
+        assert cov["cost_aborted"] is False
+        # the enforced ceiling + its source are recorded and surfaced, not just total spend (E4-S2)
+        assert cov["cost_cap_usd"] == 20.0 and cov["cost_cap_source"] == "default", cov
+        assert read(run / "cost_policy.json")["cap_usd"] == 20.0
+    finally:
+        mock_router.reset()
+
+
+def t_cost_cap_rejects_invalid_values():
+    # A non-finite or negative cap is rejected loudly — at policy load and at runtime resolution —
+    # so a config typo can never silently disable the spending guard (E4-S2).
+    import panel
+    import _common
+    for bad in ("nan", "inf", "-inf", "-5", "-0.01"):
+        os.environ["AR_MAX_COST_USD"] = bad
+        try:
+            panel.cost_cap()
+            raise AssertionError(f"cost_cap accepted {bad!r}")
+        except SystemExit:
+            pass
+        finally:
+            os.environ.pop("AR_MAX_COST_USD", None)
+    os.environ["AR_MAX_COST_USD"] = "none"           # documented disable token
+    assert panel.cost_cap() == (None, "env")
+    os.environ["AR_MAX_COST_USD"] = "12.5"           # finite value + its source
+    assert panel.cost_cap() == (12.5, "env")
+    os.environ.pop("AR_MAX_COST_USD", None)
+    for bad in (float("nan"), float("inf"), -1, "nan", "-2"):
+        try:
+            _common._validate_policy({"max_cost_usd": bad}, "policy")
+            raise AssertionError(f"policy load accepted {bad!r}")
+        except SystemExit:
+            pass
+    _common._validate_policy({"max_cost_usd": "off"}, "policy")   # disable token OK at load
+    _common._validate_policy({"max_cost_usd": 15}, "policy")      # finite non-negative OK
+
+
+def t_retry_accumulates_billed_cost():
+    # A malformed-JSON retry is a second billed call; call_reviewer accumulates both attempts'
+    # usage so the cap and coverage don't undercount actual spend (E4-S2).
+    import _common
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.10
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        run = latest_run(repo)
+        plan = read(run / "panel" / "plan.json")
+        # force the correctness reviewer's first attempt to be malformed → one internal retry
+        mock_router.STATE["malformed_once"] = {plan["roles"]["correctness"]["model"]}
+        sh(["panel.py", "run", "--context-file", "context.md"], repo)
+        # two billed $0.10 calls recorded as $0.20 for that role; single-call roles stay $0.10
+        assert abs(_common.meta_cost(read(run / "panel" / "meta" / "correctness.json")) - 0.20) < 1e-9
+        assert abs(_common.meta_cost(read(run / "panel" / "meta" / "security.json")) - 0.10) < 1e-9
+    finally:
+        mock_router.reset()
+
+
+def t_cost_cap_enforced_in_rebuttal():
+    # The cost cap governs the rebuttal phase too: a panel that finished just under the ceiling
+    # cannot spend past it during rebuttal (E4-S2).
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.20
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        # 6 SENSITIVE reviewers * $0.20 = $1.20 total; a $1.10 cap lets the panel finish (last
+        # pre-call check sees $1.00 < $1.10) yet is exceeded ($1.20) before the rebuttal round.
+        env = {**ENV, "AR_MAX_COST_USD": "1.10"}
+        sh(["panel.py", "run", "--context-file", "context.md"], repo, env=env)
+        run = latest_run(repo)
+        assert not (run / "cost_abort.json").exists()   # the panel itself did not abort
+        # rebuttal is required (security raised a high finding) but the cap is already exceeded
+        r = sh(["panel.py", "rebuttal"], repo, expect=2, env=env)
+        assert "cost cap" in r.stderr.lower(), r.stderr
+        abort = read(run / "cost_abort.json")
+        assert abort["phase"] == "rebuttal"
+        # skipped work is the unrun REBUTTAL roles, not an empty panel list (all reports exist)
+        assert abort["not_run"], abort
+    finally:
+        mock_router.reset()
+
+
+def t_cost_cap_persisted_across_phases():
+    # The run's cost ceiling is authoritative for later phases: rebuttal reads the cap panel.py
+    # persisted to cost_policy.json, so changing AR_MAX_COST_USD after the panel can neither
+    # disable nor raise it out from under the run (E4-S2).
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.20
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        # $1.10 cap: the 6-reviewer panel finishes at $1.20 (last check saw $1.00 < $1.10)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo,
+           env={**ENV, "AR_MAX_COST_USD": "1.10"})
+        run = latest_run(repo)
+        assert not (run / "cost_abort.json").exists()
+        assert read(run / "cost_policy.json")["cap_usd"] == 1.10
+        # DISABLE the cap in the environment; rebuttal must still honor the persisted $1.10
+        r = sh(["panel.py", "rebuttal"], repo, expect=2, env={**ENV, "AR_MAX_COST_USD": "none"})
+        assert "cost cap" in r.stderr.lower(), r.stderr
+        abort = read(run / "cost_abort.json")
+        assert abort["phase"] == "rebuttal" and abort["cap_usd"] == 1.10, abort
+        # the persisted policy was not overwritten by the later 'none'
+        assert read(run / "cost_policy.json")["cap_usd"] == 1.10
+    finally:
+        mock_router.reset()
+
+
+def t_concurrence_cost_recorded():
+    # cmd_concur makes a paid call; its cost is recorded under panel/meta so it counts toward
+    # panel_cost() and the verdict's coverage.cost_usd (E4-S2).
+    import _common
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.05
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        (repo / "fp.md").write_text("Finding X is a false positive because the check exists.")
+        sh(["panel.py", "concur", "--prompt-file", "fp.md"], repo)
+        run = latest_run(repo)
+        metas = sorted((run / "panel" / "meta").glob("concurrence.*.json"))
+        assert len(metas) == 1, metas
+        assert abs(_common.meta_cost(read(metas[0])) - 0.05) < 1e-9, read(metas[0])
+    finally:
+        mock_router.reset()
 
 
 def t_mock_router_response_provider_override():

@@ -24,7 +24,7 @@ from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import family_of, now_iso, read_json, resolve_run, write_json
+from _common import family_of, meta_cost, now_iso, read_json, resolve_run, write_json
 
 HIGH = ("critical", "high")
 
@@ -660,8 +660,28 @@ def main():
         vals = rep.get("areas_not_reviewed")
         if isinstance(vals, list):
             areas.update(str(a) for a in vals)
+    # Cost accounting + cap enforcement, read from the same recorded artifacts (E4-S2). A run
+    # that panel.py aborted on the cost cap BLOCKS — the missing reviewers already do, but name
+    # the cost reason explicitly so it is not mistaken for an ordinary incomplete panel.
+    panel_cost_usd = 0.0
+    mdir = run / "panel" / "meta"
+    if mdir.is_dir():
+        for p in sorted(mdir.glob("*.json")):
+            panel_cost_usd += meta_cost(read_json(p))
+    cost_abort = read_json(run / "cost_abort.json") if (run / "cost_abort.json").exists() else None
+    if isinstance(cost_abort, dict):
+        blocked.append(
+            f"{cost_abort.get('phase') or 'panel'} phase aborted on cost cap "
+            f"${cost_abort.get('cap_usd')} (spent ${cost_abort.get('spent_usd')}); not run: "
+            f"{', '.join(str(r) for r in (cost_abort.get('not_run') or [])) or 'none'}")
+    # Surface the enforced ceiling + its source (recorded by panel.py at run time) so the audit
+    # shows which cap actually applied, not just total spend.
+    cpol = read_json(run / "cost_policy.json") if (run / "cost_policy.json").exists() else None
+    cpol = cpol if isinstance(cpol, dict) else {}
     coverage = {"risk": meta["risk"], "gates": gcov, "panel": pcov,
                 "rebuttal": rcov, "findings": fcov,
+                "cost_usd": round(panel_cost_usd, 6), "cost_aborted": bool(cost_abort),
+                "cost_cap_usd": cpol.get("cap_usd"), "cost_cap_source": cpol.get("source"),
                 "areas_not_reviewed": sorted(areas)}
 
     verdict = "FAIL" if fail else ("BLOCKED" if blocked else "PASS")
