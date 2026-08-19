@@ -2544,15 +2544,51 @@ def t_trends_rejects_nonfinite_cost():
                          '"computed_at": "2026-08-11T10:00:00Z", "coverage": {"cost_usd": NaN}}')
         mkrun("run-inf", '{"verdict": "PASS", "run_id": "run-inf", '
                          '"computed_at": "2026-08-12T10:00:00Z", "coverage": {"cost_usd": Infinity}}')
+        # a huge int: float(10**400) AND math.isfinite(10**400) both raise OverflowError, which
+        # would abort the whole dashboard if the cost guard converted before rejecting.
+        mkrun("run-huge", '{"verdict": "PASS", "run_id": "run-huge", '
+                          '"computed_at": "2026-08-13T10:00:00Z", "coverage": {"cost_usd": %s}}'
+                          % ("9" * 400))
 
         records, summary, skipped = trends.build(str(runs), str(root / "out"))
         by_id = {r["run_id"]: r for r in records}
         assert by_id["run-nan"]["cost_usd"] is None, by_id["run-nan"]
         assert by_id["run-inf"]["cost_usd"] is None, by_id["run-inf"]
+        assert by_id["run-huge"]["cost_usd"] is None, by_id["run-huge"]
         assert by_id["run-ok"]["cost_usd"] == 0.50, by_id["run-ok"]
-        # only the finite cost is counted; the total stays finite and exact (NaN would fail ==)
+        # all four runs chart; only the finite cost is counted; the total stays finite and exact
+        assert len(records) == 4, [r["run_id"] for r in records]
         assert summary["runs_with_cost"] == 1, summary
         assert summary["total_cost_usd"] == 0.5, summary
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_trends_tolerates_unencodable_text():
+    # E5-S2 hardening: json.load accepts lone surrogates (e.g. "\ud800") in text fields; str() and
+    # html.escape() preserve them, and the UTF-8 write of the HTML report then raises
+    # UnicodeEncodeError mid-stream. Such a run must degrade (sanitized text), not crash the tool.
+    sys.path.insert(0, str(SKILL / "integrations"))
+    import trends
+
+    root = Path(tempfile.mkdtemp(prefix="ar-trends-uni-"))
+    try:
+        runs = root / "runs"
+        d = runs / "run-a"
+        d.mkdir(parents=True)
+        # json.dumps escapes the surrogate to ASCII on disk; json.load restores it on read
+        (d / "verdict.json").write_text(json.dumps(
+            {"verdict": "PASS", "run_id": "bad\ud800id", "risk": "NOR\ud800MAL",
+             "computed_at": "2026-08-10T10:00:00Z", "coverage": {"cost_usd": 0.1}}))
+
+        out = root / "out"
+        records, summary, skipped = trends.build(str(runs), str(out))  # must not raise
+        assert len(records) == 1, records
+        # both outputs fully written and re-readable as UTF-8 (no lone surrogate survived)
+        assert (out / "trends.json").read_text(encoding="utf-8")
+        htext = (out / "trends.html").read_text(encoding="utf-8")
+        assert "PASS" in htext
+        assert "\ud800" not in records[0]["run_id"] and "\ud800" not in records[0]["risk"]
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

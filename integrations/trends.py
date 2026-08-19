@@ -43,6 +43,29 @@ def _int(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
+def _finite_cost(value):
+    """A real, finite float, or ``None``. Rejects bool and non-numbers, the ``NaN``/``Infinity``
+    tokens ``json.load`` accepts by default, and huge ints whose ``float()`` overflows — so a
+    malformed or future artifact degrades to 'unknown' instead of poisoning the rollup or aborting
+    the report. Both ``float(10**400)`` and ``math.isfinite(10**400)`` raise ``OverflowError``, so
+    the conversion is guarded before finiteness is checked."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _text(value):
+    """A UTF-8-encodable ``str``. ``json.load`` can return lone surrogates (e.g. ``"\\ud800"``) that
+    survive ``str()`` and ``html.escape`` but crash the UTF-8 write of the report mid-stream. Round-
+    trip through UTF-8 with replacement so a malformed run's text degrades to a placeholder rather
+    than aborting the whole dashboard."""
+    return str(value).encode("utf-8", "replace").decode("utf-8")
+
+
 def _extract(run_id, v):
     """Pull the trend metrics out of one ``verdict.json`` mapping.
 
@@ -60,20 +83,16 @@ def _extract(run_id, v):
     if verdict not in VERDICTS:
         verdict = "BLOCKED"  # an unrecognized verdict is treated as not-a-pass, never as PASS
 
-    cost = coverage.get("cost_usd")
-    # Accept a real, finite number only. json.load() parses NaN/Infinity by default, and a
-    # non-finite cost would poison the rollup's sum/round — so those degrade to None (unknown).
-    cost = (float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool)
-            and math.isfinite(cost) else None)
+    cost = _finite_cost(coverage.get("cost_usd"))
 
     def _len(seq):
         return len(seq) if isinstance(seq, list) else 0
 
     return {
-        "run_id": str(v.get("run_id") or run_id),
-        "computed_at": str(v.get("computed_at") or ""),
+        "run_id": _text(v.get("run_id") or run_id),
+        "computed_at": _text(v.get("computed_at") or ""),
         "verdict": verdict,
-        "risk": str(v.get("risk") or coverage.get("risk") or ""),
+        "risk": _text(v.get("risk") or coverage.get("risk") or ""),
         "findings_high_critical": _int(counts.get("findings_high_critical")),
         "findings_medium_low": _int(counts.get("findings_medium_low")),
         "confirmed": _int(counts.get("confirmed")),

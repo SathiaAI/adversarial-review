@@ -37,8 +37,10 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   distribution, pass rate, finding and cost trends, and a per-run table. The read-only guarantee
   is enforced, not just documented: `build()` refuses (raises) an `--out-dir` that resolves to or
   under a run dir, so it can never overwrite an audit artifact. It skips malformed runs, tolerates
-  runs predating cost accounting, and rejects non-finite (`NaN`/`Infinity`) costs — which
-  `json.load` accepts by default — so a single poisoned artifact can't corrupt the rollup totals.
+  runs predating cost accounting, and hardens every value it reads from an artifact so one poisoned
+  run can neither corrupt the rollup nor abort the report: unconvertible costs degrade to unknown
+  (`NaN`/`Infinity`, which `json.load` accepts, and ints too large for `float()`), and lone-surrogate
+  text is sanitized before the UTF-8 write. It is a source-checkout tool, not a packaged console script.
 
 ## [0.1.0]
 
