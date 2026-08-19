@@ -699,8 +699,9 @@ def cmd_run(args):
             "For keyless MCP transport use `panel.py prepare` + `panel.py ingest`.", 2)
 
     # Establish (and persist, on first call) the run's cost ceiling; it stays authoritative for
-    # rebuttal and concurrence too, so the audit shows which cap was actually enforced.
-    cap, cap_src = run_cost_cap(run)
+    # rebuttal and concurrence too, so the audit shows which cap was actually enforced. The source
+    # is persisted by run_cost_cap and surfaced by aggregate, so it isn't needed here.
+    cap, _ = run_cost_cap(run)
     failed = []
     for role in plan["roles"]:
         if (run / "panel" / f"{role}.json").exists() and not args.force:
