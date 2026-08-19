@@ -2155,6 +2155,97 @@ def t_capability_profile_malformed_rejected():
         assert e.code == 1
 
 
+def t_build_request_capability_shaping():
+    # build_request omits temperature when a model forbids it, floors max_tokens (never
+    # lowers it), and emits a reasoning budget only for mandatory-reasoning models. A None
+    # profile reproduces today's one-size-fits-all body exactly (E4-S1).
+    import panel
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "u"}]
+    base = int(os.environ.get("AR_MAX_TOKENS", "8000"))
+    effort = os.environ.get("AR_REASONING_EFFORT", "high")
+
+    def mk(cap):
+        return panel.build_request("x/y", msgs, panel.REPORT_SCHEMA, "reviewer_report",
+                                   True, "NORMAL", cap)[0]
+    b = mk(None)
+    assert "temperature" in b and b["max_tokens"] == base and "reasoning" not in b
+    assert "temperature" not in mk({"temperature": "forbidden"})
+    assert mk({"reasoning": "mandatory"}).get("reasoning") == {"effort": effort}
+    assert "reasoning" not in mk({"reasoning": "none"})
+    assert mk({"max_tokens_floor": base + 50000})["max_tokens"] == base + 50000
+    assert mk({"max_tokens_floor": 1})["max_tokens"] == base   # a low floor never lowers it
+
+
+def t_capability_driven_request_flow():
+    # assign records each role's capability profile, and prepare shapes the request from it:
+    # a temperature-forbidden pin drops `temperature`; a mandatory-reasoning pin gets a
+    # reasoning budget + raised max_tokens; an un-overridden role keeps the defaults (E4-S1).
+    repo = fresh_repo()
+    (repo / ".adversarial-review.capabilities.yml").write_text(
+        "openai/gpt-5.6-luna-pro:\n  temperature: forbidden\n"
+        "qwen/qwen3.8-max:\n  reasoning: mandatory\n  max_tokens_floor: 20000\n")
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+    sh(["panel.py", "assign",
+        "--pin", "correctness=openai/gpt-5.6-luna-pro",
+        "--pin", "security=qwen/qwen3.8-max"], repo)
+    run = latest_run(repo)
+    plan = read(run / "panel" / "plan.json")
+    assert plan["roles"]["correctness"]["capability"]["temperature"] == "forbidden"
+    assert plan["roles"]["correctness"]["capability_source"] == "override"
+    assert plan["roles"]["security"]["capability"]["reasoning"] == "mandatory"
+    sh(["panel.py", "prepare", "--context-file", "context.md"], repo)
+    corr = read(run / "panel" / "requests" / "correctness.json")
+    assert "temperature" not in corr, corr
+    sec = read(run / "panel" / "requests" / "security.json")
+    assert sec.get("reasoning") and sec["max_tokens"] >= 20000, sec
+    # an un-pinned, un-overridden role keeps the default temperature and base max_tokens
+    tq = read(run / "panel" / "requests" / "test_quality.json")
+    assert "temperature" in tq, tq
+
+
+def t_cost_cap_aborts_panel():
+    # A hard per-run cost ceiling aborts the remaining reviewers and BLOCKS — a verbose model
+    # can raise the bill but never buy a silent partial PASS (E4-S2).
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.50   # $0.50 per reviewer
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        env = {**ENV, "AR_MAX_COST_USD": "0.60"}   # trips after the 2nd reviewer ($1.00 >= $0.60)
+        r = sh(["panel.py", "run", "--context-file", "context.md"], repo, expect=2, env=env)
+        assert "cost cap" in r.stderr.lower(), r.stderr
+        run = latest_run(repo)
+        abort = read(run / "cost_abort.json")
+        assert abort["cap_usd"] == 0.60 and abort["not_run"], abort
+        sh(["aggregate.py"], repo, expect=2, env=env)   # BLOCKED
+        vj = read(run / "verdict.json")
+        assert vj["verdict"] == "BLOCKED"
+        assert vj["coverage"]["cost_aborted"] is True
+        assert any("cost cap" in reason.lower() for reason in vj["reasons"]), vj["reasons"]
+    finally:
+        mock_router.reset()
+
+
+def t_cost_accounting_surfaced():
+    # Total reviewer cost is summed from meta and surfaced in the verdict coverage; a run under
+    # the cap is not aborted (E4-S2).
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.02
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo)   # default $20 cap, no trip
+        run = latest_run(repo)
+        sh(["aggregate.py"], repo, expect=None)   # verdict may BLOCK on the canned finding; cost still surfaces
+        cov = read(run / "verdict.json")["coverage"]
+        assert abs(cov["cost_usd"] - 0.08) < 1e-6, cov["cost_usd"]   # 4 NORMAL reviewers * $0.02
+        assert cov["cost_aborted"] is False
+    finally:
+        mock_router.reset()
+
+
 def t_mock_router_response_provider_override():
     # A response_provider override is served in place of the default canned report and flows
     # through panel run + ingest (E0-S1); default behavior is preserved when it returns None.

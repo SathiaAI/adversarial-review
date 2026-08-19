@@ -31,6 +31,14 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   (OIDC, no stored token); an `action-selftest` workflow exercises the composite action keyless
   and asserts the honest BLOCKED verdict; a GitLab CI template (`examples/.gitlab-ci.yml`); and a
   `Changelog` project URL.
+- Reviewer robustness & cost control (E4): `build_request` is now capability-driven — a model whose
+  profile forbids `temperature` is sent none, `max_tokens` is floored at the profile's
+  `max_tokens_floor`, and a mandatory-reasoning model receives a `reasoning` budget
+  (`AR_REASONING_EFFORT`, default `high`); a model with an all-default profile gets the byte-identical
+  request it did before. A per-run cost ceiling (`AR_MAX_COST_USD`, or policy `max_cost_usd`, default
+  `$20`) aborts the remaining reviewers once reached, records a BLOCKED cost reason, and sums each
+  run's reviewer cost onto the verdict — a verbose model can raise the bill but never buy a silent
+  partial PASS.
 
 ## [0.1.0]
 

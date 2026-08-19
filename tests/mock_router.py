@@ -39,7 +39,10 @@ STATE = {"fail_models": set(), "malformed_once": set(), "calls": {}, "concur_agr
          # Optional hook: Callable[[dict], dict|None]. Called per chat/completions request with
          # {kind, role, model, request_body}; a non-None return replaces the default content.
          # Lets suites inject per-scenario reviewer responses without forking the handler (E0-S1).
-         "response_provider": None}
+         "response_provider": None,
+         # Per-response usage.cost (USD) reported to the client — lets a suite trip the cost
+         # cap (E4-S2). 0.0 means the router reports no cost, like a provider that omits it.
+         "reviewer_cost": 0.0}
 
 
 def _report(role, model):
@@ -122,7 +125,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             payload = json.dumps(content)
         self._send(200, {"choices": [{"message": {"content": payload}}],
-                         "usage": {"prompt_tokens": 1200, "completion_tokens": 300},
+                         "usage": {"prompt_tokens": 1200, "completion_tokens": 300,
+                                   "cost": STATE["reviewer_cost"]},
                          "provider": "MockServe"})
 
 
@@ -140,3 +144,4 @@ def reset():
     STATE["calls"] = {}
     STATE["concur_agrees"] = True
     STATE["response_provider"] = None
+    STATE["reviewer_cost"] = 0.0

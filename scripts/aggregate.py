@@ -660,8 +660,25 @@ def main():
         vals = rep.get("areas_not_reviewed")
         if isinstance(vals, list):
             areas.update(str(a) for a in vals)
+    # Cost accounting + cap enforcement, read from the same recorded artifacts (E4-S2). A run
+    # that panel.py aborted on the cost cap BLOCKS — the missing reviewers already do, but name
+    # the cost reason explicitly so it is not mistaken for an ordinary incomplete panel.
+    panel_cost_usd = 0.0
+    mdir = run / "panel" / "meta"
+    if mdir.is_dir():
+        for p in sorted(mdir.glob("*.json")):
+            c = read_json(p).get("cost")
+            if isinstance(c, (int, float)) and not isinstance(c, bool):
+                panel_cost_usd += float(c)
+    cost_abort = read_json(run / "cost_abort.json") if (run / "cost_abort.json").exists() else None
+    if isinstance(cost_abort, dict):
+        blocked.append(
+            f"panel aborted on cost cap ${cost_abort.get('cap_usd')} "
+            f"(spent ${cost_abort.get('spent_usd')}); reviewers not run: "
+            f"{', '.join(str(r) for r in (cost_abort.get('not_run') or []))}")
     coverage = {"risk": meta["risk"], "gates": gcov, "panel": pcov,
                 "rebuttal": rcov, "findings": fcov,
+                "cost_usd": round(panel_cost_usd, 6), "cost_aborted": bool(cost_abort),
                 "areas_not_reviewed": sorted(areas)}
 
     verdict = "FAIL" if fail else ("BLOCKED" if blocked else "PASS")

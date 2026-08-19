@@ -80,7 +80,7 @@ def family_of(slug):
 
 POLICY_BASENAMES = (".adversarial-review.yml", ".adversarial-review.json")
 POLICY_KEYS = ("risk", "dev_providers", "rebuttal_policy", "required_gates", "pins",
-               "mutation")
+               "mutation", "max_cost_usd")
 VALID_RISKS = ("NORMAL", "SENSITIVE", "CRITICAL")
 VALID_REBUTTAL = ("critical", "contention", "any")
 # Scoped/bounded mutation budget — a repo-tunable cost cap so mutation testing survives
