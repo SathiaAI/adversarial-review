@@ -80,7 +80,7 @@ def family_of(slug):
 
 POLICY_BASENAMES = (".adversarial-review.yml", ".adversarial-review.json")
 POLICY_KEYS = ("risk", "dev_providers", "rebuttal_policy", "required_gates", "pins",
-               "mutation")
+               "mutation", "max_cost_usd")
 VALID_RISKS = ("NORMAL", "SENSITIVE", "CRITICAL")
 VALID_REBUTTAL = ("critical", "contention", "any")
 # Scoped/bounded mutation budget — a repo-tunable cost cap so mutation testing survives
@@ -239,6 +239,38 @@ def _policy_number(v):
     return n if math.isfinite(n) else None
 
 
+def meta_cost(meta):
+    """Billed USD from one reviewer-meta mapping as a finite float (0.0 if absent/malformed).
+    Prefers the top-level ``cost``; falls back to nested ``usage.cost`` — the MCP ingest path
+    records cost only under ``usage``. A missing, non-finite, or negative cost counts as 0: a
+    provider that omits or corrupts cost can neither be charged against the cap nor drive the
+    running total down, and cannot poison the sum or the coverage JSON."""
+    if not isinstance(meta, dict):
+        return 0.0
+    c = _policy_number(meta.get("cost"))
+    if c is None and isinstance(meta.get("usage"), dict):
+        c = _policy_number(meta["usage"].get("cost"))
+    return c if c is not None and c >= 0 else 0.0
+
+
+def merge_usage(prior, current):
+    """Sum the billed numeric fields of two usage objects so a malformed-JSON retry — a second
+    paid call — is fully counted, not just the final attempt. Only finite numbers accumulate;
+    non-numeric metadata from the latest response is preserved. ``prior`` None means first call."""
+    current = current if isinstance(current, dict) else {}
+    if not prior:
+        return dict(current)
+    out = dict(prior)
+    for k, v in current.items():
+        cv = _policy_number(v)
+        if cv is not None:
+            pv = _policy_number(out.get(k))
+            out[k] = (pv or 0.0) + cv
+        elif k not in out:
+            out[k] = v
+    return out
+
+
 def _validate_mutation(v, name):
     if not isinstance(v, dict):
         die(f"{name}: mutation must be a mapping of budget settings "
@@ -308,6 +340,16 @@ def _validate_policy(data, name):
                     f"got {slug!r}")
     if "mutation" in data:
         _validate_mutation(data["mutation"], name)
+    if "max_cost_usd" in data:
+        v = data["max_cost_usd"]
+        # A documented disable token, or a finite non-negative number. Reject at load so a bare
+        # NaN/inf/negative can't pass validation and silently disable the cap at resolution time.
+        tok = v.strip().lower() if isinstance(v, str) else None
+        if tok not in ("", "none", "off", "unlimited"):
+            n = _policy_number(v)
+            if n is None or n < 0:
+                die(f"{name}: max_cost_usd must be a finite non-negative number or "
+                    f"'none'/'off'/'unlimited', got {v!r}")
 
 
 def load_policy(root=None):

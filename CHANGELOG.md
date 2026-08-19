@@ -31,6 +31,28 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   (OIDC, no stored token); an `action-selftest` workflow exercises the composite action keyless
   and asserts the honest BLOCKED verdict; a GitLab CI template (`examples/.gitlab-ci.yml`); and a
   `Changelog` project URL.
+- Reviewer robustness & cost control (E4): `build_request` is now capability-driven — a model whose
+  profile forbids `temperature` is sent none, `max_tokens` is floored at the profile's
+  `max_tokens_floor`, and a mandatory-reasoning model receives a `reasoning` budget
+  (`AR_REASONING_EFFORT`, default `high`); a profile's `structured_outputs` flag overrides the
+  catalog's in either direction (so a wrong catalog can't force an unsupported `response_format`);
+  and a model with an all-default profile gets the byte-identical request it did before — the
+  pre-E4 key order (`temperature` before `max_tokens`) is preserved, not just the values. A per-run
+  cost ceiling (`AR_MAX_COST_USD`, or policy `max_cost_usd`, default `$20`) is enforced as a
+  pre-call gate across **every** paid phase — panel, rebuttal, and concurrence — aborting the
+  remaining calls once reached (each phase records its own skipped work), recording a BLOCKED cost
+  reason, and surfacing the run's total. The cap the run records in `cost_policy.json` is
+  authoritative for the whole run: rebuttal and concurrence reuse it rather than re-resolving live
+  settings, so changing `AR_MAX_COST_USD` mid-run can neither disable nor raise it. Also surfaced:
+  `cost_usd` plus the enforced `cost_cap_usd`/`cost_cap_source` on the verdict; a verbose model can
+  raise the bill but never buy a silent partial PASS. Cost accounting is hardened end to end: a
+  malformed-JSON retry (a second billed call) is fully counted, the MCP-ingest path's nested
+  `usage.cost` is read, non-finite/negative per-reviewer costs are metered as `$0`, and a
+  non-finite or negative cap is rejected at policy load and at resolution rather than silently
+  disabling the guard. The new `coverage.cost_usd` / `cost_aborted` / `cost_cap_usd` /
+  `cost_cap_source` fields and the cost-triggered BLOCKED reason are documented in
+  `references/schemas.md`; being a pre-call gate (not a reservation), the recorded total can
+  overshoot the cap by up to the in-flight reviewer's cost, as `references/config.md` now states.
 
 ## [0.1.0]
 

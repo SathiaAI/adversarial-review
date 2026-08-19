@@ -15,6 +15,7 @@ Stdlib only. Exit codes: 0 ok, 1 error, 2 BLOCKED.
 """
 import argparse
 import json
+import math
 import os
 import re
 import secrets
@@ -27,9 +28,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (RUN_ROOT, VALID_REBUTTAL, VALID_RISKS, die, family_of,
-                     load_policy, now_iso, read_json, resolve_run,
-                     resolve_setting, write_json)
+from _common import (RUN_ROOT, VALID_REBUTTAL, VALID_RISKS, capability_of, die,
+                     family_of, load_capabilities, load_policy, merge_usage, meta_cost,
+                     now_iso, read_json, resolve_run, resolve_setting, write_json)
 
 DEFAULT_BASE = "https://openrouter.ai/api/v1"
 
@@ -232,6 +233,9 @@ def load_catalog(catalog_file=None):
             "created": m.get("created") or 0,
             "context_length": m.get("context_length") or 0,
             "structured_outputs": "structured_outputs" in (m.get("supported_parameters") or []),
+            # Preserved so cmd_assign can derive the per-model capability profile (E4-S1);
+            # capability_defaults() reads it, and it is dropped from plan.json.
+            "supported_parameters": m.get("supported_parameters") or [],
         })
     if not out:
         die("model catalog is empty after filtering — wrong endpoint?", 2)
@@ -319,11 +323,18 @@ def cmd_assign(args):
                 f"for {len(roles)} roles (missing: {', '.join(missing)}). "
                 "A smaller panel requires --allow-degraded --authorized-by '<user>'.", 2)
 
+    # Resolve each role's capability profile now and record it on the plan (audit trail);
+    # the run/prepare/rebuttal paths read it back so request-building is capability-driven
+    # without re-resolving (E4-S1).
+    cap_overrides = load_capabilities()
+    caps = {r: capability_of(plan[r]["slug"], plan[r], cap_overrides) for r in roles}
     out = {"risk": meta["risk"], "dev_families_excluded": sorted(dev_families),
            "roles": {r: {"model": plan[r]["slug"], "family": plan[r]["family"],
                          "structured_outputs": plan[r]["structured_outputs"],
                          "pinned": plan[r]["pinned"],
-                         "pin_source": plan[r].get("pin_source")} for r in roles},
+                         "pin_source": plan[r].get("pin_source"),
+                         "capability": caps[r][0], "capability_source": caps[r][1]}
+                     for r in roles},
            "substitutions": [], "degraded": degraded, "assigned_at": now_iso()}
     write_json(run / "panel" / "plan.json", out)
     for r in roles:
@@ -401,7 +412,8 @@ def reviewer_messages(role, meta, context_text, boundary):
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def build_request(model_slug, messages, schema, schema_name, supports_structured, risk):
+def build_request(model_slug, messages, schema, schema_name, supports_structured, risk,
+                  capability=None):
     # Inline the schema into the system message for every transport: some MCP routes
     # (e.g. Composio's chat-completions tool) silently drop response_format, and a
     # "provided schema" the model never sees produces malformed first attempts (#2).
@@ -417,14 +429,27 @@ def build_request(model_slug, messages, schema, schema_name, supports_structured
                     + list(messages[1:]))
     else:
         messages = [{"role": "system", "content": schema_note.lstrip()}] + list(messages)
-    body = {
-        "model": model_slug,
-        "messages": messages,
-        "temperature": float(os.environ.get("AR_TEMPERATURE", "0.1")),
-        "max_tokens": int(os.environ.get("AR_MAX_TOKENS", "8000")),
-    }
+    # Capability-driven request shaping (E4-S1): a None/empty profile reproduces the
+    # previous one-size-fits-all behavior exactly. Otherwise: omit `temperature` for
+    # models that forbid it, floor `max_tokens` at the model's minimum, and emit a
+    # reasoning budget for models that mandate reasoning.
+    cap = capability or {}
+    base_max = int(os.environ.get("AR_MAX_TOKENS", "8000"))
+    floor = cap.get("max_tokens_floor") or 0
+    # Preserve the pre-E4 key insertion order for the default profile — `temperature` before
+    # `max_tokens` — so an all-default request serializes byte-for-byte as it did before (http_json
+    # dumps in insertion order). Profiles that forbid temperature simply omit it; that is not a
+    # default request and carries no byte-identity promise.
+    body = {"model": model_slug, "messages": messages}
+    if cap.get("temperature") != "forbidden":
+        body["temperature"] = float(os.environ.get("AR_TEMPERATURE", "0.1"))
+    body["max_tokens"] = max(base_max, floor)
+    if cap.get("reasoning") == "mandatory":
+        body["reasoning"] = {"effort": os.environ.get("AR_REASONING_EFFORT", "high")}
     prefs, mode = privacy_provider_prefs(risk)
-    if supports_structured:
+    # A capability profile can override the catalog's structured-output flag in either direction
+    # (correct a catalog that wrongly advertises support, or enable it for an incomplete catalog).
+    if cap.get("structured_outputs", supports_structured):
         body["response_format"] = {"type": "json_schema", "json_schema": {
             "name": schema_name, "strict": True, "schema": schema}}
         prefs["require_parameters"] = True
@@ -550,13 +575,15 @@ def FAMILY_OR_SELF(p):
     return FAMILY_ALIASES.get(p.strip().lower(), p.strip().lower())
 
 
-def call_reviewer(base, key, body, schema, corrective=None):
-    """One HTTP attempt (+1 retry on malformed JSON). Returns (obj, raw, usage, provider)."""
+def call_reviewer(base, key, body, schema, corrective=None, prior_usage=None):
+    """One HTTP attempt (+1 retry on malformed JSON). Returns (obj, raw, usage, provider).
+    ``usage`` accumulates across the retry (``prior_usage``) so a malformed-JSON retry — which is
+    a second billed call — is fully counted against the cost cap, not just the final attempt."""
     resp = http_json(f"{base}/chat/completions", payload=body, key=key)
     if "error" in resp and "choices" not in resp:
         raise RuntimeError(str(resp["error"]))
     content = resp["choices"][0]["message"]["content"]
-    usage = resp.get("usage", {})
+    usage = merge_usage(prior_usage, resp.get("usage", {}))
     provider = resp.get("provider")
     try:
         obj = extract_json(content)
@@ -569,7 +596,7 @@ def call_reviewer(base, key, body, schema, corrective=None):
             {"role": "assistant", "content": content if isinstance(content, str) else json.dumps(content)},
             {"role": "user", "content": "Your output failed validation:\n- "
              + "\n- ".join(errs[:20]) + "\nRespond again with ONLY the corrected JSON object."}]
-        return call_reviewer(base, key, retry_body, schema, corrective=errs)
+        return call_reviewer(base, key, retry_body, schema, corrective=errs, prior_usage=usage)
     if errs:
         raise ValueError("reviewer output failed validation after retry: " + "; ".join(errs[:10]))
     return obj, content, usage, provider
@@ -580,7 +607,8 @@ def run_one_role(run, meta, plan, role, context_text, base, key):
     info = plan["roles"][role]
     messages = reviewer_messages(role, meta, context_text, boundary)
     body, privacy = build_request(info["model"], messages, REPORT_SCHEMA,
-                                  "reviewer_report", info["structured_outputs"], meta["risk"])
+                                  "reviewer_report", info["structured_outputs"], meta["risk"],
+                                  info.get("capability"))
     attempts, substituted_from = [], None
     for attempt in (1, 2):
         try:
@@ -603,6 +631,63 @@ def run_one_role(run, meta, plan, role, context_text, base, key):
     return False
 
 
+def cost_cap():
+    """Resolved per-run USD ceiling and its source (E4-S2): AR_MAX_COST_USD > policy
+    max_cost_usd > $20. A value of 0 / '' / 'none' / 'off' / 'unlimited' disables the cap.
+    Returns ``(cap_or_None, source)``. Non-finite or negative values are rejected loudly, so a
+    configuration typo can never silently remove the spending guard."""
+    raw, src = resolve_setting(None, "AR_MAX_COST_USD", load_policy(), "max_cost_usd", "20")
+    s = str(raw).strip().lower()
+    if s in ("", "0", "none", "off", "unlimited"):
+        return None, src
+    try:
+        v = float(s)
+    except ValueError:
+        die(f"max_cost_usd must be a number or 'none'/'off', got {raw!r}")
+    if not math.isfinite(v) or v < 0:
+        die(f"max_cost_usd must be a finite, non-negative number or 'none'/'off', got {raw!r}")
+    return (v if v > 0 else None), src
+
+
+def panel_cost(run):
+    """USD spent so far, summed from recorded reviewer meta (panel + rebuttal + concurrence).
+    A missing, non-finite, or negative cost counts as 0 (see ``meta_cost``) — a provider that
+    omits or corrupts cost can neither be charged against the cap nor drive the total down."""
+    total, mdir = 0.0, run / "panel" / "meta"
+    if mdir.is_dir():
+        for p in sorted(mdir.glob("*.json")):
+            total += meta_cost(read_json(p))
+    return total
+
+
+def run_cost_cap(run):
+    """The per-run USD ceiling, authoritative for the whole run. Returns ``(cap, source)``. Prefers
+    the value ``panel.py run`` persisted in ``cost_policy.json`` so a later paid phase (rebuttal,
+    concurrence) honors the SAME cap even if ``AR_MAX_COST_USD`` / policy change between phases; if
+    no record exists yet (a phase invoked before ``run``, or an older run), it resolves live and
+    persists it so the run has one stable, recorded ceiling from that point on."""
+    p = run / "cost_policy.json"
+    if p.exists():
+        rec = read_json(p)
+        if isinstance(rec, dict) and "cap_usd" in rec:
+            return rec.get("cap_usd"), rec.get("source")
+    cap, src = cost_cap()
+    write_json(p, {"cap_usd": cap, "source": src, "recorded_at": now_iso()})
+    return cap, src
+
+
+def _cost_abort(run, cap, spent, phase, not_run):
+    """Record ``cost_abort.json`` and die BLOCKED — the shared stop for any paid phase that would
+    cross the cap. The aggregator BLOCKS on the missing coverage; ``phase`` plus the phase-specific
+    ``not_run`` (unrun panel reviewers, rebuttal roles, or the concurrence call) keep the cost
+    reason distinct from an ordinary incomplete panel and count the skipped work of *this* phase."""
+    write_json(run / "cost_abort.json",
+               {"cap_usd": cap, "spent_usd": round(spent, 6), "phase": phase,
+                "not_run": not_run, "at": now_iso()})
+    die(f"BLOCKED: cost cap ${cap:.2f} reached (spent ${spent:.4f}) in {phase}; "
+        f"{len(not_run)} item(s) not run: {', '.join(not_run) or 'none'}", 2)
+
+
 def cmd_run(args):
     run = resolve_run(args.run)
     meta = read_json(run / "run.json")
@@ -613,11 +698,24 @@ def cmd_run(args):
         die("no API key found (OPENROUTER_API_KEY / AR_API_KEY / AR_KEY_FILE). "
             "For keyless MCP transport use `panel.py prepare` + `panel.py ingest`.", 2)
 
+    # Establish (and persist, on first call) the run's cost ceiling; it stays authoritative for
+    # rebuttal and concurrence too, so the audit shows which cap was actually enforced. The source
+    # is persisted by run_cost_cap and surfaced by aggregate, so it isn't needed here.
+    cap, _ = run_cost_cap(run)
     failed = []
     for role in plan["roles"]:
         if (run / "panel" / f"{role}.json").exists() and not args.force:
             print(f"  {role}: already complete, skipping (use --force to redo)")
             continue
+        # Cost ceiling: if the reviewers recorded so far already reached the cap, abort the rest
+        # with a recorded reason. The aggregator then BLOCKS on the missing coverage — a verbose
+        # model can raise the bill but can never buy a silent partial PASS (E4-S2). This is a
+        # pre-call gate, not a reservation: a reviewer already in flight can still overshoot.
+        if cap is not None:
+            spent = panel_cost(run)
+            if spent >= cap:
+                not_run = [r for r in plan["roles"] if not (run / "panel" / f"{r}.json").exists()]
+                _cost_abort(run, cap, spent, "panel", not_run)
         print(f"  {role}: calling {plan['roles'][role]['model']} ...")
         if run_one_role(run, meta, plan, role, context_text, base, key):
             continue
@@ -635,9 +733,11 @@ def cmd_run(args):
                 break
         if sub:
             old = plan["roles"][role]["model"]
+            sub_cap, sub_cap_src = capability_of(sub["slug"], sub, load_capabilities())
             plan["roles"][role] = {"model": sub["slug"], "family": sub["family"],
                                    "structured_outputs": sub["structured_outputs"],
-                                   "pinned": False}
+                                   "pinned": False,
+                                   "capability": sub_cap, "capability_source": sub_cap_src}
             plan["substitutions"].append({"role": role, "from": old, "to": sub["slug"],
                                           "at": now_iso()})
             write_json(run / "panel" / "plan.json", plan)
@@ -661,7 +761,8 @@ def cmd_prepare(args):
         boundary = secrets.token_hex(8)
         messages = reviewer_messages(role, meta, context_text, boundary)
         body, _ = build_request(info["model"], messages, REPORT_SCHEMA,
-                                "reviewer_report", info["structured_outputs"], meta["risk"])
+                                "reviewer_report", info["structured_outputs"], meta["risk"],
+                                info.get("capability"))
         write_json(run / "panel" / "requests" / f"{role}.json", body)
     print(f"request bodies written to {run / 'panel' / 'requests'}/")
     print("Execute each via your MCP route (POST /chat/completions with the body "
@@ -723,6 +824,7 @@ def cmd_rebuttal(args):
         print("no high/critical findings — rebuttal round not required, marker written")
         return
     base, key = api_config()
+    cap, _ = run_cost_cap(run)  # the run's persisted ceiling; rebuttal is billed under the same cap
     failed = []
     for role, info in plan["roles"].items():
         others = [d for d in digest if d["author_role"] != role]
@@ -744,13 +846,19 @@ def cmd_rebuttal(args):
                                 [{"role": "system", "content": system},
                                  {"role": "user", "content": user}],
                                 REBUTTAL_SCHEMA, "rebuttal", info["structured_outputs"],
-                                meta["risk"])
+                                meta["risk"], info.get("capability"))
         if args.prepare:
             write_json(run / "rebuttal" / "requests" / f"{role}.json", body)
             continue
         if not key:
             die("no API key; use `panel.py rebuttal --prepare` + "
                 "`panel.py ingest --phase rebuttal`", 2)
+        if cap is not None:
+            spent = panel_cost(run)
+            if spent >= cap:
+                not_run = [r for r in plan["roles"]
+                           if not (run / "rebuttal" / f"{r}.json").exists()]
+                _cost_abort(run, cap, spent, "rebuttal", not_run)
         try:
             t0 = time.monotonic()
             obj, raw, usage, provider = call_reviewer(base, key, body, REBUTTAL_SCHEMA)
@@ -785,6 +893,7 @@ def cmd_concur(args):
     if not fam:
         die("no eligible uninvolved family for concurrence", 2)
     model = pick_model(by_family[fam])
+    concur_cap, _ = capability_of(model["slug"], model, load_capabilities())
     prompt = Path(args.prompt_file).read_text(encoding="utf-8")
     system = ("You are an uninvolved arbiter on a release panel. A conflicted party "
               "(the development model) wants to dismiss a reviewer finding as a false "
@@ -796,7 +905,7 @@ def cmd_concur(args):
                             [{"role": "system", "content": system},
                              {"role": "user", "content": prompt}],
                             CONCUR_SCHEMA, "concurrence", model["structured_outputs"],
-                            meta["risk"])
+                            meta["risk"], concur_cap)
     if args.prepare:
         out = run / "validation" / "concur-request.json"
         write_json(out, body)
@@ -805,8 +914,21 @@ def cmd_concur(args):
     base, key = api_config()
     if not key:
         die("no API key; use --prepare for MCP transport", 2)
+    cap, _ = run_cost_cap(run)  # the run's persisted ceiling governs concurrence too
+    if cap is not None:
+        spent = panel_cost(run)
+        if spent >= cap:
+            _cost_abort(run, cap, spent, "concurrence", ["concurrence"])
+    t0 = time.monotonic()
     obj, _, usage, provider = call_reviewer(base, key, body, CONCUR_SCHEMA)
     obj["model_id"], obj["family"] = model["slug"], fam
+    # Record concurrence cost under panel/meta so it counts toward panel_cost() and the verdict's
+    # coverage.cost_usd. A unique token keeps repeated concurrence calls from clobbering each other.
+    write_json(run / "panel" / "meta" / f"concurrence.{secrets.token_hex(4)}.json",
+               {"model": model["slug"], "family": fam, "phase": "concurrence",
+                "usage": usage, "cost": meta_cost({"usage": usage}),
+                "latency_ms": int((time.monotonic() - t0) * 1000),
+                "provider": provider, "completed_at": now_iso()})
     print(json.dumps(obj, indent=2))
 
 
