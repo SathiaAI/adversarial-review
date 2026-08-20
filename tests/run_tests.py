@@ -1928,6 +1928,11 @@ def t_mcp_stdio_transport_framing():
     # parse error, not escape serve_message and kill the transport (panel finding correctness-1)
     deep = json.loads(mcpsrv.serve_message("[" * 20000 + "]" * 20000))
     assert deep["error"]["code"] == -32700 and deep["id"] is None, deep
+    # bytes carrying invalid UTF-8 raise UnicodeDecodeError in the decoder; serve_message is the
+    # transport-agnostic core a future bytes/HTTP transport reuses, so it too must frame as a
+    # parse error, never escape (CodeRabbit stability review)
+    ub = json.loads(mcpsrv.serve_message(b"\xff"))
+    assert ub["error"]["code"] == -32700 and ub["id"] is None, ub
 
 
 def t_mcp_serve_message_handler_crash_is_framed():

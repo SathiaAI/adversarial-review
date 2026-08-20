@@ -657,10 +657,12 @@ def serve_message(raw):
     loop nor a future HTTP handler can be killed by a single malformed message."""
     try:
         msg = json.loads(raw)
-    except (json.JSONDecodeError, RecursionError):
-        # RecursionError: pathologically nested JSON (e.g. "[[[[…") overflows the decoder's
-        # recursion limit. It is a malformed message, not a live bug, so it must frame as a
-        # parse error rather than escape and kill the transport (panel finding correctness-1).
+    except (ValueError, RecursionError):
+        # Any malformed message must frame as a parse error rather than escape and kill the
+        # transport. json.loads raises JSONDecodeError or UnicodeDecodeError (both ValueError —
+        # bad JSON text, or bad UTF-8 once a bytes-oriented transport hands over raw bytes) and
+        # RecursionError (pathologically nested input overflowing the decoder). Panel finding
+        # correctness-1 + CodeRabbit stability review.
         return json.dumps(_error(None, -32700, "parse error"))
     try:
         response = handle(msg)

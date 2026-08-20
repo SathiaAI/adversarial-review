@@ -59,11 +59,12 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   into a `StdioTransport` class around a transport-agnostic `serve_message()` core, leaving the
   `handle()` dispatch untouched. Framing is byte-identical for well-formed and ordinarily-malformed
   messages (`-32700` parse errors, `-32603` handler-crash containment, notification suppression);
-  the extracted parse guard additionally converts a `RecursionError` from pathologically nested JSON
-  into the same `-32700` instead of letting it escape and kill the loop (closing a pre-existing gap),
-  so the seam's "a single malformed message never kills the transport" guarantee holds. The seam lets
-  the forthcoming Streamable-HTTP transport (E3-S2) reuse the exact dispatch and error semantics.
-  Stdlib-only, 3.9-safe.
+  the extracted parse guard catches every malformed-input failure `json.loads` can raise — a
+  `JSONDecodeError`, a `RecursionError` from pathologically nested input, and a `UnicodeDecodeError`
+  from bad bytes — and frames each as `-32700` instead of letting it escape and kill the loop
+  (closing a pre-existing gap), so the seam's "a single malformed message never kills the transport"
+  guarantee holds for the stdio loop and for the byte-oriented Streamable-HTTP transport (E3-S2) that
+  will reuse the exact dispatch and error semantics. Stdlib-only, 3.9-safe.
 
 ## [0.1.0]
 
