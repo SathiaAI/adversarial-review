@@ -2959,6 +2959,168 @@ def t_trends_tolerates_unreadable_root():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def _import_score():
+    sys.path.insert(0, str(SKILL / "evals"))
+    import score
+    return score
+
+
+def _f(file="a.py", line=10, severity="high", title="", evidence="", scenario="", fix=""):
+    """Build a minimal reviewer finding for scoring tests."""
+    return {"file": file, "line": line, "severity": severity, "title": title,
+            "evidence": evidence, "scenario": scenario, "fix": fix}
+
+
+def t_eval_score_file_overlaps():
+    # E1-S2: file match is exact-after-normalization or a basename fallback (tolerates a/ b/ ./ diff
+    # prefixes and a reviewer citing the bare filename); empty either side never overlaps.
+    s = _import_score()
+    assert s.file_overlaps("api/invoices.py", "api/invoices.py")
+    assert s.file_overlaps("b/api/invoices.py", "a/api/invoices.py")       # diff prefixes stripped
+    assert s.file_overlaps("./invoices.py", "api/invoices.py")             # basename fallback
+    assert s.file_overlaps("api\\invoices.py", "api/invoices.py")          # backslash normalized
+    assert not s.file_overlaps("api/orders.py", "api/invoices.py")
+    assert not s.file_overlaps("", "api/invoices.py") and not s.file_overlaps("x.py", "")
+
+
+def t_eval_score_line_in_range():
+    # E1-S2: line path honors +/- tolerance at both edges; a non-int/absent line or a malformed range
+    # never satisfies it (must qualify via the tag path instead); a reversed range is tolerated.
+    s = _import_score()
+    assert s.line_in_range(10, [10, 12]) and s.line_in_range(12, [10, 12])
+    assert s.line_in_range(13, [10, 12], line_tol=1) and not s.line_in_range(14, [10, 12], line_tol=1)
+    assert s.line_in_range(7, [10, 12], line_tol=3) and not s.line_in_range(6, [10, 12], line_tol=3)
+    assert s.line_in_range(11, [12, 10])                                    # reversed range tolerated
+    assert not s.line_in_range(None, [10, 12]) and not s.line_in_range(True, [10, 12])
+    assert not s.line_in_range(10, [10]) and not s.line_in_range(10, "nope")
+
+
+def t_eval_score_tag_intersects():
+    # E1-S2: a tag matches only when ALL its words appear as tokens in the finding text; a single-token
+    # tag is a substring-token match; empty tags never match.
+    s = _import_score()
+    ok, tag = s.tag_intersects(["missing-ownership-check", "idor"],
+                               _f(evidence="This is a missing ownership check on the object"))
+    assert ok and tag == "missing-ownership-check"
+    ok2, tag2 = s.tag_intersects(["idor"], _f(title="Classic IDOR on invoice id"))
+    assert ok2 and tag2 == "idor"
+    assert not s.tag_intersects(["missing-ownership-check"], _f(evidence="ownership only"))[0]  # not all words
+    assert not s.tag_intersects([], _f(evidence="anything"))[0]
+
+
+def t_eval_score_match_finding_to_defect():
+    # E1-S2: location match (right file + near line), root-cause match (right file + tag named though
+    # line is off), no match when the tag is named in the WRONG file, and non-dict inputs are safe.
+    s = _import_score()
+    defect = {"defect_id": "idor-1", "must_detect": True, "severity_floor": "high",
+              "locators": [{"file": "api/invoices.py", "line_range": [10, 12]}],
+              "root_cause_tags": ["idor", "authz"]}
+    assert s.match_finding_to_defect(_f(file="api/invoices.py", line=11), defect)[1] == "location"
+    off = s.match_finding_to_defect(_f(file="api/invoices.py", line=200, title="IDOR authz gap"), defect)
+    assert off == (True, "root_cause")                                      # right file, tag names it
+    # tag named but in the WRONG file -> not a match (root-cause path still requires file overlap)
+    assert not s.match_finding_to_defect(_f(file="other.py", line=1, title="IDOR authz"), defect)[0]
+    assert s.match_finding_to_defect("nope", defect) == (False, None)
+
+
+def t_eval_score_case_tp_partial_fn():
+    # E1-S2: a must_detect defect is TP when matched at/above its severity floor, PARTIAL when matched
+    # below the floor (noticed but under-rated), FN when unmatched.
+    s = _import_score()
+    defect = {"defect_id": "d1", "must_detect": True, "severity_floor": "high",
+              "locators": [{"file": "a.py", "line_range": [10, 10]}], "root_cause_tags": ["boom"]}
+    exp = {"defects": [defect], "fp_budget": 0}
+    tp = s.score_case(exp, [_f(file="a.py", line=10, severity="high")])
+    assert tp["tp"] == 1 and tp["partial"] == 0 and tp["fn"] == 0
+    part = s.score_case(exp, [_f(file="a.py", line=10, severity="low")])
+    assert part["partial"] == 1 and part["tp"] == 0 and part["fn"] == 0
+    miss = s.score_case(exp, [_f(file="zzz.py", line=99, severity="high", title="unrelated")])
+    assert miss["fn"] == 1 and miss["tp"] == 0
+    assert miss["defect_outcomes"][0]["outcome"] == "fn"
+
+
+def t_eval_score_case_informational_and_fp():
+    # E1-S2: a must_detect:false defect never scores FN/TP (bonus if matched). FP rules: on a clean
+    # case any finding beyond fp_budget is FP; on a defect case only unmatched high/critical beyond
+    # budget is FP (unmatched low/medium is noise, not a false alarm). A bad fp_budget floors to 0.
+    s = _import_score()
+    info = {"defect_id": "opt", "must_detect": False, "severity_floor": "low",
+            "locators": [{"file": "a.py", "line_range": [1, 1]}], "root_cause_tags": ["x"]}
+    r = s.score_case({"defects": [info], "fp_budget": 0}, [_f(file="a.py", line=1, severity="low", title="x")])
+    assert r["tp"] == 0 and r["fn"] == 0 and r["defect_outcomes"][0]["outcome"] == "informational"
+    # clean case: 2 findings, budget 1 -> exactly 1 FP
+    clean = s.score_case({"defects": [], "fp_budget": 1}, [_f(severity="low"), _f(severity="low")])
+    assert clean["fp"] == 1 and clean["fp_candidates"] == 2
+    # defect case: an unmatched HIGH is an FP (budget 0); an unmatched LOW is noise, not FP
+    defect = {"defect_id": "d", "must_detect": True, "severity_floor": "high",
+              "locators": [{"file": "a.py", "line_range": [5, 5]}], "root_cause_tags": ["q"]}
+    d = s.score_case({"defects": [defect], "fp_budget": 0},
+                     [_f(file="a.py", line=5, severity="high", title="q"),      # the TP
+                      _f(file="z.py", line=1, severity="critical", title="bogus"),  # unmatched high -> FP
+                      _f(file="z.py", line=2, severity="low", title="nit")])        # unmatched low -> noise
+    assert d["tp"] == 1 and d["fp"] == 1 and d["noise"] == 1
+    bad = s.score_case({"defects": [], "fp_budget": -5}, [_f(severity="low")])
+    assert bad["fp"] == 1 and bad["fp_budget"] == 0                          # negative budget floored
+
+
+def t_eval_score_case_nondict_finding():
+    # E1-S2 (correctness-1 regression): match_finding_to_defect already refuses a non-dict finding, so
+    # such an entry lands in `unmatched` and reaches the FP severity tally. That tally must tolerate it
+    # (floor to 0) instead of raising AttributeError on `.get`. A non-dict is never high/critical, so on
+    # a defect case it is noise, not a false alarm; on a clean case it still counts toward fp_budget.
+    s = _import_score()
+    defect = {"defect_id": "d", "must_detect": True, "severity_floor": "high",
+              "locators": [{"file": "a.py", "line_range": [10, 12]}], "root_cause_tags": ["idor"]}
+    d = s.score_case({"defects": [defect], "fp_budget": 0},
+                     [_f(file="a.py", line=11, severity="high", title="idor"),  # the TP
+                      "not-a-dict", None])                                       # malformed -> noise, no crash
+    assert d["tp"] == 1 and d["fp"] == 0 and d["noise"] == 2
+    # clean case: two malformed entries are candidate FPs beyond a budget of 1 -> exactly 1 FP, no crash
+    clean = s.score_case({"defects": [], "fp_budget": 1}, ["x", None])
+    assert clean["fp"] == 1 and clean["fp_candidates"] == 2
+
+
+def t_eval_score_aggregate():
+    # E1-S2: aggregate rolls up overall + per-category + per-tier; detection_rate counts only TPs and
+    # is None when a bucket has no must_detect defects (clean-only).
+    s = _import_score()
+    r_tp = {"tp": 1, "partial": 0, "fn": 0, "fp": 0, "noise": 0, "must_detect_total": 1}
+    r_fn = {"tp": 0, "partial": 1, "fn": 1, "fp": 2, "noise": 0, "must_detect_total": 2}
+    r_clean = {"tp": 0, "partial": 0, "fn": 0, "fp": 0, "noise": 0, "must_detect_total": 0}
+    agg = s.aggregate([({"category": "security", "tier": "NORMAL"}, r_tp),
+                       ({"category": "correctness", "tier": "NORMAL"}, r_fn),
+                       ({"category": "clean", "tier": "NORMAL"}, r_clean)])
+    assert agg["overall"]["tp"] == 1 and agg["overall"]["fn"] == 1 and agg["overall"]["fp"] == 2
+    assert agg["overall"]["detection_rate"] == round(1 / 3, 4)
+    assert agg["by_category"]["clean"]["detection_rate"] is None            # no must_detect defects
+    assert agg["by_category"]["security"]["detection_rate"] == 1.0
+    assert agg["by_tier"]["NORMAL"]["cases"] == 3
+
+
+def t_eval_score_on_real_corpus():
+    # E1-S2: the scorer runs against the committed E1-S1 corpus. A finding placed on each defect's
+    # locator scores TP; a clean case with no findings has zero FP.
+    s = _import_score()
+    corpus = SKILL / "evals" / "corpus"
+    scored = 0
+    for d in sorted(os.listdir(corpus)):
+        cd = corpus / d
+        if not cd.is_dir():
+            continue
+        exp = json.loads((cd / "expected.json").read_text(encoding="utf-8"))
+        defs = exp.get("defects", [])
+        if defs:
+            loc = defs[0]["locators"][0]
+            find = _f(file=loc["file"], line=loc["line_range"][0],
+                      severity=defs[0]["severity_floor"], title=" ".join(defs[0]["root_cause_tags"]))
+            res = s.score_case(exp, [find])
+            assert res["tp"] == 1, (d, res)
+        else:  # clean case, no findings -> no false positives
+            assert s.score_case(exp, [])["fp"] == 0, d
+        scored += 1
+    assert scored >= 6
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

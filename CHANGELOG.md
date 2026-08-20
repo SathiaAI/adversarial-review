@@ -27,6 +27,18 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   across every defect category plus clean cases, an `evals/README.md`, and CI coverage. This
   is the groundwork for measuring the panel's true-positive / false-negative / false-positive
   rates (scoring lands in E1-S2).
+- Reviewer meta-evaluation scoring (E1-S2): `evals/score.py` grades reviewer findings against the
+  corpus ground truth. A finding matches a defect when it is in the same file **and** either its
+  cited line is within a locator's range (±`line_tol`, default 3) **or** the finding's text names one
+  of the defect's `root_cause_tags` — file-overlap is required even on the tag path, so a root-cause
+  word in the wrong file is not a match (neither line-only nor tag-only is sufficient on its own).
+  Scoring is severity-aware: a `must_detect` defect matched at/above its `severity_floor` is a true
+  positive, a match below the floor is a **partial** (noticed but under-rated, not a detection), an
+  unmatched one is a false negative; a `must_detect: false` defect is informational. A false positive
+  is a finding matching no defect — any finding beyond `fp_budget` on a clean case, or an unmatched
+  high/critical one beyond budget on a defect case (an extra low/medium is noise). `aggregate()` rolls
+  per-case results up overall and per category/tier. Pure, stdlib-only, 3.9-safe, 100% branch-covered
+  offline (`t_eval_score_*`); the offline harness that drives it lands in E1-S3.
 - Distribution: a `release` workflow publishes to PyPI on a `v*` tag via **Trusted Publishing**
   (OIDC, no stored token); an `action-selftest` workflow exercises the composite action keyless
   and asserts the honest BLOCKED verdict; a GitLab CI template (`examples/.gitlab-ci.yml`); and a
