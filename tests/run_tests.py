@@ -1893,6 +1893,32 @@ def t_mcp_stdio_parse_error_survives():
     assert any("result" in o and o.get("id") == 1 for o in lines), lines
 
 
+def t_mcp_stdio_transport_framing():
+    # E3-S1: the stdio framing is extracted into StdioTransport around the transport-agnostic
+    # serve_message() core (handle() dispatch is untouched). Drive the class with injected
+    # streams and assert newline framing, parse-error framing, notification suppression, and
+    # empty-line skipping in-process — the seam a future HTTP transport reuses.
+    import io
+    feed = "\n".join([
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover"}),
+        "",                                                                     # blank: skipped
+        "not json {{{",                                                         # parse error -> -32700
+        json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),  # notification: no reply
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    ]) + "\n"
+    out = io.StringIO()
+    mcpsrv.StdioTransport(stdin=io.StringIO(feed), stdout=out).serve_forever()
+    replies = [json.loads(x) for x in out.getvalue().splitlines() if x]
+    # exactly three framed replies, in order: discover(id 1), parse-error(id null), list(id 2)
+    assert [r.get("id") for r in replies] == [1, None, 2], replies
+    assert replies[1]["error"]["code"] == -32700, replies[1]
+    assert "tools" in replies[2]["result"], replies[2]
+    # serve_message() itself returns None for a notification — nothing to frame
+    assert mcpsrv.serve_message(json.dumps({"jsonrpc": "2.0", "method": "notifications/x"})) is None
+    assert mcpsrv.serve_message("garbage {") == json.dumps(
+        mcpsrv._error(None, -32700, "parse error"))
+
+
 def t_mcp_subprocess_timeout_surfaced():
     # test_quality-2: a CLI timeout is surfaced as a tool error, not a hang/crash
     orig = mcpsrv.subprocess.run

@@ -54,6 +54,13 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   `references/schemas.md`; being a pre-call gate (not a reservation), the recorded total can
   overshoot the cap by up to the in-flight reviewer's cost, as `references/config.md` now states.
 
+### Changed
+- MCP server transport seam (E3-S1): the stdio framing in `scripts/mcp_server.py` is extracted
+  into a `StdioTransport` class around a transport-agnostic `serve_message()` core, leaving the
+  `handle()` dispatch untouched. Behavior over stdio is unchanged (byte-identical framing, parse
+  errors, notification suppression); the seam lets the forthcoming Streamable-HTTP transport
+  (E3-S2) reuse the exact dispatch and error semantics. Stdlib-only, 3.9-safe.
+
 ## [0.1.0]
 
 ### Added

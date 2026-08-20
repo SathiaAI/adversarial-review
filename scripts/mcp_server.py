@@ -649,27 +649,49 @@ def handle(msg):
     return _error(id_, -32601, f"method not found: {method}")
 
 
+def serve_message(raw):
+    """Transport-agnostic core: turn one raw JSON-RPC message string into a response string,
+    or ``None`` when there is nothing to send back (a notification, or any message ``handle``
+    declines to answer). Parse errors and handler crashes are converted to JSON-RPC error
+    responses here, so every transport gets identical error semantics and neither the stdio
+    loop nor a future HTTP handler can be killed by a single malformed message."""
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError:
+        return json.dumps(_error(None, -32700, "parse error"))
+    try:
+        response = handle(msg)
+    except Exception as e:  # a malformed message must never kill the transport
+        log(f"handler crashed on a message: {e}")
+        response = _error(msg.get("id") if isinstance(msg, dict) else None,
+                          -32603, "internal error")
+    return None if response is None else json.dumps(response)
+
+
+class StdioTransport:
+    """Newline-delimited JSON-RPC over stdin/stdout — the *framing* half of the server, kept
+    separate from dispatch (``handle`` / ``serve_message``) so a second transport (the
+    Streamable-HTTP surface, E3-S2) can reuse the exact same core without touching this loop.
+    Streams are injectable so the framing is testable offline; they default to real stdio."""
+
+    def __init__(self, stdin=None, stdout=None):
+        self.stdin = stdin if stdin is not None else sys.stdin
+        self.stdout = stdout if stdout is not None else sys.stdout
+
+    def serve_forever(self):
+        for line in self.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            out = serve_message(line)
+            if out is not None:
+                self.stdout.write(out + "\n")
+                self.stdout.flush()
+
+
 def main():
     log(f"v{VERSION} ready on stdio (cwd={os.getcwd()})")
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            sys.stdout.write(json.dumps(_error(None, -32700, "parse error")) + "\n")
-            sys.stdout.flush()
-            continue
-        try:
-            response = handle(msg)
-        except Exception as e:  # a malformed message must never kill the stdio loop
-            log(f"handler crashed on a message: {e}")
-            response = _error(msg.get("id") if isinstance(msg, dict) else None,
-                              -32603, "internal error")
-        if response is not None:
-            sys.stdout.write(json.dumps(response) + "\n")
-            sys.stdout.flush()
+    StdioTransport().serve_forever()
 
 
 if __name__ == "__main__":
