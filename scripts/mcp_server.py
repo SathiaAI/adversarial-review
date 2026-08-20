@@ -657,7 +657,10 @@ def serve_message(raw):
     loop nor a future HTTP handler can be killed by a single malformed message."""
     try:
         msg = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
+        # RecursionError: pathologically nested JSON (e.g. "[[[[…") overflows the decoder's
+        # recursion limit. It is a malformed message, not a live bug, so it must frame as a
+        # parse error rather than escape and kill the transport (panel finding correctness-1).
         return json.dumps(_error(None, -32700, "parse error"))
     try:
         response = handle(msg)
