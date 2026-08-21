@@ -2993,6 +2993,12 @@ def t_eval_score_line_in_range():
     assert s.line_in_range(11, [12, 10])                                    # reversed range tolerated
     assert not s.line_in_range(None, [10, 12]) and not s.line_in_range(True, [10, 12])
     assert not s.line_in_range(10, [10]) and not s.line_in_range(10, "nope")
+    # A malformed locator endpoint (None/string/boolean) or a bad line_tol must be a non-match, not a
+    # crash — a corrupt corpus label cannot stop scoring (PR #44 CodeRabbit).
+    assert not s.line_in_range(10, [None, 12]) and not s.line_in_range(10, ["x", 12])
+    assert not s.line_in_range(10, [10, None]) and not s.line_in_range(10, [True, 12])
+    assert not s.line_in_range(10, [10, 12], line_tol=-1)
+    assert not s.line_in_range(10, [10, 12], line_tol=True) and not s.line_in_range(10, [10, 12], line_tol="3")
 
 
 def t_eval_score_tag_intersects():
@@ -3078,6 +3084,27 @@ def t_eval_score_case_nondict_finding():
     # clean case: two malformed entries are candidate FPs beyond a budget of 1 -> exactly 1 FP, no crash
     clean = s.score_case({"defects": [], "fp_budget": 1}, ["x", None])
     assert clean["fp"] == 1 and clean["fp_candidates"] == 2
+
+
+def t_eval_score_case_one_finding_one_defect():
+    # E1-S2 (PR #44 Codex P1 regression): a single reviewer finding must credit at most one defect.
+    # When two must_detect defects sit within tolerance (or share a tag) in the same file, one finding
+    # scored both defects as TP -> tp:2, inflating detection. Assignment is now one-to-one.
+    s = _import_score()
+    D = lambda n, floor="high": {"defect_id": "d%d" % n, "must_detect": True, "severity_floor": floor,
+                                 "locators": [{"file": "a.py", "line_range": [n, n]}], "root_cause_tags": ["t%d" % n]}
+    F = lambda ln, sev="high": _f(file="a.py", line=ln, severity=sev, title="x")
+    # one finding, two overlapping defects -> exactly one TP (the other is an FN), never tp:2
+    one = s.score_case({"defects": [D(10), D(11)], "fp_budget": 0}, [F(10)])
+    assert (one["tp"], one["partial"], one["fn"]) == (1, 0, 1), one
+    assert sorted(o["outcome"] for o in one["defect_outcomes"]) == ["fn", "tp"]
+    assert sum(len(o["matched_finding_indices"]) for o in one["defect_outcomes"]) == 1  # finding used once
+    # two findings covering two overlapping defects -> both detected (no under-counting from greedy)
+    two = s.score_case({"defects": [D(10), D(11)], "fp_budget": 0}, [F(10), F(11)])
+    assert (two["tp"], two["partial"], two["fn"]) == (2, 0, 0), two
+    # a below-floor finding on one of two overlapping defects is a PARTIAL, and it is still consumed
+    part = s.score_case({"defects": [D(10), D(11)], "fp_budget": 0}, [F(10, "low")])
+    assert (part["tp"], part["partial"], part["fn"]) == (0, 1, 1), part
 
 
 def t_eval_score_aggregate():

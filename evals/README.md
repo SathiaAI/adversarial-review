@@ -94,6 +94,9 @@ component + same root cause", not "same line".
 **Outcomes.** For each `must_detect` defect: **TP** if a matching finding meets the `severity_floor`,
 **PARTIAL** if matched only below the floor (noticed but under-rated — recorded, not a detection),
 **FN** if unmatched. A `must_detect: false` defect is informational (a bonus if matched, never an FN).
+Each finding credits **at most one** defect: findings are assigned to defects by maximum bipartite
+matching, so one finding that lands near two defects cannot score two detections, while several
+findings that genuinely cover several nearby defects still each count.
 A **FP** is a finding matching no defect: on a clean case, any finding beyond `fp_budget`; on a defect
 case, only an unmatched **high/critical** finding beyond budget (an extra low/medium is noise). `aggregate()`
 rolls per-case results up overall and per category/tier; `detection_rate` counts only true positives.

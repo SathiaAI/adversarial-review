@@ -35,6 +35,13 @@ match **below** the floor (a `low` finding on a `high` defect — the panel noti
 under-rated it) is a **partial**: recorded separately, and NOT counted as a detection. An unmatched
 `must_detect` defect is a false negative.
 
+Each finding credits **at most one** defect. When two nearby defects (within tolerance, or sharing a
+tag) sit in the same file and one finding matches both, crediting both would inflate the detection
+rate — the reviewer noticed one thing, not two. So findings are assigned to `must_detect` defects by
+maximum bipartite matching (`_bipartite_match`): the true-positive count is the largest set of defects
+that can each be given a distinct floor-meeting finding, which neither double-counts one finding nor
+under-counts when several findings genuinely cover several defects.
+
 A false positive is a finding that matches no known defect: on a clean case (no defects) any such
 finding beyond `fp_budget` counts; on a defect case only an unmatched **high/critical** finding beyond
 budget counts (an extra low/medium finding on a real-defect diff is noise, recorded but not an FP).
@@ -90,12 +97,18 @@ def file_overlaps(finding_file, defect_file):
 
 def line_in_range(finding_line, line_range, line_tol=DEFAULT_LINE_TOL):
     """True when ``finding_line`` falls within ``[start-tol, end+tol]``. A missing/non-int line (a
-    finding with no anchor) never satisfies the line path — it must qualify via the tag path instead."""
+    finding with no anchor) never satisfies the line path — it must qualify via the tag path instead.
+    A malformed locator (a non-int/boolean endpoint) or a bad ``line_tol`` (non-int, boolean, or
+    negative) yields a non-match rather than raising — a corrupt corpus label must not stop scoring."""
     if not isinstance(finding_line, int) or isinstance(finding_line, bool):
         return False
     if not isinstance(line_range, (list, tuple)) or len(line_range) < 2:
         return False
     start, end = line_range[0], line_range[1]
+    if (not isinstance(start, int) or isinstance(start, bool)
+            or not isinstance(end, int) or isinstance(end, bool)
+            or not isinstance(line_tol, int) or isinstance(line_tol, bool) or line_tol < 0):
+        return False
     if start > end:  # tolerate a reversed range in the label
         start, end = end, start
     return (start - line_tol) <= finding_line <= (end + line_tol)
@@ -142,6 +155,30 @@ def match_finding_to_defect(finding, defect, line_tol=DEFAULT_LINE_TOL):
     return False, None
 
 
+def _bipartite_match(edges, order):
+    """Maximum bipartite matching (Kuhn's augmenting paths). ``edges`` maps a defect key to the
+    finding indices it may claim; ``order`` fixes the deterministic processing order. Returns
+    ``{defect_key: finding_index}`` — each finding assigned to at most one defect, and the number of
+    matched defects is the maximum achievable. Used so one reviewer finding can credit at most one
+    defect (no inflation) while still crediting every defect a distinct finding covers (no
+    under-counting when several findings cover several nearby defects)."""
+    match_f = {}  # finding index -> defect key currently holding it
+
+    def _assign(d, seen):
+        for f in edges.get(d, ()):
+            if f in seen:
+                continue
+            seen.add(f)
+            if f not in match_f or _assign(match_f[f], seen):
+                match_f[f] = d
+                return True
+        return False
+
+    for d in order:
+        _assign(d, set())
+    return {d: f for f, d in match_f.items()}
+
+
 def score_case(expected, findings, line_tol=DEFAULT_LINE_TOL):
     """Score one case's reviewer findings against its ground truth. ``findings`` is a flat list across
     all reviewers (each an item of a report's ``findings``); pass role-tagged subsets to attribute per
@@ -152,33 +189,57 @@ def score_case(expected, findings, line_tol=DEFAULT_LINE_TOL):
         fp_budget = 0
     findings = list(findings or [])
 
+    # Per defect: which findings match it (with the reason), its severity floor, and whether it is
+    # a must_detect. A finding matching ANY defect is a real match, so it is excluded from the
+    # false-positive pool regardless of which defect ends up crediting it.
     matched_idx = set()
-    outcomes = []
-    tp = partial = fn = 0
+    per_defect = []
     for d in defects:
         floor = sev_rank(d.get("severity_floor"))
         hits = []
         for i, f in enumerate(findings):
             ok, reason = match_finding_to_defect(f, d, line_tol)
             if ok:
+                matched_idx.add(i)
                 hits.append((i, reason))
-        matched_idx.update(i for i, _ in hits)
-        if not d.get("must_detect", False):
-            outcome = "informational"  # known but optional: matching is a bonus, missing is not an FN
-        elif not hits:
-            outcome = "fn"
-            fn += 1
+        per_defect.append({"id": d.get("defect_id"), "must": bool(d.get("must_detect", False)),
+                           "floor": floor, "hits": hits})
+
+    # One finding credits at most one defect (no inflation). Assign findings to must_detect defects
+    # by maximum bipartite matching: phase 1 over findings AT/ABOVE each defect's floor — the matched
+    # defects are the true positives, and a maximum matching is exactly the largest set of defects
+    # that can each be given a distinct floor-meeting finding (so neither inflated nor under-counted);
+    # phase 2 assigns each still-unmatched defect a distinct remaining matching finding below its
+    # floor (a PARTIAL — noticed but under-rated). Any must_detect defect left unmatched is an FN.
+    # Informational (must_detect:false) defects never consume a finding — they must not starve a
+    # required defect — but their matches still count toward matched_idx above.
+    must = [di for di, m in enumerate(per_defect) if m["must"]]
+    qual = {di: [i for i, _ in per_defect[di]["hits"] if _severity_of(findings[i]) >= per_defect[di]["floor"]]
+            for di in must}
+    tp_assign = _bipartite_match(qual, must)
+    used = set(tp_assign.values())
+    rest = [di for di in must if di not in tp_assign]
+    any_edges = {di: [i for i, _ in per_defect[di]["hits"] if i not in used] for di in rest}
+    partial_assign = _bipartite_match(any_edges, rest)
+
+    outcomes = []
+    tp = partial = fn = 0
+    for di, m in enumerate(per_defect):
+        reason_of = dict(m["hits"])
+        if not m["must"]:
+            outcome, assigned = "informational", [i for i, _ in m["hits"]]
+        elif di in tp_assign:
+            outcome, assigned = "tp", [tp_assign[di]]
+            tp += 1
+        elif di in partial_assign:
+            outcome, assigned = "partial", [partial_assign[di]]
+            partial += 1
         else:
-            best = max(_severity_of(findings[i]) for i, _ in hits)
-            if best >= floor:
-                outcome = "tp"
-                tp += 1
-            else:
-                outcome = "partial"
-                partial += 1
-        outcomes.append({"defect_id": d.get("defect_id"), "must_detect": bool(d.get("must_detect", False)),
-                         "outcome": outcome, "matched_finding_indices": [i for i, _ in hits],
-                         "match_reasons": [r for _, r in hits]})
+            outcome, assigned = "fn", []
+            fn += 1
+        outcomes.append({"defect_id": m["id"], "must_detect": m["must"], "outcome": outcome,
+                         "matched_finding_indices": assigned,
+                         "match_reasons": [reason_of[i] for i in assigned]})
 
     unmatched = [i for i in range(len(findings)) if i not in matched_idx]
     if not defects:  # clean case: every finding is a candidate false positive
