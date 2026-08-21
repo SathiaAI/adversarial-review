@@ -1893,6 +1893,67 @@ def t_mcp_stdio_parse_error_survives():
     assert any("result" in o and o.get("id") == 1 for o in lines), lines
 
 
+def t_mcp_stdio_transport_framing():
+    # E3-S1: the stdio framing is extracted into StdioTransport around the transport-agnostic
+    # serve_message() core (handle() dispatch is untouched). Drive the class with injected
+    # streams and assert newline framing, parse-error framing, notification suppression, and
+    # empty-line skipping in-process — the seam a future HTTP transport reuses.
+    import io
+    feed = "\n".join([
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover"}),
+        "",                                                                     # blank: skipped
+        "   ",                                                                  # whitespace-only: skipped
+        "not json {{{",                                                         # unparseable -> -32700 (id null)
+        json.dumps([1, 2, 3]),                                                  # valid JSON, non-object -> -32600 (id null)
+        json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),  # notification: no reply
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    ]) + "\n"
+    out = io.StringIO()
+    mcpsrv.StdioTransport(stdin=io.StringIO(feed), stdout=out).serve_forever()
+    replies = [json.loads(x) for x in out.getvalue().splitlines() if x]
+    # framed replies in order: discover(id 1), parse-error(id null), invalid-request(id null),
+    # list(id 2). Both the blank and the whitespace-only line are skipped; the notification is
+    # unanswered — so a non-dict JSON value frames as -32600, it does not vanish or crash.
+    assert [r.get("id") for r in replies] == [1, None, None, 2], replies
+    assert replies[1]["error"]["code"] == -32700, replies[1]   # unparseable bytes
+    assert replies[2]["error"]["code"] == -32600, replies[2]   # valid JSON, not a JSON-RPC object
+    assert "tools" in replies[3]["result"], replies[3]
+    # serve_message() itself returns None for a notification — nothing to frame
+    assert mcpsrv.serve_message(json.dumps({"jsonrpc": "2.0", "method": "notifications/x"})) is None
+    # a parse failure frames as a -32700 error with a null id — asserted structurally rather
+    # than by reconstructing the expected string through _error (which would be tautological)
+    perr = json.loads(mcpsrv.serve_message("garbage {"))
+    assert perr["error"]["code"] == -32700 and perr["id"] is None, perr
+    # pathologically nested JSON overflows the decoder (RecursionError); it must frame as a
+    # parse error, not escape serve_message and kill the transport (panel finding correctness-1)
+    deep = json.loads(mcpsrv.serve_message("[" * 20000 + "]" * 20000))
+    assert deep["error"]["code"] == -32700 and deep["id"] is None, deep
+    # bytes carrying invalid UTF-8 raise UnicodeDecodeError in the decoder; serve_message is the
+    # transport-agnostic core a future bytes/HTTP transport reuses, so it too must frame as a
+    # parse error, never escape (CodeRabbit stability review)
+    ub = json.loads(mcpsrv.serve_message(b"\xff"))
+    assert ub["error"]["code"] == -32700 and ub["id"] is None, ub
+
+
+def t_mcp_serve_message_handler_crash_is_framed():
+    # E3-S1 acceptance guarantee: serve_message() converts a handler crash into a JSON-RPC
+    # -32603 error (preserving the request id) instead of letting the exception escape and
+    # kill the transport. handle() is deliberately defensive, so the -32603 path is reached
+    # by forcing handle to raise — this is the seam's explicit contract (panel finding
+    # test_quality-1, previously untested).
+    orig = mcpsrv.handle
+    try:
+        def boom(msg):
+            raise RuntimeError("handler kaboom")
+        mcpsrv.handle = boom
+        out = mcpsrv.serve_message(json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/list"}))
+        err = json.loads(out)
+        assert err["error"]["code"] == -32603, err
+        assert err["id"] == 7, err            # id propagated from the crashing request
+    finally:
+        mcpsrv.handle = orig
+
+
 def t_mcp_subprocess_timeout_surfaced():
     # test_quality-2: a CLI timeout is surfaced as a tool error, not a hang/crash
     orig = mcpsrv.subprocess.run
