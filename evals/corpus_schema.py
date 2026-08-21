@@ -209,7 +209,10 @@ def _expected_semantics(case_id, meta, exp):
     # scripts.offline may only script roles the case's tier actually runs (Codex, PR #45). A NORMAL
     # case scripting `data_privacy`/`reliability` would have those findings silently never served or
     # scored — a false negative that hides. Reject it so the mistake fails loudly at validation.
-    offline = (exp.get("scripts") or {}).get("offline")
+    # Read scripts only when it is an object: a truthy non-object is already a schema type error above,
+    # so it must fall through cleanly here, not raise AttributeError on .get() (CodeRabbit, PR #45).
+    scripts = exp.get("scripts")
+    offline = scripts.get("offline") if isinstance(scripts, dict) else None
     tier = meta.get("tier") if isinstance(meta, dict) else None
     if isinstance(offline, dict) and tier in TIER_ROLES:
         allowed = set(TIER_ROLES[tier])

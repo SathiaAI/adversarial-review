@@ -248,12 +248,14 @@ def run_offline(corpus_dir, only=None, line_tol=score.DEFAULT_LINE_TOL, quiet=Fa
 
 
 def _md_cell(value):
-    """Escape a repository-controlled identifier (a case id, category, tier, or role) before it goes
-    into a Markdown table cell: a stray ``|`` or newline in an external corpus's id would otherwise
-    forge extra cells/rows (Codex, PR #45). Pipes are escaped; control chars collapse to a space."""
+    """Escape a repository-controlled identifier (a case id, category, tier, role, corpus path, or
+    skipped id) before it goes into Markdown: a stray ``|``, backtick, or newline in an external
+    corpus's id would otherwise forge extra cells/rows or break out of a code span (Codex +
+    CodeRabbit, PR #45). Pipes and backticks are escaped; control chars collapse to a space. Callers
+    render the result unwrapped — never inside raw backticks, which an embedded backtick could close."""
     s = str(value)
     s = "".join(" " if c in "\r\n\t" else c for c in s)
-    return s.replace("\\", "\\\\").replace("|", "\\|")
+    return s.replace("\\", "\\\\").replace("|", "\\|").replace("`", "\\`")
 
 
 def _summary_md(result, generated_at):
@@ -261,8 +263,8 @@ def _summary_md(result, generated_at):
     scored numbers come straight from `result` (this file is a view, never a second source of truth)."""
     ov = result["aggregate"]["overall"]
     lines = ["# Reviewer meta-eval — offline harness report", ""]
-    lines.append("Generated: %s · corpus: `%s` · line tolerance: ±%d"
-                 % (generated_at, result["corpus"], result["line_tol"]))
+    lines.append("Generated: %s · corpus: %s · line tolerance: ±%d"
+                 % (generated_at, _md_cell(result["corpus"]), result["line_tol"]))
     lines.append("")
     lines.append("Offline mode serves **scripted** reviewer findings, so these numbers measure the "
                  "harness (assembly + scoring), not model quality. Live-model calibration is E1-S4.")
@@ -277,7 +279,7 @@ def _summary_md(result, generated_at):
                  % (ov["fp"], ov["noise"]))
     if result.get("skipped"):
         lines.append("- Skipped (no `scripts.offline`, not offline-runnable): %s"
-                     % ", ".join("`%s`" % s for s in result["skipped"]))
+                     % ", ".join(_md_cell(s) for s in result["skipped"]))
     lines.append("")
 
     def table(title, by):

@@ -2703,6 +2703,19 @@ def t_corpus_validator_rejects_malformed():
         assert any("unexpected field" in e for e in cs.validate_case(str(stray))), \
             "unknown top-level expected field should be rejected"
 
+        # truthy non-object scripts (a schema type error) must fall through _expected_semantics
+        # cleanly, not raise AttributeError on .get() (CodeRabbit, PR #45)
+        scriptstr = d / "scriptstr"
+        scriptstr.mkdir()
+        (scriptstr / "meta.json").write_text(json.dumps({
+            "id": "scriptstr", "title": "x", "tier": "NORMAL", "category": "clean",
+            "language": "python", "source": "seeded"}))
+        (scriptstr / "context.md").write_text("some context")
+        (scriptstr / "expected.json").write_text(json.dumps({
+            "defects": [], "fp_budget": 1, "scripts": "invalid"}))
+        errs_ss = cs.validate_case(str(scriptstr))   # regression: must return errors, never raise
+        assert any("scripts" in e for e in errs_ss), errs_ss
+
         # clean category carrying ANY defect (even non-must_detect) is contradictory ground truth
         cleandef = d / "cleandef"
         cleandef.mkdir()
@@ -4015,6 +4028,29 @@ def t_corpus_rejects_offtier_script_role():
         assert any("not run at tier" in e for e in errs), errs
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def t_eval_summary_escapes_untrusted_identifiers():
+    # E1-S3 (PR #45, CodeRabbit): every corpus-controlled identifier rendered into summary.md — the
+    # table cells AND the corpus path and the skipped-case list — goes through _md_cell, so a `|`,
+    # backtick, or newline in an external id can't forge cells/rows or break out of a code span.
+    sys.path.insert(0, str(SKILL / "evals"))
+    import run as evalrun
+    assert evalrun._md_cell("a|b") == "a\\|b"
+    assert evalrun._md_cell("a`b") == "a\\`b"
+    assert evalrun._md_cell("a\nb") == "a b"          # control chars collapse to a space
+    result = {
+        "corpus": "corp`x|y", "line_tol": 3, "skipped": ["sk`|id"], "cases": [],
+        "aggregate": {
+            "overall": {"cases": 0, "must_detect_total": 0, "detection_rate": None,
+                        "tp": 0, "partial": 0, "fn": 0, "fp": 0, "noise": 0},
+            "by_category": {}, "by_tier": {}, "by_role": {}}}
+    md = evalrun._summary_md(result, "test")
+    # raw (unescaped) identifiers must not survive into the report; their escaped forms must
+    assert "corp`x|y" not in md and "corp\\`x\\|y" in md, md
+    assert "sk`|id" not in md and "sk\\`\\|id" in md, md
+    # the corpus path is no longer wrapped in raw backticks (an embedded ` could close the span)
+    assert "corpus: `" not in md, md
 
 
 def main():
