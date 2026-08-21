@@ -24,3 +24,20 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Run mocked end-to-end suite (no network, no keys)
         run: python tests/run_tests.py
+
+  # Full offline meta-eval harness over the whole corpus (E1-S3). The test job above already runs a
+  # fast 2-3 case subset every time; this job exercises every corpus case end-to-end (assign -> run
+  # -> ingest -> score) so a case that breaks offline mode, or a scoring regression, fails CI. Still
+  # no network and no keys — reviewer outputs are scripted and served by the in-process mock router.
+  evals:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Offline meta-eval harness over the full corpus
+        run: python evals/run.py --mode offline --no-write

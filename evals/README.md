@@ -77,6 +77,54 @@ A `clean` case carries `defects: []` (and a small `fp_budget`); every other cate
 least one `must_detect` defect, or it could never score a true positive. The validator enforces
 this.
 
+## `scripts.offline` — scripted reviewers for the offline harness
+
+`expected.json` may carry an **optional** `scripts` block. Its `offline` map holds the findings
+each reviewer *role* returns when the case is run through the offline meta-eval harness (E1-S3,
+`evals/run.py`). Each entry is the scoring-relevant subset of a real reviewer finding; the harness
+fills the structural rest before the mock router serves it, so the run still exercises the real
+ingest/validation path — offline mode measures **harness correctness**, not model quality.
+
+```json
+{
+  "defects": [ /* ... */ ],
+  "fp_budget": 1,
+  "scripts": {
+    "offline": {
+      "security": [
+        { "title": "IDOR: invoice fetched without an ownership check",
+          "severity": "high", "file": "api/invoices.py", "line": 11,
+          "evidence": "no authz check; missing ownership check enables IDOR" }
+      ]
+    }
+  }
+}
+```
+
+- Keyed by reviewer role (`security`, `correctness`, `data_privacy`, `test_quality`,
+  `reliability`, `output_fidelity`). A role **absent** from the map reviews and finds nothing —
+  that is how a case scripts a **deliberate miss** (false negative).
+- An extra finding that matches no defect scripts a **false positive**; a finding **below** a
+  defect's `severity_floor` scores a **partial**. The six seed cases together exercise every
+  outcome (TP / partial / FN / FP / noise) end-to-end.
+- `title`, `severity`, `file`, `line` are required per scripted finding; `evidence`/`scenario`
+  carry the text the root-cause-tag match scans. `scripts` is optional: a case without it is still
+  valid, just not runnable in `--mode offline` (the harness skips it and says so).
+
+## Running the offline harness
+
+```bash
+python evals/run.py --mode offline                 # whole corpus -> evals/report/<ts>.json + summary.md
+python evals/run.py --mode offline --only sec-idor-invoice
+python evals/run.py --mode offline --no-write --print-result   # canonical result JSON to stdout
+```
+
+Offline mode drives the **real** panel pipeline (`panel.py assign` → `run` → ingest) against the
+in-process mock router with the scripted reviewers, then scores with `score.py` (E1-S2). No network,
+no API keys, and deterministic: the same corpus + scripts produce a byte-identical scored `result`
+(the timestamp is stamped only outside it). CI runs a fast 2–3 case subset on every push and the
+full corpus as a separate `evals` job. Live-model calibration is E1-S4.
+
 ## Scoring (`score.py`)
 
 `evals/score.py` grades a list of reviewer findings (a report's `findings` array) against a case's
@@ -106,7 +154,8 @@ rolls per-case results up overall and per category/tier; `detection_rate` counts
 1. `mkdir evals/corpus/<case-id>` and add the three files above.
 2. Write a minimal, realistic `context.md` with one seeded defect (or none, for a `clean` case).
 3. Label it in `expected.json`.
-4. Validate: `python3 evals/corpus_schema.py` (exits non-zero and lists every problem if a
+4. Optional: add a `scripts.offline` block so the case runs in the offline harness (see above).
+5. Validate: `python3 evals/corpus_schema.py` (exits non-zero and lists every problem if a
    case is malformed). The test suite runs the same validator over the whole corpus, so a bad
    case fails CI.
 

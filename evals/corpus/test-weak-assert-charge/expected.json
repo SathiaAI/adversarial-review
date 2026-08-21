@@ -21,5 +21,18 @@
       "severity_floor": "medium"
     }
   ],
-  "fp_budget": 1
+  "fp_budget": 1,
+  "scripts": {
+    "offline": {
+      "test_quality": [
+        {
+          "title": "Test name could be clearer",
+          "severity": "low",
+          "file": "tests/test_billing.py",
+          "line": 2,
+          "evidence": "minor style nit on the test's name, unrelated to assertion strength"
+        }
+      ]
+    }
+  }
 }

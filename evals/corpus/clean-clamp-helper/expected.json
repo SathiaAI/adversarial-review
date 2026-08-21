@@ -1,4 +1,17 @@
 {
   "defects": [],
-  "fp_budget": 1
+  "fp_budget": 1,
+  "scripts": {
+    "offline": {
+      "correctness": [
+        {
+          "title": "Consider documenting the raise on lo > hi",
+          "severity": "low",
+          "file": "core/num.py",
+          "line": 3,
+          "evidence": "a docstring note about the ValueError would help; not a defect"
+        }
+      ]
+    }
+  }
 }

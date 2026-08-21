@@ -20,5 +20,20 @@
       "severity_floor": "medium"
     }
   ],
-  "fp_budget": 1
+  "fp_budget": 1,
+  "scripts": {
+    "offline": {
+      "correctness": [
+        {
+          "title": "Off-by-one in pagination slice bound",
+          "severity": "medium",
+          "file": "core/paging.py",
+          "line": 4,
+          "evidence": "slice bound overshoots by one (off-by-one boundary on the slice-bound), leaking the next page's first row",
+          "scenario": "a page of size N returns N+1 rows",
+          "fix": "use an exclusive upper bound"
+        }
+      ]
+    }
+  }
 }

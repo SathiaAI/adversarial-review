@@ -25,7 +25,7 @@ import sys
 _SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
-from panel import validate_obj  # noqa: E402  (path set above)
+from panel import ROLES, validate_obj  # noqa: E402  (path set above)
 
 # Mirrors scripts/panel.py:ROLES (all six reviewer lenses) plus "clean" for no-defect cases,
 # so the corpus can classify coverage for every role the panel runs — including the
@@ -72,10 +72,44 @@ DEFECT_SCHEMA = {
     "required": ["defect_id", "must_detect", "locators", "root_cause_tags", "severity_floor"],
 }
 
+# A single scripted reviewer finding for offline harness mode (E1-S3): the scoring-relevant subset
+# of a panel FINDING. `evals/run.py` fills the structural rest (id, confidence, reproduction, ...)
+# to satisfy the panel's REPORT_SCHEMA before the mock router serves it, so the offline run still
+# exercises the real ingest/validation path. `file`+`line` locate the finding; `severity` decides
+# TP-vs-partial against a defect's floor; `evidence`/`scenario` carry the text the root-cause tag
+# match scans.
+SCRIPT_FINDING_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "title": {"type": "string"},
+        "severity": {"type": "string", "enum": SEVERITIES},
+        "file": {"type": "string"},
+        "line": {"type": "integer"},
+        "evidence": {"type": "string"},
+        "scenario": {"type": "string"},
+        "fix": {"type": "string"},
+        "release_blocking": {"type": "boolean"},
+    },
+    "required": ["title", "severity", "file", "line"],
+}
+
+# `scripts.offline` maps a reviewer role to the findings its mock reviewer returns for this case.
+# A role absent from the map reviews and finds nothing; that is how a case scripts a deliberate
+# miss (false negative). Extra unmatched findings script false positives. Keyed by the exact panel
+# ROLES (validate_obj has no dynamic-key support), STRICT so a typo'd role name fails loudly.
+_OFFLINE_SCRIPTS_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {r: {"type": "array", "items": SCRIPT_FINDING_SCHEMA} for r in ROLES},
+}
+SCRIPTS_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {"offline": _OFFLINE_SCRIPTS_SCHEMA},
+}
+
 # The nested defect/locator objects are STRICT (additionalProperties: False) so a typo'd label
 # is caught. The top level is STRICT too (additionalProperties: False) so a typo'd or stray
-# expected-result field fails loudly. When E1-S3 adds its optional `scripts` block (scripted
-# reviewer outputs for offline harness mode), it adds that to `properties` here in the same change.
+# expected-result field fails loudly. `scripts` is OPTIONAL (offline harness data, E1-S3); a case
+# without it is still valid and simply can't be driven in `--mode offline`.
 EXPECTED_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {
@@ -83,6 +117,7 @@ EXPECTED_SCHEMA = {
         # Max tolerated findings before an extra one scores as a false positive. Clean cases
         # (defects == []) bound total findings; defect cases bound findings beyond the known set.
         "fp_budget": {"type": "integer"},
+        "scripts": SCRIPTS_SCHEMA,
     },
     "required": ["defects", "fp_budget"],
 }

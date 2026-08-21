@@ -21,5 +21,19 @@
       "severity_floor": "medium"
     }
   ],
-  "fp_budget": 1
+  "fp_budget": 1,
+  "scripts": {
+    "offline": {
+      "output_fidelity": [
+        {
+          "title": "Failure branch logs a success message",
+          "severity": "low",
+          "file": "orders/finalize.py",
+          "line": 4,
+          "evidence": "inverted output: the failure path emits a false statement, the status message says finalized successfully",
+          "scenario": "finalize fails yet logs 'finalized successfully'"
+        }
+      ]
+    }
+  }
 }
