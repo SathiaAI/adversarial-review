@@ -3916,14 +3916,17 @@ def t_eval_offline_harness_scores_representative_cases():
     # scripted reviewers and scores through score.py. A representative subset — a detected defect,
     # a deliberate miss, and an over-budget clean case — guards the whole assembly on every CI run.
     result, _ = _run_eval_offline(
-        ["sec-idor-invoice", "test-weak-assert-charge", "clean-refactor-total"])
+        ["sec-idor-invoice", "corr-offbyone-pagination", "out-inverted-finalize",
+         "test-weak-assert-charge", "clean-refactor-total"])
     per = {c["case_id"]: c for c in result["cases"]}
     assert (per["sec-idor-invoice"]["tp"], per["sec-idor-invoice"]["fp"]) == (1, 0), per["sec-idor-invoice"]
+    assert per["corr-offbyone-pagination"]["tp"] == 1, per["corr-offbyone-pagination"]
+    assert per["out-inverted-finalize"]["partial"] == 1, per["out-inverted-finalize"]  # found, under-rated
     assert (per["test-weak-assert-charge"]["fn"], per["test-weak-assert-charge"]["noise"]) == (1, 1), \
-        per["test-weak-assert-charge"]
-    assert per["clean-refactor-total"]["fp"] == 1, per["clean-refactor-total"]
+        per["test-weak-assert-charge"]  # reviewer looked but missed -> FN + a low unmatched nit = noise
+    assert per["clean-refactor-total"]["fp"] == 1, per["clean-refactor-total"]  # over fp_budget
     ov = result["aggregate"]["overall"]
-    assert (ov["tp"], ov["fn"], ov["fp"]) == (1, 1, 1), ov
+    assert (ov["tp"], ov["partial"], ov["fn"], ov["fp"]) == (2, 1, 1, 1), ov
     assert result["skipped"] == [], result["skipped"]
 
 
@@ -3934,6 +3937,41 @@ def t_eval_offline_harness_deterministic():
     _, a = _run_eval_offline(["corr-offbyone-pagination", "out-inverted-finalize"])
     _, b = _run_eval_offline(["corr-offbyone-pagination", "out-inverted-finalize"])
     assert a == b, "offline scored result is not deterministic across runs"
+
+
+def t_eval_offline_harness_skips_and_rejects_edge_cases():
+    # E1-S3: a valid case with no scripts.offline is SKIPPED and surfaced in result['skipped'] (never
+    # silently), while a MALFORMED case FAILS the run — a broken self-test must not pass quietly.
+    base = Path(tempfile.mkdtemp(prefix="ar-evalcorp-"))
+    runpy = str(SKILL / "evals" / "run.py")
+    try:
+        noscript = base / "noscript"
+        noscript.mkdir()
+        (noscript / "meta.json").write_text(json.dumps({"id": "noscript", "title": "x", "tier": "NORMAL",
+            "category": "clean", "language": "python", "source": "seeded"}))
+        (noscript / "context.md").write_text("diff --git a/x b/x\n+clean\n")
+        (noscript / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1}))
+        r = subprocess.run([sys.executable, runpy, "--mode", "offline", "--corpus", str(base),
+                            "--no-write", "--print-result", "--quiet"], env=ENV,
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        result = json.loads(r.stdout.strip().splitlines()[-1])
+        assert result["skipped"] == ["noscript"], result["skipped"]
+        assert result["cases"] == [], result["cases"]
+
+        bad = base / "bad"        # meta.id != dir name -> validate_case rejects it
+        bad.mkdir()
+        (bad / "meta.json").write_text(json.dumps({"id": "WRONGID", "title": "x", "tier": "NORMAL",
+            "category": "clean", "language": "python", "source": "seeded"}))
+        (bad / "context.md").write_text("x")
+        (bad / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1,
+            "scripts": {"offline": {}}}))
+        r2 = subprocess.run([sys.executable, runpy, "--mode", "offline", "--corpus", str(base),
+                             "--no-write", "--quiet"], env=ENV, capture_output=True, text=True)
+        assert r2.returncode != 0, "a malformed case must fail the offline run, not be skipped"
+        assert "invalid" in (r2.stdout + r2.stderr).lower(), (r2.stdout + r2.stderr)[-300:]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def main():

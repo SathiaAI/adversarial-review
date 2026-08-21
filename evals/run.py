@@ -72,8 +72,11 @@ def _make_provider(offline):
 
 
 def _panel_env(base_url):
-    """Subprocess env: force every reviewer call at the local mock router and strip real credentials
-    so a synthetic corpus can never reach a live provider, even if a key is present in the parent env."""
+    """Subprocess env for the panel run. Pointing `AR_BASE_URL` at the local mock router is what keeps
+    a synthetic corpus offline — every reviewer call resolves there. Real credential env vars are also
+    dropped (defence-in-depth): if `AR_BASE_URL` were somehow ignored, there is still no key in the
+    child env to authenticate a live call. The credential list is a denylist of the keys this pipeline
+    reads, not an exhaustive secret scrub — the offline guarantee rests on the base-URL binding."""
     env = {k: v for k, v in os.environ.items()
            if k not in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "AR_KEY_FILE", "AR_MAX_COST_USD",
                         "AR_PINS")}
@@ -167,8 +170,9 @@ def _roll_roles(cases):
 
 def run_offline(corpus_dir, only=None, line_tol=score.DEFAULT_LINE_TOL, quiet=False):
     """Drive the whole corpus offline and return the deterministic `result` payload. Raises on a
-    malformed case, a case missing `scripts.offline`, or a panel failure — offline mode is a
-    self-test, so a broken case must fail the run, never be silently skipped."""
+    *malformed* case or a panel failure — offline mode is a self-test, so a broken case fails the run
+    rather than being silently dropped. A case with no `scripts.offline` is not broken, only not
+    offline-runnable: it is skipped and listed in `result['skipped']` (surfaced, never silent)."""
     corpus_dir = Path(corpus_dir)
     names = sorted(d.name for d in corpus_dir.iterdir()
                    if d.is_dir() and not d.name.startswith("."))
