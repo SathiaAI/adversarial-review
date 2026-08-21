@@ -76,36 +76,45 @@ def _panel_env(base_url):
     a synthetic corpus offline — every reviewer call resolves there. Real credential env vars are also
     dropped (defence-in-depth): if `AR_BASE_URL` were somehow ignored, there is still no key in the
     child env to authenticate a live call. The credential list is a denylist of the keys this pipeline
-    reads, not an exhaustive secret scrub — the offline guarantee rests on the base-URL binding."""
+    reads, not an exhaustive secret scrub — the offline guarantee rests on the base-URL binding.
+    `AR_RUN_DIR` is also dropped: an inherited run-root override would send the child's artifacts
+    outside the throwaway repo, so `_run_panel` would then find no run dir."""
     env = {k: v for k, v in os.environ.items()
            if k not in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "AR_KEY_FILE", "AR_MAX_COST_USD",
-                        "AR_PINS")}
+                        "AR_PINS", "AR_RUN_DIR")}
     env.update({"AR_BASE_URL": base_url, "AR_API_KEY": "offline-mock-key",
                 "AR_TIMEOUT_S": "20", "AR_MAX_TOKENS": "2000"})
     return env
 
 
 def _run_panel(case_dir, tier, base_url):
-    """init/assign/run in a throwaway repo; return (repo, run_dir). Findings land under the run dir."""
+    """init/assign/run in a throwaway repo; return (repo, run_dir). Findings land under the run dir.
+    The caller owns `repo` on success and removes it; if anything here raises, the repo is removed
+    before re-raising so a failed case never leaks an ``ar-eval-*`` directory (Codex, PR #45)."""
     repo = Path(tempfile.mkdtemp(prefix="ar-eval-"))
-    shutil.copyfile(case_dir / "context.md", repo / "context.md")
-    env = _panel_env(base_url)
-    panel = str(ROOT / "scripts" / "panel.py")
+    try:
+        shutil.copyfile(case_dir / "context.md", repo / "context.md")
+        env = _panel_env(base_url)
+        panel = str(ROOT / "scripts" / "panel.py")
 
-    def run(args):
-        r = subprocess.run([sys.executable, panel] + args, cwd=str(repo), env=env,
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError("panel %s failed (exit %d)\n%s" % (" ".join(args), r.returncode, r.stderr))
-        return r
+        def run(args):
+            r = subprocess.run([sys.executable, panel] + args, cwd=str(repo), env=env,
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError("panel %s failed (exit %d)\n%s"
+                                   % (" ".join(args), r.returncode, r.stderr))
+            return r
 
-    run(["init", "--risk", tier, "--dev-providers", "anthropic"])
-    run(["assign"])
-    run(["run", "--context-file", "context.md"])
-    runs = sorted((repo / ".adversarial-review").glob("run-*"))
-    if not runs:
-        raise RuntimeError("panel produced no run dir under %s" % repo)
-    return repo, runs[-1]
+        run(["init", "--risk", tier, "--dev-providers", "anthropic"])
+        run(["assign"])
+        run(["run", "--context-file", "context.md"])
+        runs = sorted((repo / ".adversarial-review").glob("run-*"))
+        if not runs:
+            raise RuntimeError("panel produced no run dir under %s" % repo)
+        return repo, runs[-1]
+    except BaseException:
+        shutil.rmtree(repo, ignore_errors=True)
+        raise
 
 
 def _collect_findings(run_dir):
@@ -119,14 +128,20 @@ def _collect_findings(run_dir):
     return per_role
 
 
-def _attribute_roles(flat, case_score):
+def _attribute_roles(flat, case_score, roles_ran=()):
     """Per-role attribution from the case's flat score: findings emitted, and how many landed as a
-    true positive / partial / unmatched (FP candidate or noise). `flat` items carry a `_role` tag."""
+    true positive / partial / unmatched (FP candidate or noise). `flat` items carry a `_role` tag.
+    Every role in `roles_ran` gets an entry even if it emitted nothing — a reviewer that reviewed
+    and stayed silent must stay visible (`emitted: 0`), not vanish from the rollup (Codex, PR #45).
+    Per-role FN/FP are deliberately not attributed: which defect a given role *should* have caught is
+    not encoded (any role may catch any defect), so those live at the case/category/tier level."""
     roles = {}
 
     def acc(r):
         return roles.setdefault(r, {"emitted": 0, "tp": 0, "partial": 0, "unmatched": 0})
 
+    for r in roles_ran:
+        acc(r)
     for f in flat:
         acc(f.get("_role", "?"))["emitted"] += 1
     for o in case_score["defect_outcomes"]:
@@ -153,7 +168,7 @@ def _score_one(case_id, meta, expected, per_role, line_tol):
         "noise": cs["noise"], "fp_budget": cs["fp_budget"],
         "fp_candidates": cs["fp_candidates"], "must_detect_total": cs["must_detect_total"],
         "defect_outcomes": cs["defect_outcomes"],
-        "roles": _attribute_roles(flat, cs),
+        "roles": _attribute_roles(flat, cs, roles_ran=sorted(per_role)),
     }, (meta, cs)
 
 
@@ -204,7 +219,7 @@ def run_offline(corpus_dir, only=None, line_tol=score.DEFAULT_LINE_TOL, quiet=Fa
                 # skip — silent truncation would read as "scored everything" when it didn't.
                 skipped.append(name)
                 if not quiet:
-                    print("  %-28s SKIP (no scripts.offline)" % name)
+                    print("  %-28s SKIP (no scripts.offline)" % name, file=sys.stderr)
                 continue
 
             mock_router.reset()
@@ -221,7 +236,7 @@ def run_offline(corpus_dir, only=None, line_tol=score.DEFAULT_LINE_TOL, quiet=Fa
             if not quiet:
                 print("  %-28s tp=%d partial=%d fn=%d fp=%d noise=%d"
                       % (name, report["tp"], report["partial"], report["fn"],
-                         report["fp"], report["noise"]))
+                         report["fp"], report["noise"]), file=sys.stderr)
     finally:
         mock_router.reset()
         srv.shutdown()
@@ -230,6 +245,15 @@ def run_offline(corpus_dir, only=None, line_tol=score.DEFAULT_LINE_TOL, quiet=Fa
     agg["by_role"] = _roll_roles(case_reports)
     return {"corpus": corpus_dir.name, "line_tol": line_tol,
             "cases": case_reports, "skipped": sorted(skipped), "aggregate": agg}
+
+
+def _md_cell(value):
+    """Escape a repository-controlled identifier (a case id, category, tier, or role) before it goes
+    into a Markdown table cell: a stray ``|`` or newline in an external corpus's id would otherwise
+    forge extra cells/rows (Codex, PR #45). Pipes are escaped; control chars collapse to a space."""
+    s = str(value)
+    s = "".join(" " if c in "\r\n\t" else c for c in s)
+    return s.replace("\\", "\\\\").replace("|", "\\|")
 
 
 def _summary_md(result, generated_at):
@@ -264,7 +288,7 @@ def _summary_md(result, generated_at):
             a = by[key]
             d = "n/a" if a["detection_rate"] is None else "%.0f%%" % (a["detection_rate"] * 100)
             rows.append("| %s | %d | %d | %d | %d | %d | %s |"
-                        % (key, a["cases"], a["tp"], a["partial"], a["fn"], a["fp"], d))
+                        % (_md_cell(key), a["cases"], a["tp"], a["partial"], a["fn"], a["fp"], d))
         rows.append("")
         return rows
 
@@ -276,7 +300,7 @@ def _summary_md(result, generated_at):
     for role in sorted(result["aggregate"]["by_role"]):
         r = result["aggregate"]["by_role"][role]
         lines.append("| %s | %d | %d | %d | %d |"
-                     % (role, r["emitted"], r["tp"], r["partial"], r["unmatched"]))
+                     % (_md_cell(role), r["emitted"], r["tp"], r["partial"], r["unmatched"]))
     lines.append("")
 
     lines += ["## Per case", "", "| case | category | tier | outcome |", "|---|---|---|---|"]
@@ -286,7 +310,8 @@ def _summary_md(result, generated_at):
             if c[k]:
                 bits.append("%d %s" % (c[k], k))
         lines.append("| %s | %s | %s | %s |"
-                     % (c["case_id"], c["category"], c["tier"], ", ".join(bits) or "clean"))
+                     % (_md_cell(c["case_id"]), _md_cell(c["category"]),
+                        _md_cell(c["tier"]), ", ".join(bits) or "clean"))
     lines.append("")
     return "\n".join(lines)
 
@@ -305,13 +330,21 @@ def main(argv=None):
     ap.add_argument("--no-write", action="store_true", help="do not write report files")
     ap.add_argument("--quiet", action="store_true", help="suppress per-case progress")
     args = ap.parse_args(argv)
+    if args.line_tol < 0:
+        # A negative tolerance reaches score.line_in_range(), which then fails every location match
+        # and silently reports real detections as false negatives. Reject it up front.
+        ap.error("--line-tol must be >= 0 (a negative tolerance makes every location match fail)")
 
     result = run_offline(args.corpus, only=args.only, line_tol=args.line_tol, quiet=args.quiet)
     canonical = json.dumps(result, sort_keys=True, separators=(",", ":"))
 
     if not args.no_write:
-        generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        now = datetime.now(timezone.utc)
+        generated_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Filename carries the pid so two harness processes sharing one --out dir in the same second
+        # don't overwrite each other's report (Codex, PR #45); it is outside the scored payload, so
+        # determinism of `result` is unaffected.
+        stamp = "%s-%d" % (now.strftime("%Y%m%d-%H%M%S"), os.getpid())
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
         report = {"schema": REPORT_SCHEMA_ID, "mode": "offline", "generated_at": generated_at,
@@ -320,12 +353,12 @@ def main(argv=None):
             json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         (out / ("offline-%s.summary.md" % stamp)).write_text(
             _summary_md(result, generated_at), encoding="utf-8")
-        if not args.quiet:
+        if not args.quiet:  # diagnostics on stderr so --print-result keeps stdout pure JSON
             ov = result["aggregate"]["overall"]
-            print("report: %s" % (out / ("offline-%s.json" % stamp)))
+            print("report: %s" % (out / ("offline-%s.json" % stamp)), file=sys.stderr)
             print("detection=%s fp=%d over %d case(s)"
                   % ("n/a" if ov["detection_rate"] is None else "%.0f%%" % (ov["detection_rate"] * 100),
-                     ov["fp"], ov["cases"]))
+                     ov["fp"], ov["cases"]), file=sys.stderr)
 
     if args.print_result:
         print(canonical)

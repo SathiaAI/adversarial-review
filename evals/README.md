@@ -7,7 +7,8 @@ clean code? Each case is **data** — you add one by dropping in a directory, no
 The **case format** and its validator are E1-S1 (`evals/corpus_schema.py`); the **scoring** that
 consumes these labels — true-positive / false-negative / false-positive — is E1-S2
 (`evals/score.py`, documented below). The offline harness that drives the corpus through the panel
-and rolls the scores up per role/model/tier is E1-S3 (`evals/run.py`, not yet built).
+and rolls the scores up per case, category, tier, and reviewer role is E1-S3 (`evals/run.py`,
+documented below).
 
 ## Layout
 

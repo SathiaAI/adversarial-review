@@ -3974,6 +3974,49 @@ def t_eval_offline_harness_skips_and_rejects_edge_cases():
         shutil.rmtree(base, ignore_errors=True)
 
 
+def t_eval_offline_harness_cli_hardening():
+    # E1-S3 (PR #45): a negative --line-tol makes every location match fail, so the CLI must reject
+    # it up front; and --print-result must keep stdout pure JSON (progress goes to stderr) so the
+    # documented `... --no-write --print-result | jq` pipe works even without --quiet.
+    runpy = str(SKILL / "evals" / "run.py")
+    r = subprocess.run([sys.executable, runpy, "--mode", "offline", "--only", "sec-idor-invoice",
+                        "--no-write", "--quiet", "--line-tol", "-1"], env=ENV,
+                       capture_output=True, text=True)
+    assert r.returncode != 0, "negative --line-tol must be rejected"
+    assert "line-tol" in r.stderr.lower(), r.stderr[-200:]
+    r2 = subprocess.run([sys.executable, runpy, "--mode", "offline", "--only", "sec-idor-invoice",
+                         "--no-write", "--print-result"], env=ENV, capture_output=True, text=True)
+    assert r2.returncode == 0, r2.stderr
+    parsed = json.loads(r2.stdout)   # entire stdout is the canonical JSON, no progress lines mixed in
+    assert parsed["cases"][0]["case_id"] == "sec-idor-invoice", parsed
+
+
+def t_corpus_rejects_offtier_script_role():
+    # E1-S3 (PR #45): scripts.offline may only script roles the case's tier runs. A NORMAL case
+    # scripting data_privacy would have those findings silently never served/scored (a hidden FN),
+    # so the validator rejects it loudly.
+    sys.path.insert(0, str(SKILL / "evals"))
+    import corpus_schema as cs
+    d = Path(tempfile.mkdtemp(prefix="ar-corpus-tier-"))
+    try:
+        case = d / "offtier"
+        case.mkdir()
+        (case / "meta.json").write_text(json.dumps({"id": "offtier", "title": "x", "tier": "NORMAL",
+            "category": "correctness", "language": "python", "source": "seeded"}))
+        (case / "context.md").write_text("diff\n+x\n")
+        (case / "expected.json").write_text(json.dumps({
+            "defects": [{"defect_id": "d1", "must_detect": True,
+                         "locators": [{"file": "a.py", "line_range": [1, 1]}],
+                         "root_cause_tags": ["t"], "severity_floor": "high"}],
+            "fp_budget": 1,
+            "scripts": {"offline": {"data_privacy": [{"title": "x", "severity": "high",
+                                                      "file": "a.py", "line": 1}]}}}))
+        errs = cs.validate_case(str(case))
+        assert any("not run at tier" in e for e in errs), errs
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

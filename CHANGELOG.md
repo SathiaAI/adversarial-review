@@ -44,8 +44,10 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   router, serving each case's scripted reviewer findings — a new optional `scripts.offline` block in
   `expected.json` — through the E0-S1 `response_provider`, then scores the ingested findings with
   `evals/score.py`. It emits a dated `evals/report/<ts>.json` plus a human-readable `summary.md` with
-  overall / per-category / per-tier / per-role true-positive / partial / false-negative /
-  false-positive metrics. Because reviewer outputs are scripted, it measures harness correctness, not
+  true-positive / partial / false-negative / false-positive metrics overall and per category and tier,
+  plus a per-reviewer-role breakdown (findings emitted, and how many were true positives, partials, or
+  unmatched — per-role FN/FP are not attributed, since which role should catch a given defect is not
+  encoded). Because reviewer outputs are scripted, it measures harness correctness, not
   model quality (live calibration is E1-S4); a role omitted from a case's script is a deliberate miss
   and an extra finding is a false positive, so the seed corpus exercises every scoring outcome
   end-to-end. Deterministic (same corpus + scripts → byte-identical scored `result`; wall-clock

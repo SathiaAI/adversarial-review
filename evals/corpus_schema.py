@@ -25,7 +25,7 @@ import sys
 _SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
-from panel import ROLES, validate_obj  # noqa: E402  (path set above)
+from panel import ROLES, TIER_ROLES, validate_obj  # noqa: E402  (path set above)
 
 # Mirrors scripts/panel.py:ROLES (all six reviewer lenses) plus "clean" for no-defect cases,
 # so the corpus can classify coverage for every role the panel runs — including the
@@ -205,6 +205,19 @@ def _expected_semantics(case_id, meta, exp):
         if meta.get("category") not in (None, "clean") and not has_must:
             errs.append(
                 f"{case_id}: category {meta.get('category')!r} needs >= 1 must_detect defect")
+
+    # scripts.offline may only script roles the case's tier actually runs (Codex, PR #45). A NORMAL
+    # case scripting `data_privacy`/`reliability` would have those findings silently never served or
+    # scored — a false negative that hides. Reject it so the mistake fails loudly at validation.
+    offline = (exp.get("scripts") or {}).get("offline")
+    tier = meta.get("tier") if isinstance(meta, dict) else None
+    if isinstance(offline, dict) and tier in TIER_ROLES:
+        allowed = set(TIER_ROLES[tier])
+        for role in offline:
+            if role in ROLES and role not in allowed:
+                errs.append(
+                    f"{case_id}: scripts.offline role {role!r} is not run at tier {tier!r} "
+                    f"(tier roles: {', '.join(sorted(allowed))}) — its findings would never be scored")
     return errs
 
 
