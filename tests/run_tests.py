@@ -3091,9 +3091,13 @@ def t_eval_score_case_one_finding_one_defect():
     # When two must_detect defects sit within tolerance (or share a tag) in the same file, one finding
     # scored both defects as TP -> tp:2, inflating detection. Assignment is now one-to-one.
     s = _import_score()
-    D = lambda n, floor="high": {"defect_id": "d%d" % n, "must_detect": True, "severity_floor": floor,
-                                 "locators": [{"file": "a.py", "line_range": [n, n]}], "root_cause_tags": ["t%d" % n]}
-    F = lambda ln, sev="high": _f(file="a.py", line=ln, severity=sev, title="x")
+
+    def D(n, floor="high"):
+        return {"defect_id": "d%d" % n, "must_detect": True, "severity_floor": floor,
+                "locators": [{"file": "a.py", "line_range": [n, n]}], "root_cause_tags": ["t%d" % n]}
+
+    def F(ln, sev="high"):
+        return _f(file="a.py", line=ln, severity=sev, title="x")
     # one finding, two overlapping defects -> exactly one TP (the other is an FN), never tp:2
     one = s.score_case({"defects": [D(10), D(11)], "fp_budget": 0}, [F(10)])
     assert (one["tp"], one["partial"], one["fn"]) == (1, 0, 1), one
