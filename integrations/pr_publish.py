@@ -656,7 +656,8 @@ def publish(run_dir, ctx, client, secrets=()):
     unanchored = [e for e in findings if not (e["file"] and e["line"])]
 
     plan = {"verdict": verdict, "created": 0, "updated": 0, "deleted": 0,
-            "unanchored": len(unanchored), "status_state": _STATUS_STATE[verdict]}
+            "summary_retired": 0, "unanchored": len(unanchored),
+            "status_state": _STATUS_STATE[verdict]}
 
     # Ownership is proven by comment *author*, not the public marker alone, so this tool never edits
     # or deletes a human's comment that merely quotes a marker (panel findings security-1 /
@@ -699,7 +700,7 @@ def publish(run_dir, ctx, client, secrets=()):
             for cid in owned[1:] + [bootstrap_cid]:  # retire extras + the throwaway bootstrap comment
                 if isinstance(cid, int):
                     client.delete_issue_comment(cid)
-                    plan["deleted"] += 1
+                    plan["summary_retired"] += 1  # issue-comment retirement, not an inline deletion
             plan["summary"] = "updated"
         else:
             summary_cid = bootstrap_cid  # first run on this PR: the bootstrap comment IS the summary
@@ -892,9 +893,11 @@ def main(argv=None):
     mode = "DRY-RUN" if dry else "published"
     note = "" if plan.get("status_set") else " [status skipped: %s]" % plan.get(
         "status_skipped_reason", "n/a")
-    print("pr_publish: %s %s#%d verdict=%s (summary %s, +%d/~%d/-%d inline, %d unanchored)%s"
+    print("pr_publish: %s %s#%d verdict=%s (summary %s, +%d/~%d/-%d inline, -%d summary, "
+          "%d unanchored)%s"
           % (mode, repo, args.pr, plan["verdict"], plan.get("summary", "?"),
-             plan["created"], plan["updated"], plan["deleted"], plan["unanchored"], note))
+             plan["created"], plan["updated"], plan["deleted"],
+             plan.get("summary_retired", 0), plan["unanchored"], note))
     return plan["exit_code"]
 
 

@@ -3540,9 +3540,6 @@ def t_pr_publish_scrubs_password_named_secret():
              "evidence": secret}]})
         os.environ["GITHUB_TOKEN"] = "x"        # force non-dry-run path in main()
         os.environ["DB_PASSWORD"] = secret
-        # main() builds `secrets` from the env allowlist and runs a DryRunClient-free publish; use the
-        # dry-run flag so no network is attempted but the scrub still runs over the rendered bodies.
-        import io, contextlib
         # Drive publish() directly with the same secret list main() would build, on a recording fake.
         secrets = [v for k, v in os.environ.items()
                    if v and any(m in k.upper() for m in ("TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD",
@@ -3607,10 +3604,14 @@ def t_pr_publish_summary_id_is_stable_across_bootstrap_runs():
         pp.publish(rundir, ctx, gh)
         ids1 = sorted(i for i, c in gh.issue.items() if c["user"] == gh.LOGIN)
         assert len(ids1) == 1, ids1
-        pp.publish(rundir, ctx, gh)     # second run under the same denied-identity client
+        plan2 = pp.publish(rundir, ctx, gh)     # second run under the same denied-identity client
         pp.publish(rundir, ctx, gh)     # and a third
         ids2 = sorted(i for i, c in gh.issue.items() if c["user"] == gh.LOGIN)
         assert ids2 == ids1, "the summary comment id must be stable across bootstrap re-runs"
+        # CodeRabbit PR #43: retiring the throwaway bootstrap comment is a summary retirement, not an
+        # inline deletion — it must not inflate the "-N inline" counter.
+        assert plan2["summary_retired"] >= 1, plan2
+        assert plan2["deleted"] == 0, plan2
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
