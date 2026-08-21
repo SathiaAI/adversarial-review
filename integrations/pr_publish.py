@@ -109,7 +109,16 @@ def load_run(run_dir):
         raise ValueError("verdict.json is not an object")
 
     plan_path = os.path.join(run_dir, "panel", "plan.json")
-    plan = _read_json(plan_path) if os.path.isfile(plan_path) else {}
+    plan = {}
+    if os.path.isfile(plan_path):
+        # A malformed plan.json must not abort the publish — only verdict.json can (see docstring).
+        # The role fallback below already handles a missing/empty plan.
+        try:
+            loaded = _read_json(plan_path)
+            if isinstance(loaded, dict):
+                plan = loaded
+        except (ValueError, OSError):
+            plan = {}
     roles = list(plan.get("roles", {})) if isinstance(plan.get("roles"), dict) else []
 
     reports = {}
@@ -435,6 +444,10 @@ class GitHubClient:
     def delete_issue_comment(self, comment_id):
         return self._request("DELETE", "/repos/%s/issues/comments/%d" % (self.repo, comment_id))
 
+    # pull request (used to bind publication to the reviewed head sha)
+    def get_pull(self, pr):
+        return self._request("GET", "/repos/%s/pulls/%d" % (self.repo, pr))
+
     # inline review comments
     def list_review_comments(self, pr):
         return self._paged("/repos/%s/pulls/%d/comments" % (self.repo, pr))
@@ -468,6 +481,9 @@ class DryRunClient:
 
     def whoami(self):
         return None  # unknown identity → reconcile falls back to marker-only (a dry run mutates nothing)
+
+    def get_pull(self, pr):
+        return {}  # a dry run performs no head-sha binding (it mutates nothing)
 
     def list_issue_comments(self, pr):
         return []
@@ -549,6 +565,55 @@ def _scrub(body, secrets):
     return body
 
 
+def _verify_attestation(run_dir, verdict):
+    """Recompute the run's attestation and compare it to the digest stored in ``verdict.json`` —
+    **before any network write**. If a gate, report, or validation artifact was modified after
+    ``aggregate.py`` wrote the verdict (e.g. artifacts from two runs accidentally combined in CI),
+    the recomputed digest will not match and we refuse to publish: a PASS status must never be
+    attached to inputs that were not the ones the verdict was computed over (Codex P1, PR #43).
+
+    Mirrors ``aggregate.py:compute_attestation`` exactly (``sha256-canonical-json-v1``), kept
+    self-contained so this tool stays stdlib-only. A run with no stored attestation (aggregated
+    before attestation existed) cannot be checked, so it is allowed through with the check skipped."""
+    att = verdict.get("attestation") if isinstance(verdict, dict) else None
+    if not isinstance(att, dict) or not att.get("digest"):
+        return  # nothing to verify against — an older run without an attestation
+    files = {}
+    for root, _dirs, names in os.walk(run_dir):
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, run_dir).replace(os.sep, "/")
+            if rel == "verdict.json":  # the output is never one of its own inputs
+                continue
+            with open(path, "rb") as fh:
+                raw = fh.read()
+            try:
+                canon = json.dumps(json.loads(raw.decode("utf-8")), sort_keys=True,
+                                   separators=(",", ":"), ensure_ascii=False)
+                files[rel] = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+            except (ValueError, UnicodeDecodeError):
+                files[rel] = "raw:" + hashlib.sha256(raw).hexdigest()
+    manifest = "\n".join("%s  %s" % (sha, rel) for rel, sha in sorted(files.items()))
+    digest = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+    if digest != att.get("digest"):
+        stored = att.get("files") if isinstance(att.get("files"), dict) else {}
+        drift = sorted(rel for rel in set(stored) | set(files) if stored.get(rel) != files.get(rel))
+        raise ValueError("run attestation mismatch: stored digest %s, recomputed %s — artifacts "
+                         "changed after aggregate.py wrote the verdict; refusing to publish "
+                         "(drifted: %s). Re-run aggregate.py or verify with --check-digest."
+                         % (att.get("digest"), digest, ", ".join(drift[:10]) or "?"))
+
+
+def _sha_matches(a, b):
+    """True when two commit SHAs identify the same commit, tolerating short vs full form: compare
+    case-insensitively and accept when one is a hex prefix of the other (a 7-char ``--sha`` against
+    a 40-char PR head)."""
+    a, b = (a or "").lower(), (b or "").lower()
+    return bool(a) and bool(b) and (a == b or a.startswith(b) or b.startswith(a))
+
+
 def publish(run_dir, ctx, client, secrets=()):
     """Reconcile the PR to reflect ``run_dir``. Returns a plan dict; ``client`` performs (or, for
     ``DryRunClient``, records) the writes. ``ctx`` = {pr, commit_sha, target_url, fail_on}.
@@ -557,11 +622,33 @@ def publish(run_dir, ctx, client, secrets=()):
     commit status state always reflects the true verdict.
     """
     run = load_run(run_dir)
+    # Integrity gate: never publish a verdict whose inputs drifted after it was computed.
+    _verify_attestation(run_dir, run["verdict"])
     verdict = _verdict_of(run)
     run_id = _text(run["verdict"].get("run_id") or os.path.basename(run_dir.rstrip("/")))
     repo = ctx.get("repo", "")
     pr = ctx["pr"]
     sha = ctx.get("commit_sha")
+    write_capable = not isinstance(client, DryRunClient)
+
+    # Bind publication to the reviewed PR head. In a `pull_request` workflow $GITHUB_SHA is GitHub's
+    # synthetic merge commit, not the head that was reviewed; attaching a PASS to it (or to any
+    # `--sha` that is not the PR head) would mark bytes the run never saw. Fetch the PR head and refuse
+    # to publish to a different commit (Codex P1, PR #43). We fail only on a *confirmed* mismatch — if
+    # the head cannot be resolved we do not block, so the tool never becomes unavailable when the PR
+    # read is denied. A DryRunClient mutates nothing, so it is not bound.
+    if sha and write_capable and hasattr(client, "get_pull"):
+        try:
+            pull = client.get_pull(pr)
+        except GitHubError:
+            pull = None
+        head = (pull or {}).get("head") if isinstance(pull, dict) else None
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if isinstance(head_sha, str) and head_sha and not _sha_matches(sha, head_sha):
+            raise GitHubError(0, "refusing to publish: --sha %s is not the head of PR #%d (%s). In a "
+                                 "pull_request workflow pass github.event.pull_request.head.sha, not "
+                                 "github.sha (the merge commit)." % (sha, pr, head_sha))
+
     findings = collect_findings(run)
 
     # split findings into anchorable (have file+line) and not
@@ -580,21 +667,23 @@ def publish(run_dir, ctx, client, secrets=()):
     # from the response, then reconcile everything else by that author. A ``DryRunClient`` mutates
     # nothing, so it stays on the harmless marker-only path and is never bootstrapped.
     owner_login = client.whoami() if hasattr(client, "whoami") else None
-    write_capable = not isinstance(client, DryRunClient)
     summary_cid = None
     if owner_login is None and write_capable:
-        created = client.create_issue_comment(
+        bootstrap = client.create_issue_comment(
             pr, _scrub(render_verdict_summary(run, repo, pr, unanchored), secrets))
-        owner_login = (created.get("user") or {}).get("login") if isinstance(created, dict) else None
-        summary_cid = created.get("id") if isinstance(created, dict) else None
+        owner_login = (bootstrap.get("user") or {}).get("login") if isinstance(bootstrap, dict) else None
+        bootstrap_cid = bootstrap.get("id") if isinstance(bootstrap, dict) else None
         if owner_login is None:
             raise GitHubError(0, "cannot resolve the authenticated identity (GET /user denied and the "
                                  "created comment carried no author); refusing to reconcile comments by "
                                  "marker alone, which could touch a human's comment")
-        plan["summary"] = "created"
-        # Identity known now: retire any *older* summaries of ours so this path does not accumulate a
-        # new summary on every re-run. Enumerate the raw list (not _managed_index, which collapses
-        # every verdict-marker comment onto one key); comments authored by anyone else are untouched.
+        # Keep a *stable* summary comment id across re-runs rather than creating a fresh one each time
+        # (which would re-notify subscribers and lose the discussion anchor — CodeRabbit, PR #43).
+        # Enumerate the raw list (not _managed_index, which collapses every verdict-marker comment
+        # onto one key); of our prior summaries (excluding the throwaway bootstrap), keep the OLDEST as
+        # the anchor and update it in place below, deleting the bootstrap and any extra older summaries
+        # so exactly one stable id survives. Comments authored by anyone else are untouched.
+        owned = []
         for c in client.list_issue_comments(pr):
             if not isinstance(c, dict):
                 continue
@@ -602,9 +691,19 @@ def publish(run_dir, ctx, client, secrets=()):
             author = (c.get("user") or {}).get("login") if isinstance(c.get("user"), dict) else None
             cid = c.get("id")
             if (MANAGED in body and VERDICT_MARKER in body and author == owner_login
-                    and isinstance(cid, int) and cid != summary_cid):
-                client.delete_issue_comment(cid)
-                plan["deleted"] += 1
+                    and isinstance(cid, int) and cid != bootstrap_cid):
+                owned.append(cid)
+        if owned:
+            owned.sort()  # GitHub comment ids increase monotonically → the smallest is the oldest
+            summary_cid = owned[0]
+            for cid in owned[1:] + [bootstrap_cid]:  # retire extras + the throwaway bootstrap comment
+                if isinstance(cid, int):
+                    client.delete_issue_comment(cid)
+                    plan["deleted"] += 1
+            plan["summary"] = "updated"
+        else:
+            summary_cid = bootstrap_cid  # first run on this PR: the bootstrap comment IS the summary
+            plan["summary"] = "created"
 
     def _create_inline(e):
         """Create one inline comment; a 422 (line not in the diff) falls back to the summary."""
@@ -643,11 +742,24 @@ def publish(run_dir, ctx, client, secrets=()):
         else:
             unanchored.append(e)
         desired[e["key"]] = True
-    # retire managed finding comments whose finding is gone
-    for key, meta in existing.items():
-        if key not in desired:
-            client.delete_review_comment(meta["id"])
+    # Retire managed finding comments whose finding is gone — but only when this run's panel actually
+    # completed. If reviewer reports are missing (a transport/cost abort left the panel partial),
+    # collect_findings sees fewer findings than a prior complete run did; missing panel output is not
+    # proof an issue was fixed, so deleting those comments would erase still-valid warnings. Preserve
+    # them when coverage does not prove completion, and record that reconciliation was held (Codex P1,
+    # PR #43).
+    cov = run["verdict"].get("coverage") if isinstance(run["verdict"].get("coverage"), dict) else {}
+    pcov = cov.get("panel") if isinstance(cov.get("panel"), dict) else {}
+    req = pcov.get("roles_required") if isinstance(pcov.get("roles_required"), list) else []
+    filled = pcov.get("roles_filled") if isinstance(pcov.get("roles_filled"), list) else []
+    panel_complete = bool(req) and set(req).issubset(set(filled))
+    stale = [meta["id"] for key, meta in existing.items() if key not in desired]
+    if panel_complete:
+        for cid in stale:
+            client.delete_review_comment(cid)
             plan["deleted"] += 1
+    elif stale:
+        plan["reconcile_held"] = len(stale)  # prior finding comments preserved (panel incomplete)
 
     # 2) verdict summary comment. If we already created it above to bootstrap our identity, finalize
     #    that same comment now that ``unanchored`` is complete (inline 422s may have appended to it);
@@ -707,7 +819,7 @@ def _resolve_repo(arg):
         return _check_repo(repo)
     except ValueError:
         raise ValueError("repo must be 'owner/name' with no path/query characters (got %r); "
-                         "set --repo or $GITHUB_REPOSITORY" % (repo,))
+                         "set --repo or $GITHUB_REPOSITORY" % (repo,)) from None
 
 
 def _resolve_sha(arg):
@@ -715,7 +827,7 @@ def _resolve_sha(arg):
         return _check_sha(arg)
     except ValueError:
         raise ValueError("--sha must be 7-64 hex characters (got %r); set --sha or $GITHUB_SHA"
-                         % ((arg or "").strip(),))
+                         % ((arg or "").strip(),)) from None
 
 
 def main(argv=None):
@@ -742,9 +854,14 @@ def main(argv=None):
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
     dry = args.dry_run or not token
     client = DryRunClient() if dry else GitHubClient(token, repo, args.api_url)
-    # scrub any credential-looking env value out of every body, defensively
+    # scrub any credential-looking env value out of every body, defensively. The name allowlist
+    # covers password/credential-style variables too — a `DB_PASSWORD` is as much a secret as an
+    # API token and must not survive into a comment or the job summary. Markers are matched
+    # case-insensitively; `KEY` already subsumes `APIKEY`/`PRIVATE_KEY`. Deliberately narrow (no bare
+    # `PWD`/`AUTH`/`PASS`) so common non-secrets like `$PWD` or `AUTHOR` are not needlessly redacted.
+    _SECRET_NAME_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PASSPHRASE")
     secrets = [v for k, v in os.environ.items()
-               if v and ("TOKEN" in k or "KEY" in k or "SECRET" in k)]
+               if v and any(m in k.upper() for m in _SECRET_NAME_MARKERS)]
 
     ctx = {"repo": repo, "pr": args.pr, "commit_sha": sha or None,
            "target_url": args.target_url or None, "fail_on": args.fail_on}
