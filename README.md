@@ -569,6 +569,7 @@ references/
 tests/                # mock router + end-to-end suite (see tests/run_tests.py)
 integrations/
   trends.py           # cross-run trends dashboard: run dirs -> self-contained HTML + JSON rollup
+  pr_publish.py       # publish a run to a GitHub PR: findings as inline comments + verdict status
 ```
 
 Cross-run trends: `python integrations/trends.py .adversarial-review --out-dir .` reads a directory
@@ -577,6 +578,18 @@ verdict distribution, pass rate, finding/cost trends, per-run table. It never wr
 — an `--out-dir` that resolves inside one is refused, so an audit artifact can't be overwritten.
 It's a repo-local tool run from a source checkout: the packaged wheel ships the pipeline console
 scripts (`ar-panel`/`ar-gate`/`ar-aggregate`/`ar-mcp`), not this dashboard.
+
+PR integration: `python integrations/pr_publish.py <run-dir> --repo owner/name --pr <n>` mirrors a
+completed run onto a pull request — a deduped finding as an inline review comment anchored to its
+file/line, the verdict as an updatable summary comment, and an `adversarial-review` commit status
+(PASS→success, FAIL→failure, BLOCKED→error). It is **idempotent**: a re-run updates its own comments
+in place and deletes the comment for a finding that is gone — it never duplicates and never touches
+a human's comment (every managed comment carries a hidden `<!-- ar-managed -->` marker). It is
+**token-gated** — with no `GITHUB_TOKEN`/`GH_TOKEN` it is a dry run that computes the plan and writes
+nothing (the same path the offline tests drive) — and never writes a secret into a comment. A
+finding whose line is not part of the diff falls back into the summary instead of being dropped.
+`--fail-on fail|blocked` mirrors the gate's exit semantics; the commit status always reflects the
+true verdict. Like the dashboard, it's repo-local tooling (stdlib-only), not part of the wheel.
 
 ## Security notes
 

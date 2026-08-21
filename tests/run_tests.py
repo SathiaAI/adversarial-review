@@ -3020,6 +3020,690 @@ def t_trends_tolerates_unreadable_root():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def _import_pr_publish():
+    sys.path.insert(0, str(SKILL / "integrations"))
+    import pr_publish
+    return pr_publish
+
+
+def _write_run(path, verdict="PASS", risk="NORMAL", run_id="run-x", reports=None, validations=None,
+               roles_filled=None):
+    """Write a minimal but well-formed run dir (verdict.json + panel/plan.json + panel/<role>.json
+    + validation/) for the pr_publish tests. ``reports`` maps role -> [finding dict]. The verdict
+    carries a REAL attestation over the artifacts (as a genuine run dir does), so pr_publish's
+    pre-publish integrity check passes; ``roles_filled`` overrides panel coverage to simulate an
+    incomplete panel."""
+    sys.path.insert(0, str(SKILL / "scripts"))
+    from aggregate import compute_attestation
+    d = Path(path)
+    (d / "panel").mkdir(parents=True, exist_ok=True)
+    (d / "validation").mkdir(parents=True, exist_ok=True)
+    reports = reports if reports is not None else {"security": []}
+    roles = list(reports.keys())
+    # write the input artifacts first, then attest over them, then write the verdict (the output)
+    (d / "panel" / "plan.json").write_text(json.dumps({"roles": {r: {"model": "m/" + r} for r in roles}}))
+    for role, findings in reports.items():
+        (d / "panel" / (role + ".json")).write_text(json.dumps({"role": role, "findings": findings}))
+    for i, rec in enumerate(validations or []):
+        (d / "validation" / ("v%d.json" % i)).write_text(json.dumps(rec))
+    att = compute_attestation(d)  # sha256-canonical-json-v1 over every .json except verdict.json
+    (d / "verdict.json").write_text(json.dumps({
+        "verdict": verdict, "risk": risk, "run_id": run_id, "computed_at": "2026-08-20T00:00:00Z",
+        "counts": {"findings_high_critical": 0, "findings_medium_low": 0, "confirmed": 0, "unresolved": 0},
+        "coverage": {"risk": risk, "gates": {"passed": ["build", "unit"], "required": ["build", "unit"]},
+                     "panel": {"roles_filled": roles_filled if roles_filled is not None else roles,
+                               "roles_required": roles},
+                     "findings": {"raised": sum(len(v) for v in reports.values()), "triaged": 0},
+                     "cost_usd": 0.05},
+        "attestation": att}))
+    return str(d)
+
+
+class _FakeGitHub:
+    """Stateful in-memory GitHub double: create/update/delete/list actually mutate a store, so a
+    second publish sees the first's comments (the point of the idempotency tests). Author-aware —
+    every comment carries a login — so the ownership filtering is genuinely exercised."""
+    LOGIN = "ar-bot"
+
+    def __init__(self, errcls, fail_create_422=False):
+        self.issue, self.review, self.statuses = {}, {}, []
+        self._n = 1000
+        self._errcls = errcls
+        self._fail = fail_create_422
+        self.head_sha = None  # when set, get_pull reports it → head-sha binding is exercised
+
+    def _id(self):
+        self._n += 1
+        return self._n
+
+    def whoami(self):
+        return self.LOGIN
+
+    def get_pull(self, pr):
+        return {"head": {"sha": self.head_sha}} if self.head_sha else {}
+
+    def list_issue_comments(self, pr):
+        return [{"id": i, "body": c["body"], "user": {"login": c["user"]}} for i, c in self.issue.items()]
+
+    def create_issue_comment(self, pr, body):
+        i = self._id()
+        self.issue[i] = {"body": body, "user": self.LOGIN}
+        return {"id": i, "user": {"login": self.LOGIN}}  # real GitHub returns the created comment
+
+    def update_issue_comment(self, cid, body):
+        self.issue[cid]["body"] = body
+        return {"id": cid}
+
+    def delete_issue_comment(self, cid):
+        self.issue.pop(cid, None)
+        return {}
+
+    def list_review_comments(self, pr):
+        return [{"id": i, "body": c["body"], "line": c["line"], "user": {"login": c["user"]}}
+                for i, c in self.review.items()]
+
+    def create_review_comment(self, pr, sha, path, line, body):
+        if self._fail:
+            raise self._errcls(422, "line not part of the diff")
+        i = self._id()
+        self.review[i] = {"body": body, "path": path, "line": line, "user": self.LOGIN}
+        return {"id": i, "user": {"login": self.LOGIN}}
+
+    def update_review_comment(self, cid, body):
+        self.review[cid]["body"] = body
+        return {"id": cid}
+
+    def delete_review_comment(self, cid):
+        self.review.pop(cid, None)
+        return {}
+
+    def set_status(self, sha, state, description, target_url=None):
+        self.statuses.append(state)
+        return {}
+
+    # helpers for tests: inject a comment authored by someone else (a human / attacker)
+    def inject_issue(self, body, user="mallory"):
+        i = self._id()
+        self.issue[i] = {"body": body, "user": user}
+        return i
+
+    def inject_review(self, body, line, user="mallory"):
+        i = self._id()
+        self.review[i] = {"body": body, "path": "a.py", "line": line, "user": user}
+        return i
+
+
+def t_pr_publish_creates_and_idempotent():
+    # E5-S1: first publish creates a verdict summary + one inline comment per finding and sets a
+    # commit status; a re-run of the SAME run updates in place and never duplicates.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        rundir = _write_run(root / "run", verdict="PASS", reports={"correctness": [
+            {"id": "correctness-1", "title": "Bug X", "severity": "high", "file": "a.py",
+             "line": 10, "evidence": "boom", "release_blocking": True}]},
+            validations=[{"finding_ids": ["correctness-1"], "classification": "confirmed",
+                          "resolution": {"fixed": True, "gates_rerun": ["unit"]}}])
+        gh = _FakeGitHub(pp.GitHubError)
+        ctx = {"repo": "o/r", "pr": 7, "commit_sha": "deadbeef", "fail_on": "blocked"}
+        p1 = pp.publish(rundir, ctx, gh)
+        assert p1["created"] == 1 and p1["updated"] == 0 and p1["summary"] == "created", p1
+        assert len(gh.review) == 1 and len(gh.issue) == 1, (len(gh.review), len(gh.issue))
+        assert gh.statuses == ["success"], gh.statuses
+        assert "confirmed" in next(iter(gh.review.values()))["body"], "triage must show on the inline comment"
+        p2 = pp.publish(rundir, ctx, gh)
+        assert p2["created"] == 0 and p2["updated"] == 1 and p2["summary"] == "updated", p2
+        assert len(gh.review) == 1 and len(gh.issue) == 1, "re-run must not duplicate"
+        assert gh.statuses == ["success", "success"], gh.statuses
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_retires_stale_findings():
+    # E5-S1: a finding present in run A but gone in run B (same PR) has its inline comment deleted.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        run_a = _write_run(root / "a", reports={"correctness": [
+            {"id": "correctness-1", "title": "Bug X", "severity": "high", "file": "a.py", "line": 10}]})
+        run_b = _write_run(root / "b", reports={"security": []})  # clean re-review
+        gh = _FakeGitHub(pp.GitHubError)
+        ctx = {"repo": "o/r", "pr": 9, "commit_sha": "deadbeef", "fail_on": "blocked"}
+        pp.publish(run_a, ctx, gh)
+        assert len(gh.review) == 1
+        p = pp.publish(run_b, ctx, gh)
+        assert p["deleted"] == 1 and len(gh.review) == 0, (p, gh.review)
+        assert len(gh.issue) == 1, "verdict summary stays (updated), only the finding retires"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_status_maps_verdict():
+    # E5-S1: commit status state is faithful to the verdict (BLOCKED = error, not failure).
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        for verdict, state in (("PASS", "success"), ("FAIL", "failure"), ("BLOCKED", "error")):
+            gh = _FakeGitHub(pp.GitHubError)
+            rundir = _write_run(root / verdict, verdict=verdict)
+            pp.publish(rundir, {"repo": "o/r", "pr": 1, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh)
+            assert gh.statuses == [state], (verdict, gh.statuses)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_dry_run_no_op():
+    # E5-S1: with no token, main() uses the DryRunClient — no network, exit code still reflects the
+    # verdict (PASS -> 0), and BLOCKED under fail-on=blocked -> 2.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    saved = {k: os.environ.pop(k) for k in ("GITHUB_TOKEN", "GH_TOKEN", "GITHUB_STEP_SUMMARY") if k in os.environ}
+    try:
+        ok = _write_run(root / "ok", verdict="PASS")
+        assert pp.main([ok, "--repo", "o/r", "--pr", "3"]) == 0
+        fail = _write_run(root / "fail", verdict="FAIL")
+        assert pp.main([fail, "--repo", "o/r", "--pr", "3"]) == 1               # FAIL -> 1
+        assert pp.main([fail, "--repo", "o/r", "--pr", "3", "--fail-on", "fail"]) == 1
+        blk = _write_run(root / "blk", verdict="BLOCKED")
+        assert pp.main([blk, "--repo", "o/r", "--pr", "3"]) == 2                # BLOCKED -> 2 (default)
+        assert pp.main([blk, "--repo", "o/r", "--pr", "3", "--fail-on", "fail"]) == 0  # tolerated
+    finally:
+        os.environ.update(saved)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_scrubs_secrets():
+    # E5-S1: a credential that leaked into an artifact must never reach a comment body.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        secret = "sk-supersecrettoken1234567890"
+        rundir = _write_run(root / "run", reports={"correctness": [
+            {"id": "c1", "title": "Leak", "severity": "low", "file": "a.py", "line": 1,
+             "evidence": "the key is " + secret + " oops"}]})
+        gh = _FakeGitHub(pp.GitHubError)
+        pp.publish(rundir, {"repo": "o/r", "pr": 5, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh,
+                   secrets=[secret])
+        for c in gh.review.values():
+            assert secret not in c["body"] and "***redacted***" in c["body"], c["body"]
+        for c in gh.issue.values():
+            assert secret not in c["body"]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_unanchored_fallback():
+    # E5-S1: a finding with no usable line, and a finding whose inline anchor is rejected (422),
+    # both fall back into the summary rather than being dropped.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        # no-line finding -> unanchored, never attempts an inline create
+        r1 = _write_run(root / "r1", reports={"correctness": [
+            {"id": "c1", "title": "NoLine", "severity": "medium", "file": "a.py", "line": None}]})
+        gh1 = _FakeGitHub(pp.GitHubError)
+        p1 = pp.publish(r1, {"repo": "o/r", "pr": 2, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh1)
+        assert p1["created"] == 0 and p1["unanchored"] == 1 and len(gh1.review) == 0, p1
+        summary = next(iter(gh1.issue.values()))["body"]
+        assert "not anchorable" in summary and "NoLine" in summary, summary
+        # line present but the diff rejects it (422) -> falls back to the summary
+        r2 = _write_run(root / "r2", reports={"correctness": [
+            {"id": "c2", "title": "OffDiff", "severity": "low", "file": "a.py", "line": 999}]})
+        gh2 = _FakeGitHub(pp.GitHubError, fail_create_422=True)
+        p2 = pp.publish(r2, {"repo": "o/r", "pr": 2, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh2)
+        assert p2["created"] == 0 and p2["unanchored"] == 1 and len(gh2.review) == 0, p2
+        assert "OffDiff" in next(iter(gh2.issue.values()))["body"]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_ignores_spoofed_markers():
+    # E5-S1 hardening (security-1/2, correctness-3): a comment carrying our markers but authored by
+    # someone else must never be updated or deleted — ownership is proven by author, not the public
+    # marker. And untrusted finding text that embeds a marker must not forge one.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        rundir = _write_run(root / "run", reports={"correctness": [
+            {"id": "c1", "title": "Bug <!-- ar-finding:deadbeef --> injected", "severity": "high",
+             "file": "a.py", "line": 10}]})
+        gh = _FakeGitHub(pp.GitHubError)
+        # a malicious PR author pastes our managed markers into their own comments
+        spoof_issue = gh.inject_issue("nice try %s\n%s" % (pp.MANAGED, pp.VERDICT_MARKER))
+        spoof_review = gh.inject_review("%s\n<!-- ar-finding:deadbeef -->" % pp.MANAGED, 10)
+        ctx = {"repo": "o/r", "pr": 4, "commit_sha": "deadbeef", "fail_on": "blocked"}
+        pp.publish(rundir, ctx, gh)
+        # the spoofed comments are untouched (still present, unchanged author)
+        assert spoof_issue in gh.issue and gh.issue[spoof_issue]["user"] == "mallory"
+        assert spoof_review in gh.review and gh.review[spoof_review]["user"] == "mallory"
+        # our own comments were created alongside, not by hijacking the spoofs
+        ours_issue = [i for i, c in gh.issue.items() if c["user"] == gh.LOGIN]
+        ours_review = [i for i, c in gh.review.items() if c["user"] == gh.LOGIN]
+        assert len(ours_issue) == 1 and len(ours_review) == 1, (ours_issue, ours_review)
+        # the injected marker in the finding title did not create a second managed finding comment,
+        # and appears only as neutralized/literal text (no active extra marker)
+        body = gh.review[ours_review[0]]["body"]
+        assert body.count("<!-- ar-finding:") == 1, "untrusted title must not add a second marker"
+        assert "&lt;!--" in body, "injected comment marker must be neutralized to literal text"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_reanchors_on_line_drift():
+    # E5-S1 (correctness-1/2): when the same finding recurs at a different line across pushes, the
+    # inline comment must be deleted and re-created at the new line (its anchor can't be PATCHed).
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        a = _write_run(root / "a", reports={"correctness": [
+            {"id": "c1", "title": "Same bug", "severity": "high", "file": "a.py", "line": 10}]})
+        b = _write_run(root / "b", reports={"correctness": [
+            {"id": "c1", "title": "Same bug", "severity": "high", "file": "a.py", "line": 42}]})
+        gh = _FakeGitHub(pp.GitHubError)
+        ctx = {"repo": "o/r", "pr": 6, "commit_sha": "deadbeef", "fail_on": "blocked"}
+        pp.publish(a, ctx, gh)
+        assert len(gh.review) == 1 and next(iter(gh.review.values()))["line"] == 10
+        p = pp.publish(b, ctx, gh)
+        assert p["deleted"] == 1 and p["created"] == 1 and p["updated"] == 0, p
+        assert len(gh.review) == 1 and next(iter(gh.review.values()))["line"] == 42, "anchor must move"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_dedupes_across_roles():
+    # E5-S1 (test_quality-4): two reviewers reporting the same (file, title) collapse into one
+    # inline comment that names both roles.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        rundir = _write_run(root / "run", reports={
+            "security": [{"id": "security-1", "title": "Dup issue", "severity": "high",
+                          "file": "a.py", "line": 5}],
+            "correctness": [{"id": "correctness-1", "title": "Dup issue", "severity": "medium",
+                             "file": "a.py", "line": 5}]})
+        gh = _FakeGitHub(pp.GitHubError)
+        p = pp.publish(rundir, {"repo": "o/r", "pr": 8, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh)
+        assert p["created"] == 1 and len(gh.review) == 1, p
+        body = next(iter(gh.review.values()))["body"]
+        assert "security" in body and "correctness" in body, "both source roles must be named"
+        # most-severe label wins for the merged finding
+        assert body.startswith("**HIGH**"), body[:20]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_no_sha_skips_status_not_silently():
+    # E5-S1 (correctness-4): with no head SHA, no commit status is set and no inline anchor is
+    # attempted — but the skip is surfaced in the plan, not silent, and findings fall back to summary.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        rundir = _write_run(root / "run", reports={"correctness": [
+            {"id": "c1", "title": "Bug", "severity": "high", "file": "a.py", "line": 10}]})
+        gh = _FakeGitHub(pp.GitHubError)
+        p = pp.publish(rundir, {"repo": "o/r", "pr": 10, "commit_sha": None, "fail_on": "blocked"}, gh)
+        assert p["status_set"] is False and "no commit sha" in p.get("status_skipped_reason", ""), p
+        assert gh.statuses == [] and len(gh.review) == 0, "no status, no inline anchor without a sha"
+        assert p["unanchored"] == 1 and "Bug" in next(iter(gh.issue.values()))["body"], p
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_bootstraps_identity_when_user_denied():
+    # E5-S1 hardening (CodeRabbit, major): a write-capable client can be denied GET /user (a default
+    # Actions GITHUB_TOKEN 403s it), so whoami() is None. Ownership must still be proven by author,
+    # not by the public marker alone — else a human comment quoting a marker would be edited/deleted.
+    # Identity is bootstrapped from a self-authored write; spoofed comments survive and re-runs stay
+    # idempotent. (Under the old marker-only fallback the spoofs below would be overwritten/deleted.)
+    pp = _import_pr_publish()
+
+    class _NoUser(_FakeGitHub):
+        def whoami(self):
+            return None  # GET /user denied for this token
+
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        rundir = _write_run(root / "run", reports={"correctness": [
+            {"id": "c1", "title": "Bug", "severity": "high", "file": "a.py", "line": 10}]})
+        gh = _NoUser(pp.GitHubError)
+        # a human pastes our managed markers into their own comments
+        spoof_issue = gh.inject_issue("nice try %s\n%s" % (pp.MANAGED, pp.VERDICT_MARKER))
+        spoof_review = gh.inject_review("%s\n<!-- ar-finding:deadbeef -->" % pp.MANAGED, 10)
+        ctx = {"repo": "o/r", "pr": 11, "commit_sha": "deadbeef", "fail_on": "blocked"}
+        pp.publish(rundir, ctx, gh)
+        # spoofed comments untouched (marker-only ownership would have overwritten/deleted them)
+        assert spoof_issue in gh.issue and gh.issue[spoof_issue]["body"].startswith("nice try")
+        assert spoof_review in gh.review and gh.review[spoof_review]["user"] == "mallory"
+        ours_issue = [i for i, c in gh.issue.items() if c["user"] == gh.LOGIN]
+        ours_review = [i for i, c in gh.review.items() if c["user"] == gh.LOGIN]
+        assert len(ours_issue) == 1 and len(ours_review) == 1, (ours_issue, ours_review)
+        # re-run under the same denied-identity client stays idempotent (no dup summary/inline)
+        pp.publish(rundir, ctx, gh)
+        assert len([i for i, c in gh.issue.items() if c["user"] == gh.LOGIN]) == 1, "no dup summary"
+        assert len([i for i, c in gh.review.items() if c["user"] == gh.LOGIN]) == 1, "no dup inline"
+        assert spoof_issue in gh.issue and spoof_review in gh.review, "human comments never touched"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_severity_guard_malformed():
+    # E5-S1 hardening (CodeRabbit): a malformed report with a non-string severity ([]/{}) must not
+    # crash the publish — _severity degrades it to "low" instead of raising TypeError on `in`.
+    pp = _import_pr_publish()
+    assert pp._severity([]) == "low" and pp._severity({}) == "low" and pp._severity(None) == "low"
+    assert pp._severity("high") == "high"
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        rundir = _write_run(root / "run", reports={"correctness": [
+            {"id": "c1", "title": "Weird", "severity": [], "file": "a.py", "line": 3}]})
+        gh = _FakeGitHub(pp.GitHubError)
+        p = pp.publish(rundir, {"repo": "o/r", "pr": 12, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh)
+        assert p["created"] == 1, p  # did not crash; posted as low severity
+        assert "**LOW**" in next(iter(gh.review.values()))["body"]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_repo_and_sha_validation():
+    # E5-S1 hardening (CodeRabbit): repo and sha are interpolated straight into request paths, so
+    # values carrying path/query characters (?, #, .., space) must be rejected, not silently used.
+    pp = _import_pr_publish()
+    for bad in ("owner", "own/er/name", "own er/name", "o/r?x", "o/r#x", "../etc", "o/..", "."):
+        try:
+            pp._resolve_repo(bad)
+            raise AssertionError("expected ValueError for repo %r" % bad)
+        except ValueError:
+            pass
+    assert pp._resolve_repo("SathiaAI/adversarial-review") == "SathiaAI/adversarial-review"
+    assert pp._resolve_repo("o/my.repo-1_2") == "o/my.repo-1_2"  # dots/dashes/underscores are ok
+    for bad in ("xyz", "g" * 65, "abc?d", "12 34", "../a", "dead!beef"):
+        try:
+            pp._resolve_sha(bad)
+            raise AssertionError("expected ValueError for sha %r" % bad)
+        except ValueError:
+            pass
+    assert pp._resolve_sha("deadbeef") == "deadbeef"
+    assert pp._resolve_sha("A" * 40) == "A" * 40
+    assert pp._resolve_sha("") == ""  # absent sha allowed (status then skipped + surfaced)
+
+
+def t_pr_publish_job_summary_includes_unanchored():
+    # E5-S1 hardening (CodeRabbit): publish() returns the unanchored findings so the Actions job
+    # summary renders the same "not anchorable" section the PR comment does (it used to pass []).
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        rundir = _write_run(root / "run", reports={"correctness": [
+            {"id": "c1", "title": "NoLine", "severity": "medium", "file": "a.py", "line": None}]})
+        gh = _FakeGitHub(pp.GitHubError)
+        run = pp.load_run(rundir)
+        p = pp.publish(rundir, {"repo": "o/r", "pr": 13, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh)
+        entries = p.get("unanchored_entries")
+        assert entries and len(entries) == 1 and entries[0]["title"] == "NoLine", p
+        summary = pp.render_verdict_summary(run, "o/r", 13, entries)
+        assert "not anchorable" in summary and "NoLine" in summary
+        assert "not anchorable" not in pp.render_verdict_summary(run, "o/r", 13, [])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_programmatic_validation():
+    # E5-S1 re-review (correctness-1, HIGH): repo/sha validation must guard the programmatic API, not
+    # just the CLI. GitHubClient rejects a bad repo at construction; set_status rejects a bad sha
+    # before interpolating it into the request path — both offline, before any network call.
+    pp = _import_pr_publish()
+    for bad in ("owner/repo?x=1", "owner", "../x", "o/..", "o/r%2e%2e", "o/r#f", "a/b/c"):
+        try:
+            pp.GitHubClient("tok", bad)
+            raise AssertionError("expected ValueError for repo %r" % bad)
+        except ValueError:
+            pass
+    client = pp.GitHubClient("tok", "o/r")  # valid repo; no network on construction
+    for bad in ("abc?x=1", "..", "deadbeef!", "zzzzzzz", "abc"):
+        try:
+            client.set_status(bad, "success", "desc")
+            raise AssertionError("expected ValueError for sha %r" % bad)
+        except ValueError:
+            pass
+    assert pp._check_repo("SathiaAI/adversarial-review") == "SathiaAI/adversarial-review"
+    assert pp._check_sha("A" * 40) == "A" * 40 and pp._check_sha("") == ""
+
+
+def t_pr_publish_reanchors_null_line():
+    # E5-S1 re-review (correctness-2): an owned inline comment the API returns with line=None must be
+    # re-anchored (delete + create) when the finding has a real line — not updated in place.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        rundir = _write_run(root / "run", reports={"correctness": [
+            {"id": "c1", "title": "Bug", "severity": "high", "file": "a.py", "line": 10}]})
+        gh = _FakeGitHub(pp.GitHubError)
+        key = pp._finding_key("a.py", "Bug")
+        gh.inject_review("x\n%s\n<!-- ar-finding:%s -->" % (pp.MANAGED, key), None, user=gh.LOGIN)
+        p = pp.publish(rundir, {"repo": "o/r", "pr": 6, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh)
+        assert p["deleted"] == 1 and p["created"] == 1 and p["updated"] == 0, p
+        assert len(gh.review) == 1 and next(iter(gh.review.values()))["line"] == 10, "must re-anchor to 10"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_summary_neutralizes_file():
+    # E5-S1 re-review (correctness-3): untrusted finding *file* text must be neutralized in the summary
+    # so it cannot forge a managed marker (only our own real verdict marker may appear).
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        rundir = _write_run(root / "run", reports={"correctness": [
+            {"id": "c1", "title": "NoLine", "severity": "low",
+             "file": "x <!-- ar-verdict --> y", "line": None}]})
+        gh = _FakeGitHub(pp.GitHubError)
+        pp.publish(rundir, {"repo": "o/r", "pr": 2, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh)
+        body = next(iter(gh.issue.values()))["body"]
+        assert body.count(pp.VERDICT_MARKER) == 1, "injected file marker must not add a second marker"
+        assert "&lt;!--" in body, "injected file marker must be neutralized to literal text"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_bad_verdict_json():
+    # E5-S1 re-review (test_quality-1): a missing or unparseable verdict.json is surfaced as a clean
+    # exit 2, not a crash.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    saved = {k: os.environ.pop(k) for k in ("GITHUB_TOKEN", "GH_TOKEN", "GITHUB_STEP_SUMMARY") if k in os.environ}
+    try:
+        missing = root / "missing"
+        missing.mkdir()
+        assert pp.main([str(missing), "--repo", "o/r", "--pr", "1"]) == 2  # no verdict.json
+        bad = root / "bad"
+        bad.mkdir()
+        (bad / "verdict.json").write_text("{ not json")
+        assert pp.main([str(bad), "--repo", "o/r", "--pr", "1"]) == 2      # unparseable
+        for d in (missing, bad):
+            try:
+                pp.load_run(str(d))
+                raise AssertionError("load_run must raise on %s" % d)
+            except (FileNotFoundError, ValueError):
+                pass
+    finally:
+        os.environ.update(saved)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_verifies_attestation_before_publishing():
+    # E5-S1 PR #43 (Codex P1): if a run's artifacts drift after aggregate.py wrote the verdict, the
+    # stored attestation no longer matches — publish must refuse BEFORE any network write, so a PASS
+    # is never attached to inputs the verdict was not computed over.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        rundir = _write_run(root / "run", reports={"security": [
+            {"id": "s1", "title": "Bug", "severity": "high", "file": "a.py", "line": 10}]})
+        gh = _FakeGitHub(pp.GitHubError)
+        # untouched run publishes fine (attestation matches)
+        pp.publish(rundir, {"repo": "o/r", "pr": 1, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh)
+        assert gh.issue or gh.review, "a clean run should publish"
+        # tamper a panel artifact after the verdict was written
+        p = Path(rundir) / "panel" / "security.json"
+        p.write_text(json.dumps({"role": "security", "findings": [
+            {"id": "s1", "title": "Bug", "severity": "low", "file": "a.py", "line": 10}]}))
+        gh2 = _FakeGitHub(pp.GitHubError)
+        try:
+            pp.publish(rundir, {"repo": "o/r", "pr": 1, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh2)
+            raise AssertionError("tampered run must abort before publishing")
+        except ValueError as exc:
+            assert "attestation mismatch" in str(exc)
+        assert not gh2.issue and not gh2.review and not gh2.statuses, "no write on a tampered run"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_binds_to_reviewed_head():
+    # E5-S1 PR #43 (Codex P1): the status/comments must bind to the reviewed PR head. When the PR
+    # head is known and the provided --sha is a different commit (e.g. the pull_request merge
+    # commit), publish fails closed rather than marking bytes the run never reviewed. A matching (or
+    # unresolved) head proceeds.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        rundir = _write_run(root / "run", reports={"security": []})
+        # mismatch → abort, no writes
+        gh = _FakeGitHub(pp.GitHubError)
+        gh.head_sha = "cafebabecafebabecafebabecafebabecafebabe"
+        try:
+            pp.publish(rundir, {"repo": "o/r", "pr": 7, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh)
+            raise AssertionError("must refuse to publish to a non-head sha")
+        except pp.GitHubError as exc:
+            assert "not the head" in str(exc)
+        assert not gh.issue and not gh.statuses, "no write when head sha mismatches"
+        # matching head (short --sha is a prefix of the full head) → proceeds
+        gh2 = _FakeGitHub(pp.GitHubError)
+        gh2.head_sha = "deadbeef00000000000000000000000000000000"
+        pp.publish(rundir, {"repo": "o/r", "pr": 7, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh2)
+        assert gh2.statuses == ["success"], gh2.statuses
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_scrubs_password_named_secret():
+    # E5-S1 PR #43 (Codex P1): a password/credential-named env value is a secret too and must be
+    # redacted from bodies — the old TOKEN/KEY/SECRET-only allowlist leaked e.g. DB_PASSWORD.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    secret = "hunter2-db-password-value"
+    saved = {k: os.environ.get(k) for k in ("GITHUB_TOKEN", "GH_TOKEN", "DB_PASSWORD", "GITHUB_STEP_SUMMARY")}
+    for k in ("GH_TOKEN", "GITHUB_STEP_SUMMARY"):
+        os.environ.pop(k, None)
+    try:
+        # a finding whose text echoes the password (defense-in-depth: bodies come from artifacts)
+        rundir = _write_run(root / "run", reports={"security": [
+            {"id": "s1", "title": "leak " + secret, "severity": "high", "file": "a.py", "line": 3,
+             "evidence": secret}]})
+        os.environ["GITHUB_TOKEN"] = "x"        # force non-dry-run path in main()
+        os.environ["DB_PASSWORD"] = secret
+        # Drive publish() directly with the same secret list main() would build, on a recording fake.
+        secrets = [v for k, v in os.environ.items()
+                   if v and any(m in k.upper() for m in ("TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD",
+                                                          "CREDENTIAL", "PASSPHRASE"))]
+        assert secret in secrets, "DB_PASSWORD must be collected as a secret"
+        gh = _FakeGitHub(pp.GitHubError)
+        pp.publish(rundir, {"repo": "o/r", "pr": 9, "commit_sha": "deadbeef", "fail_on": "blocked"},
+                   gh, secrets=secrets)
+        bodies = "".join(c["body"] for c in gh.issue.values()) + "".join(c["body"] for c in gh.review.values())
+        assert bodies, "expected a published body"
+        assert secret not in bodies, "the password value must be redacted from every body"
+        assert "***redacted***" in bodies
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_tolerates_malformed_plan_json():
+    # E5-S1 PR #43 (CodeRabbit): a malformed panel/plan.json must not abort publish — only
+    # verdict.json can (the role fallback handles a missing/broken plan).
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        rundir = _write_run(root / "run", reports={"security": [
+            {"id": "s1", "title": "Bug", "severity": "high", "file": "a.py", "line": 10}]})
+        # a run whose plan.json was malformed when aggregated: corrupt it, then re-attest so the
+        # stored digest covers the malformed bytes (aggregate.py hashes an unparseable .json raw)
+        (Path(rundir) / "panel" / "plan.json").write_text("{ not json")
+        sys.path.insert(0, str(SKILL / "scripts"))
+        from aggregate import compute_attestation
+        v = json.loads((Path(rundir) / "verdict.json").read_text())
+        v["attestation"] = compute_attestation(Path(rundir))
+        (Path(rundir) / "verdict.json").write_text(json.dumps(v))
+        run = pp.load_run(rundir)                      # must not raise
+        assert run["plan"] == {} and "security" in run["reports"], run["plan"]
+        gh = _FakeGitHub(pp.GitHubError)
+        pp.publish(rundir, {"repo": "o/r", "pr": 1, "commit_sha": "deadbeef", "fail_on": "blocked"}, gh)
+        assert gh.review, "publish should still post the finding despite a broken plan.json"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_summary_id_is_stable_across_bootstrap_runs():
+    # E5-S1 PR #43 (CodeRabbit): under the identity-bootstrap path (GET /user denied), re-runs must
+    # keep ONE stable summary comment id instead of churning a fresh comment (and notification) each
+    # time.
+    pp = _import_pr_publish()
+
+    class _NoUser(_FakeGitHub):
+        def whoami(self):
+            return None
+
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        rundir = _write_run(root / "run", reports={"security": []})
+        gh = _NoUser(pp.GitHubError)
+        ctx = {"repo": "o/r", "pr": 2, "commit_sha": "deadbeef", "fail_on": "blocked"}
+        pp.publish(rundir, ctx, gh)
+        ids1 = sorted(i for i, c in gh.issue.items() if c["user"] == gh.LOGIN)
+        assert len(ids1) == 1, ids1
+        plan2 = pp.publish(rundir, ctx, gh)     # second run under the same denied-identity client
+        pp.publish(rundir, ctx, gh)     # and a third
+        ids2 = sorted(i for i, c in gh.issue.items() if c["user"] == gh.LOGIN)
+        assert ids2 == ids1, "the summary comment id must be stable across bootstrap re-runs"
+        # CodeRabbit PR #43: retiring the throwaway bootstrap comment is a summary retirement, not an
+        # inline deletion — it must not inflate the "-N inline" counter.
+        assert plan2["summary_retired"] >= 1, plan2
+        assert plan2["deleted"] == 0, plan2
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_pr_publish_preserves_findings_when_panel_incomplete():
+    # E5-S1 PR #43 (Codex P1): a later BLOCKED/incomplete re-run (reviewer reports missing) must not
+    # delete the prior run's finding comments — missing panel output is not proof the issue is fixed.
+    pp = _import_pr_publish()
+    root = Path(tempfile.mkdtemp(prefix="ar-prpub-"))
+    try:
+        # run 1: complete panel posts one inline finding
+        r1 = _write_run(root / "r1", reports={"security": [
+            {"id": "s1", "title": "Bug", "severity": "high", "file": "a.py", "line": 10}]})
+        gh = _FakeGitHub(pp.GitHubError)
+        ctx = {"repo": "o/r", "pr": 5, "commit_sha": "deadbeef", "fail_on": "blocked"}
+        pp.publish(r1, ctx, gh)
+        assert len(gh.review) == 1, gh.review
+        # run 2: the finding is gone AND the panel is incomplete (roles_filled < required) → preserve
+        r2 = _write_run(root / "r2", verdict="BLOCKED", reports={"security": []},
+                        roles_filled=[])   # required=["security"], filled=[] → incomplete
+        p = pp.publish(r2, ctx, gh)
+        assert len(gh.review) == 1, "stale finding comment preserved while panel is incomplete"
+        assert p.get("reconcile_held") == 1, p
+        # run 3: complete panel, finding still gone → now it is retired
+        r3 = _write_run(root / "r3", reports={"security": []})
+        pp.publish(r3, ctx, gh)
+        assert len(gh.review) == 0, "a complete clean re-run retires the stale finding comment"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
