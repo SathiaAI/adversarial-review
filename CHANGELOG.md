@@ -54,24 +54,17 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   `references/schemas.md`; being a pre-call gate (not a reservation), the recorded total can
   overshoot the cap by up to the in-flight reviewer's cost, as `references/config.md` now states.
 
-- Native PR-comment integration (E5-S1): `integrations/pr_publish.py` mirrors a completed run onto a
-  GitHub pull request — each deduped finding as an inline review comment anchored to its file/line,
-  the verdict as an updatable summary comment, and an `adversarial-review` commit status
-  (PASS→success, FAIL→failure, BLOCKED→error). It is idempotent (every managed comment carries a
-  hidden `<!-- ar-managed -->` marker keyed to the finding, so a re-run updates in place, creates for
-  new findings, and deletes the comment for a finding that is gone — never duplicating, never
-  touching a human's comment), token-gated (no `GITHUB_TOKEN`/`GH_TOKEN` → a dry run that writes
-  nothing), and secret-scrubbing (a credential that leaked into an artifact is redacted before any
-  body is sent). A finding whose line is not part of the diff (GitHub rejects the anchor) falls back
-  into the summary rather than being dropped. `--fail-on fail|blocked` mirrors the gate's exit codes.
-  Ownership is proven by comment *author*, not the marker alone — and when the token cannot read
-  `GET /user` (a default GitHub Actions `GITHUB_TOKEN` 403s it) the author is bootstrapped from a
-  self-written comment, so the "never touch a human's comment" guarantee holds even there. `repo`
-  and `sha` are validated against their real character sets before path interpolation, a malformed
-  non-string finding severity degrades to `low` instead of aborting the run, and the Actions job
-  summary carries the same "not anchorable to the diff" findings the PR comment does. Stdlib-only
-  tooling in `integrations/` (never imported by `scripts/*.py`); offline-tested with a stateful,
-  author-aware fake GitHub, no network or keys.
+### Changed
+- MCP server transport seam (E3-S1): the stdio framing in `scripts/mcp_server.py` is extracted
+  into a `StdioTransport` class around a transport-agnostic `serve_message()` core, leaving the
+  `handle()` dispatch untouched. Framing is byte-identical for well-formed and ordinarily-malformed
+  messages (`-32700` parse errors, `-32603` handler-crash containment, notification suppression);
+  the extracted parse guard catches every malformed-input failure `json.loads` can raise — a
+  `JSONDecodeError`, a `RecursionError` from pathologically nested input, and a `UnicodeDecodeError`
+  from bad bytes — and frames each as `-32700` instead of letting it escape and kill the loop
+  (closing a pre-existing gap), so the seam's "a single malformed message never kills the transport"
+  guarantee holds for the stdio loop and for the byte-oriented Streamable-HTTP transport (E3-S2) that
+  will reuse the exact dispatch and error semantics. Stdlib-only, 3.9-safe.
 
 ## [0.1.0]
 
