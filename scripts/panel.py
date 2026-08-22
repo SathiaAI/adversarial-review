@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (RUN_ROOT, VALID_REBUTTAL, VALID_RISKS, capability_of, die,
+from _common import (MAX_HIGH_SAMPLES, RUN_ROOT, VALID_REBUTTAL, VALID_RISKS, capability_of, die,
                      family_of, load_capabilities, load_policy, merge_usage, meta_cost,
                      now_iso, read_json, resolve_run, resolve_setting, write_json)
 
@@ -599,7 +599,9 @@ def call_reviewer(base, key, body, schema, corrective=None, prior_usage=None):
              + "\n- ".join(errs[:20]) + "\nRespond again with ONLY the corrected JSON object."}]
         return call_reviewer(base, key, retry_body, schema, corrective=errs, prior_usage=usage)
     if errs:
-        raise ValueError("reviewer output failed validation after retry: " + "; ".join(errs[:10]))
+        err = ValueError("reviewer output failed validation after retry: " + "; ".join(errs[:10]))
+        err.usage = usage  # expose billed usage so a failed-but-billed attempt can be cost-metered
+        raise err
     return obj, content, usage, provider
 
 
@@ -661,8 +663,8 @@ def high_samples():
         n = int(str(raw).strip())
     except (TypeError, ValueError):
         die(f"AR_HIGH_SAMPLES must be a positive integer (>= 1), got {raw!r} (from {src})")
-    if n < 1:
-        die(f"AR_HIGH_SAMPLES must be a positive integer (>= 1), got {raw!r} (from {src})")
+    if n < 1 or n > MAX_HIGH_SAMPLES:
+        die(f"AR_HIGH_SAMPLES must be an integer in [1, {MAX_HIGH_SAMPLES}], got {raw!r} (from {src})")
     return n
 
 
@@ -784,7 +786,15 @@ def corroborate_role(run, meta, plan, role, context_text, base, key, cap, n):
             obj, raw, usage, provider = call_reviewer(base, key, body, REPORT_SCHEMA)
         except Exception as e:  # noqa: BLE001
             # A sample that will not validate is a non-agreeing sample, never a run failure:
-            # corroboration only enriches. The gap shows up as a lower recorded agreement.
+            # corroboration only enriches. The gap shows up as a lower recorded agreement. But a
+            # sample that WAS billed before it failed must still be metered, or the pre-call cost gate
+            # would under-count and could silently exceed the cap (panel finding security-1).
+            failed_usage = getattr(e, "usage", None)
+            if failed_usage:
+                write_json(run / "panel" / "meta" / f"{role}.sample{i}.json", {
+                    "model": info["model"], "family": info["family"], "phase": "corroboration",
+                    "sample": i, "status": "failed", "usage": failed_usage,
+                    "cost": failed_usage.get("cost"), "completed_at": now_iso()})
             print(f"  {role}: corroboration sample {i} failed: {e}", file=sys.stderr)
             continue
         obj["role"], obj["model_id"] = role, info["model"]

@@ -4562,12 +4562,35 @@ def t_high_samples_cost_cap_honored_during_resampling():
         mock_router.reset()
 
 
+def t_call_reviewer_exposes_usage_on_validation_failure():
+    # E4-S3 (panel security-1): call_reviewer must attach the billed usage to the exception it raises
+    # when reviewer output fails validation after the retry, so a corroboration sample that was billed
+    # but then failed can be cost-metered (otherwise the pre-call cost gate under-counts and the cap
+    # could be silently exceeded). The mock bills reviewer_cost on every call and the provider returns
+    # an invalid report both times, forcing the after-retry failure path.
+    import panel
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.05
+    mock_router.STATE["response_provider"] = lambda meta: {"not": "a valid report"}
+    try:
+        body = {"model": "x/y", "messages": [{"role": "system", "content": "Your role: security"},
+                                             {"role": "user", "content": "go"}]}
+        try:
+            panel.call_reviewer("http://127.0.0.1:%d" % PORT, "k", body, panel.REPORT_SCHEMA)
+            raise AssertionError("expected a validation failure")
+        except ValueError as e:
+            u = getattr(e, "usage", None)
+            assert u and (u.get("cost") or 0) > 0, ("billed usage not attached to failure", u)
+    finally:
+        mock_router.reset()
+
+
 def t_high_samples_rejects_invalid_values():
     # E4-S3: a non-integer / < 1 AR_HIGH_SAMPLES is rejected loudly (like the cost cap), so a typo
     # can never silently change the sampling count. Also validated at policy load.
     import panel
     import _common
-    for bad in ("0", "-1", "1.5", "abc", "  "):
+    for bad in ("0", "-1", "1.5", "abc", "  ", "26"):
         os.environ["AR_HIGH_SAMPLES"] = bad
         try:
             panel.high_samples()
@@ -4579,9 +4602,11 @@ def t_high_samples_rejects_invalid_values():
     try:
         os.environ["AR_HIGH_SAMPLES"] = "3"
         assert panel.high_samples() == 3
+        os.environ["AR_HIGH_SAMPLES"] = str(_common.MAX_HIGH_SAMPLES)   # upper bound is inclusive
+        assert panel.high_samples() == _common.MAX_HIGH_SAMPLES
     finally:
         os.environ.pop("AR_HIGH_SAMPLES", None)
-    for bad in (0, -1, 1.5, "2.5", float("nan"), True):
+    for bad in (0, -1, 1.5, "2.5", float("nan"), True, _common.MAX_HIGH_SAMPLES + 1):
         try:
             _common._validate_policy({"high_samples": bad}, "policy")
             raise AssertionError(f"policy load accepted {bad!r}")
@@ -4589,6 +4614,7 @@ def t_high_samples_rejects_invalid_values():
             pass
     _common._validate_policy({"high_samples": 3}, "policy")    # positive integer OK
     _common._validate_policy({"high_samples": "4"}, "policy")  # YAML-subset string integer OK
+    _common._validate_policy({"high_samples": _common.MAX_HIGH_SAMPLES}, "policy")  # upper bound OK
 
 
 def main():

@@ -83,6 +83,8 @@ POLICY_KEYS = ("risk", "dev_providers", "rebuttal_policy", "required_gates", "pi
                "mutation", "max_cost_usd", "high_samples")
 VALID_RISKS = ("NORMAL", "SENSITIVE", "CRITICAL")
 VALID_REBUTTAL = ("critical", "contention", "any")
+MAX_HIGH_SAMPLES = 25  # practical upper bound on corroboration samples (E4-S3): bounds the
+                       # cost blast radius and the not_run list built on a cost-abort.
 # Scoped/bounded mutation budget — a repo-tunable cost cap so mutation testing survives
 # large or resource-constrained repos. A flat mapping (the strict YAML subset allows one
 # nested level); every field is optional. The configured budget is snapshotted into the
@@ -356,8 +358,8 @@ def _validate_policy(data, name):
         # typo can't silently change the count. 2**53 is float64's exact-integer ceiling: at or
         # above it a fractional value rounds to a whole float and would slip the `!= int(n)` check.
         n = _policy_number(data["high_samples"])
-        if n is None or n < 1 or n >= 2 ** 53 or n != int(n):
-            die(f"{name}: high_samples must be a positive integer (>= 1), "
+        if n is None or n < 1 or n > MAX_HIGH_SAMPLES or n != int(n):
+            die(f"{name}: high_samples must be an integer in [1, {MAX_HIGH_SAMPLES}], "
                 f"got {data['high_samples']!r}")
 
 
