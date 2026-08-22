@@ -14,6 +14,7 @@ Subcommands:
 Stdlib only. Exit codes: 0 ok, 1 error, 2 BLOCKED.
 """
 import argparse
+import difflib
 import json
 import math
 import os
@@ -649,6 +650,22 @@ def cost_cap():
     return (v if v > 0 else None), src
 
 
+def high_samples():
+    """Resolved AR_HIGH_SAMPLES (E4-S3): how many low-temperature samples to take of a role that
+    raised a high/critical finding, so the agreement rate across samples can be recorded on the
+    finding before it gates. AR_HIGH_SAMPLES env > policy ``high_samples`` > default ``1``. A value
+    of 1 (the default) means NO resampling — exactly today's behavior, byte-identical artifacts.
+    Must be an integer >= 1; anything else dies loudly so a typo can't silently change sampling."""
+    raw, src = resolve_setting(None, "AR_HIGH_SAMPLES", load_policy(), "high_samples", "1")
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        die(f"AR_HIGH_SAMPLES must be a positive integer (>= 1), got {raw!r} (from {src})")
+    if n < 1:
+        die(f"AR_HIGH_SAMPLES must be a positive integer (>= 1), got {raw!r} (from {src})")
+    return n
+
+
 def panel_cost(run):
     """USD spent so far, summed from recorded reviewer meta (panel + rebuttal + concurrence).
     A missing, non-finite, or negative cost counts as 0 (see ``meta_cost``) — a provider that
@@ -688,6 +705,104 @@ def _cost_abort(run, cap, spent, phase, not_run):
         f"{len(not_run)} item(s) not run: {', '.join(not_run) or 'none'}", 2)
 
 
+# ---------------------------------------------------------------- multi-sample corroboration (E4-S3)
+# Enrich (never gate) high/critical findings with a cross-sample agreement rate. The verdict stays
+# aggregate.py's alone — corroboration is informational and feeds later variance measurement.
+
+# Two high/critical findings describe the same defect when they cite the SAME file (case-insensitive)
+# and their titles are similar. difflib is stdlib and deterministic; the threshold is documented in
+# references/config.md. Same recorded samples in -> same agreement out (no wall-clock/random here).
+CORROBORATION_TITLE_SIMILARITY = 0.6
+
+
+def _norm_text(s):
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def findings_corroborate(a, b):
+    """True if two findings match under the E4-S3 heuristic: same normalized ``file`` AND title
+    similarity >= CORROBORATION_TITLE_SIMILARITY (difflib ratio over whitespace/case-normalized
+    titles). Deterministic and stdlib-only."""
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    if _norm_text(a.get("file")) != _norm_text(b.get("file")):
+        return False
+    return difflib.SequenceMatcher(
+        None, _norm_text(a.get("title")), _norm_text(b.get("title"))
+    ).ratio() >= CORROBORATION_TITLE_SIMILARITY
+
+
+def corroboration_rate(finding, samples, n):
+    """Agreement record for one primary high/critical ``finding`` across ``n`` total samples.
+    Sample 1 is the primary report itself, which contains the finding by construction, so ``agreed``
+    starts at 1; each additional recorded sample whose own high/critical findings include a match
+    (per findings_corroborate) increments it. ``samples`` is the list of extra sample reports (2..N)
+    that were successfully recorded — a sample that failed to produce a valid report simply does not
+    match, which honestly lowers the rate. Pure function of the recorded inputs (reproducible)."""
+    agreed = 1
+    for rep in samples:
+        hc = [f for f in (rep.get("findings") or [])
+              if isinstance(f, dict) and f.get("severity") in ("critical", "high")]
+        if any(findings_corroborate(finding, other) for other in hc):
+            agreed += 1
+    return {"samples": n, "agreed": agreed, "rate": round(agreed / n, 4)}
+
+
+def corroborate_role(run, meta, plan, role, context_text, base, key, cap, n):
+    """Re-run ONE role's reviewer up to N total samples and record the cross-sample agreement rate on
+    each of its high/critical findings (E4-S3). INFORMATIONAL ONLY: aggregate.py alone decides the
+    verdict; a low agreement rate never changes it and this adds no gating path. Only a role that
+    actually raised a high/critical finding is resampled (a thin loop, not the whole panel). Each
+    extra sample and its cost are recorded under panel/samples + panel/meta, so the enrichment
+    reproduces from recorded artifacts and every resample counts against the run cost cap."""
+    if n <= 1:
+        return  # no resampling — caller also guards; byte-identical to pre-E4-S3
+    report_path = run / "panel" / f"{role}.json"
+    if not report_path.exists():
+        return
+    report = read_json(report_path)
+    flagged = [f for f in (report.get("findings") or [])
+               if isinstance(f, dict) and f.get("severity") in ("critical", "high")]
+    if not flagged:
+        return  # only flagged roles are resampled
+    info = plan["roles"][role]
+    samples = []
+    for i in range(2, n + 1):
+        # Reuse the E4-S2 pre-call gate: a resample is billed, so stop BEFORE crossing the cap,
+        # record the reason, and BLOCK (aggregate.py then BLOCKS on it) — never silently exceed.
+        if cap is not None:
+            spent = panel_cost(run)
+            if spent >= cap:
+                _cost_abort(run, cap, spent, "corroboration",
+                            [f"{role}#sample{j}" for j in range(i, n + 1)])
+        boundary = secrets.token_hex(8)
+        messages = reviewer_messages(role, meta, context_text, boundary)
+        body, _ = build_request(info["model"], messages, REPORT_SCHEMA, "reviewer_report",
+                                info["structured_outputs"], meta["risk"], info.get("capability"))
+        try:
+            t0 = time.monotonic()
+            obj, raw, usage, provider = call_reviewer(base, key, body, REPORT_SCHEMA)
+        except Exception as e:  # noqa: BLE001
+            # A sample that will not validate is a non-agreeing sample, never a run failure:
+            # corroboration only enriches. The gap shows up as a lower recorded agreement.
+            print(f"  {role}: corroboration sample {i} failed: {e}", file=sys.stderr)
+            continue
+        obj["role"], obj["model_id"] = role, info["model"]
+        write_json(run / "panel" / "samples" / f"{role}.{i}.json", obj)
+        (run / "panel" / "raw" / f"{role}.sample{i}.txt").write_text(
+            raw if isinstance(raw, str) else json.dumps(raw), encoding="utf-8")
+        write_json(run / "panel" / "meta" / f"{role}.sample{i}.json", {
+            "model": info["model"], "family": info["family"], "provider": provider,
+            "phase": "corroboration", "sample": i, "usage": usage, "cost": usage.get("cost"),
+            "latency_ms": int((time.monotonic() - t0) * 1000), "completed_at": now_iso()})
+        samples.append(obj)
+    for f in flagged:
+        f["corroboration"] = corroboration_rate(f, samples, n)
+    write_json(report_path, report)
+    print(f"  {role}: corroborated {len(flagged)} high/critical finding(s) "
+          f"across {len(samples) + 1}/{n} samples")
+
+
 def cmd_run(args):
     run = resolve_run(args.run)
     meta = read_json(run / "run.json")
@@ -698,6 +813,9 @@ def cmd_run(args):
         die("no API key found (OPENROUTER_API_KEY / AR_API_KEY / AR_KEY_FILE). "
             "For keyless MCP transport use `panel.py prepare` + `panel.py ingest`.", 2)
 
+    # Resolve the corroboration sample count first (E4-S3): a bad AR_HIGH_SAMPLES dies here, before
+    # any paid call or persisted side effect. 1 (the default) leaves the run byte-identical.
+    n_samples = high_samples()
     # Establish (and persist, on first call) the run's cost ceiling; it stays authoritative for
     # rebuttal and concurrence too, so the audit shows which cap was actually enforced. The source
     # is persisted by run_cost_cap and surfaced by aggregate, so it isn't needed here.
@@ -750,6 +868,13 @@ def cmd_run(args):
     print(f"panel complete: {len(done)}/{len(plan['roles'])} roles")
     if failed:
         die(f"BLOCKED: roles failed after retry and substitution: {', '.join(failed)}", 2)
+    # E4-S3: second pass — corroborate flagged roles' high/critical findings across N samples.
+    # Guarded by n_samples > 1 so the default (N=1) is a strict no-op: no reads, no writes, no
+    # output — byte-identical to pre-E4-S3 control flow and artifacts. It runs only after every
+    # primary report is complete, so this informational resampling never starves primary coverage.
+    if n_samples > 1:
+        for role in plan["roles"]:
+            corroborate_role(run, meta, plan, role, context_text, base, key, cap, n_samples)
 
 
 def cmd_prepare(args):

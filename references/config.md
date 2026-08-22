@@ -171,6 +171,39 @@ default **`$20`**; set any of them to `0`, `none`, `off`, or `unlimited` to disa
 negative value is rejected loudly (it would otherwise silently remove the guard). A provider that
 omits `cost` is metered as `$0`.
 
+## Multi-sample corroboration of high/critical findings
+
+`AR_HIGH_SAMPLES=N` (integer, default **`1`**) makes `panel.py run` **corroborate** high/critical
+findings across `N` low-temperature samples before they gate, so single-sample reviewer variance
+does not flap verdicts. It is **informational only** — it enriches findings and never changes the
+gate.
+
+- **`N=1` (default) is a strict no-op**: exactly today's behavior, byte-identical artifacts. No
+  resampling happens and no `corroboration` field is written.
+- With `N>1`, after every primary reviewer completes, each role that raised a `high`/`critical`
+  finding (only those roles — a thin loop, not the whole panel) is re-run to `N` total samples.
+  Each extra sample is recorded under `panel/samples/<role>.<i>.json` (its raw response and cost
+  metadata alongside the primary, under `panel/raw/` and `panel/meta/`), so the agreement rate
+  reproduces from the recorded artifacts.
+- Each flagged finding gains a `corroboration` object: `{ "samples": N, "agreed": k, "rate": k/N }`.
+  `agreed` counts the samples whose own high/critical findings **match** this one; sample 1 is the
+  primary report itself, so it always counts. Two findings match when they cite the **same file**
+  (case-insensitive) **and** their titles are similar — a `difflib` ratio ≥ `0.6` over
+  whitespace/case-normalized titles. A sample that fails to produce a valid report simply does not
+  match, which honestly lowers the rate.
+- **The verdict is unchanged.** `aggregate.py` alone decides PASS/FAIL/BLOCKED from the recorded
+  artifacts; a low agreement rate is **not** a majority-vote override and never flips the gate. The
+  agreement rate is recorded for downstream variance measurement, not for gating.
+- **Cost-aware.** Resamples are billed calls that count against and honor the per-run cost cap
+  (see *Per-run cost cap*): each sample is gated *before* the call, and if the cap is already
+  reached the resampling stops, records a `cost_abort.json` with phase `corroboration`, and the run
+  exits BLOCKED — a resample never silently exceeds the ceiling. Because it runs only after every
+  primary report is complete, corroboration never starves primary coverage of the budget.
+
+Precedence is `AR_HIGH_SAMPLES` > policy `high_samples` > default **`1`**. A non-integer or `< 1`
+value is rejected loudly at env resolution and at policy load, so a typo can never silently change
+the sampling count.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -184,7 +217,8 @@ omits `cost` is metered as `$0`.
 | `AR_TEMPERATURE` | `0.1` | Reviewer sampling temperature |
 | `AR_MAX_TOKENS` | `8000` | Reviewer response cap (floored per model by `max_tokens_floor`) |
 | `AR_REASONING_EFFORT` | `high` | Reasoning budget for models whose profile marks `reasoning: mandatory` |
-| `AR_MAX_COST_USD` | `20` | Per-run USD ceiling (pre-call gate across panel/rebuttal/concurrence; BLOCKS the remaining calls once reached and may overshoot by the in-flight call). `0`/`none`/`off`/`unlimited` disables; non-finite/negative is rejected. Also settable via the policy key `max_cost_usd`. |
+| `AR_MAX_COST_USD` | `20` | Per-run USD ceiling (pre-call gate across panel/rebuttal/concurrence/corroboration; BLOCKS the remaining calls once reached and may overshoot by the in-flight call). `0`/`none`/`off`/`unlimited` disables; non-finite/negative is rejected. Also settable via the policy key `max_cost_usd`. |
+| `AR_HIGH_SAMPLES` | `1` | Number of low-temperature samples to corroborate each high/critical finding (see *Multi-sample corroboration*). `1` = today's behavior (no resampling). Informational-only: records an agreement rate, never changes the verdict. Resamples honor `AR_MAX_COST_USD`. Also settable via the policy key `high_samples`. |
 | `AR_TIMEOUT_S` | `240` | Per-request timeout |
 | `AR_RUN_DIR` | `.adversarial-review` | Artifact root |
 | `AR_RISK` | — | Default risk tier for `init` (below `--risk`, above policy) |

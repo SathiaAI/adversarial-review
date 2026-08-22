@@ -10,6 +10,17 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
 ## [Unreleased]
 
 ### Added
+- Multi-sample corroboration of high/critical findings (E4-S3): the opt-in `AR_HIGH_SAMPLES=N`
+  (integer, default `1`; also the policy key `high_samples`) makes `panel.py run` re-run any role
+  that raised a `high`/`critical` finding to `N` low-temperature samples and record a
+  `corroboration: {samples, agreed, rate}` object on that finding — the share of samples whose own
+  high/critical findings match it (same file + similar title via a `difflib` ratio). Only flagged
+  roles are resampled, each sample is recorded under `panel/samples/` (with cost metered under
+  `panel/meta/`, honoring the per-run cost cap — a resample that would cross the cap records a
+  `corroboration`-phase `cost_abort.json` and BLOCKS rather than overspend), and `N=1` is a strict
+  no-op (byte-identical to prior behavior). The agreement rate is **informational only**:
+  `aggregate.py` alone still decides the verdict, so disagreement never overrides the gate. See
+  `references/config.md`.
 - Release hygiene: this changelog and a "cutting a release" ritual in `CONTRIBUTING.md`.
 - Documentation drift guards: `tests/run_tests.py` now asserts the gate matrix in
   `references/gates.md` stays consistent with `MINIMUM_GATES` in `scripts/gate.py`, and that
