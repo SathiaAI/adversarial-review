@@ -56,6 +56,21 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   **restores the `t_eval_score_*` scorer tests** (100% branch coverage) that the E1-S2 (#44) merge
   dropped from `tests/run_tests.py` — `evals/score.py` had shipped to `main` untested — so the scorer
   the harness relies on is verified again.
+- Reviewer meta-evaluation live calibration (E1-S4): `evals/run.py --mode live` runs the corpus
+  through **real** model panels (`--reps N` per case) over the configured transport, scoring each
+  panel's ingested findings with `evals/score.py`. Unlike offline mode it serves no scripts and starts
+  no mock router — reviewers answer for real — so it measures model + panel quality, not just harness
+  assembly. It emits a dated `evals/report/live-<ts>.json` + `summary.md` with detection rate per
+  category, tier, reviewer role, and **model**, the false-positive rate on clean cases, cost per case,
+  and per-rep detail so single-run noise stays visible; each case runs at its own tier (a SENSITIVE
+  case gets the six-role panel). A cumulative USD budget (`--budget-usd`, default **$20**) caps the
+  whole run: checked before each panel, and when reached the remaining `(case, rep)` units are recorded
+  in `not_run` and the run stops — never a silent partial, overshoot bounded by the one in-flight
+  panel; each individual panel still honours its own `AR_MAX_COST_USD` cap (E4-S2). Opt-in and never in
+  CI: it needs a provider (a key, key file, or `AR_BASE_URL` proxy) and exits rather than spend a run
+  on no-op panels without one. Live results are non-deterministic by nature (the per-rep raw detail
+  keeps the aggregate auditable); the harness code itself is exercised offline against the mock router
+  with no network and no keys. Regression thresholds seeded from the first live report are E1-S5.
 - Distribution: a `release` workflow publishes to PyPI on a `v*` tag via **Trusted Publishing**
   (OIDC, no stored token); an `action-selftest` workflow exercises the composite action keyless
   and asserts the honest BLOCKED verdict; a GitLab CI template (`examples/.gitlab-ci.yml`); and a

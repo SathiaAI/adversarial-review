@@ -39,6 +39,7 @@ for _p in (ROOT / "tests", ROOT / "scripts", HERE):  # mock_router, panel, score
 import mock_router  # noqa: E402  (path set above)
 import score  # noqa: E402
 from corpus_schema import default_corpus_dir, validate_case  # noqa: E402
+from _common import meta_cost  # noqa: E402
 
 REPORT_SCHEMA_ID = "adversarial-review/eval-report/1"
 
@@ -87,14 +88,15 @@ def _panel_env(base_url):
     return env
 
 
-def _run_panel(case_dir, tier, base_url):
+def _run_panel(case_dir, tier, base_url, env=None):
     """init/assign/run in a throwaway repo; return (repo, run_dir). Findings land under the run dir.
     The caller owns `repo` on success and removes it; if anything here raises, the repo is removed
     before re-raising so a failed case never leaks an ``ar-eval-*`` directory (Codex, PR #45)."""
     repo = Path(tempfile.mkdtemp(prefix="ar-eval-"))
     try:
         shutil.copyfile(case_dir / "context.md", repo / "context.md")
-        env = _panel_env(base_url)
+        if env is None:  # offline default; live mode passes the real ambient env
+            env = _panel_env(base_url)
         panel = str(ROOT / "scripts" / "panel.py")
 
         def run(args):
@@ -247,6 +249,168 @@ def run_offline(corpus_dir, only=None, line_tol=score.DEFAULT_LINE_TOL, quiet=Fa
             "cases": case_reports, "skipped": sorted(skipped), "aggregate": agg}
 
 
+def _panel_env_live():
+    """Env for a LIVE panel: the ambient environment is passed through unchanged, so reviewers reach
+    the configured provider with the operator's real credentials and transport (`AR_BASE_URL`,
+    `OPENROUTER_API_KEY`, a key file, or a proxy — whatever config.md resolves). Nothing is stripped,
+    unlike the offline env: live mode is meant to spend, bounded by the harness budget guard below."""
+    return dict(os.environ)
+
+
+def _live_credentialed(env=None):
+    """True when the environment can actually reach a provider — a key (OpenRouter / OpenAI / key file /
+    generic `AR_API_KEY`) or an explicit `AR_BASE_URL` (proxy). Guards `--mode live` from spending a
+    run on no-op panels when nothing is configured."""
+    e = env if env is not None else os.environ
+    return any(e.get(k) for k in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "AR_KEY_FILE",
+                                  "AR_API_KEY", "AR_BASE_URL"))
+
+
+def _case_costs_and_models(run_dir):
+    """Per-reviewer model + recorded USD cost from the run dir. Cost is read from the same per-reviewer
+    meta the panel's own cost cap sums, via `meta_cost` (a missing / non-finite / negative cost counts
+    as 0). Returns `{role: {"model": slug|None, "cost": float}}`."""
+    info = {}
+    plan = json.loads((run_dir / "panel" / "plan.json").read_text(encoding="utf-8"))
+    roles = plan.get("roles", {})
+    for role in sorted(roles):
+        entry = roles[role] if isinstance(roles[role], dict) else {}
+        model, cost = entry.get("model"), 0.0
+        mp = run_dir / "panel" / "meta" / ("%s.json" % role)
+        if mp.exists():
+            m = json.loads(mp.read_text(encoding="utf-8"))
+            model = m.get("model", model)
+            cost = meta_cost(m)
+        info[role] = {"model": model, "cost": cost}
+    return info
+
+
+def _roll_models(units):
+    """Per-model attribution + cost, aggregated across every scored (case, rep) unit. A model is
+    credited via the role->model map the run recorded. Per-model FN/FP are not attributed, for the same
+    reason as per-role: which model *should* have caught a defect is not encoded. Every reviewer's cost
+    is summed (even a silent one), so the per-model cost column always reconciles to the run total."""
+    out = {}
+
+    def acc(model):
+        return out.setdefault(model, {"emitted": 0, "tp": 0, "partial": 0,
+                                      "unmatched": 0, "cost_usd": 0.0})
+
+    for u in units:
+        for role, r in u["roles"].items():
+            a = acc(u["models"].get(role) or "?")
+            for k in ("emitted", "tp", "partial", "unmatched"):
+                a[k] += r[k]
+        for role, cost in u["_role_cost"].items():
+            acc(u["models"].get(role) or "?")["cost_usd"] += cost
+    return out
+
+
+def _case_rollup(case_id, meta, units):
+    """Collapse a case's per-rep units into one report row: per-rep detail (so single-run noise stays
+    visible) plus the case's summed cost and mean detection across reps."""
+    md = sum(u["must_detect_total"] for u in units)
+    tp = sum(u["tp"] for u in units)
+    return {
+        "case_id": case_id, "category": meta.get("category"), "tier": meta.get("tier"),
+        "reps": len(units),
+        "detection_rate": (tp / md) if md else None,
+        "tp": tp, "partial": sum(u["partial"] for u in units),
+        "fn": sum(u["fn"] for u in units), "fp": sum(u["fp"] for u in units),
+        "noise": sum(u["noise"] for u in units),
+        "cost_usd": round(sum(u["cost_usd"] for u in units), 6),
+        "per_rep": [{"rep": u["rep"], "tp": u["tp"], "partial": u["partial"], "fn": u["fn"],
+                     "fp": u["fp"], "noise": u["noise"], "cost_usd": round(u["cost_usd"], 6)}
+                    for u in units],
+    }
+
+
+def run_live(corpus_dir, only=None, reps=1, line_tol=score.DEFAULT_LINE_TOL,
+             budget_usd=None, quiet=False):
+    """Drive the corpus through REAL model panels (`reps` per case) over the configured transport, and
+    score each panel's ingested findings with `evals/score.py`. Unlike offline mode it serves no scripts
+    and starts no mock router — reviewers answer for real — so it measures model + panel quality, not
+    just harness assembly. A cumulative USD budget caps the whole run: before each panel, if spend has
+    already reached `budget_usd`, the remaining (case, rep) units are recorded in `not_run` and the run
+    stops rather than overspending or silently truncating. Non-deterministic by nature (real models);
+    the report keeps enough per-rep raw detail to be audited."""
+    corpus_dir = Path(corpus_dir)
+    names = sorted(d.name for d in corpus_dir.iterdir()
+                   if d.is_dir() and not d.name.startswith("."))
+    if only:
+        want = set(only)
+        missing = want - set(names)
+        if missing:
+            raise SystemExit("unknown case(s): %s" % ", ".join(sorted(missing)))
+        names = [n for n in names if n in want]
+    if not names:
+        raise SystemExit("no cases to run in %s" % corpus_dir)
+    if reps < 1:
+        raise SystemExit("reps must be >= 1")
+
+    env = _panel_env_live()
+    units, score_pairs, cases_out, not_run = [], [], [], []
+    spent, stopped = 0.0, False
+    for name in names:
+        cdir = corpus_dir / name
+        problems = validate_case(str(cdir))
+        if problems:  # a malformed case is broken, never silently skipped
+            raise SystemExit("case %s is invalid:\n  - %s" % (name, "\n  - ".join(problems)))
+        meta = json.loads((cdir / "meta.json").read_text(encoding="utf-8"))
+        expected = json.loads((cdir / "expected.json").read_text(encoding="utf-8"))
+        tier = meta.get("tier", "NORMAL")
+        case_units = []
+        for k in range(1, reps + 1):
+            if budget_usd is not None and spent >= budget_usd:
+                not_run.append({"case": name, "rep": k})
+                stopped = True
+                continue
+            repo, run_dir = _run_panel(cdir, tier, None, env=env)
+            try:
+                per_role = _collect_findings(run_dir)
+                role_info = _case_costs_and_models(run_dir)
+            finally:
+                shutil.rmtree(repo, ignore_errors=True)
+            report, pair = _score_one(name, meta, expected, per_role, line_tol)
+            rep_cost = sum(ci["cost"] for ci in role_info.values())
+            spent += rep_cost
+            unit = {
+                "case_id": name, "category": meta.get("category"), "tier": tier, "rep": k,
+                "tp": report["tp"], "partial": report["partial"], "fn": report["fn"],
+                "fp": report["fp"], "noise": report["noise"],
+                "must_detect_total": report["must_detect_total"], "cost_usd": rep_cost,
+                "roles": report["roles"],
+                "models": {r: role_info[r]["model"] for r in role_info},
+                "_role_cost": {r: role_info[r]["cost"] for r in role_info},
+            }
+            units.append(unit)
+            score_pairs.append(pair)
+            case_units.append(unit)
+            if not quiet:
+                print("  %-28s rep %d/%d tp=%d partial=%d fn=%d fp=%d cost=$%.4f"
+                      % (name, k, reps, unit["tp"], unit["partial"], unit["fn"],
+                         unit["fp"], rep_cost), file=sys.stderr)
+        if case_units:
+            cases_out.append(_case_rollup(name, meta, case_units))
+
+    if score_pairs:
+        agg = score.aggregate(score_pairs)
+    else:  # budget too small to run even one panel; still emit an honest, empty rollup
+        agg = {"overall": {"cases": 0, "must_detect_total": 0, "detection_rate": None,
+                           "tp": 0, "partial": 0, "fn": 0, "fp": 0, "noise": 0},
+               "by_category": {}, "by_tier": {}}
+    agg["by_role"] = _roll_roles(units)
+    agg["by_model"] = _roll_models(units)
+    clean = [u for u in units if u["category"] == "clean"]
+    return {
+        "corpus": corpus_dir.name, "line_tol": line_tol, "reps": reps,
+        "budget_usd": budget_usd, "spent_usd": round(spent, 6),
+        "complete": not stopped, "not_run": not_run,
+        "clean_fp": sum(u["fp"] for u in clean), "clean_units": len(clean),
+        "cases": cases_out, "aggregate": agg,
+    }
+
+
 def _md_cell(value):
     """Escape a repository-controlled identifier (a case id, category, tier, role, corpus path, or
     skipped id) before it goes into Markdown: a stray ``|``, backtick, or newline in an external
@@ -318,10 +482,91 @@ def _summary_md(result, generated_at):
     return "\n".join(lines)
 
 
+def _live_summary_md(result, generated_at):
+    """Human-readable live calibration rollup. Numbers come straight from `result` (this file is a view,
+    never a second source of truth). Corpus-controlled ids go through `_md_cell` (Codex + CodeRabbit,
+    PR #45)."""
+    ov = result["aggregate"]["overall"]
+    lines = ["# Reviewer meta-eval \u2014 live calibration report", ""]
+    lines.append("Generated: %s \u00b7 corpus: %s \u00b7 reps/case: %d \u00b7 line tolerance: \u00b1%d"
+                 % (generated_at, _md_cell(result["corpus"]), result["reps"], result["line_tol"]))
+    lines.append("")
+    lines.append("Live mode runs **real** model panels, so these numbers reflect model + panel quality, "
+                 "not just harness assembly. Each case ran %d rep(s); per-rep detail is in the JSON so "
+                 "single-run noise stays visible." % result["reps"])
+    lines.append("")
+    cap = "none" if result["budget_usd"] is None else "$%.2f" % result["budget_usd"]
+    tail = "" if result["complete"] else " \u00b7 **stopped early (budget reached)**"
+    lines.append("Budget: %s \u00b7 spent: **$%.4f**%s" % (cap, result["spent_usd"], tail))
+    if result["not_run"]:
+        skipped = ", ".join("%s#%d" % (_md_cell(u["case"]), u["rep"]) for u in result["not_run"])
+        lines.append("")
+        lines.append("- Not run (budget): %s" % skipped)
+    lines.append("")
+    dr = "n/a" if ov["detection_rate"] is None else "%.0f%%" % (ov["detection_rate"] * 100)
+    lines.append("## Overall")
+    lines.append("")
+    lines.append("- Scored panels (case\u00d7rep): **%d** \u00b7 must-detect (summed over reps): **%d**"
+                 % (ov["cases"], ov["must_detect_total"]))
+    lines.append("- Detection rate: **%s** \u2014 %d TP, %d partial, %d FN"
+                 % (dr, ov["tp"], ov["partial"], ov["fn"]))
+    lines.append("- False positives: **%d** \u00b7 clean-case FPs: %d over %d clean panel(s)"
+                 % (ov["fp"], result["clean_fp"], result["clean_units"]))
+    lines.append("")
+
+    def dtable(title, by):
+        rows = ["## %s" % title, "",
+                "| %s | panels | TP | partial | FN | FP | detection |" % title.split()[-1].lower(),
+                "|---|---:|---:|---:|---:|---:|---:|"]
+        for key in sorted(by):
+            a = by[key]
+            d = "n/a" if a["detection_rate"] is None else "%.0f%%" % (a["detection_rate"] * 100)
+            rows.append("| %s | %d | %d | %d | %d | %d | %s |"
+                        % (_md_cell(key), a["cases"], a["tp"], a["partial"], a["fn"], a["fp"], d))
+        rows.append("")
+        return rows
+
+    lines += dtable("By category", result["aggregate"]["by_category"])
+    lines += dtable("By tier", result["aggregate"]["by_tier"])
+
+    lines += ["## By reviewer role", "",
+              "| role | emitted | TP | partial | unmatched |", "|---|---:|---:|---:|---:|"]
+    for role in sorted(result["aggregate"]["by_role"]):
+        r = result["aggregate"]["by_role"][role]
+        lines.append("| %s | %d | %d | %d | %d |"
+                     % (_md_cell(role), r["emitted"], r["tp"], r["partial"], r["unmatched"]))
+    lines.append("")
+
+    lines += ["## By model", "",
+              "| model | emitted | TP | partial | unmatched | cost |",
+              "|---|---:|---:|---:|---:|---:|"]
+    for model in sorted(result["aggregate"]["by_model"]):
+        m = result["aggregate"]["by_model"][model]
+        lines.append("| %s | %d | %d | %d | %d | $%.4f |"
+                     % (_md_cell(model), m["emitted"], m["tp"], m["partial"], m["unmatched"],
+                        m["cost_usd"]))
+    lines.append("")
+
+    lines += ["## Per case", "",
+              "| case | category | tier | reps | detection | cost |", "|---|---|---|---:|---:|---:|"]
+    for c in result["cases"]:
+        d = "n/a" if c["detection_rate"] is None else "%.0f%%" % (c["detection_rate"] * 100)
+        lines.append("| %s | %s | %s | %d | %s | $%.4f |"
+                     % (_md_cell(c["case_id"]), _md_cell(c["category"]), _md_cell(c["tier"]),
+                        c["reps"], d, c["cost_usd"]))
+    lines.append("")
+    return "\n".join(lines)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Reviewer meta-evaluation harness (offline mode).")
-    ap.add_argument("--mode", choices=["offline"], default="offline",
-                    help="offline drives scripted reviewers via the mock router (live is E1-S4).")
+    ap.add_argument("--mode", choices=["offline", "live"], default="offline",
+                    help="offline serves scripted reviewers via the mock router (deterministic, free); "
+                         "live runs real model panels for calibration (opt-in, spends money).")
+    ap.add_argument("--reps", type=int, default=1,
+                    help="live mode: panels per case, to quantify reviewer variance (default 1)")
+    ap.add_argument("--budget-usd", type=float, default=20.0,
+                    help="live mode: hard USD ceiling for the whole run; 0 disables (default 20)")
     ap.add_argument("--corpus", default=default_corpus_dir(), help="corpus directory")
     ap.add_argument("--out", default=str(HERE / "report"), help="where to write the report + summary")
     ap.add_argument("--only", nargs="+", metavar="CASE", help="run only these case ids")
@@ -337,28 +582,40 @@ def main(argv=None):
         # and silently reports real detections as false negatives. Reject it up front.
         ap.error("--line-tol must be >= 0 (a negative tolerance makes every location match fail)")
 
-    result = run_offline(args.corpus, only=args.only, line_tol=args.line_tol, quiet=args.quiet)
+    if args.reps < 1:
+        ap.error("--reps must be >= 1")
+    if args.mode == "live":
+        if not _live_credentialed():
+            ap.error("--mode live needs a provider: set OPENROUTER_API_KEY (or AR_API_KEY / "
+                     "AR_KEY_FILE), or AR_BASE_URL for a proxy. Offline mode needs neither.")
+        budget = args.budget_usd if args.budget_usd and args.budget_usd > 0 else None
+        result = run_live(args.corpus, only=args.only, reps=args.reps, line_tol=args.line_tol,
+                          budget_usd=budget, quiet=args.quiet)
+        summarize = _live_summary_md
+    else:
+        result = run_offline(args.corpus, only=args.only, line_tol=args.line_tol, quiet=args.quiet)
+        summarize = _summary_md
     canonical = json.dumps(result, sort_keys=True, separators=(",", ":"))
 
     if not args.no_write:
         now = datetime.now(timezone.utc)
         generated_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         # Filename carries the pid so two harness processes sharing one --out dir in the same second
-        # don't overwrite each other's report (Codex, PR #45); it is outside the scored payload, so
-        # determinism of `result` is unaffected.
+        # don't overwrite each other's report (Codex, PR #45); it is outside the scored payload.
         stamp = "%s-%d" % (now.strftime("%Y%m%d-%H%M%S"), os.getpid())
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
-        report = {"schema": REPORT_SCHEMA_ID, "mode": "offline", "generated_at": generated_at,
+        report = {"schema": REPORT_SCHEMA_ID, "mode": args.mode, "generated_at": generated_at,
                   "python": "%d.%d" % sys.version_info[:2], "result": result}
-        (out / ("offline-%s.json" % stamp)).write_text(
+        base = "%s-%s" % (args.mode, stamp)
+        (out / (base + ".json")).write_text(
             json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        (out / ("offline-%s.summary.md" % stamp)).write_text(
-            _summary_md(result, generated_at), encoding="utf-8")
+        (out / (base + ".summary.md")).write_text(
+            summarize(result, generated_at), encoding="utf-8")
         if not args.quiet:  # diagnostics on stderr so --print-result keeps stdout pure JSON
             ov = result["aggregate"]["overall"]
-            print("report: %s" % (out / ("offline-%s.json" % stamp)), file=sys.stderr)
-            print("detection=%s fp=%d over %d case(s)"
+            print("report: %s" % (out / (base + ".json")), file=sys.stderr)
+            print("detection=%s fp=%d over %d panel(s)"
                   % ("n/a" if ov["detection_rate"] is None else "%.0f%%" % (ov["detection_rate"] * 100),
                      ov["fp"], ov["cases"]), file=sys.stderr)
 

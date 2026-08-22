@@ -8,7 +8,8 @@ The **case format** and its validator are E1-S1 (`evals/corpus_schema.py`); the 
 consumes these labels — true-positive / false-negative / false-positive — is E1-S2
 (`evals/score.py`, documented below). The offline harness that drives the corpus through the panel
 and rolls the scores up per case, category, tier, and reviewer role is E1-S3 (`evals/run.py`,
-documented below).
+documented below). That same runner's **live** mode (E1-S4) runs the corpus against real models
+for a calibration report (opt-in, spends money) — also documented below.
 
 ## Layout
 
@@ -124,7 +125,37 @@ Offline mode drives the **real** panel pipeline (`panel.py assign` → `run` →
 in-process mock router with the scripted reviewers, then scores with `score.py` (E1-S2). No network,
 no API keys, and deterministic: the same corpus + scripts produce a byte-identical scored `result`
 (the timestamp is stamped only outside it). CI runs a fast 2–3 case subset on every push and the
-full corpus as a separate `evals` job. Live-model calibration is E1-S4.
+full corpus as a separate `evals` job. Live-model calibration is `--mode live` (next section).
+
+## Running the live calibration (`--mode live`)
+
+Live mode runs the corpus against **real models** to measure the panel's actual efficacy — the
+evidence offline mode can't give, since offline serves scripted findings. It is **opt-in and never
+in CI**: it needs a provider and it spends money.
+
+```bash
+export OPENROUTER_API_KEY=sk-...                    # or a key file / an AR_BASE_URL proxy
+python evals/run.py --mode live                     # whole corpus, 1 rep/case
+python evals/run.py --mode live --reps 3            # 3 panels/case to expose reviewer variance
+python evals/run.py --mode live --budget-usd 5 --only sec-idor-invoice
+```
+
+- **Provider required.** Live mode uses the transport `references/config.md` resolves
+  (`OPENROUTER_API_KEY`, a key file, or an `AR_BASE_URL` proxy). With none configured it exits
+  rather than spend a run on no-op panels.
+- **Budget.** `--budget-usd` (default **$20**) is a cumulative ceiling for the whole run, checked
+  before each panel; when it is reached the remaining `(case, rep)` units are recorded in `not_run`
+  and the run stops — never a silent partial, and overspend is bounded by the one in-flight panel.
+  (This is the harness-level cap; each individual panel still honours its own `AR_MAX_COST_USD`
+  ceiling from E4-S2.) Cadence is monthly; the report records the actual spend.
+- **Report.** Writes a dated `evals/report/live-<ts>.json` + `.summary.md` with detection rate per
+  category, tier, reviewer role, and **model**, the FP rate on clean cases, cost per case, and
+  per-rep detail so single-run noise stays visible. Each case runs at **its own tier** (a SENSITIVE
+  case gets the six-role panel), so per-tier numbers reflect real panels.
+- **Not deterministic.** Real models vary run to run, so — unlike offline mode — the live scored
+  payload is not byte-identical across runs (that is what `--reps` quantifies). The per-rep raw
+  detail is kept so the aggregate stays auditable. The corpus is synthetic and carries no secrets,
+  so reports are committable under `evals/report/` as the project's standing evidence base.
 
 ## Scoring (`score.py`)
 
