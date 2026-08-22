@@ -389,14 +389,14 @@ def run_live(corpus_dir, only=None, reps=1, line_tol=score.DEFAULT_LINE_TOL,
                 continue
             try:
                 repo, run_dir = _run_panel(cdir, tier, None, env=env, keep_on_error=True)
-            except BaseException as exc:
-                # A live panel can fail after billing earlier reviewers; keep_on_error preserves that
-                # paid throwaway repo for audit, and we stop with a report rather than aborting the whole
-                # run with a traceback (Codex, PR #46).
+            except Exception as exc:  # Exception, not BaseException: a KeyboardInterrupt/SystemExit
+                # must propagate, not be turned into a partial report (CodeRabbit, PR #46). A live panel
+                # can fail after billing earlier reviewers; keep_on_error preserves that paid throwaway
+                # repo for audit, and we stop with a report rather than aborting with a traceback.
                 stopped = True
                 stop_reason = "live panel failed at %s rep %d: %s" % (name, k, str(exc)[:160])
                 not_run.append({"case": name, "rep": k, "error": str(exc)[:200]})
-                break
+                continue  # not break: let the remaining reps of this (possibly last) case record in not_run
             try:
                 per_role = _collect_findings(run_dir)
                 role_info = _case_costs_and_models(run_dir)

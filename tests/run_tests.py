@@ -4174,7 +4174,8 @@ def t_eval_live_harness_fails_closed_without_cost_telemetry():
 def t_eval_live_harness_ignores_inherited_run_dir():
     # E1-S4 (PR #46, CodeRabbit/Codex): a live run must not break when the operator has AR_RUN_DIR set.
     # _panel_env_live drops it so each child panel writes its run dir inside its own throwaway repo.
-    env = dict(ENV); env["AR_RUN_DIR"] = "/tmp/ar-inherited-run-dir-should-be-ignored"
+    env = dict(ENV)
+    env["AR_RUN_DIR"] = "/tmp/ar-inherited-run-dir-should-be-ignored"
     result, _ = _run_eval_live(["sec-idor-invoice"], extra=["--reps", "1", "--budget-usd", "20"],
                                reviewer_cost=0.05, env=env)
     assert result["cases"][0]["reps"] == 1, result       # panel ran and produced a run dir
@@ -4186,12 +4187,14 @@ def t_eval_live_harness_preflights_before_paid_calls():
     # panel runs — no wasted spend. Proven by the mock router receiving zero chat calls.
     base = Path(tempfile.mkdtemp(prefix="ar-livepre-"))
     try:
-        good = base / "aaa-good"; good.mkdir()
+        good = base / "aaa-good"
+        good.mkdir()
         (good / "meta.json").write_text(json.dumps({"id": "aaa-good", "title": "x", "tier": "NORMAL",
             "category": "clean", "language": "python", "source": "seeded"}))
         (good / "context.md").write_text("diff\n+x\n")
         (good / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1}))
-        bad = base / "zzz-bad"; bad.mkdir()
+        bad = base / "zzz-bad"
+        bad.mkdir()
         (bad / "meta.json").write_text(json.dumps({"id": "WRONGID", "title": "x", "tier": "NORMAL",
             "category": "clean", "language": "python", "source": "seeded"}))
         (bad / "context.md").write_text("x")
@@ -4229,6 +4232,27 @@ def t_eval_live_summary_is_stop_neutral():
     assert "later cases ran fewer" not in md, md
     assert "Not run (budget)" not in md and "Not run (early stop)" in md, md
     assert "cost telemetry" in md, md
+
+
+def t_eval_live_harness_records_units_after_panel_failure():
+    # E1-S4 (PR #46, CodeRabbit): when a live panel fails on the last/only case, its remaining reps must
+    # still be recorded in not_run (continue, not break), and the run must stop with a report rather than
+    # a traceback. Every reviewer 500s so the panel dies after retry + substitution.
+    mock_router.reset()
+    mock_router.STATE["fail_models"] = {m["id"] for m in mock_router.CATALOG["data"]}
+    try:
+        r = subprocess.run([sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "live",
+                            "--only", "sec-idor-invoice", "--reps", "2", "--budget-usd", "20",
+                            "--no-write", "--print-result", "--quiet"],
+                           env=ENV, capture_output=True, text=True)
+    finally:
+        mock_router.reset()
+    assert r.returncode == 0, r.stderr[-400:]      # a panel failure yields a report, not a crash
+    result = json.loads(r.stdout.strip().splitlines()[-1])
+    assert result["complete"] is False, result
+    assert [u["rep"] for u in result["not_run"]] == [1, 2], result["not_run"]   # BOTH reps recorded
+    assert "live panel failed" in (result.get("stop_reason") or ""), result.get("stop_reason")
+    assert result["cases"] == [], result["cases"]
 
 
 def main():
