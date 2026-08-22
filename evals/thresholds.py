@@ -35,6 +35,16 @@ def _result(obj):
     return obj["result"] if isinstance(obj, dict) and "result" in obj and "aggregate" not in obj else obj
 
 
+def _finite_rate(x):
+    """True if x is a real (non-bool) number and a finite fraction in [0, 1]."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and 0 <= x <= 1
+
+
+def _count(x):
+    """A real (non-bool), finite number for TP contribution; anything else -> 0 (no signal)."""
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else 0
+
+
 def check_offline(result, thresholds):
     """Return a list of human-readable breach strings (empty list = pass). Pure."""
     result = _result(result)
@@ -83,7 +93,12 @@ def compare_live(baseline, current, max_drop):
             return
         if cv is None:
             out.append("%s detection_rate is absent from the current report" % label)
-        elif (bv - cv) > max_drop:
+            return
+        if not _finite_rate(bv) or not _finite_rate(cv):
+            out.append("%s detection_rate is invalid (baseline=%r, current=%r); expected a finite fraction in [0, 1]"
+                       % (label, bv, cv))
+            return
+        if (bv - cv) > max_drop:
             out.append("%s detection dropped %.0f%% -> %.0f%% (max allowed drop %.0f%%)"
                        % (label, bv * 100, cv * 100, max_drop * 100))
 
@@ -101,7 +116,7 @@ def compare_live(baseline, current, max_drop):
     bm = (b.get("aggregate", {}) or {}).get("by_model", {}) or {}
     cm = (c.get("aggregate", {}) or {}).get("by_model", {}) or {}
     for m in sorted(bm):
-        btp, ctp = bm[m].get("tp") or 0, cm.get(m, {}).get("tp") or 0
+        btp, ctp = _count(bm[m].get("tp")), _count(cm.get(m, {}).get("tp"))
         if btp > 0 and ctp < btp:
             out.append("model %s true positives fell %d -> %d (candidate for pin removal / substitution)"
                        % (m, btp, ctp))

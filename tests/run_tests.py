@@ -4350,6 +4350,17 @@ def t_eval_thresholds_compare_live():
     cinc = {"complete": False, "stop_reason": "budget reached",
             "aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
     assert any("incomplete" in r for r in th.compare_live(babs, cinc, 0.2)), th.compare_live(babs, cinc, 0.2)
+    # E1-S5 bot round 2 (CodeRabbit Major): a non-numeric / NaN detection_rate is reported, never a
+    # crash and never a silent clean pass.
+    bstr = {"aggregate": {"overall": {"detection_rate": "0.9"}, "by_category": {}, "by_model": {}}}
+    cstr = {"aggregate": {"overall": {"detection_rate": "0.1"}, "by_category": {}, "by_model": {}}}
+    assert any("invalid" in r for r in th.compare_live(bstr, cstr, 0.2)), th.compare_live(bstr, cstr, 0.2)
+    cnan = {"aggregate": {"overall": {"detection_rate": float("nan")}, "by_category": {}, "by_model": {}}}
+    bok = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
+    assert any("invalid" in r for r in th.compare_live(bok, cnan, 0.2)), "NaN current rate must not silently pass"
+    # a non-numeric tp is coerced to no-signal, never a TypeError.
+    btpstr = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {"m": {"tp": "5"}}}}
+    assert th.compare_live(btpstr, btpstr, 0.2) == [], "string tp must not crash"
 
 
 def t_eval_thresholds_cli():
