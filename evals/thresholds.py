@@ -17,6 +17,7 @@ Two guards, both stdlib-only and 3.9-safe:
 """
 import argparse
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -46,7 +47,7 @@ def check_offline(result, thresholds):
     if "min_detection_rate" in o and (dr is None or dr < o["min_detection_rate"]):
         breaches.append("overall detection_rate %s < floor %s" % (dr, o["min_detection_rate"]))
     ofp = ov.get("fp")
-    if "max_fp" in o and (ofp is None or ofp > o["max_fp"]):
+    if "max_fp" in o and (not isinstance(ofp, (int, float)) or ofp > o["max_fp"]):
         breaches.append("overall fp %s > ceiling %d" % (ofp, o["max_fp"]))
     for cat, cthr in (off.get("by_category") or {}).items():
         c = (agg.get("by_category") or {}).get(cat)
@@ -58,7 +59,7 @@ def check_offline(result, thresholds):
             breaches.append("category %s detection_rate %s < floor %s"
                             % (cat, cdr, cthr["min_detection_rate"]))
         cfp = c.get("fp")
-        if "max_fp" in cthr and (cfp is None or cfp > cthr["max_fp"]):
+        if "max_fp" in cthr and (not isinstance(cfp, (int, float)) or cfp > cthr["max_fp"]):
             breaches.append("category %s fp %s > ceiling %d" % (cat, cfp, cthr["max_fp"]))
     return breaches
 
@@ -78,14 +79,24 @@ def compare_live(baseline, current, max_drop):
     out = []
 
     def drop(label, bv, cv):
-        if bv is not None and cv is not None and (bv - cv) > max_drop:
+        if bv is None:
+            return
+        if cv is None:
+            out.append("%s detection_rate is absent from the current report" % label)
+        elif (bv - cv) > max_drop:
             out.append("%s detection dropped %.0f%% -> %.0f%% (max allowed drop %.0f%%)"
                        % (label, bv * 100, cv * 100, max_drop * 100))
 
+    if c.get("complete") is False:
+        out.append("current report is incomplete (stopped early: %s) -- comparison may mask regressions"
+                   % (c.get("stop_reason") or "unknown"))
     drop("overall", det(b, "overall"), det(c, "overall"))
     bcat = (b.get("aggregate", {}) or {}).get("by_category", {}) or {}
     ccat = (c.get("aggregate", {}) or {}).get("by_category", {}) or {}
-    for cat in sorted(set(bcat) & set(ccat)):
+    for cat in sorted(bcat):
+        if cat not in ccat:
+            out.append("category %s present in baseline is absent from the current report" % cat)
+            continue
         drop("category %s" % cat, bcat[cat].get("detection_rate"), ccat[cat].get("detection_rate"))
     bm = (b.get("aggregate", {}) or {}).get("by_model", {}) or {}
     cm = (c.get("aggregate", {}) or {}).get("by_model", {}) or {}
@@ -134,9 +145,12 @@ def main(argv=None):
         print("offline thresholds OK", file=sys.stderr)
         return 0
 
+    md = args.max_drop if args.max_drop is not None else (thr.get("live") or {}).get("max_detection_drop", 0.2)
+    if not (isinstance(md, (int, float)) and math.isfinite(md) and 0 <= md <= 1):
+        print("invalid max drop %r: must be a finite fraction in [0, 1]" % (md,), file=sys.stderr)
+        return 2
     base = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
     cur = json.loads(Path(args.current).read_text(encoding="utf-8"))
-    md = args.max_drop if args.max_drop is not None else (thr.get("live") or {}).get("max_detection_drop", 0.2)
     regs = compare_live(base, cur, md)
     if regs:
         print("LIVE MODEL DEGRADATION vs baseline:", file=sys.stderr)

@@ -185,7 +185,7 @@ the same PR (the floors are the recorded contract).
 the new report against the last committed one:
 
 ```bash
-python evals/thresholds.py compare --baseline evals/report/<old>-live.json --current evals/report/<new>-live.json
+python evals/thresholds.py compare --baseline evals/report/live-<old>.json --current evals/report/live-<new>.json
 ```
 
 It flags any overall or per-category detection-rate drop greater than `live.max_detection_drop`

@@ -4286,6 +4286,9 @@ def t_eval_thresholds_offline_gate():
     thr_ofp = {"offline": {"overall": {"max_fp": 1}, "by_category": {}}}
     nullfp = {"aggregate": {"overall": {"detection_rate": 0.5, "fp": None}, "by_category": {}}}
     assert any("fp" in b for b in th.check_offline(nullfp, thr_ofp)), th.check_offline(nullfp, thr_ofp)
+    # E1-S5 bot round (Codex): a present-but-non-numeric fp also fail-closes (isinstance guard).
+    strfp = {"aggregate": {"overall": {"detection_rate": 0.5, "fp": "x"}, "by_category": {}}}
+    assert any("fp" in b for b in th.check_offline(strfp, thr_ofp)), th.check_offline(strfp, thr_ofp)
     # E1-S5 (test_quality-5): per-category max_fp ceiling is enforced.
     thr_cfp = {"offline": {"overall": {}, "by_category": {"security": {"max_fp": 0}}}}
     catfp = {"aggregate": {"overall": {}, "by_category": {"security": {"detection_rate": 1.0, "fp": 3}}}}
@@ -4337,6 +4340,16 @@ def t_eval_thresholds_compare_live():
     # E1-S5 (test_quality-2): a bare result and the {result: ...} wrapper unwrap to identical output.
     assert th.compare_live(base, cur, 0.2) == th.compare_live({"result": base}, {"result": cur}, 0.2), \
         "wrapped and bare reports must compare identically"
+    # E1-S5 bot round (CodeRabbit Major / Codex): a baseline category absent from current is flagged.
+    babs = {"aggregate": {"overall": {"detection_rate": 1.0},
+                          "by_category": {"security": {"detection_rate": 1.0}}, "by_model": {}}}
+    cabs = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
+    assert any("security" in r and "absent" in r for r in th.compare_live(babs, cabs, 0.2)), \
+        th.compare_live(babs, cabs, 0.2)
+    # an incomplete current report (stopped early) is itself flagged, never a silent "no regression".
+    cinc = {"complete": False, "stop_reason": "budget reached",
+            "aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
+    assert any("incomplete" in r for r in th.compare_live(babs, cinc, 0.2)), th.compare_live(babs, cinc, 0.2)
 
 
 def t_eval_thresholds_cli():
@@ -4369,6 +4382,10 @@ def t_eval_thresholds_cli():
         r4 = subprocess.run([sys.executable, thr_py, "compare", "--baseline", str(d / "base.json"),
                              "--current", str(d / "base.json")], env=ENV, capture_output=True, text=True)
         assert r4.returncode == 0, (r4.returncode, r4.stderr[-200:])
+        r5 = subprocess.run([sys.executable, thr_py, "compare", "--baseline", str(d / "base.json"),
+                             "--current", str(d / "cur.json"), "--max-drop", "nan"],
+                            env=ENV, capture_output=True, text=True)
+        assert r5.returncode == 2 and "finite fraction" in r5.stderr, (r5.returncode, r5.stderr[-200:])
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
