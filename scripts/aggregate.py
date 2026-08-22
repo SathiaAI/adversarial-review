@@ -5,7 +5,10 @@ Computes PASS / FAIL / BLOCKED purely from recorded artifacts and writes verdict
 No model — including the one operating this pipeline — can emit a verdict; only this
 script can, which is the point.
 
-Exit codes: 0 PASS, 1 FAIL, 2 BLOCKED.
+Exit codes: 0 PASS, 1 FAIL, 2 BLOCKED. The optional detached-signature path
+(`--sign` / `--verify-signature`, E6-S1) reuses 0/1/2 for verify results and adds 3 for
+a signer/verifier that is unavailable or fails to start — signing never changes the
+verdict, only whether a separate signature sidecar is produced or checked.
 
   PASS    all tier-required gates recorded & passing; panel complete & independent;
           every high/critical finding validated with a compliant record.
@@ -19,7 +22,12 @@ import argparse
 import hashlib
 import html
 import json
+import os
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 from datetime import date
 from pathlib import Path
 
@@ -219,6 +227,179 @@ def check_digest(run):
     print(f"attestation MISMATCH: stored {stored.get('digest')}, "
           f"recomputed {att['digest']} — this run's artifacts changed after the "
           "verdict was computed")
+    sys.exit(1)
+
+
+# --- Detached signature over the attestation digest (E6-S1) -------------------------
+# The signature is a SIDECAR over the run's EXISTING attestation digest. It NEVER recomputes the
+# digest, changes the algorithm, or alters the attested file set (compute_attestation is untouched),
+# and it is deliberately NOT a `.json` file, so compute_attestation() — which globs `*.json` — never
+# folds it back into the digest: the signature is not itself attested (a signature that fed the
+# digest could not describe the run it signs). Signing is strictly OUT-OF-PROCESS via subprocess:
+# cosign / minisign are invoked, never imported, so the stdlib-only, zero-third-party-dependency
+# runtime import contract is preserved. `--sign` is additive: without it the run's artifacts are
+# byte-identical to before, and the verdict never depends on whether a signature exists.
+SIG_FILENAME = "attestation.sig"
+
+
+def _sign_fail(msg):
+    """Loud, non-zero failure for the signing/verifying TOOLING path (no signer configured, or the
+    external tool could not start / errored). Exit 3 keeps it distinct from the verdict codes
+    (0 PASS / 1 FAIL / 2 BLOCKED) and from a verify mismatch (1). Never a silent skip."""
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(3)
+
+
+def _resolve_tool(env_cmd, builders):
+    """Resolve a signing/verifying command as an argv TEMPLATE carrying `{msg}`/`{sig}` tokens.
+    Precedence: an explicit env override (`env_cmd`, e.g. AR_SIGNER_CMD) wins; otherwise the first
+    auto-detected tool whose builder returns a non-None argv (cosign keyless primary, minisign
+    fallback). Returns (argv, kind) or (None, None) when nothing resolves. The command is only ever
+    executed via subprocess — nothing here imports the signer."""
+    cmd = os.environ.get(env_cmd, "").strip()
+    if cmd:
+        return shlex.split(cmd), "custom"
+    for kind, build in builders:
+        argv = build()
+        if argv is not None:
+            return argv, kind
+    return None, None
+
+
+def _cosign_sign_argv():
+    # Primary: sigstore/cosign KEYLESS. An ephemeral Fulcio certificate (from an ambient OIDC
+    # identity) plus a Rekor transparency-log entry; no long-lived private key. `--yes` suppresses
+    # the confirmation prompt; `--bundle` packs signature + certificate + log proof into ONE
+    # self-contained sidecar an outside verifier consumes with `verify-blob --bundle`.
+    if not shutil.which("cosign"):
+        return None
+    return ["cosign", "sign-blob", "--yes", "--bundle", "{sig}", "{msg}"]
+
+
+def _minisign_sign_argv():
+    # Fallback: minisign (Ed25519). Requires a configured secret key (AR_MINISIGN_KEY); `-x` writes
+    # the detached signature to the given path. Use a password-less key for non-interactive runs.
+    key = os.environ.get("AR_MINISIGN_KEY", "").strip()
+    if not (shutil.which("minisign") and key):
+        return None
+    return ["minisign", "-S", "-s", key, "-m", "{msg}", "-x", "{sig}"]
+
+
+def _cosign_verify_argv():
+    if not shutil.which("cosign"):
+        return None
+    argv = ["cosign", "verify-blob", "--bundle", "{sig}"]
+    # Keyless verification is only meaningful against an expected signer identity + issuer; pass
+    # them through so the outside verifier owns the trust policy rather than this script.
+    ident = os.environ.get("AR_COSIGN_IDENTITY", "").strip()
+    issuer = os.environ.get("AR_COSIGN_ISSUER", "").strip()
+    if ident:
+        argv += ["--certificate-identity", ident]
+    if issuer:
+        argv += ["--certificate-oidc-issuer", issuer]
+    return argv + ["{msg}"]
+
+
+def _minisign_verify_argv():
+    pub = os.environ.get("AR_MINISIGN_PUBKEY", "").strip()
+    if not (shutil.which("minisign") and pub):
+        return None
+    return ["minisign", "-V", "-p", pub, "-m", "{msg}", "-x", "{sig}"]
+
+
+def _digest_from_verdict(run):
+    """The EXISTING attestation digest string recorded in verdict.json — READ, never recomputed —
+    so the signature is over exactly what the verdict already attests. Exits 2 when there is no
+    verdict or no attestation to sign/verify (a missing prerequisite, not a signer failure)."""
+    vpath = run / "verdict.json"
+    if not vpath.exists():
+        print("no verdict.json in run — aggregate first")
+        sys.exit(2)
+    stored = read_json(vpath).get("attestation") or {}
+    digest = stored.get("digest")
+    if not isinstance(digest, str) or not digest:
+        print("verdict.json carries no attestation digest — re-aggregate")
+        sys.exit(2)
+    return digest
+
+
+def _run_tool(argv_tmpl, msg_path, sig_path):
+    """Substitute `{msg}`/`{sig}` in the argv template and run the external tool. When the template
+    references `{msg}` the digest file is substituted there, else it is appended as the final arg.
+    Returns the completed process; exits 3 (loud) if the tool cannot even be started."""
+    argv = [a.replace("{msg}", str(msg_path)).replace("{sig}", str(sig_path)) for a in argv_tmpl]
+    if not any("{msg}" in a for a in argv_tmpl):
+        argv.append(str(msg_path))
+    try:
+        return subprocess.run(argv, capture_output=True)
+    except OSError as e:
+        _sign_fail(f"could not start signer/verifier {argv[0]!r}: {e}")
+
+
+def sign_attestation(run):
+    """Write a DETACHED signature sidecar (`attestation.sig`) over the run's EXISTING attestation
+    digest, out-of-process. Signer resolution: AR_SIGNER_CMD override > cosign keyless > minisign
+    (AR_MINISIGN_KEY). Fails loudly with a non-zero exit when no signer is configured — opt-in
+    signing is never silently skipped and never reports a false success."""
+    digest = _digest_from_verdict(run)
+    argv_tmpl, kind = _resolve_tool(
+        "AR_SIGNER_CMD",
+        [("cosign-keyless", _cosign_sign_argv), ("minisign", _minisign_sign_argv)])
+    if argv_tmpl is None:
+        _sign_fail("no signer available: set AR_SIGNER_CMD to a signing command (using the {msg} "
+                   "and {sig} tokens), or install cosign (keyless) or minisign (with AR_MINISIGN_KEY "
+                   "set). --sign is opt-in and never silently skipped.")
+    want_sig_out = any("{sig}" in a for a in argv_tmpl)
+    with tempfile.TemporaryDirectory() as td:
+        msg = Path(td) / "attestation.digest"
+        msg.write_bytes(digest.encode("utf-8"))          # exact digest bytes, no trailing newline
+        sig_tmp = Path(td) / "sig.out"
+        proc = _run_tool(argv_tmpl, msg, sig_tmp)
+        if proc.returncode != 0:
+            _sign_fail(f"signer '{kind}' exited {proc.returncode}: "
+                       + (proc.stderr or b"").decode("utf-8", "replace").strip()[-500:])
+        if want_sig_out:
+            if not sig_tmp.exists():
+                _sign_fail(f"signer '{kind}' exited 0 but wrote no signature file")
+            sig = sig_tmp.read_bytes()
+        else:
+            sig = proc.stdout or b""
+    if not sig:
+        _sign_fail(f"signer '{kind}' produced an empty signature")
+    (run / SIG_FILENAME).write_bytes(sig)                 # sidecar; not a *.json, so never attested
+    print(f"signed: {run / SIG_FILENAME} over attestation sha256 {digest} (signer: {kind})")
+
+
+def verify_signature(run):
+    """Verify the detached `attestation.sig` sidecar against the recorded attestation digest, then
+    exit: 0 valid, 1 invalid (a tampered digest or a tampered signature no longer matches),
+    2 a missing prerequisite (no verdict / no sidecar), 3 no verifier available. Verifier
+    resolution mirrors the signer: AR_VERIFIER_CMD override > cosign verify-blob > minisign -V."""
+    digest = _digest_from_verdict(run)
+    sigpath = run / SIG_FILENAME
+    if not sigpath.exists():
+        print(f"no signature sidecar ({SIG_FILENAME}) — run `aggregate.py --sign` first")
+        sys.exit(2)
+    argv_tmpl, kind = _resolve_tool(
+        "AR_VERIFIER_CMD",
+        [("cosign-keyless", _cosign_verify_argv), ("minisign", _minisign_verify_argv)])
+    if argv_tmpl is None:
+        _sign_fail("no verifier available: set AR_VERIFIER_CMD (using the {msg} and {sig} tokens), "
+                   "or install cosign (keyless; set AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER) or minisign "
+                   "(with AR_MINISIGN_PUBKEY set).")
+    with tempfile.TemporaryDirectory() as td:
+        msg = Path(td) / "attestation.digest"
+        msg.write_bytes(digest.encode("utf-8"))
+        proc = _run_tool(argv_tmpl, msg, sigpath)
+    if proc.returncode == 0:
+        print(f"signature OK: {SIG_FILENAME} verifies against attestation sha256 {digest} "
+              f"(verifier: {kind})")
+        sys.exit(0)
+    print(f"signature INVALID: {SIG_FILENAME} does not verify against attestation sha256 {digest} "
+          f"(verifier: {kind}, exit {proc.returncode})")
+    err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+    if err:
+        print("  " + err[-500:])
     sys.exit(1)
 
 
@@ -629,10 +810,20 @@ def main():
     ap.add_argument("--check-digest", action="store_true",
                     help="verify the stored attestation against the run directory "
                          "and exit (0 intact, 1 drifted); does not rewrite anything")
+    ap.add_argument("--sign", action="store_true",
+                    help="after the verdict is written, produce a DETACHED signature sidecar "
+                         "(attestation.sig) over the existing attestation digest via an "
+                         "out-of-process signer (cosign keyless / minisign / AR_SIGNER_CMD). "
+                         "Opt-in and additive; fails loudly (exit 3) if no signer is configured")
+    ap.add_argument("--verify-signature", action="store_true",
+                    help="verify the detached attestation.sig sidecar against the recorded digest "
+                         "and exit (0 valid, 1 invalid, 2 missing prerequisite, 3 no verifier)")
     args = ap.parse_args()
     run = resolve_run(args.run)
     if args.check_digest:
         check_digest(run)
+    if args.verify_signature:
+        verify_signature(run)
     meta = read_json(run / "run.json")
 
     fail, blocked, notes = [], [], []
@@ -733,6 +924,11 @@ def main():
     for n in notes:
         print(f"  note    - {n}")
     print(f"written: {run / 'verdict.json'} and verdict.md")
+    # Opt-in detached signature over the digest just written. Additive: it runs only with --sign,
+    # touches no verdict/attestation state, and on signer failure exits loudly (3) rather than
+    # letting a false success stand. Without --sign this block is skipped entirely.
+    if args.sign:
+        sign_attestation(run)
     sys.exit({"PASS": 0, "FAIL": 1, "BLOCKED": 2}[verdict])
 
 

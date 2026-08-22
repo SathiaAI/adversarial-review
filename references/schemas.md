@@ -189,6 +189,15 @@ exit 1 with each drifted artifact named `DRIFT modified|added|removed`; exit 2 w
 verdict or no attestation exists. Third parties can verify a shipped run directory the
 same way.
 
+Optionally, `aggregate.py --sign` produces a **detached cryptographic signature over this
+digest**, written as the sidecar `attestation.sig` (cosign keyless primary, minisign
+fallback, invoked out-of-process — no signing library is imported). The signature is a
+sidecar, **not** an attested input: it is not a `*.json` file, so it is never folded back
+into the digest, and `--sign` is additive — without it the artifacts are byte-identical.
+`aggregate.py --verify-signature` checks it against the recorded digest; the full
+outside-verifier path (identity/issuer, cosign/minisign commands) is in
+`references/config.md`, *Signing the attestation*.
+
 The `coverage` block is the machine-readable manifest of what the run did and did not
 verify. It is assembled exclusively from recorded artifacts — the same inputs as the
 verdict — so an unrecorded fact is absent from coverage too, never inferred. It is
