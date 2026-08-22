@@ -2703,6 +2703,19 @@ def t_corpus_validator_rejects_malformed():
         assert any("unexpected field" in e for e in cs.validate_case(str(stray))), \
             "unknown top-level expected field should be rejected"
 
+        # truthy non-object scripts (a schema type error) must fall through _expected_semantics
+        # cleanly, not raise AttributeError on .get() (CodeRabbit, PR #45)
+        scriptstr = d / "scriptstr"
+        scriptstr.mkdir()
+        (scriptstr / "meta.json").write_text(json.dumps({
+            "id": "scriptstr", "title": "x", "tier": "NORMAL", "category": "clean",
+            "language": "python", "source": "seeded"}))
+        (scriptstr / "context.md").write_text("some context")
+        (scriptstr / "expected.json").write_text(json.dumps({
+            "defects": [], "fp_budget": 1, "scripts": "invalid"}))
+        errs_ss = cs.validate_case(str(scriptstr))   # regression: must return errors, never raise
+        assert any("scripts" in e for e in errs_ss), errs_ss
+
         # clean category carrying ANY defect (even non-must_detect) is contradictory ground truth
         cleandef = d / "cleandef"
         cleandef.mkdir()
@@ -3702,6 +3715,342 @@ def t_pr_publish_preserves_findings_when_panel_incomplete():
         assert len(gh.review) == 0, "a complete clean re-run retires the stale finding comment"
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+
+# --- Reviewer meta-eval scorer tests (E1-S2). Recovered here: these 100%-branch-coverage
+# tests were added on the E1-S2 branch (evals/score.py) but dropped from tests/run_tests.py
+# by the #44 merge into main; evals/score.py shipped untested. Restored with E1-S3, which
+# scores through this module. ---
+def _import_score():
+    sys.path.insert(0, str(SKILL / "evals"))
+    import score
+    return score
+
+
+def _f(file="a.py", line=10, severity="high", title="", evidence="", scenario="", fix=""):
+    """Build a minimal reviewer finding for scoring tests."""
+    return {"file": file, "line": line, "severity": severity, "title": title,
+            "evidence": evidence, "scenario": scenario, "fix": fix}
+
+
+def t_eval_score_file_overlaps():
+    # E1-S2: file match is exact-after-normalization or a basename fallback (tolerates a/ b/ ./ diff
+    # prefixes and a reviewer citing the bare filename); empty either side never overlaps.
+    s = _import_score()
+    assert s.file_overlaps("api/invoices.py", "api/invoices.py")
+    assert s.file_overlaps("b/api/invoices.py", "a/api/invoices.py")       # diff prefixes stripped
+    assert s.file_overlaps("./invoices.py", "api/invoices.py")             # basename fallback
+    assert s.file_overlaps("api\\invoices.py", "api/invoices.py")          # backslash normalized
+    assert not s.file_overlaps("api/orders.py", "api/invoices.py")
+    assert not s.file_overlaps("", "api/invoices.py") and not s.file_overlaps("x.py", "")
+
+
+def t_eval_score_line_in_range():
+    # E1-S2: line path honors +/- tolerance at both edges; a non-int/absent line or a malformed range
+    # never satisfies it (must qualify via the tag path instead); a reversed range is tolerated.
+    s = _import_score()
+    assert s.line_in_range(10, [10, 12]) and s.line_in_range(12, [10, 12])
+    assert s.line_in_range(13, [10, 12], line_tol=1) and not s.line_in_range(14, [10, 12], line_tol=1)
+    assert s.line_in_range(7, [10, 12], line_tol=3) and not s.line_in_range(6, [10, 12], line_tol=3)
+    assert s.line_in_range(11, [12, 10])                                    # reversed range tolerated
+    assert not s.line_in_range(None, [10, 12]) and not s.line_in_range(True, [10, 12])
+    assert not s.line_in_range(10, [10]) and not s.line_in_range(10, "nope")
+    # A malformed locator endpoint (None/string/boolean) or a bad line_tol must be a non-match, not a
+    # crash — a corrupt corpus label cannot stop scoring (PR #44 CodeRabbit).
+    assert not s.line_in_range(10, [None, 12]) and not s.line_in_range(10, ["x", 12])
+    assert not s.line_in_range(10, [10, None]) and not s.line_in_range(10, [True, 12])
+    assert not s.line_in_range(10, [10, 12], line_tol=-1)
+    assert not s.line_in_range(10, [10, 12], line_tol=True) and not s.line_in_range(10, [10, 12], line_tol="3")
+
+
+def t_eval_score_tag_intersects():
+    # E1-S2: a tag matches only when ALL its words appear as tokens in the finding text; a single-token
+    # tag is a substring-token match; empty tags never match.
+    s = _import_score()
+    ok, tag = s.tag_intersects(["missing-ownership-check", "idor"],
+                               _f(evidence="This is a missing ownership check on the object"))
+    assert ok and tag == "missing-ownership-check"
+    ok2, tag2 = s.tag_intersects(["idor"], _f(title="Classic IDOR on invoice id"))
+    assert ok2 and tag2 == "idor"
+    assert not s.tag_intersects(["missing-ownership-check"], _f(evidence="ownership only"))[0]  # not all words
+    assert not s.tag_intersects([], _f(evidence="anything"))[0]
+
+
+def t_eval_score_match_finding_to_defect():
+    # E1-S2: location match (right file + near line), root-cause match (right file + tag named though
+    # line is off), no match when the tag is named in the WRONG file, and non-dict inputs are safe.
+    s = _import_score()
+    defect = {"defect_id": "idor-1", "must_detect": True, "severity_floor": "high",
+              "locators": [{"file": "api/invoices.py", "line_range": [10, 12]}],
+              "root_cause_tags": ["idor", "authz"]}
+    assert s.match_finding_to_defect(_f(file="api/invoices.py", line=11), defect)[1] == "location"
+    off = s.match_finding_to_defect(_f(file="api/invoices.py", line=200, title="IDOR authz gap"), defect)
+    assert off == (True, "root_cause")                                      # right file, tag names it
+    # tag named but in the WRONG file -> not a match (root-cause path still requires file overlap)
+    assert not s.match_finding_to_defect(_f(file="other.py", line=1, title="IDOR authz"), defect)[0]
+    assert s.match_finding_to_defect("nope", defect) == (False, None)
+
+
+def t_eval_score_case_tp_partial_fn():
+    # E1-S2: a must_detect defect is TP when matched at/above its severity floor, PARTIAL when matched
+    # below the floor (noticed but under-rated), FN when unmatched.
+    s = _import_score()
+    defect = {"defect_id": "d1", "must_detect": True, "severity_floor": "high",
+              "locators": [{"file": "a.py", "line_range": [10, 10]}], "root_cause_tags": ["boom"]}
+    exp = {"defects": [defect], "fp_budget": 0}
+    tp = s.score_case(exp, [_f(file="a.py", line=10, severity="high")])
+    assert tp["tp"] == 1 and tp["partial"] == 0 and tp["fn"] == 0
+    part = s.score_case(exp, [_f(file="a.py", line=10, severity="low")])
+    assert part["partial"] == 1 and part["tp"] == 0 and part["fn"] == 0
+    miss = s.score_case(exp, [_f(file="zzz.py", line=99, severity="high", title="unrelated")])
+    assert miss["fn"] == 1 and miss["tp"] == 0
+    assert miss["defect_outcomes"][0]["outcome"] == "fn"
+
+
+def t_eval_score_case_informational_and_fp():
+    # E1-S2: a must_detect:false defect never scores FN/TP (bonus if matched). FP rules: on a clean
+    # case any finding beyond fp_budget is FP; on a defect case only unmatched high/critical beyond
+    # budget is FP (unmatched low/medium is noise, not a false alarm). A bad fp_budget floors to 0.
+    s = _import_score()
+    info = {"defect_id": "opt", "must_detect": False, "severity_floor": "low",
+            "locators": [{"file": "a.py", "line_range": [1, 1]}], "root_cause_tags": ["x"]}
+    r = s.score_case({"defects": [info], "fp_budget": 0}, [_f(file="a.py", line=1, severity="low", title="x")])
+    assert r["tp"] == 0 and r["fn"] == 0 and r["defect_outcomes"][0]["outcome"] == "informational"
+    # clean case: 2 findings, budget 1 -> exactly 1 FP
+    clean = s.score_case({"defects": [], "fp_budget": 1}, [_f(severity="low"), _f(severity="low")])
+    assert clean["fp"] == 1 and clean["fp_candidates"] == 2
+    # defect case: an unmatched HIGH is an FP (budget 0); an unmatched LOW is noise, not FP
+    defect = {"defect_id": "d", "must_detect": True, "severity_floor": "high",
+              "locators": [{"file": "a.py", "line_range": [5, 5]}], "root_cause_tags": ["q"]}
+    d = s.score_case({"defects": [defect], "fp_budget": 0},
+                     [_f(file="a.py", line=5, severity="high", title="q"),      # the TP
+                      _f(file="z.py", line=1, severity="critical", title="bogus"),  # unmatched high -> FP
+                      _f(file="z.py", line=2, severity="low", title="nit")])        # unmatched low -> noise
+    assert d["tp"] == 1 and d["fp"] == 1 and d["noise"] == 1
+    bad = s.score_case({"defects": [], "fp_budget": -5}, [_f(severity="low")])
+    assert bad["fp"] == 1 and bad["fp_budget"] == 0                          # negative budget floored
+
+
+def t_eval_score_case_nondict_finding():
+    # E1-S2 (correctness-1 regression): match_finding_to_defect already refuses a non-dict finding, so
+    # such an entry lands in `unmatched` and reaches the FP severity tally. That tally must tolerate it
+    # (floor to 0) instead of raising AttributeError on `.get`. A non-dict is never high/critical, so on
+    # a defect case it is noise, not a false alarm; on a clean case it still counts toward fp_budget.
+    s = _import_score()
+    defect = {"defect_id": "d", "must_detect": True, "severity_floor": "high",
+              "locators": [{"file": "a.py", "line_range": [10, 12]}], "root_cause_tags": ["idor"]}
+    d = s.score_case({"defects": [defect], "fp_budget": 0},
+                     [_f(file="a.py", line=11, severity="high", title="idor"),  # the TP
+                      "not-a-dict", None])                                       # malformed -> noise, no crash
+    assert d["tp"] == 1 and d["fp"] == 0 and d["noise"] == 2
+    # clean case: two malformed entries are candidate FPs beyond a budget of 1 -> exactly 1 FP, no crash
+    clean = s.score_case({"defects": [], "fp_budget": 1}, ["x", None])
+    assert clean["fp"] == 1 and clean["fp_candidates"] == 2
+
+
+def t_eval_score_case_one_finding_one_defect():
+    # E1-S2 (PR #44 Codex P1 regression): a single reviewer finding must credit at most one defect.
+    # When two must_detect defects sit within tolerance (or share a tag) in the same file, one finding
+    # scored both defects as TP -> tp:2, inflating detection. Assignment is now one-to-one.
+    s = _import_score()
+    D = lambda n, floor="high": {"defect_id": "d%d" % n, "must_detect": True, "severity_floor": floor,
+                                 "locators": [{"file": "a.py", "line_range": [n, n]}], "root_cause_tags": ["t%d" % n]}
+    F = lambda ln, sev="high": _f(file="a.py", line=ln, severity=sev, title="x")
+    # one finding, two overlapping defects -> exactly one TP (the other is an FN), never tp:2
+    one = s.score_case({"defects": [D(10), D(11)], "fp_budget": 0}, [F(10)])
+    assert (one["tp"], one["partial"], one["fn"]) == (1, 0, 1), one
+    assert sorted(o["outcome"] for o in one["defect_outcomes"]) == ["fn", "tp"]
+    assert sum(len(o["matched_finding_indices"]) for o in one["defect_outcomes"]) == 1  # finding used once
+    # two findings covering two overlapping defects -> both detected (no under-counting from greedy)
+    two = s.score_case({"defects": [D(10), D(11)], "fp_budget": 0}, [F(10), F(11)])
+    assert (two["tp"], two["partial"], two["fn"]) == (2, 0, 0), two
+    # a below-floor finding on one of two overlapping defects is a PARTIAL, and it is still consumed
+    part = s.score_case({"defects": [D(10), D(11)], "fp_budget": 0}, [F(10, "low")])
+    assert (part["tp"], part["partial"], part["fn"]) == (0, 1, 1), part
+
+
+def t_eval_score_aggregate():
+    # E1-S2: aggregate rolls up overall + per-category + per-tier; detection_rate counts only TPs and
+    # is None when a bucket has no must_detect defects (clean-only).
+    s = _import_score()
+    r_tp = {"tp": 1, "partial": 0, "fn": 0, "fp": 0, "noise": 0, "must_detect_total": 1}
+    r_fn = {"tp": 0, "partial": 1, "fn": 1, "fp": 2, "noise": 0, "must_detect_total": 2}
+    r_clean = {"tp": 0, "partial": 0, "fn": 0, "fp": 0, "noise": 0, "must_detect_total": 0}
+    agg = s.aggregate([({"category": "security", "tier": "NORMAL"}, r_tp),
+                       ({"category": "correctness", "tier": "NORMAL"}, r_fn),
+                       ({"category": "clean", "tier": "NORMAL"}, r_clean)])
+    assert agg["overall"]["tp"] == 1 and agg["overall"]["fn"] == 1 and agg["overall"]["fp"] == 2
+    assert agg["overall"]["detection_rate"] == round(1 / 3, 4)
+    assert agg["by_category"]["clean"]["detection_rate"] is None            # no must_detect defects
+    assert agg["by_category"]["security"]["detection_rate"] == 1.0
+    assert agg["by_tier"]["NORMAL"]["cases"] == 3
+
+
+def t_eval_score_on_real_corpus():
+    # E1-S2: the scorer runs against the committed E1-S1 corpus. A finding placed on each defect's
+    # locator scores TP; a clean case with no findings has zero FP.
+    s = _import_score()
+    corpus = SKILL / "evals" / "corpus"
+    scored = 0
+    for d in sorted(os.listdir(corpus)):
+        cd = corpus / d
+        if not cd.is_dir():
+            continue
+        exp = json.loads((cd / "expected.json").read_text(encoding="utf-8"))
+        defs = exp.get("defects", [])
+        if defs:
+            loc = defs[0]["locators"][0]
+            find = _f(file=loc["file"], line=loc["line_range"][0],
+                      severity=defs[0]["severity_floor"], title=" ".join(defs[0]["root_cause_tags"]))
+            res = s.score_case(exp, [find])
+            assert res["tp"] == 1, (d, res)
+        else:  # clean case, no findings -> no false positives
+            assert s.score_case(exp, [])["fp"] == 0, d
+        scored += 1
+    assert scored >= 6
+
+
+def _run_eval_offline(only, extra=()):
+    """Invoke evals/run.py --mode offline as a subprocess (its real CLI) and return
+    (parsed_result, raw_stdout). run.py starts its own ephemeral mock router, so it never
+    collides with this suite's server on :PORT."""
+    r = subprocess.run(
+        [sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "offline",
+         "--no-write", "--print-result", "--quiet", "--only", *only, *extra],
+        env=ENV, capture_output=True, text=True)
+    assert r.returncode == 0, "evals/run.py failed (exit %d)\n%s" % (r.returncode, r.stderr)
+    last = r.stdout.strip().splitlines()[-1]
+    return json.loads(last), last
+
+
+def t_eval_offline_harness_scores_representative_cases():
+    # E1-S3: the offline harness drives the REAL panel path (assign -> run -> ingest) against
+    # scripted reviewers and scores through score.py. A representative subset — a detected defect,
+    # a deliberate miss, and an over-budget clean case — guards the whole assembly on every CI run.
+    result, _ = _run_eval_offline(
+        ["sec-idor-invoice", "corr-offbyone-pagination", "out-inverted-finalize",
+         "test-weak-assert-charge", "clean-refactor-total"])
+    per = {c["case_id"]: c for c in result["cases"]}
+    assert (per["sec-idor-invoice"]["tp"], per["sec-idor-invoice"]["fp"]) == (1, 0), per["sec-idor-invoice"]
+    assert per["corr-offbyone-pagination"]["tp"] == 1, per["corr-offbyone-pagination"]
+    assert per["out-inverted-finalize"]["partial"] == 1, per["out-inverted-finalize"]  # found, under-rated
+    assert (per["test-weak-assert-charge"]["fn"], per["test-weak-assert-charge"]["noise"]) == (1, 1), \
+        per["test-weak-assert-charge"]  # reviewer looked but missed -> FN + a low unmatched nit = noise
+    assert per["clean-refactor-total"]["fp"] == 1, per["clean-refactor-total"]  # over fp_budget
+    ov = result["aggregate"]["overall"]
+    assert (ov["tp"], ov["partial"], ov["fn"], ov["fp"]) == (2, 1, 1, 1), ov
+    assert result["skipped"] == [], result["skipped"]
+
+
+def t_eval_offline_harness_deterministic():
+    # Invariant 4 (deterministic audit record): same corpus + same scripts -> byte-identical scored
+    # `result`. Wall-clock is stamped only OUTSIDE result (generated_at + filename), so two runs of
+    # the scored payload must match exactly.
+    _, a = _run_eval_offline(["corr-offbyone-pagination", "out-inverted-finalize"])
+    _, b = _run_eval_offline(["corr-offbyone-pagination", "out-inverted-finalize"])
+    assert a == b, "offline scored result is not deterministic across runs"
+
+
+def t_eval_offline_harness_skips_and_rejects_edge_cases():
+    # E1-S3: a valid case with no scripts.offline is SKIPPED and surfaced in result['skipped'] (never
+    # silently), while a MALFORMED case FAILS the run — a broken self-test must not pass quietly.
+    base = Path(tempfile.mkdtemp(prefix="ar-evalcorp-"))
+    runpy = str(SKILL / "evals" / "run.py")
+    try:
+        noscript = base / "noscript"
+        noscript.mkdir()
+        (noscript / "meta.json").write_text(json.dumps({"id": "noscript", "title": "x", "tier": "NORMAL",
+            "category": "clean", "language": "python", "source": "seeded"}))
+        (noscript / "context.md").write_text("diff --git a/x b/x\n+clean\n")
+        (noscript / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1}))
+        r = subprocess.run([sys.executable, runpy, "--mode", "offline", "--corpus", str(base),
+                            "--no-write", "--print-result", "--quiet"], env=ENV,
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        result = json.loads(r.stdout.strip().splitlines()[-1])
+        assert result["skipped"] == ["noscript"], result["skipped"]
+        assert result["cases"] == [], result["cases"]
+
+        bad = base / "bad"        # meta.id != dir name -> validate_case rejects it
+        bad.mkdir()
+        (bad / "meta.json").write_text(json.dumps({"id": "WRONGID", "title": "x", "tier": "NORMAL",
+            "category": "clean", "language": "python", "source": "seeded"}))
+        (bad / "context.md").write_text("x")
+        (bad / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1,
+            "scripts": {"offline": {}}}))
+        r2 = subprocess.run([sys.executable, runpy, "--mode", "offline", "--corpus", str(base),
+                             "--no-write", "--quiet"], env=ENV, capture_output=True, text=True)
+        assert r2.returncode != 0, "a malformed case must fail the offline run, not be skipped"
+        assert "invalid" in (r2.stdout + r2.stderr).lower(), (r2.stdout + r2.stderr)[-300:]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def t_eval_offline_harness_cli_hardening():
+    # E1-S3 (PR #45): a negative --line-tol makes every location match fail, so the CLI must reject
+    # it up front; and --print-result must keep stdout pure JSON (progress goes to stderr) so the
+    # documented `... --no-write --print-result | jq` pipe works even without --quiet.
+    runpy = str(SKILL / "evals" / "run.py")
+    r = subprocess.run([sys.executable, runpy, "--mode", "offline", "--only", "sec-idor-invoice",
+                        "--no-write", "--quiet", "--line-tol", "-1"], env=ENV,
+                       capture_output=True, text=True)
+    assert r.returncode != 0, "negative --line-tol must be rejected"
+    assert "line-tol" in r.stderr.lower(), r.stderr[-200:]
+    r2 = subprocess.run([sys.executable, runpy, "--mode", "offline", "--only", "sec-idor-invoice",
+                         "--no-write", "--print-result"], env=ENV, capture_output=True, text=True)
+    assert r2.returncode == 0, r2.stderr
+    parsed = json.loads(r2.stdout)   # entire stdout is the canonical JSON, no progress lines mixed in
+    assert parsed["cases"][0]["case_id"] == "sec-idor-invoice", parsed
+
+
+def t_corpus_rejects_offtier_script_role():
+    # E1-S3 (PR #45): scripts.offline may only script roles the case's tier runs. A NORMAL case
+    # scripting data_privacy would have those findings silently never served/scored (a hidden FN),
+    # so the validator rejects it loudly.
+    sys.path.insert(0, str(SKILL / "evals"))
+    import corpus_schema as cs
+    d = Path(tempfile.mkdtemp(prefix="ar-corpus-tier-"))
+    try:
+        case = d / "offtier"
+        case.mkdir()
+        (case / "meta.json").write_text(json.dumps({"id": "offtier", "title": "x", "tier": "NORMAL",
+            "category": "correctness", "language": "python", "source": "seeded"}))
+        (case / "context.md").write_text("diff\n+x\n")
+        (case / "expected.json").write_text(json.dumps({
+            "defects": [{"defect_id": "d1", "must_detect": True,
+                         "locators": [{"file": "a.py", "line_range": [1, 1]}],
+                         "root_cause_tags": ["t"], "severity_floor": "high"}],
+            "fp_budget": 1,
+            "scripts": {"offline": {"data_privacy": [{"title": "x", "severity": "high",
+                                                      "file": "a.py", "line": 1}]}}}))
+        errs = cs.validate_case(str(case))
+        assert any("not run at tier" in e for e in errs), errs
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def t_eval_summary_escapes_untrusted_identifiers():
+    # E1-S3 (PR #45, CodeRabbit): every corpus-controlled identifier rendered into summary.md — the
+    # table cells AND the corpus path and the skipped-case list — goes through _md_cell, so a `|`,
+    # backtick, or newline in an external id can't forge cells/rows or break out of a code span.
+    sys.path.insert(0, str(SKILL / "evals"))
+    import run as evalrun
+    assert evalrun._md_cell("a|b") == "a\\|b"
+    assert evalrun._md_cell("a`b") == "a\\`b"
+    assert evalrun._md_cell("a\nb") == "a b"          # control chars collapse to a space
+    result = {
+        "corpus": "corp`x|y", "line_tol": 3, "skipped": ["sk`|id"], "cases": [],
+        "aggregate": {
+            "overall": {"cases": 0, "must_detect_total": 0, "detection_rate": None,
+                        "tp": 0, "partial": 0, "fn": 0, "fp": 0, "noise": 0},
+            "by_category": {}, "by_tier": {}, "by_role": {}}}
+    md = evalrun._summary_md(result, "test")
+    # raw (unescaped) identifiers must not survive into the report; their escaped forms must
+    assert "corp`x|y" not in md and "corp\\`x\\|y" in md, md
+    assert "sk`|id" not in md and "sk\\`\\|id" in md, md
+    # the corpus path is no longer wrapped in raw backticks (an embedded ` could close the span)
+    assert "corpus: `" not in md, md
 
 
 def main():

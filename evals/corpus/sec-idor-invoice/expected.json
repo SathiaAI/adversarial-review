@@ -21,5 +21,21 @@
       "severity_floor": "high"
     }
   ],
-  "fp_budget": 1
+  "fp_budget": 1,
+  "scripts": {
+    "offline": {
+      "security": [
+        {
+          "title": "IDOR: invoice fetched without an ownership check",
+          "severity": "high",
+          "file": "api/invoices.py",
+          "line": 11,
+          "evidence": "no authz check before fetch; missing ownership check enables IDOR / broken object level authorization",
+          "scenario": "user A requests user B's invoice id and receives it",
+          "fix": "filter the query by the authenticated principal",
+          "release_blocking": true
+        }
+      ]
+    }
+  }
 }

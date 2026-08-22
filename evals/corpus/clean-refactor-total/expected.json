@@ -1,4 +1,24 @@
 {
   "defects": [],
-  "fp_budget": 1
+  "fp_budget": 1,
+  "scripts": {
+    "offline": {
+      "correctness": [
+        {
+          "title": "Prefer a comprehension name that mirrors the domain",
+          "severity": "low",
+          "file": "cart/pricing.py",
+          "line": 3,
+          "evidence": "purely stylistic naming preference"
+        },
+        {
+          "title": "Docstring could state the return type",
+          "severity": "low",
+          "file": "cart/pricing.py",
+          "line": 2,
+          "evidence": "add a return-type note; not a behavior change"
+        }
+      ]
+    }
+  }
 }

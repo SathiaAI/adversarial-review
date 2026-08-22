@@ -38,7 +38,24 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   is a finding matching no defect — any finding beyond `fp_budget` on a clean case, or an unmatched
   high/critical one beyond budget on a defect case (an extra low/medium is noise). `aggregate()` rolls
   per-case results up overall and per category/tier. Pure, stdlib-only, 3.9-safe, 100% branch-covered
-  offline (`t_eval_score_*`); the offline harness that drives it lands in E1-S3.
+  offline (`t_eval_score_*`); the offline harness that drives it is E1-S3 (below).
+- Reviewer meta-evaluation offline harness (E1-S3): `evals/run.py --mode offline` drives the **real**
+  panel pipeline (`panel.py assign` → `run` → ingest) over the corpus against the in-process mock
+  router, serving each case's scripted reviewer findings — a new optional `scripts.offline` block in
+  `expected.json` — through the E0-S1 `response_provider`, then scores the ingested findings with
+  `evals/score.py`. It emits a dated `evals/report/<ts>.json` plus a human-readable `summary.md` with
+  true-positive / partial / false-negative / false-positive metrics overall and per category and tier,
+  plus a per-reviewer-role breakdown (findings emitted, and how many were true positives, partials, or
+  unmatched — per-role FN/FP are not attributed, since which role should catch a given defect is not
+  encoded). Because reviewer outputs are scripted, it measures harness correctness, not
+  model quality (live calibration is E1-S4); a role omitted from a case's script is a deliberate miss
+  and an extra finding is a false positive, so the seed corpus exercises every scoring outcome
+  end-to-end. Deterministic (same corpus + scripts → byte-identical scored `result`; wall-clock
+  stamped only outside it), stdlib-only, 3.9-safe, no network and no keys. A fast 2–3 case subset runs
+  in the suite on every push; the full corpus runs as a separate CI `evals` job. This change also
+  **restores the `t_eval_score_*` scorer tests** (100% branch coverage) that the E1-S2 (#44) merge
+  dropped from `tests/run_tests.py` — `evals/score.py` had shipped to `main` untested — so the scorer
+  the harness relies on is verified again.
 - Distribution: a `release` workflow publishes to PyPI on a `v*` tag via **Trusted Publishing**
   (OIDC, no stored token); an `action-selftest` workflow exercises the composite action keyless
   and asserts the honest BLOCKED verdict; a GitLab CI template (`examples/.gitlab-ci.yml`); and a
