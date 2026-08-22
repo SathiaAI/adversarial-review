@@ -4361,6 +4361,14 @@ def t_eval_thresholds_compare_live():
     # a non-numeric tp is coerced to no-signal, never a TypeError.
     btpstr = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {"m": {"tp": "5"}}}}
     assert th.compare_live(btpstr, btpstr, 0.2) == [], "string tp must not crash"
+    # E1-S5 bot round 3 (CodeRabbit Major): an invalid CURRENT tp must not fake a "fell to 0"
+    # degradation; it is reported as not-comparable. An absent tp still reads as no-contribution.
+    bval = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {"m": {"tp": 3}}}}
+    cbad = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {"m": {"tp": "x"}}}}
+    rb = th.compare_live(bval, cbad, 0.2)
+    assert any("invalid" in r for r in rb) and not any("fell" in r for r in rb), rb
+    cgone = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
+    assert any("fell 3 -> 0" in r for r in th.compare_live(bval, cgone, 0.2)), th.compare_live(bval, cgone, 0.2)
 
 
 def t_eval_thresholds_cli():

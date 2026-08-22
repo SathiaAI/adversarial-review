@@ -40,9 +40,9 @@ def _finite_rate(x):
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and 0 <= x <= 1
 
 
-def _count(x):
-    """A real (non-bool), finite number for TP contribution; anything else -> 0 (no signal)."""
-    return x if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else 0
+def _is_count(x):
+    """True if x is a real (non-bool), finite number usable as a true-positive count."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
 def check_offline(result, thresholds):
@@ -116,7 +116,15 @@ def compare_live(baseline, current, max_drop):
     bm = (b.get("aggregate", {}) or {}).get("by_model", {}) or {}
     cm = (c.get("aggregate", {}) or {}).get("by_model", {}) or {}
     for m in sorted(bm):
-        btp, ctp = _count(bm[m].get("tp")), _count(cm.get(m, {}).get("tp"))
+        btp = bm[m].get("tp")
+        if not _is_count(btp):
+            continue  # no reliable baseline signal for this model
+        cmi = cm.get(m, {})
+        if "tp" in cmi and not _is_count(cmi["tp"]):
+            out.append("model %s true-positive count is invalid in the current report (%r) -- not comparable"
+                       % (m, cmi["tp"]))
+            continue
+        ctp = cmi.get("tp", 0)  # absent -> 0 (real no-contribution signal, unlike malformed data)
         if btp > 0 and ctp < btp:
             out.append("model %s true positives fell %d -> %d (candidate for pin removal / substitution)"
                        % (m, btp, ctp))
