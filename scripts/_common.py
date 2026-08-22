@@ -353,14 +353,19 @@ def _validate_policy(data, name):
                 die(f"{name}: max_cost_usd must be a finite non-negative number or "
                     f"'none'/'off'/'unlimited', got {v!r}")
     if "high_samples" in data:
-        # Multi-sample corroboration count (E4-S3), informational-only: a positive integer.
-        # 1 (the default) disables resampling — exactly today's behavior. Rejected at load so a
-        # typo can't silently change the count. 2**53 is float64's exact-integer ceiling: at or
-        # above it a fractional value rounds to a whole float and would slip the `!= int(n)` check.
-        n = _policy_number(data["high_samples"])
-        if n is None or n < 1 or n > MAX_HIGH_SAMPLES or n != int(n):
+        # Multi-sample corroboration count (E4-S3), informational-only: an integer in
+        # [1, MAX_HIGH_SAMPLES]; 1 (the default) disables resampling. Validate EXACTLY as
+        # panel.high_samples() resolves it — int(str(value)) — so an integral-looking float ("3.0",
+        # 1e1) or any non-integer that `init` would accept here cannot be rejected later at `run`
+        # time; the two must agree (panel/Codex E4-S3).
+        hv = data["high_samples"]
+        try:
+            n = int(str(hv).strip())
+        except (TypeError, ValueError):
+            n = None
+        if n is None or n < 1 or n > MAX_HIGH_SAMPLES:
             die(f"{name}: high_samples must be an integer in [1, {MAX_HIGH_SAMPLES}], "
-                f"got {data['high_samples']!r}")
+                f"got {hv!r}")
 
 
 def load_policy(root=None):

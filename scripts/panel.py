@@ -80,6 +80,11 @@ FINDING_SCHEMA = {
         "reproduction": {"type": "array", "items": {"type": "string"}},
         "fix": {"type": "string"}, "regression_test": {"type": "string"},
         "release_blocking": {"type": "boolean"},
+        # E4-S3: cross-sample agreement record added by corroborate_role (informational; never gates).
+        # Declared so an ENRICHED report stays schema-valid; absent on unsampled findings.
+        "corroboration": {"type": "object", "additionalProperties": False, "properties": {
+            "samples": {"type": "integer"}, "agreed": {"type": "integer"},
+            "rate": {"type": "number"}}},
     },
     "required": ["id", "title", "severity", "confidence", "file", "line", "evidence",
                  "scenario", "reproduction", "fix", "regression_test", "release_blocking"],
@@ -652,12 +657,12 @@ def cost_cap():
     return (v if v > 0 else None), src
 
 
-def high_samples():
-    """Resolved AR_HIGH_SAMPLES (E4-S3): how many low-temperature samples to take of a role that
-    raised a high/critical finding, so the agreement rate across samples can be recorded on the
-    finding before it gates. AR_HIGH_SAMPLES env > policy ``high_samples`` > default ``1``. A value
-    of 1 (the default) means NO resampling — exactly today's behavior, byte-identical artifacts.
-    Must be an integer >= 1; anything else dies loudly so a typo can't silently change sampling."""
+def high_samples_resolved():
+    """Resolve AR_HIGH_SAMPLES (E4-S3) to ``(n, source)``: how many low-temperature samples to take of
+    a role that raised a high/critical finding, so the agreement rate across samples can be recorded
+    on the finding before it gates. AR_HIGH_SAMPLES env > policy ``high_samples`` > default ``1``. A
+    value of 1 (the default) means NO resampling. Returning the source lets ``run`` persist which
+    value actually applied and where it came from. Must be an integer in [1, MAX_HIGH_SAMPLES]."""
     raw, src = resolve_setting(None, "AR_HIGH_SAMPLES", load_policy(), "high_samples", "1")
     try:
         n = int(str(raw).strip())
@@ -665,7 +670,12 @@ def high_samples():
         die(f"AR_HIGH_SAMPLES must be a positive integer (>= 1), got {raw!r} (from {src})")
     if n < 1 or n > MAX_HIGH_SAMPLES:
         die(f"AR_HIGH_SAMPLES must be an integer in [1, {MAX_HIGH_SAMPLES}], got {raw!r} (from {src})")
-    return n
+    return n, src
+
+
+def high_samples():
+    """Resolved AR_HIGH_SAMPLES (E4-S3) as an int (>= 1); see high_samples_resolved for its source."""
+    return high_samples_resolved()[0]
 
 
 def panel_cost(run):
@@ -750,7 +760,7 @@ def corroboration_rate(finding, samples, n):
     return {"samples": n, "agreed": agreed, "rate": round(agreed / n, 4)}
 
 
-def corroborate_role(run, meta, plan, role, context_text, base, key, cap, n):
+def corroborate_role(run, meta, plan, role, context_text, base, key, cap, n, later_roles=None):
     """Re-run ONE role's reviewer up to N total samples and record the cross-sample agreement rate on
     each of its high/critical findings (E4-S3). INFORMATIONAL ONLY: aggregate.py alone decides the
     verdict; a low agreement rate never changes it and this adds no gating path. Only a role that
@@ -775,8 +785,12 @@ def corroborate_role(run, meta, plan, role, context_text, base, key, cap, n):
         if cap is not None:
             spent = panel_cost(run)
             if spent >= cap:
-                _cost_abort(run, cap, spent, "corroboration",
-                            [f"{role}#sample{j}" for j in range(i, n + 1)])
+                # _cost_abort exits the process, so every LATER flagged role is skipped too — name
+                # them all in the audit record, not just this role's remaining samples (panel/Codex).
+                not_run = [f"{role}#sample{j}" for j in range(i, n + 1)]
+                for lr in (later_roles or []):
+                    not_run += [f"{lr}#sample{j}" for j in range(2, n + 1)]
+                _cost_abort(run, cap, spent, "corroboration", not_run)
         boundary = secrets.token_hex(8)
         messages = reviewer_messages(role, meta, context_text, boundary)
         body, _ = build_request(info["model"], messages, REPORT_SCHEMA, "reviewer_report",
@@ -824,13 +838,18 @@ def cmd_run(args):
             "For keyless MCP transport use `panel.py prepare` + `panel.py ingest`.", 2)
 
     # Resolve the corroboration sample count first (E4-S3): a bad AR_HIGH_SAMPLES dies here, before
-    # any paid call or persisted side effect. 1 (the default) leaves the run byte-identical.
-    n_samples = high_samples()
+    # any paid call or persisted side effect. 1 (the default) leaves the reviewer artifacts identical.
+    n_samples, hs_src = high_samples_resolved()
     # Establish (and persist, on first call) the run's cost ceiling; it stays authoritative for
     # rebuttal and concurrence too, so the audit shows which cap was actually enforced. The source
     # is persisted by run_cost_cap and surfaced by aggregate, so it isn't needed here.
     cap, _ = run_cost_cap(run)
+    # Persist the resolved corroboration policy (value + source) so the audit records exactly which
+    # high_samples applied — even at the default 1, where no corroboration fields are written
+    # (panel/Codex E4-S3). Run-level metadata alongside cost_policy.json, not a reviewer artifact.
+    write_json(run / "sample_policy.json", {"high_samples": n_samples, "source": hs_src})
     failed = []
+    produced_this_run = []          # roles whose PRIMARY was produced in THIS invocation
     for role in plan["roles"]:
         if (run / "panel" / f"{role}.json").exists() and not args.force:
             print(f"  {role}: already complete, skipping (use --force to redo)")
@@ -846,6 +865,7 @@ def cmd_run(args):
                 _cost_abort(run, cap, spent, "panel", not_run)
         print(f"  {role}: calling {plan['roles'][role]['model']} ...")
         if run_one_role(run, meta, plan, role, context_text, base, key):
+            produced_this_run.append(role)
             continue
         # substitution: re-assign this role to an unused eligible family and retry once
         catalog = load_catalog(args.catalog_file)
@@ -871,6 +891,7 @@ def cmd_run(args):
             write_json(run / "panel" / "plan.json", plan)
             print(f"  {role}: substituting {sub['slug']}")
             if run_one_role(run, meta, plan, role, context_text, base, key):
+                produced_this_run.append(role)
                 continue
         failed.append(role)
 
@@ -883,8 +904,20 @@ def cmd_run(args):
     # output — byte-identical to pre-E4-S3 control flow and artifacts. It runs only after every
     # primary report is complete, so this informational resampling never starves primary coverage.
     if n_samples > 1:
-        for role in plan["roles"]:
-            corroborate_role(run, meta, plan, role, context_text, base, key, cap, n_samples)
+        # Only corroborate roles whose PRIMARY was produced in THIS invocation. A plain resume (no
+        # --force) skips existing primaries, so it must NOT re-buy samples: the sample files overwrite
+        # in place, so a repeat would spend without the recorded cost accumulating (panel/Codex).
+        # --force re-runs primaries, so they re-appear in produced_this_run and are resampled afresh.
+        flagged_order = []
+        for role in produced_this_run:
+            rp = run / "panel" / f"{role}.json"
+            rep = read_json(rp) if rp.exists() else {}
+            if any(isinstance(f, dict) and f.get("severity") in ("critical", "high")
+                   for f in (rep.get("findings") or [])):
+                flagged_order.append(role)
+        for idx, role in enumerate(flagged_order):
+            corroborate_role(run, meta, plan, role, context_text, base, key, cap, n_samples,
+                             later_roles=flagged_order[idx + 1:])
 
 
 def cmd_prepare(args):
@@ -934,6 +967,19 @@ def cmd_ingest(args):
         "model": plan["roles"][args.role]["model"], "transport": "mcp/ingest",
         "usage": usage, "provider": provider, "completed_at": now_iso()})
     print(f"validated and stored: {run / subdir / (args.role + '.json')}")
+    # E4-S3: corroboration resampling runs only on the direct-HTTP `panel.py run` path. On the
+    # keyless prepare/ingest (MCP) transport it is NOT applied — surface that instead of silently
+    # honoring high_samples for one path and ignoring it for the other (panel/Codex).
+    if args.phase != "rebuttal":
+        try:
+            n_hs = high_samples_resolved()[0]
+        except SystemExit:
+            n_hs = 1
+        if n_hs > 1:
+            print(f"  note: high_samples={n_hs} is set, but multi-sample corroboration applies only "
+                  "to the direct-HTTP `panel.py run` path — the prepare/ingest (MCP) transport takes "
+                  "no corroboration samples, so this report carries no agreement record.",
+                  file=sys.stderr)
 
 
 def high_critical_digest(run, plan):

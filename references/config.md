@@ -200,9 +200,15 @@ gate.
   exits BLOCKED — a resample never silently exceeds the ceiling. Because it runs only after every
   primary report is complete, corroboration never starves primary coverage of the budget.
 
-Precedence is `AR_HIGH_SAMPLES` > policy `high_samples` > default **`1`**. A non-integer or `< 1`
-value is rejected loudly at env resolution and at policy load, so a typo can never silently change
-the sampling count.
+Precedence is `AR_HIGH_SAMPLES` > policy `high_samples` > default **`1`**. The value is validated
+identically at policy load (`init`) and at `run` — an integer in `[1, 25]`; an integral-looking
+float such as `3.0` or `1e1` is rejected in **both** places, so a value that passes `init` can never
+be rejected later at `run`. The resolved count and its source are recorded to `sample_policy.json`
+in the run directory (even at the default `1`), so the audit shows exactly which value applied.
+
+**Transport scope.** Corroboration resampling runs only on the direct-HTTP `panel.py run` path. The
+keyless `panel.py prepare` + `ingest` (MCP) transport does **not** take corroboration samples; when
+`AR_HIGH_SAMPLES > 1` is set, `ingest` prints a note saying so rather than silently ignoring it.
 
 ## Environment variables
 

@@ -4590,7 +4590,7 @@ def t_high_samples_rejects_invalid_values():
     # can never silently change the sampling count. Also validated at policy load.
     import panel
     import _common
-    for bad in ("0", "-1", "1.5", "abc", "  ", "26"):
+    for bad in ("0", "-1", "1.5", "abc", "  ", "26", "3.0", "1e1"):   # 3.0/1e1: run rejects, so init must too
         os.environ["AR_HIGH_SAMPLES"] = bad
         try:
             panel.high_samples()
@@ -4606,7 +4606,7 @@ def t_high_samples_rejects_invalid_values():
         assert panel.high_samples() == _common.MAX_HIGH_SAMPLES
     finally:
         os.environ.pop("AR_HIGH_SAMPLES", None)
-    for bad in (0, -1, 1.5, "2.5", float("nan"), True, _common.MAX_HIGH_SAMPLES + 1):
+    for bad in (0, -1, 1.5, "2.5", float("nan"), True, _common.MAX_HIGH_SAMPLES + 1, 3.0, "3.0", "1e1"):
         try:
             _common._validate_policy({"high_samples": bad}, "policy")
             raise AssertionError(f"policy load accepted {bad!r}")
@@ -4615,6 +4615,125 @@ def t_high_samples_rejects_invalid_values():
     _common._validate_policy({"high_samples": 3}, "policy")    # positive integer OK
     _common._validate_policy({"high_samples": "4"}, "policy")  # YAML-subset string integer OK
     _common._validate_policy({"high_samples": _common.MAX_HIGH_SAMPLES}, "policy")  # upper bound OK
+
+
+def t_high_samples_resume_does_not_recharge():
+    # E4-S3 (panel/Codex): a plain `panel.py run` resume (no --force) must NOT re-buy corroboration
+    # samples — the sample files overwrite in place, so a repeat would spend without the recorded cost
+    # accumulating. Only roles whose PRIMARY was produced in THIS invocation are corroborated.
+    mock_router.reset()
+    def provider(m):
+        return None if (m["kind"] != "report" or m["role"] != "security") \
+            else mock_router._report("security", m["model"])
+    mock_router.STATE["response_provider"] = provider
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        env = {**ENV, "AR_HIGH_SAMPLES": "3"}
+        sh(["panel.py", "run", "--context-file", "context.md"], repo, env=env)
+        run = latest_run(repo)
+        sec = read(run / "panel" / "plan.json")["roles"]["security"]["model"]
+        assert mock_router.STATE["calls"][sec] == 3, mock_router.STATE["calls"]        # primary + 2
+        r = sh(["panel.py", "run", "--context-file", "context.md"], repo, env=env)     # resume
+        assert "already complete" in r.stdout, r.stdout
+        assert mock_router.STATE["calls"][sec] == 3, ("resume re-bought samples", mock_router.STATE["calls"])
+        sh(["panel.py", "run", "--context-file", "context.md", "--force"], repo, env=env)  # --force redoes
+        assert mock_router.STATE["calls"][sec] == 6, mock_router.STATE["calls"]        # +3 (primary+2)
+    finally:
+        mock_router.reset()
+
+
+def t_corroboration_enriched_report_is_schema_valid():
+    # E4-S3 (Codex): adding the `corroboration` record to a finding must keep the canonical report
+    # schema-valid — FINDING_SCHEMA (additionalProperties:false) now declares it.
+    import panel
+    mock_router.reset()
+    def provider(m):
+        return None if (m["kind"] != "report" or m["role"] != "security") \
+            else mock_router._report("security", m["model"])
+    mock_router.STATE["response_provider"] = provider
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo, env={**ENV, "AR_HIGH_SAMPLES": "3"})
+        rep = read(latest_run(repo) / "panel" / "security.json")
+        assert "corroboration" in rep["findings"][0], rep["findings"][0]
+        errs = panel.validate_obj(rep, panel.REPORT_SCHEMA)
+        assert not errs, ("enriched report is not schema-valid", errs)
+    finally:
+        mock_router.reset()
+
+
+def t_sample_policy_persisted():
+    # E4-S3 (Codex): the run records which high_samples applied (value + source), even at the default
+    # 1 where no corroboration fields exist, so an auditor can tell a policy edit from a no-op.
+    mock_router.reset()
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo)                  # default 1
+        sp = read(latest_run(repo) / "sample_policy.json")
+        assert sp["high_samples"] == 1 and sp["source"], sp
+        repo2 = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo2)
+        sh(["panel.py", "assign"], repo2)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo2, env={**ENV, "AR_HIGH_SAMPLES": "2"})
+        sp2 = read(latest_run(repo2) / "sample_policy.json")
+        assert sp2["high_samples"] == 2, sp2
+    finally:
+        mock_router.reset()
+
+
+def t_corroboration_cost_abort_names_later_flagged_roles():
+    # E4-S3 (Codex): when the cap is hit while corroborating an earlier flagged role, _cost_abort exits
+    # and every LATER flagged role is skipped too — the audit record must name them all.
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.05
+    def provider(m):
+        if m["kind"] != "report" or m["role"] not in ("security", "correctness"):
+            return None
+        rep = mock_router._report("security", m["model"])          # a high finding
+        rep["role"] = m["role"]
+        rep["findings"] = [{**rep["findings"][0], "id": m["role"] + "-1"}]
+        return rep
+    mock_router.STATE["response_provider"] = provider
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        # 4 primaries * 0.05 = 0.20 reaches the cap before any corroboration sample is bought
+        sh(["panel.py", "run", "--context-file", "context.md"], repo,
+           env={**ENV, "AR_HIGH_SAMPLES": "3", "AR_MAX_COST_USD": "0.20"}, expect=None)
+        abort = read(latest_run(repo) / "cost_abort.json")
+        assert abort["phase"] == "corroboration", abort
+        joined = " ".join(str(x) for x in abort["not_run"])
+        assert "security#sample" in joined and "correctness#sample" in joined, abort["not_run"]
+    finally:
+        mock_router.reset()
+
+
+def t_ingest_notes_corroboration_not_applied_on_mcp():
+    # E4-S3 (Codex): corroboration runs only on the direct-HTTP run path; the keyless prepare/ingest
+    # (MCP) path must SURFACE that it isn't applied rather than silently ignore high_samples.
+    mock_router.reset()
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        sh(["panel.py", "prepare", "--context-file", "context.md"], repo)
+        run = latest_run(repo)
+        model = read(run / "panel" / "plan.json")["roles"]["security"]["model"]
+        rep = mock_router._report("security", model)
+        respfile = repo / "resp.json"
+        write(respfile, {"choices": [{"message": {"content": json.dumps(rep)}}], "usage": {"cost": 0.0}})
+        r = sh(["panel.py", "ingest", "--role", "security", "--response-file", str(respfile)], repo,
+               env={**ENV, "AR_HIGH_SAMPLES": "2"})
+        assert "corroboration applies only" in r.stderr, r.stderr
+    finally:
+        mock_router.reset()
 
 
 def main():
