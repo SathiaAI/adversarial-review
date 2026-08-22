@@ -10,17 +10,24 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
 ## [Unreleased]
 
 ### Added
-- Detached signature over the attestation digest (E6-S1): `aggregate.py --sign` writes a detached
-  cryptographic signature (`attestation.sig`) over the run's **existing** attestation digest, and
-  `aggregate.py --verify-signature` checks it (exit 0 valid / 1 invalid / 2 missing / 3 no verifier).
-  Signing is opt-in and additive — without `--sign` the run's artifacts are byte-identical — and the
-  digest algorithm, attested file set, and verdict are unchanged: the signature is a sidecar, not a
-  `*.json` file, so it is never folded back into the attestation. The signer is invoked
-  **out-of-process** (sigstore/cosign keyless primary, minisign fallback, `AR_SIGNER_CMD`/
-  `AR_VERIFIER_CMD` override with `{msg}`/`{sig}` tokens), preserving the stdlib-only,
-  zero-third-party-dependency runtime contract; a `--sign` with no signer configured fails loudly
-  (non-zero) rather than silently skipping. Documented in `references/config.md` (with the
-  outside-verifier path) and `references/schemas.md`.
+- Detached signature over the verdict (E6-S1): `aggregate.py --sign` writes a detached cryptographic
+  signature (`attestation.sig`) over the run's canonical `verdict.json`, and
+  `aggregate.py --verify-signature` checks it (exit 0 valid / 1 not verified / 2 missing / 3 no
+  verifier). `--sign` and `--verify-signature` are **standalone** post-verdict modes (like
+  `--check-digest`): they operate on the existing `verdict.json` and never re-aggregate. Signing the
+  canonical `verdict.json` — not merely its input digest — **binds the computed verdict decision**
+  (verdict / reasons / coverage) to the signature, so a relabeled verdict no longer verifies; both
+  `--sign` and `--verify-signature` first **recompute the attestation** from the artifacts and refuse
+  a drifted run, so a tampered input is caught even when the sidecar is untouched and signing never
+  silently re-attests changed state. The signature is a sidecar, not a `*.json` file, so it is never
+  folded back into the attestation and the digest algorithm is unchanged. The signer/verifier is
+  invoked **out-of-process** under a bounded timeout (`AR_SIGN_TIMEOUT`, default 120s; sigstore/cosign
+  keyless primary, minisign fallback, `AR_SIGNER_CMD`/`AR_VERIFIER_CMD` override with `{msg}`/`{sig}`
+  tokens), preserving the stdlib-only runtime contract; no signer, a malformed command template, a
+  signer that cannot start, or a subprocess timeout all fail loudly (exit 3) rather than silently
+  skipping. cosign keyless verification requires `AR_COSIGN_IDENTITY` + `AR_COSIGN_ISSUER` (else it is
+  not auto-selected); `AR_MINISIGN_PUBKEY` accepts a key file (`-p`) or an inline key (`-P`).
+  Documented in `references/config.md` (with the outside-verifier path) and `references/schemas.md`.
 - Release hygiene: this changelog and a "cutting a release" ritual in `CONTRIBUTING.md`.
 - Documentation drift guards: `tests/run_tests.py` now asserts the gate matrix in
   `references/gates.md` stays consistent with `MINIMUM_GATES` in `scripts/gate.py`, and that

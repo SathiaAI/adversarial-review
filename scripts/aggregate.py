@@ -230,24 +230,40 @@ def check_digest(run):
     sys.exit(1)
 
 
-# --- Detached signature over the attestation digest (E6-S1) -------------------------
-# The signature is a SIDECAR over the run's EXISTING attestation digest. It NEVER recomputes the
-# digest, changes the algorithm, or alters the attested file set (compute_attestation is untouched),
-# and it is deliberately NOT a `.json` file, so compute_attestation() — which globs `*.json` — never
-# folds it back into the digest: the signature is not itself attested (a signature that fed the
-# digest could not describe the run it signs). Signing is strictly OUT-OF-PROCESS via subprocess:
-# cosign / minisign are invoked, never imported, so the stdlib-only, zero-third-party-dependency
-# runtime import contract is preserved. `--sign` is additive: without it the run's artifacts are
-# byte-identical to before, and the verdict never depends on whether a signature exists.
+# --- Detached signature over the run verdict (E6-S1) --------------------------------
+# `--sign` writes a DETACHED signature SIDECAR (attestation.sig) over the run's canonical verdict.json,
+# out-of-process. It signs verdict.json — not merely the attestation digest — so the signature binds
+# the COMPUTED VERDICT (verdict/reasons/coverage) and its attestation digest together: a relabeled
+# verdict ("BLOCKED"->"PASS") no longer verifies. `--sign` and `--verify-signature` are STANDALONE
+# post-verdict modes (like --check-digest): they operate on the EXISTING verdict.json and never
+# re-aggregate, and both first RECOMPUTE the attestation from the on-disk artifacts and refuse unless
+# it still matches the recorded digest — so signing never silently re-attests drift, and a tampered
+# input artifact fails verification even when the sidecar is untouched. The sidecar is deliberately NOT
+# a `.json` file, so compute_attestation() (globbing `*.json`) never folds it into the digest. Signing
+# is strictly OUT-OF-PROCESS via subprocess: cosign / minisign are invoked, never imported, so the
+# stdlib-only runtime import contract is preserved. Adding a signature changes no verdict/attestation
+# state; the verdict never depends on whether a signature exists.
 SIG_FILENAME = "attestation.sig"
 
 
 def _sign_fail(msg):
-    """Loud, non-zero failure for the signing/verifying TOOLING path (no signer configured, or the
-    external tool could not start / errored). Exit 3 keeps it distinct from the verdict codes
-    (0 PASS / 1 FAIL / 2 BLOCKED) and from a verify mismatch (1). Never a silent skip."""
+    """Loud, non-zero failure for the signing/verifying TOOLING path (no signer configured, a
+    malformed command template, or the external tool could not start / timed out / errored). Exit 3
+    keeps it distinct from the verdict codes (0 PASS / 1 FAIL / 2 BLOCKED) and from a verify mismatch
+    (1). Never a silent skip."""
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(3)
+
+
+def _sign_timeout():
+    """Bounded subprocess timeout (seconds) for signer/verifier calls; AR_SIGN_TIMEOUT overrides.
+    A non-positive or non-numeric override falls back to the default rather than crashing the gate."""
+    raw = os.environ.get("AR_SIGN_TIMEOUT", "120").strip()
+    try:
+        t = int(raw)
+    except ValueError:
+        return 120
+    return t if t > 0 else 120
 
 
 def _resolve_tool(env_cmd, builders):
@@ -258,7 +274,10 @@ def _resolve_tool(env_cmd, builders):
     executed via subprocess — nothing here imports the signer."""
     cmd = os.environ.get(env_cmd, "").strip()
     if cmd:
-        return shlex.split(cmd), "custom"
+        try:
+            return shlex.split(cmd), "custom"
+        except ValueError as e:
+            _sign_fail(f"{env_cmd} is not a valid command template ({e}): {cmd!r}")
     for kind, build in builders:
         argv = build()
         if argv is not None:
@@ -306,23 +325,36 @@ def _minisign_verify_argv():
     pub = os.environ.get("AR_MINISIGN_PUBKEY", "").strip()
     if not (shutil.which("minisign") and pub):
         return None
-    return ["minisign", "-V", "-p", pub, "-m", "{msg}", "-x", "{sig}"]
+    # AR_MINISIGN_PUBKEY may be a public-key FILE or an inline key value. minisign's `-p` expects a
+    # key file and `-P` an inline key on the command line; pick by whether the value names an existing
+    # file, so an inline "RW..." key is not misread as a (missing) filename (Codex minisign -p vs -P).
+    flag = "-p" if os.path.exists(pub) else "-P"
+    return ["minisign", "-V", flag, pub, "-m", "{msg}", "-x", "{sig}"]
 
 
-def _digest_from_verdict(run):
-    """The EXISTING attestation digest string recorded in verdict.json — READ, never recomputed —
-    so the signature is over exactly what the verdict already attests. Exits 2 when there is no
-    verdict or no attestation to sign/verify (a missing prerequisite, not a signer failure)."""
+def _load_verdict(run):
+    """Read the run's EXISTING verdict.json (READ, never recomputed). Exits 2 when there is no verdict
+    or no attestation digest to sign/verify (a missing prerequisite, not a signer failure)."""
     vpath = run / "verdict.json"
     if not vpath.exists():
         print("no verdict.json in run — aggregate first")
         sys.exit(2)
-    stored = read_json(vpath).get("attestation") or {}
-    digest = stored.get("digest")
+    verdict = read_json(vpath)
+    digest = (verdict.get("attestation") or {}).get("digest")
     if not isinstance(digest, str) or not digest:
         print("verdict.json carries no attestation digest — re-aggregate")
         sys.exit(2)
-    return digest
+    return verdict, digest
+
+
+def _canonical_verdict_bytes(verdict):
+    """The exact bytes signed/verified: verdict.json canonicalized (sorted keys, compact separators),
+    with the non-reproducible `computed_at` timestamp excluded so re-aggregating an untouched run
+    reproduces the same signable bytes. Signing verdict.json — not just its attestation digest — binds
+    the computed verdict decision (verdict/reasons/coverage) to the signature."""
+    core = {k: v for k, v in verdict.items() if k != "computed_at"}
+    return json.dumps(core, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
 
 
 def _run_tool(argv_tmpl, msg_path, sig_path):
@@ -333,17 +365,27 @@ def _run_tool(argv_tmpl, msg_path, sig_path):
     if not any("{msg}" in a for a in argv_tmpl):
         argv.append(str(msg_path))
     try:
-        return subprocess.run(argv, capture_output=True)
+        return subprocess.run(argv, capture_output=True, timeout=_sign_timeout())
     except OSError as e:
         _sign_fail(f"could not start signer/verifier {argv[0]!r}: {e}")
+    except subprocess.TimeoutExpired:
+        _sign_fail(f"signer/verifier {argv[0]!r} timed out after {_sign_timeout()}s "
+                   "(set AR_SIGN_TIMEOUT to adjust)")
 
 
 def sign_attestation(run):
-    """Write a DETACHED signature sidecar (`attestation.sig`) over the run's EXISTING attestation
-    digest, out-of-process. Signer resolution: AR_SIGNER_CMD override > cosign keyless > minisign
-    (AR_MINISIGN_KEY). Fails loudly with a non-zero exit when no signer is configured — opt-in
-    signing is never silently skipped and never reports a false success."""
-    digest = _digest_from_verdict(run)
+    """Write a DETACHED signature sidecar (`attestation.sig`) over the run's EXISTING, canonical
+    verdict.json, out-of-process. STANDALONE: it does not re-aggregate (a prior `aggregate.py` must
+    have written verdict.json) and it REFUSES to sign a run whose artifacts drifted from the recorded
+    attestation digest, so signing can never silently re-attest changed state. Signer resolution:
+    AR_SIGNER_CMD override > cosign keyless > minisign (AR_MINISIGN_KEY). Exit 0 signed, 1 drift,
+    2 nothing to sign, 3 no signer / signer failure — opt-in signing is never silently skipped."""
+    verdict, digest = _load_verdict(run)
+    att = compute_attestation(run)
+    if att["digest"] != digest:
+        print(f"refusing to sign: run artifacts drifted — recomputed attestation {att['digest']} "
+              f"!= recorded {digest}; re-aggregate before signing", file=sys.stderr)
+        sys.exit(1)
     argv_tmpl, kind = _resolve_tool(
         "AR_SIGNER_CMD",
         [("cosign-keyless", _cosign_sign_argv), ("minisign", _minisign_sign_argv)])
@@ -353,8 +395,8 @@ def sign_attestation(run):
                    "set). --sign is opt-in and never silently skipped.")
     want_sig_out = any("{sig}" in a for a in argv_tmpl)
     with tempfile.TemporaryDirectory() as td:
-        msg = Path(td) / "attestation.digest"
-        msg.write_bytes(digest.encode("utf-8"))          # exact digest bytes, no trailing newline
+        msg = Path(td) / "verdict.canonical.json"
+        msg.write_bytes(_canonical_verdict_bytes(verdict))
         sig_tmp = Path(td) / "sig.out"
         proc = _run_tool(argv_tmpl, msg, sig_tmp)
         if proc.returncode != 0:
@@ -369,19 +411,30 @@ def sign_attestation(run):
     if not sig:
         _sign_fail(f"signer '{kind}' produced an empty signature")
     (run / SIG_FILENAME).write_bytes(sig)                 # sidecar; not a *.json, so never attested
-    print(f"signed: {run / SIG_FILENAME} over attestation sha256 {digest} (signer: {kind})")
+    print(f"signed: {run / SIG_FILENAME} over verdict.json of run {verdict.get('run_id')} "
+          f"(attestation sha256 {digest}, signer: {kind})")
+    sys.exit(0)
 
 
 def verify_signature(run):
-    """Verify the detached `attestation.sig` sidecar against the recorded attestation digest, then
-    exit: 0 valid, 1 invalid (a tampered digest or a tampered signature no longer matches),
-    2 a missing prerequisite (no verdict / no sidecar), 3 no verifier available. Verifier
-    resolution mirrors the signer: AR_VERIFIER_CMD override > cosign verify-blob > minisign -V."""
-    digest = _digest_from_verdict(run)
+    """Verify the detached `attestation.sig` sidecar against the run's verdict.json, then exit:
+    0 valid, 1 not verified (a tampered verdict.json, a tampered/absent signature, or drifted input
+    artifacts), 2 a missing prerequisite (no verdict / no sidecar), 3 no verifier available / verifier
+    tooling error. Verification is COMPLETE: it (a) recomputes the attestation from the on-disk
+    artifacts and requires it matches the digest recorded in verdict.json — so a tampered input
+    artifact is caught even though the sidecar is untouched — and (b) verifies the signature over the
+    canonical verdict.json — so a relabeled verdict decision no longer verifies. Verifier resolution
+    mirrors the signer: AR_VERIFIER_CMD override > cosign verify-blob > minisign -V."""
+    verdict, digest = _load_verdict(run)
     sigpath = run / SIG_FILENAME
     if not sigpath.exists():
         print(f"no signature sidecar ({SIG_FILENAME}) — run `aggregate.py --sign` first")
         sys.exit(2)
+    att = compute_attestation(run)
+    if att["digest"] != digest:
+        print(f"signature INVALID: run artifacts drifted — recomputed attestation {att['digest']} "
+              f"!= recorded {digest}; the signed verdict no longer describes this run's inputs")
+        sys.exit(1)
     argv_tmpl, kind = _resolve_tool(
         "AR_VERIFIER_CMD",
         [("cosign-keyless", _cosign_verify_argv), ("minisign", _minisign_verify_argv)])
@@ -390,15 +443,16 @@ def verify_signature(run):
                    "or install cosign (keyless; set AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER) or minisign "
                    "(with AR_MINISIGN_PUBKEY set).")
     with tempfile.TemporaryDirectory() as td:
-        msg = Path(td) / "attestation.digest"
-        msg.write_bytes(digest.encode("utf-8"))
+        msg = Path(td) / "verdict.canonical.json"
+        msg.write_bytes(_canonical_verdict_bytes(verdict))
         proc = _run_tool(argv_tmpl, msg, sigpath)
     if proc.returncode == 0:
-        print(f"signature OK: {SIG_FILENAME} verifies against attestation sha256 {digest} "
-              f"(verifier: {kind})")
+        print(f"signature OK: {SIG_FILENAME} verifies the verdict.json of run "
+              f"{verdict.get('run_id')} (attestation sha256 {digest}, verifier: {kind})")
         sys.exit(0)
-    print(f"signature INVALID: {SIG_FILENAME} does not verify against attestation sha256 {digest} "
-          f"(verifier: {kind}, exit {proc.returncode})")
+    print(f"signature INVALID: {SIG_FILENAME} did not verify (verifier: {kind}, exit "
+          f"{proc.returncode}) — a bad or absent signature, a relabeled verdict, or a verifier "
+          "configuration error; see stderr below")
     err = (proc.stderr or b"").decode("utf-8", "replace").strip()
     if err:
         print("  " + err[-500:])
@@ -813,19 +867,22 @@ def main():
                     help="verify the stored attestation against the run directory "
                          "and exit (0 intact, 1 drifted); does not rewrite anything")
     ap.add_argument("--sign", action="store_true",
-                    help="after the verdict is written, produce a DETACHED signature sidecar "
-                         "(attestation.sig) over the existing attestation digest via an "
-                         "out-of-process signer (cosign keyless / minisign / AR_SIGNER_CMD). "
-                         "Opt-in and additive; fails loudly (exit 3) if no signer is configured")
+                    help="sign the EXISTING verdict.json with a detached sidecar (attestation.sig) "
+                         "via an out-of-process signer (cosign keyless / minisign / AR_SIGNER_CMD) "
+                         "and exit; standalone (does not re-aggregate), refuses to sign a drifted "
+                         "run, and fails loudly (exit 3) if no signer is configured")
     ap.add_argument("--verify-signature", action="store_true",
-                    help="verify the detached attestation.sig sidecar against the recorded digest "
-                         "and exit (0 valid, 1 invalid, 2 missing prerequisite, 3 no verifier)")
+                    help="verify the detached attestation.sig sidecar against verdict.json — "
+                         "recomputing the attestation from artifacts and checking the signed verdict "
+                         "— and exit (0 valid, 1 not verified, 2 missing prerequisite, 3 no verifier)")
     args = ap.parse_args()
     run = resolve_run(args.run)
     if args.check_digest:
         check_digest(run)
     if args.verify_signature:
         verify_signature(run)
+    if args.sign:
+        sign_attestation(run)
     meta = read_json(run / "run.json")
 
     fail, blocked, notes = [], [], []
@@ -926,11 +983,6 @@ def main():
     for n in notes:
         print(f"  note    - {n}")
     print(f"written: {run / 'verdict.json'} and verdict.md")
-    # Opt-in detached signature over the digest just written. Additive: it runs only with --sign,
-    # touches no verdict/attestation state, and on signer failure exits loudly (3) rather than
-    # letting a false success stand. Without --sign this block is skipped entirely.
-    if args.sign:
-        sign_attestation(run)
     sys.exit({"PASS": 0, "FAIL": 1, "BLOCKED": 2}[verdict])
 
 

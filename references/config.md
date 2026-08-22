@@ -171,45 +171,57 @@ default **`$20`**; set any of them to `0`, `none`, `off`, or `unlimited` to disa
 negative value is rejected loudly (it would otherwise silently remove the guard). A provider that
 omits `cost` is metered as `$0`.
 
-## Signing the attestation (detached signature)
+## Signing the verdict (detached signature)
 
 Every aggregation records a tamper-evident **attestation digest** — a reproducible SHA-256 over
 the run's recorded `*.json` artifacts (see `references/schemas.md`). `--check-digest` proves those
 bytes have not drifted *since the verdict was computed*, but it proves nothing about **who** stands
 behind them. `aggregate.py --sign` closes that gap: it produces a **detached cryptographic
-signature over the existing digest**, so a third party who never ran the pipeline can verify both
-that the run is intact **and** that a specific identity signed it.
+signature over the run's `verdict.json`**, so a third party who never ran the pipeline can verify
+both that the run is intact **and** that a specific identity signed this exact verdict.
 
 ```bash
-python <skill>/scripts/aggregate.py --sign               # after aggregating: writes attestation.sig
-python <skill>/scripts/aggregate.py --verify-signature   # 0 valid, 1 invalid, 2 missing, 3 no verifier
+python <skill>/scripts/aggregate.py                      # aggregate first: writes verdict.json
+python <skill>/scripts/aggregate.py --sign               # then sign: writes attestation.sig
+python <skill>/scripts/aggregate.py --verify-signature   # 0 valid, 1 not verified, 2 missing, 3 no verifier
 ```
 
 Design guarantees (each enforced by a regression test):
 
-- **Opt-in and additive.** Without `--sign`, the run's artifacts are **byte-identical** to before
-  and the verdict never depends on whether a signature exists. Signing is a post-step that runs
-  *after* the verdict and attestation are written.
-- **Signs the existing digest — never recomputes it.** `--sign` reads the digest already recorded
-  in `verdict.json` and signs exactly that string. It does not touch the digest algorithm, the
-  attested file set, or the verdict.
+- **Standalone, not a re-aggregation.** `--sign` and `--verify-signature` are post-verdict modes
+  (like `--check-digest`): they operate on the **existing** `verdict.json` and never re-run the
+  aggregation. Adding a signature changes no verdict or attestation state, and the verdict never
+  depends on whether a signature exists.
+- **Signs the verdict decision, not only its input digest.** The signed message is the canonical
+  `verdict.json` (sorted keys; the non-reproducible `computed_at` excluded so re-aggregating an
+  untouched run reproduces the signable bytes). This binds the computed **verdict / reasons /
+  coverage** and the attestation digest together — a relabeled verdict (`BLOCKED`→`PASS`) no longer
+  verifies, even though the input artifacts are untouched.
+- **Refuses to sign — and to accept — a drifted run.** Before signing, `--sign` recomputes the
+  attestation from the on-disk artifacts and **refuses** (exit 1) unless it still matches the digest
+  recorded in `verdict.json`; it never silently re-attests changed state. `--verify-signature`
+  performs the same recompute, so a tampered **input** artifact fails verification even when the
+  sidecar and `verdict.json` are untouched.
 - **The signature is a sidecar, not an attested input.** It is written as `attestation.sig`
   alongside `verdict.json`. Because it is not a `*.json` file, the attestation (which hashes only
-  `*.json`) never folds it back in — signing an already-signed run reproduces the same digest, and
-  `--check-digest` stays intact with the sidecar present. The signature is **not** self-attesting.
-- **Zero runtime dependency preserved.** The signer is invoked **out-of-process** via `subprocess`;
-  `scripts/*.py` import no third-party signing library. cosign / minisign are executed, never
-  imported.
-- **Fails loudly, never silently.** If `--sign` is requested and no signer is available, it exits
-  non-zero (**3**) with a clear message and writes no signature — never a silent skip, never a false
-  success.
+  `*.json`) never folds it back in — `--check-digest` stays intact with the sidecar present, and
+  re-aggregating an untouched run reproduces the same digest. The signature is **not** self-attesting.
+- **Zero runtime dependency preserved.** The signer is invoked **out-of-process** via `subprocess`
+  under a bounded timeout (`AR_SIGN_TIMEOUT`, default 120s — a hung signer converts to the
+  tooling-error exit rather than wedging the gate); `scripts/*.py` import no third-party signing
+  library. cosign / minisign are executed, never imported.
+- **Fails loudly, never silently.** No signer/verifier available, a malformed `AR_SIGNER_CMD` /
+  `AR_VERIFIER_CMD` template (unbalanced quotes), a signer that cannot start, or a subprocess
+  timeout all exit non-zero (**3**) with a clear message and write no signature — never a silent
+  skip, never a false success.
 
 **Signer resolution** (first match wins):
 
 1. **`AR_SIGNER_CMD`** — an explicit command template, the override and the test seam. `{msg}` is
-   substituted with a temp file holding the digest to sign; `{sig}` with the path the detached
-   signature must be written to. A template with no `{sig}` token has its signature read from
-   stdout instead. Example: `AR_SIGNER_CMD='cosign sign-blob --yes --bundle {sig} {msg}'`.
+   substituted with a temp file holding the canonical `verdict.json` to sign; `{sig}` with the path
+   the detached signature must be written to. A template with no `{sig}` token has its signature
+   read from stdout instead; a template with unbalanced quotes exits 3.
+   Example: `AR_SIGNER_CMD='cosign sign-blob --yes --bundle {sig} {msg}'`.
 2. **cosign, keyless (primary)** — auto-detected when `cosign` is on `PATH`. Uses
    `cosign sign-blob --yes --bundle {sig} {msg}`: an ephemeral Fulcio certificate tied to an
    ambient OIDC identity plus a Rekor transparency-log entry, packaged into one self-contained
@@ -219,23 +231,24 @@ Design guarantees (each enforced by a regression test):
    Use a password-less key for non-interactive runs.
 
 **Outside-verifier path** (someone who did *not* run the pipeline, holding only the shipped run
-directory):
+directory) — `aggregate.py --verify-signature` performs the complete check:
 
-1. Read the attestation digest from `verdict.json` (`attestation.digest`) and, ideally,
-   independently recompute it with `aggregate.py --check-digest` to confirm the artifacts are intact.
-2. Verify `attestation.sig` against that digest with the matching tool and the **expected signer
-   identity** — the trust decision they own, not the script:
-   - **cosign keyless:** `cosign verify-blob --bundle attestation.sig --certificate-identity <who>
-     --certificate-oidc-issuer <issuer> <digest-file>` (where `<digest-file>` contains exactly the
-     `attestation.digest` string). `aggregate.py --verify-signature` drives the same check, reading
-     the identity/issuer from `AR_COSIGN_IDENTITY` / `AR_COSIGN_ISSUER`.
-   - **minisign:** `minisign -V -p <pubkey> -m <digest-file> -x attestation.sig`, or
-     `--verify-signature` with `AR_MINISIGN_PUBKEY` set.
+1. It recomputes the attestation from the artifacts, requires it to match `verdict.json`'s recorded
+   digest, and verifies `attestation.sig` against the canonical `verdict.json` with the **expected
+   signer identity** — the trust decision the verifier owns, not the script.
+   - **cosign keyless:** reads the expected identity/issuer from `AR_COSIGN_IDENTITY` /
+     `AR_COSIGN_ISSUER` (**both required** — without them cosign `verify-blob` accepts *any* valid
+     Fulcio certificate, so cosign is not auto-selected as the verifier until both are set).
+   - **minisign:** set `AR_MINISIGN_PUBKEY` to either a **public-key file** or an **inline key**
+     value — `-p` vs `-P` is chosen automatically by whether the value names an existing file.
+2. A verifier that runs and returns non-zero yields exit **1** (a bad/absent signature, a relabeled
+   verdict, or a verifier misconfiguration — the stderr is surfaced); a verifier that cannot start,
+   has a malformed template, or times out yields exit **3**.
 
 The verifier command is resolved exactly like the signer: `AR_VERIFIER_CMD` override (same
 `{msg}`/`{sig}` tokens) > cosign `verify-blob` > minisign `-V`. Signing and verifying are always
 out-of-process; the enforcement guarantee — that only `aggregate.py` computes the verdict from
-recorded artifacts — is unchanged, because a signature can attest the digest but can never alter it.
+recorded artifacts — is unchanged, because a signature attests a verdict but can never author one.
 
 ## Environment variables
 
@@ -262,7 +275,8 @@ recorded artifacts — is unchanged, because a signature can attest the digest b
 | `AR_SIGNER_CMD` | auto | `aggregate.py --sign` signer command template (`{msg}`/`{sig}` tokens); overrides cosign/minisign auto-detect (see *Signing the attestation*) |
 | `AR_VERIFIER_CMD` | auto | `aggregate.py --verify-signature` verifier command template (`{msg}`/`{sig}` tokens); overrides auto-detect |
 | `AR_MINISIGN_KEY` | — | Path to a minisign secret key; enables the minisign signing fallback |
-| `AR_MINISIGN_PUBKEY` | — | minisign public key (or key line) for `--verify-signature` |
+| `AR_MINISIGN_PUBKEY` | — | minisign public key for `--verify-signature`: a key **file** (`-p`) or an **inline** key value (`-P`), auto-selected by whether it names an existing file |
+| `AR_SIGN_TIMEOUT` | `120` | Bounded timeout (seconds) for each signer/verifier subprocess; expiry converts to the tooling-error exit (3) |
 | `AR_COSIGN_IDENTITY` | — | Expected signer identity (SAN) for cosign keyless `--verify-signature` |
 | `AR_COSIGN_ISSUER` | — | Expected OIDC issuer for cosign keyless `--verify-signature` |
 

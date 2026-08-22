@@ -697,11 +697,12 @@ def _pass_run_for_signing():
     return repo, run
 
 
-def t_sign_additive_and_sidecar_over_digest():
-    # E6-S1 AC(a)+(d)+invariant: --sign is ADDITIVE. Aggregate WITHOUT --sign first and confirm no
-    # sidecar is produced; then --sign and confirm the ONLY new artifact is attestation.sig, that it
-    # is a detached signature over the EXISTING digest, and that signing left the verdict +
-    # attestation byte-identical (modulo computed_at) — the signature is NOT folded into the digest.
+def t_sign_additive_and_sidecar_over_verdict():
+    # E6-S1 AC(a)+(d)+invariant: --sign is ADDITIVE and STANDALONE. Aggregate WITHOUT --sign first and
+    # confirm no sidecar is produced; then --sign and confirm the ONLY new artifact is attestation.sig,
+    # that it is a detached signature over the canonical verdict.json (binding the verdict decision,
+    # not merely the digest), and that signing left verdict.json + verdict.md byte-identical — the
+    # signature is NOT folded into the digest and --sign never re-aggregates.
     repo, run = _pass_run_for_signing()
     env = _stub_signer_env()
     sh(["aggregate.py"], repo, expect=0, env=env)                       # OFF: no --sign
@@ -711,10 +712,12 @@ def t_sign_additive_and_sidecar_over_digest():
     digest = v_off["attestation"]["digest"]
     files_before = sorted(p.relative_to(run).as_posix() for p in run.rglob("*") if p.is_file())
 
-    r = sh(["aggregate.py", "--sign"], repo, expect=0, env=env)         # ON: opt-in --sign
+    r = sh(["aggregate.py", "--sign"], repo, expect=0, env=env)         # ON: opt-in --sign (standalone)
     assert "signed:" in r.stdout and digest in r.stdout, r.stdout
     sig = (run / "attestation.sig").read_bytes()
-    assert sig == b"STUBSIG-v1:" + hashlib.sha256(digest.encode()).hexdigest().encode(), sig
+    _core = {k: x for k, x in v_off.items() if k != "computed_at"}
+    _msg = json.dumps(_core, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    assert sig == b"STUBSIG-v1:" + hashlib.sha256(_msg).hexdigest().encode(), sig
     # the ONLY new file is the sidecar — nothing else changed on disk
     files_after = sorted(p.relative_to(run).as_posix() for p in run.rglob("*") if p.is_file())
     assert set(files_after) - set(files_before) == {"attestation.sig"}, \
@@ -734,6 +737,7 @@ def t_sign_signature_not_attested_and_check_digest_intact():
     # the exact same digest (attestation.sig is not a *.json, so compute_attestation never sees it).
     repo, run = _pass_run_for_signing()
     env = _stub_signer_env()
+    sh(["aggregate.py"], repo, expect=0, env=env)
     sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
     digest = read(run / "verdict.json")["attestation"]["digest"]
     assert (run / "attestation.sig").exists()
@@ -748,6 +752,7 @@ def t_sign_verify_accepts_good_rejects_tamper():
     # tampered digest. Fully offline via the stub verifier.
     repo, run = _pass_run_for_signing()
     env = _stub_signer_env()
+    sh(["aggregate.py"], repo, expect=0, env=env)
     sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
     assert "signature OK" in sh(["aggregate.py", "--verify-signature"], repo, expect=0, env=env).stdout
     # (1) tamper the signature bytes -> reject (exit 1)
@@ -775,11 +780,12 @@ def t_sign_no_signer_fails_loudly():
     repo, run = _pass_run_for_signing()
     empty = Path(tempfile.mkdtemp(prefix="ar-nopath-"))
     env = {**ENV, "PATH": str(empty), "AR_SIGNER_CMD": "", "AR_MINISIGN_KEY": ""}
+    sh(["aggregate.py"], repo, expect=0, env=env)                        # verdict written first
     r = sh(["aggregate.py", "--sign"], repo, expect=None, env=env)
     assert r.returncode != 0, (r.returncode, r.stdout, r.stderr)          # non-zero
     assert "no signer available" in r.stderr, r.stderr                    # clear message
     assert not (run / "attestation.sig").exists(), "no sidecar on failure (no false success)"
-    assert (run / "verdict.json").exists(), "verdict is still written (signing is a post-step)"
+    assert (run / "verdict.json").exists(), "verdict written by the prior aggregate; signing is standalone"
 
 
 def t_sign_cosign_verify_requires_identity():
@@ -813,10 +819,104 @@ def t_sign_signer_command_failure_fails_loudly():
     # an AR_SIGNER_CMD that runs /bin/false over the {msg}/{sig} tokens.
     repo, run = _pass_run_for_signing()
     env = {**ENV, "AR_SIGNER_CMD": "false {msg} {sig}"}
+    sh(["aggregate.py"], repo, expect=0, env=env)
     r = sh(["aggregate.py", "--sign"], repo, expect=None, env=env)
     assert r.returncode == 3, (r.returncode, r.stderr)
     assert "exited" in r.stderr or "signer" in r.stderr, r.stderr
     assert not (run / "attestation.sig").exists(), "no sidecar on signer failure"
+
+
+def t_sign_verify_detects_tampered_input_artifact():
+    # E6-S1 (Codex): --verify-signature catches a tampered ATTESTED INPUT even when verdict.json and the
+    # sidecar are untouched — it recomputes the attestation and requires it to match the recorded
+    # digest. Sign a good run, mutate an attested input (gates/unit.json) -> verify fails (exit 1).
+    repo, run = _pass_run_for_signing()
+    env = _stub_signer_env()
+    sh(["aggregate.py"], repo, expect=0, env=env)
+    sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
+    assert "signature OK" in sh(["aggregate.py", "--verify-signature"], repo, expect=0, env=env).stdout
+    gpath = run / "gates" / "unit.json"
+    g = read(gpath); g["summary"] = (g.get("summary", "") + " tampered"); write(gpath, g)
+    r = sh(["aggregate.py", "--verify-signature"], repo, expect=1, env=env)
+    assert "INVALID" in r.stdout and "drift" in r.stdout, r.stdout
+
+
+def t_sign_verify_detects_relabeled_verdict():
+    # E6-S1 (Codex): the signature binds the COMPUTED VERDICT, not only its input digest. Relabel the
+    # verdict in verdict.json (inputs — and thus the attestation digest — untouched) and
+    # --verify-signature rejects it (exit 1): the sidecar signs canonical verdict.json.
+    repo, run = _pass_run_for_signing()
+    env = _stub_signer_env()
+    sh(["aggregate.py"], repo, expect=0, env=env)
+    sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
+    v = read(run / "verdict.json")
+    v["verdict"] = "BLOCKED" if v["verdict"] != "BLOCKED" else "PASS"   # flip the decision only
+    write(run / "verdict.json", v)
+    r = sh(["aggregate.py", "--verify-signature"], repo, expect=1, env=env)
+    assert "INVALID" in r.stdout, r.stdout
+
+
+def t_sign_refuses_drift():
+    # E6-S1 (Codex): --sign REFUSES a run whose artifacts drifted since the verdict was computed, rather
+    # than silently re-attesting the changed state. Aggregate, mutate an attested input, --sign ->
+    # refuse (exit 1), no sidecar written.
+    repo, run = _pass_run_for_signing()
+    env = _stub_signer_env()
+    sh(["aggregate.py"], repo, expect=0, env=env)
+    gpath = run / "gates" / "unit.json"
+    g = read(gpath); g["summary"] = (g.get("summary", "") + " drift"); write(gpath, g)
+    r = sh(["aggregate.py", "--sign"], repo, expect=1, env=env)
+    assert "refusing to sign" in r.stderr and "drift" in r.stderr, (r.stdout, r.stderr)
+    assert not (run / "attestation.sig").exists(), "no sidecar when signing is refused"
+
+
+def t_sign_malformed_command_template_exits_3():
+    # E6-S1 (CodeRabbit): an AR_SIGNER_CMD / AR_VERIFIER_CMD with unbalanced quotes is a configuration
+    # error (shlex.split raises), not a silent fallthrough — it must exit 3. Deterministic, offline.
+    repo, run = _pass_run_for_signing()
+    sh(["aggregate.py"], repo, expect=0, env=ENV)
+    r = sh(["aggregate.py", "--sign"], repo, expect=None, env={**ENV, "AR_SIGNER_CMD": "signer 'oops"})
+    assert r.returncode == 3 and "not a valid command template" in r.stderr, (r.returncode, r.stderr)
+    assert not (run / "attestation.sig").exists()
+    env = _stub_signer_env()
+    sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
+    r2 = sh(["aggregate.py", "--verify-signature"], repo, expect=None,
+            env={**env, "AR_VERIFIER_CMD": 'verify "oops'})
+    assert r2.returncode == 3 and "not a valid command template" in r2.stderr, (r2.returncode, r2.stderr)
+
+
+def t_sign_subprocess_timeout_exits_3():
+    # E6-S1 (CodeRabbit/Codex): a hung signer must not wedge the gate — a bounded timeout converts to
+    # the tooling-error exit (3). Forced offline with a tiny AR_SIGN_TIMEOUT and a sleeping signer.
+    repo, run = _pass_run_for_signing()
+    env = {**ENV, "AR_SIGN_TIMEOUT": "1",
+           "AR_SIGNER_CMD": sys.executable + ' -c "import time;time.sleep(5)" {msg} {sig}'}
+    sh(["aggregate.py"], repo, expect=0, env=env)
+    r = sh(["aggregate.py", "--sign"], repo, expect=None, env=env)
+    assert r.returncode == 3 and "timed out" in r.stderr, (r.returncode, r.stderr)
+    assert not (run / "attestation.sig").exists()
+
+
+def t_minisign_verify_flag_inline_vs_file():
+    # E6-S1 (Codex): AR_MINISIGN_PUBKEY may be a key FILE (-p) or an inline key (-P); _minisign_verify_argv
+    # picks the flag by whether the value names an existing file, so an inline key is not misread as a path.
+    import importlib
+    import aggregate
+    importlib.reload(aggregate)
+    orig_which = aggregate.shutil.which
+    aggregate.shutil.which = lambda name: "/usr/bin/minisign" if name == "minisign" else orig_which(name)
+    keyfile = Path(tempfile.mkdtemp(prefix="ar-minipub-")) / "ar.pub"
+    keyfile.write_text("RWQexampleexamplekey\n")
+    try:
+        os.environ["AR_MINISIGN_PUBKEY"] = "RWQinlinekeyvaluenofilehere123456"   # not a path
+        argv = aggregate._minisign_verify_argv()
+        assert argv and "-P" in argv and "-p" not in argv, argv
+        os.environ["AR_MINISIGN_PUBKEY"] = str(keyfile)                          # an existing file
+        argv = aggregate._minisign_verify_argv()
+        assert argv and "-p" in argv and "-P" not in argv, argv
+    finally:
+        aggregate.shutil.which = orig_which
+        os.environ.pop("AR_MINISIGN_PUBKEY", None)
 
 
 def t_gate_blocked_status_yields_blocked_not_fail():
