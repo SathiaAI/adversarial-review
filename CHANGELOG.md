@@ -10,6 +10,17 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
 ## [Unreleased]
 
 ### Added
+- Detached signature over the attestation digest (E6-S1): `aggregate.py --sign` writes a detached
+  cryptographic signature (`attestation.sig`) over the run's **existing** attestation digest, and
+  `aggregate.py --verify-signature` checks it (exit 0 valid / 1 invalid / 2 missing / 3 no verifier).
+  Signing is opt-in and additive — without `--sign` the run's artifacts are byte-identical — and the
+  digest algorithm, attested file set, and verdict are unchanged: the signature is a sidecar, not a
+  `*.json` file, so it is never folded back into the attestation. The signer is invoked
+  **out-of-process** (sigstore/cosign keyless primary, minisign fallback, `AR_SIGNER_CMD`/
+  `AR_VERIFIER_CMD` override with `{msg}`/`{sig}` tokens), preserving the stdlib-only,
+  zero-third-party-dependency runtime contract; a `--sign` with no signer configured fails loudly
+  (non-zero) rather than silently skipping. Documented in `references/config.md` (with the
+  outside-verifier path) and `references/schemas.md`.
 - Release hygiene: this changelog and a "cutting a release" ritual in `CONTRIBUTING.md`.
 - Documentation drift guards: `tests/run_tests.py` now asserts the gate matrix in
   `references/gates.md` stays consistent with `MINIMUM_GATES` in `scripts/gate.py`, and that

@@ -476,6 +476,21 @@ python scripts/aggregate.py --check-digest
 # exit 2 — nothing to verify yet (no verdict.json, or one computed before attestations existed)
 ```
 
+`--check-digest` proves the bytes are intact; it says nothing about *who* stands behind them.
+Optionally sign the digest so a third party who never ran the pipeline can verify both:
+
+```bash
+python scripts/aggregate.py --sign               # writes a detached signature sidecar, attestation.sig
+python scripts/aggregate.py --verify-signature   # 0 valid · 1 invalid · 2 missing · 3 no verifier
+```
+
+Signing is **opt-in and additive** — without `--sign` the artifacts are byte-identical — and it
+signs the *existing* digest without changing it: the sidecar is not a `*.json` file, so it is never
+folded back into the attestation. The signer runs **out-of-process** (sigstore/cosign keyless
+primary, minisign fallback, `AR_SIGNER_CMD` override), so the zero-runtime-dependency contract
+holds — no signing library is imported. The full outsider-verification path (signer identity, cosign
+`verify-blob` / minisign `-V`) is in [`references/config.md`](references/config.md).
+
 ## Configuration
 
 ### Policy as code
