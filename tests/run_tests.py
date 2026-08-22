@@ -1750,6 +1750,21 @@ def t_ci_docs_and_gitlab_mirror_action():
         "aggregate.py must run after the gates"
     assert "OPENROUTER_API_KEY" in gl and "BLOCKED" in gl, "keyless→BLOCKED honesty must be documented"
     assert "allow_failure" in gl and "exit_codes: 2" in gl, "fail-on=fail equivalent must be documented"
+    # E2-S3 (panel test_quality-1): the doc must document the Action's OUTPUTS too, not just inputs,
+    # so a renamed/removed output forces a doc update instead of drifting.
+    outputs_block = act.split("\noutputs:", 1)[1].split("\nruns:", 1)[0]
+    output_names = re.findall(r"(?m)^  ([a-z][a-z0-9-]*):", outputs_block)
+    assert set(output_names) >= {"verdict", "exit-code"}, output_names
+    for name in output_names:
+        assert "`%s`" % name in doc, "docs/ci-integration.md omits Action output `%s`" % name
+    # (panel correctness-2): the verdict->exit-code contract is stated explicitly in the doc.
+    assert "exit code" in doc.lower()
+    for word in ("PASS", "FAIL", "BLOCKED"):
+        assert word in doc, "verdict word %r missing from ci-integration.md" % word
+    # (panel test_quality-2): the GitLab template must surface the Action's required inputs through its
+    # AR_* variables (risk, dev-providers, diff-ref/base, gate set) so the two CI paths stay in lockstep.
+    for var in ("AR_RISK", "AR_DEV_PROVIDERS", "AR_DIFF", "AR_REQUIRE"):
+        assert var in gl, ".gitlab-ci.yml omits %s (Action-input equivalent)" % var
 
 
 def t_policy_pins_precedence():
