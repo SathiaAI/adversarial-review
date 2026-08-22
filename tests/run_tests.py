@@ -4171,6 +4171,66 @@ def t_eval_live_harness_fails_closed_without_cost_telemetry():
     assert [u["rep"] for u in result["not_run"]] == [2, 3], result["not_run"]
 
 
+def t_eval_live_harness_ignores_inherited_run_dir():
+    # E1-S4 (PR #46, CodeRabbit/Codex): a live run must not break when the operator has AR_RUN_DIR set.
+    # _panel_env_live drops it so each child panel writes its run dir inside its own throwaway repo.
+    env = dict(ENV); env["AR_RUN_DIR"] = "/tmp/ar-inherited-run-dir-should-be-ignored"
+    result, _ = _run_eval_live(["sec-idor-invoice"], extra=["--reps", "1", "--budget-usd", "20"],
+                               reviewer_cost=0.05, env=env)
+    assert result["cases"][0]["reps"] == 1, result       # panel ran and produced a run dir
+    assert result["complete"] is True, result
+
+
+def t_eval_live_harness_preflights_before_paid_calls():
+    # E1-S4 (PR #46, Codex): a malformed case sorted AFTER a valid one must fail the live run BEFORE any
+    # panel runs — no wasted spend. Proven by the mock router receiving zero chat calls.
+    base = Path(tempfile.mkdtemp(prefix="ar-livepre-"))
+    try:
+        good = base / "aaa-good"; good.mkdir()
+        (good / "meta.json").write_text(json.dumps({"id": "aaa-good", "title": "x", "tier": "NORMAL",
+            "category": "clean", "language": "python", "source": "seeded"}))
+        (good / "context.md").write_text("diff\n+x\n")
+        (good / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1}))
+        bad = base / "zzz-bad"; bad.mkdir()
+        (bad / "meta.json").write_text(json.dumps({"id": "WRONGID", "title": "x", "tier": "NORMAL",
+            "category": "clean", "language": "python", "source": "seeded"}))
+        (bad / "context.md").write_text("x")
+        (bad / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1}))
+        mock_router.reset()
+        try:
+            r = subprocess.run([sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "live",
+                                "--corpus", str(base), "--no-write", "--quiet"],
+                               env=ENV, capture_output=True, text=True)
+            assert r.returncode != 0 and "invalid" in (r.stdout + r.stderr).lower(), (r.stdout + r.stderr)[-200:]
+            assert mock_router.STATE["calls"] == {}, "preflight must reject before any paid panel call"
+        finally:
+            mock_router.reset()
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def t_eval_live_summary_is_stop_neutral():
+    # E1-S4 (PR #46, CodeRabbit): after a NON-budget early stop (cost telemetry) on a single-case run,
+    # the summary must not claim "later cases ran fewer", must surface the real stop reason, and must
+    # label skipped units stop-neutrally (not "budget").
+    sys.path.insert(0, str(SKILL / "evals"))
+    import run as evalrun
+    result = {
+        "corpus": "c", "line_tol": 3, "reps": 3, "budget_usd": 5.0, "spent_usd": 0.0,
+        "complete": False, "stop_reason": "cost telemetry unavailable -- a completed panel reported $0",
+        "not_run": [{"case": "only", "rep": 2}, {"case": "only", "rep": 3}],
+        "clean_fp": 0, "clean_units": 0, "clean_fp_rate": None,
+        "cases": [{"case_id": "only", "category": "security", "tier": "SENSITIVE", "reps": 1,
+                   "detection_rate": 1.0, "cost_usd": 0.0}],
+        "aggregate": {"overall": {"cases": 1, "must_detect_total": 1, "detection_rate": 1.0,
+                                  "tp": 1, "partial": 0, "fn": 0, "fp": 0, "noise": 0},
+                      "by_category": {}, "by_tier": {}, "by_role": {}, "by_model": {}}}
+    md = evalrun._live_summary_md(result, "test")
+    assert "later cases ran fewer" not in md, md
+    assert "Not run (budget)" not in md and "Not run (early stop)" in md, md
+    assert "cost telemetry" in md, md
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

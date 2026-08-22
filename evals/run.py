@@ -88,10 +88,12 @@ def _panel_env(base_url):
     return env
 
 
-def _run_panel(case_dir, tier, base_url, env=None):
+def _run_panel(case_dir, tier, base_url, env=None, keep_on_error=False):
     """init/assign/run in a throwaway repo; return (repo, run_dir). Findings land under the run dir.
     The caller owns `repo` on success and removes it; if anything here raises, the repo is removed
-    before re-raising so a failed case never leaks an ``ar-eval-*`` directory (Codex, PR #45)."""
+    before re-raising so a failed case never leaks an ``ar-eval-*`` directory (Codex, PR #45) — unless
+    keep_on_error is set (live mode), where a failed panel may already have billed reviewers, so the
+    paid artifacts are preserved for audit and their path logged instead (Codex, PR #46)."""
     repo = Path(tempfile.mkdtemp(prefix="ar-eval-"))
     try:
         shutil.copyfile(case_dir / "context.md", repo / "context.md")
@@ -115,7 +117,10 @@ def _run_panel(case_dir, tier, base_url, env=None):
             raise RuntimeError("panel produced no run dir under %s" % repo)
         return repo, runs[-1]
     except BaseException:
-        shutil.rmtree(repo, ignore_errors=True)
+        if keep_on_error:
+            print("  live panel failed; paid artifacts preserved at %s" % repo, file=sys.stderr)
+        else:
+            shutil.rmtree(repo, ignore_errors=True)
         raise
 
 
@@ -253,17 +258,26 @@ def _panel_env_live():
     """Env for a LIVE panel: the ambient environment is passed through unchanged, so reviewers reach
     the configured provider with the operator's real credentials and transport (`AR_BASE_URL`,
     `OPENROUTER_API_KEY`, a key file, or a proxy — whatever config.md resolves). Nothing is stripped,
-    unlike the offline env: live mode is meant to spend, bounded by the harness budget guard below."""
-    return dict(os.environ)
+    unlike the offline env, except AR_RUN_DIR: a child must write its run dir inside its own throwaway
+    repo, so an inherited run-root override (which would send artifacts elsewhere and make _run_panel
+    find no run dir) is dropped, mirroring the offline env (CodeRabbit + Codex, PR #46)."""
+    env = dict(os.environ)
+    env.pop("AR_RUN_DIR", None)
+    return env
 
 
 def _live_credentialed(env=None):
-    """True when the environment can actually reach a provider — a key (OpenRouter / OpenAI / key file /
-    generic `AR_API_KEY`) or an explicit `AR_BASE_URL` (proxy). Guards `--mode live` from spending a
-    run on no-op panels when nothing is configured."""
+    """True only when the panel's OWN resolver (`panel.api_config`) would find a usable key: an
+    `AR_API_KEY`, an `OPENROUTER_API_KEY`, or an `AR_KEY_FILE` that actually exists. Mirrors the panel
+    exactly (a key is required even behind an `AR_BASE_URL` proxy), so `--mode live` fails fast with the
+    same criteria the reviewer calls use instead of passing here — e.g. on `OPENAI_API_KEY`, or a
+    non-existent key-file path — only to die later mid-assignment (Codex, PR #46)."""
     e = env if env is not None else os.environ
-    return any(e.get(k) for k in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "AR_KEY_FILE",
-                                  "AR_API_KEY", "AR_BASE_URL"))
+    key = e.get("AR_API_KEY") or e.get("OPENROUTER_API_KEY")
+    kf = e.get("AR_KEY_FILE")
+    if not key and kf and Path(kf).expanduser().is_file():
+        key = "keyfile"
+    return bool(key)
 
 
 def _case_costs_and_models(run_dir):
@@ -348,16 +362,22 @@ def run_live(corpus_dir, only=None, reps=1, line_tol=score.DEFAULT_LINE_TOL,
     if reps < 1:
         raise SystemExit("reps must be >= 1")
 
-    env = _panel_env_live()
-    units, score_pairs, cases_out, not_run = [], [], [], []
-    spent, stopped, stop_reason = 0.0, False, None
+    # Preflight: validate + load EVERY selected case before any paid call (Codex, PR #46). A malformed
+    # case late in the corpus must fail the run before earlier cases spend real money, never after.
+    loaded = []
     for name in names:
         cdir = corpus_dir / name
         problems = validate_case(str(cdir))
         if problems:  # a malformed case is broken, never silently skipped
             raise SystemExit("case %s is invalid:\n  - %s" % (name, "\n  - ".join(problems)))
-        meta = json.loads((cdir / "meta.json").read_text(encoding="utf-8"))
-        expected = json.loads((cdir / "expected.json").read_text(encoding="utf-8"))
+        loaded.append((name, cdir,
+                       json.loads((cdir / "meta.json").read_text(encoding="utf-8")),
+                       json.loads((cdir / "expected.json").read_text(encoding="utf-8"))))
+
+    env = _panel_env_live()
+    units, score_pairs, cases_out, not_run = [], [], [], []
+    spent, stopped, stop_reason = 0.0, False, None
+    for name, cdir, meta, expected in loaded:
         tier = meta.get("tier", "NORMAL")
         case_units = []
         for k in range(1, reps + 1):
@@ -367,7 +387,16 @@ def run_live(corpus_dir, only=None, reps=1, line_tol=score.DEFAULT_LINE_TOL,
                     stop_reason = "budget reached ($%.4f of $%.2f)" % (spent, budget_usd)
                 not_run.append({"case": name, "rep": k})
                 continue
-            repo, run_dir = _run_panel(cdir, tier, None, env=env)
+            try:
+                repo, run_dir = _run_panel(cdir, tier, None, env=env, keep_on_error=True)
+            except BaseException as exc:
+                # A live panel can fail after billing earlier reviewers; keep_on_error preserves that
+                # paid throwaway repo for audit, and we stop with a report rather than aborting the whole
+                # run with a traceback (Codex, PR #46).
+                stopped = True
+                stop_reason = "live panel failed at %s rep %d: %s" % (name, k, str(exc)[:160])
+                not_run.append({"case": name, "rep": k, "error": str(exc)[:200]})
+                break
             try:
                 per_role = _collect_findings(run_dir)
                 role_info = _case_costs_and_models(run_dir)
@@ -416,6 +445,7 @@ def run_live(corpus_dir, only=None, reps=1, line_tol=score.DEFAULT_LINE_TOL,
         "budget_usd": budget_usd, "spent_usd": round(spent, 6),
         "complete": not stopped, "stop_reason": stop_reason, "not_run": not_run,
         "clean_fp": sum(u["fp"] for u in clean), "clean_units": len(clean),
+        "clean_fp_rate": (sum(u["fp"] for u in clean) / len(clean)) if clean else None,
         "cases": cases_out, "aggregate": agg,
     }
 
@@ -501,8 +531,8 @@ def _live_summary_md(result, generated_at):
                  % (generated_at, _md_cell(result["corpus"]), result["reps"], result["line_tol"]))
     lines.append("")
     ran = ("Each case ran %d rep(s)" % result["reps"] if result["complete"]
-           else "Up to %d rep(s) per case were requested; the run stopped early, so later cases ran "
-                "fewer -- see the per-case table and not_run" % result["reps"])
+           else "Up to %d rep(s) per case were requested; the run stopped early, so later repetitions "
+                "or cases were skipped -- see the per-case table and not_run" % result["reps"])
     lines.append("Live mode runs **real** model panels, so these numbers reflect model + panel quality, "
                  "not just harness assembly. %s; per-rep detail is in the JSON so single-run noise "
                  "stays visible." % ran)
@@ -513,7 +543,7 @@ def _live_summary_md(result, generated_at):
     if result["not_run"]:
         skipped = ", ".join("%s#%d" % (_md_cell(u["case"]), u["rep"]) for u in result["not_run"])
         lines.append("")
-        lines.append("- Not run (budget): %s" % skipped)
+        lines.append("- Not run (early stop): %s" % skipped)
     lines.append("")
     dr = "n/a" if ov["detection_rate"] is None else "%.0f%%" % (ov["detection_rate"] * 100)
     lines.append("## Overall")
@@ -598,8 +628,9 @@ def main(argv=None):
         ap.error("--reps must be >= 1")
     if args.mode == "live":
         if not _live_credentialed():
-            ap.error("--mode live needs a provider: set OPENROUTER_API_KEY (or AR_API_KEY / "
-                     "AR_KEY_FILE), or AR_BASE_URL for a proxy. Offline mode needs neither.")
+            ap.error("--mode live needs a provider key: set OPENROUTER_API_KEY / AR_API_KEY, or "
+                     "AR_KEY_FILE (a key is required even behind an AR_BASE_URL proxy). Offline mode "
+                     "needs neither.")
         b = args.budget_usd
         if b is not None and (b != b or b < 0 or b == float("inf")):
             ap.error("--budget-usd must be finite and >= 0 (0 disables the cap; omit for the $20 default)")

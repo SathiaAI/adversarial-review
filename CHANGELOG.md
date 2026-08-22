@@ -60,15 +60,19 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   through **real** model panels (`--reps N` per case) over the configured transport, scoring each
   panel's ingested findings with `evals/score.py`. Unlike offline mode it serves no scripts and starts
   no mock router — reviewers answer for real — so it measures model + panel quality, not just harness
-  assembly. It emits a dated `evals/report/live-<ts>.json` + `summary.md` with detection rate per
-  category, tier, reviewer role, and **model**, the false-positive rate on clean cases, cost per case,
-  and per-rep detail so single-run noise stays visible; each case runs at its own tier (a SENSITIVE
+  assembly. It emits a dated `evals/report/live-<ts>.json` + `live-<ts>.summary.md` with the detection
+  rate per category and tier, a per-reviewer-role and per-model contribution breakdown (findings
+  emitted / true positives / partials / unmatched, plus cost per model), the clean-case false-positive
+  rate (`clean_fp_rate`), cost per case, and per-rep detail so single-run noise stays visible (per-role
+  and per-model FN / detection-rate are not attributed — which role/model should catch a defect is not
+  encoded); each case runs at its own tier (a SENSITIVE
   case gets the six-role panel). A cumulative USD budget (`--budget-usd`, default **$20**) caps the
   whole run: checked before each panel, and when reached the remaining `(case, rep)` units are recorded
   in `not_run` and the run stops — never a silent partial, overshoot bounded by the one in-flight
   panel; each individual panel still honours its own `AR_MAX_COST_USD` cap (E4-S2). Opt-in and never in
-  CI: it needs a provider (a key, key file, or `AR_BASE_URL` proxy) and exits rather than spend a run
-  on no-op panels without one. Live results are non-deterministic by nature (the per-rep raw detail
+  CI: it needs a provider key resolved the same way the panel resolves it (`OPENROUTER_API_KEY` /
+  `AR_API_KEY` / an existing `AR_KEY_FILE`; required even behind an `AR_BASE_URL` proxy) and exits
+  rather than spend a run on no-op panels without one. Live results are non-deterministic by nature (the per-rep raw detail
   keeps the aggregate auditable); the harness code itself is exercised offline against the mock router
   with no network and no keys. Regression thresholds seeded from the first live report are E1-S5.
 - Distribution: a `release` workflow publishes to PyPI on a `v*` tag via **Trusted Publishing**

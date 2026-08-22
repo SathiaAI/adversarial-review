@@ -134,24 +134,29 @@ evidence offline mode can't give, since offline serves scripted findings. It is 
 in CI**: it needs a provider and it spends money.
 
 ```bash
-export OPENROUTER_API_KEY=sk-...                    # or a key file / an AR_BASE_URL proxy
+export OPENROUTER_API_KEY=sk-...                    # or AR_API_KEY, or an AR_KEY_FILE path
 python evals/run.py --mode live                     # whole corpus, 1 rep/case
 python evals/run.py --mode live --reps 3            # 3 panels/case to expose reviewer variance
 python evals/run.py --mode live --budget-usd 5 --only sec-idor-invoice
 ```
 
-- **Provider required.** Live mode uses the transport `references/config.md` resolves
-  (`OPENROUTER_API_KEY`, a key file, or an `AR_BASE_URL` proxy). With none configured it exits
-  rather than spend a run on no-op panels.
+- **Provider key required.** Live mode resolves credentials exactly as the panel does
+  (`panel.api_config`): an `OPENROUTER_API_KEY`, an `AR_API_KEY`, or an `AR_KEY_FILE` that exists — a
+  key is required even behind an `AR_BASE_URL` proxy. With none it exits up front rather than spend a
+  run on no-op panels.
 - **Budget.** `--budget-usd` (default **$20**) is a cumulative ceiling for the whole run, checked
   before each panel; when it is reached the remaining `(case, rep)` units are recorded in `not_run`
   and the run stops — never a silent partial, and overspend is bounded by the one in-flight panel.
   (This is the harness-level cap; each individual panel still honours its own `AR_MAX_COST_USD`
   ceiling from E4-S2.) Cadence is monthly; the report records the actual spend.
-- **Report.** Writes a dated `evals/report/live-<ts>.json` + `.summary.md` with detection rate per
-  category, tier, reviewer role, and **model**, the FP rate on clean cases, cost per case, and
-  per-rep detail so single-run noise stays visible. Each case runs at **its own tier** (a SENSITIVE
-  case gets the six-role panel), so per-tier numbers reflect real panels.
+- **Report.** Writes a dated `evals/report/live-<ts>.json` + `live-<ts>.summary.md` with the
+  detection rate per **category** and **tier** (where a defect denominator is well-defined), a
+  per-**reviewer-role** and per-**model** contribution breakdown (findings emitted, and how many were
+  true positives / partials / unmatched — plus cost per model), the clean-case false-positive rate
+  (`clean_fp_rate`), cost per case, and per-rep detail so single-run noise stays visible. Per-role and
+  per-model FN / detection-rate are intentionally **not** attributed — which role or model *should*
+  catch a given defect is not encoded. Each case runs at **its own tier** (a SENSITIVE case gets the
+  six-role panel), so per-tier numbers reflect real panels.
 - **Not deterministic.** Real models vary run to run, so — unlike offline mode — the live scored
   payload is not byte-identical across runs (that is what `--reps` quantifies). The per-rep raw
   detail is kept so the aggregate stays auditable. The corpus is synthetic and carries no secrets,
