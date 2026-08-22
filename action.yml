@@ -150,9 +150,12 @@ runs:
         # third-party reviewer panel. Require a recorded, passing 'secrets' gate as the transmission
         # precondition (the NORMAL floor requires it anyway). Without it, skip the panel — the diff is
         # never sent unscanned and the verdict is BLOCKED for missing coverage (honest), not a leak.
-        secrets_ok="$(python -c 'import json,os,sys; p=os.path.join(sys.argv[1],"gates","secrets.json"); print("1" if os.path.isfile(p) and json.load(open(p)).get("status")=="PASS" else "0")' "$RUN_DIR")"
+        # `python -I` (isolated: cwd off sys.path, PYTHONPATH + user-site ignored) so a repo-committed
+        # json.py / sitecustomize.py in the checkout cannot execute with OPENROUTER_API_KEY in the
+        # environment. Reads only THIS run's recorded gate result; imports only the real stdlib.
+        secrets_ok="$(python -I -c 'import json,os,sys; p=os.path.join(sys.argv[1],"gates","secrets.json"); print("1" if os.path.isfile(p) and json.load(open(p)).get("status")=="PASS" else "0")' "$RUN_DIR")"
         if [ "$secrets_ok" != "1" ]; then
-          echo "::warning::adversarial-review: this run's 'secrets' gate is not recorded PASS — skipping the reviewer panel so the diff is NOT transmitted unscanned. Add a secrets scanner to 'gates' (e.g. secrets=gitleaks detect --no-banner --redact --source .); the verdict stays BLOCKED until it passes."
+          echo "::warning::adversarial-review: this run's 'secrets' gate is not recorded PASS — skipping the reviewer panel so the diff is NOT transmitted unscanned. Add a secrets scanner to 'gates' (e.g. secrets=gitleaks detect --no-banner --redact --source .); the verdict will not PASS until it does (BLOCKED for a missing scan, FAIL if the scan found a leak)."
           exit 0
         fi
         # mktemp, not a fixed $RUNNER_TEMP/context.md name — standard temp-file

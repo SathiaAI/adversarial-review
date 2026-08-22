@@ -87,9 +87,12 @@ These mirror `action.yml` exactly — do not pass anything not listed here.
   skipped and the verdict is BLOCKED for missing panel coverage. The gate-only path needs no
   network — good for a first, honest signal.
 - **The diff is transmitted only after a passing secrets scan.** The reviewer-panel step refuses to
-  send the diff to the panel unless a `secrets` gate is recorded PASS — so a committed credential is
-  caught before anything leaves your runner. Include a `secrets=…` gate (the example does); the
-  NORMAL floor requires it anyway.
+  send the diff to the panel unless this run's `secrets` gate is recorded PASS, so a
+  correctly-configured secrets scanner catches a committed credential before the diff is transmitted.
+  Include a `secrets=…` gate (the example does); the NORMAL floor requires it anyway. This is a
+  single-job precondition, not a hard isolation boundary — for untrusted/fork PRs prefer the GitLab
+  two-job template, which re-runs the scan in the keyed job so repository-controlled code cannot
+  influence the transmission decision.
 - **The verdict is written to the job summary** (`verdict.md`), and `verdict` / `exit-code` are
   exposed as step outputs you can branch on.
 

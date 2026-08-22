@@ -1786,14 +1786,40 @@ def t_ci_docs_and_gitlab_mirror_action():
         "secrets check must not glob run-* (a committed run dir could satisfy it)"
     assert panel_step.index("secrets.json") < panel_step.index('panel.py\" run'), \
         "the secrets PASS check must occur before panel.py run transmits the diff"
-    # every gate/panel/aggregate step pins to the init run dir, so a committed .adversarial-review/
-    # run-* in the checkout cannot hijack the pipeline or forge the gate result.
-    assert "steps.init.outputs.run_dir" in act and act.count('--run "') >= 5, \
-        "action.yml must pin all steps to the run dir created by panel.py init"
+    # every gate/panel/aggregate step pins to the init run dir (panel test_quality-2: assert EACH
+    # step, not just a count), so a committed .adversarial-review/run-* can't hijack the pipeline.
+    assert "steps.init.outputs.run_dir" in act, "action.yml must expose init's run dir as an output"
+    for needle in ('gate.py" plan --run "$run_dir"', 'gate.py" run --run "$RUN_DIR"',
+                   'panel.py" assign --run "$RUN_DIR"', 'panel.py" run --run "$RUN_DIR"',
+                   'aggregate.py" --run "$RUN_DIR"'):
+        assert needle in act, "action.yml step not pinned to the run dir: %r" % needle
     # the documented starter workflow BLOCK must configure the full NORMAL floor incl. secrets.
     starter = doc.split("```yaml", 1)[1].split("```", 1)[0]
     for g in ("build=", "unit=", "secrets=", "deps=", "sast="):
         assert g in starter, "ci-integration.md starter workflow omits a `%s` gate" % g
+
+
+def t_action_secrets_guard_behaviour():
+    # E2-S3 (panel security-1 + test_quality-1): the reviewer-panel secrets precondition must (a) run
+    # ISOLATED (`python -I`, so a repo-committed json.py/sitecustomize.py can't execute with the key
+    # in env) and (b) actually gate transmission — return "1" only when THIS run's gates/secrets.json
+    # is recorded PASS, "0" for a missing file or any non-PASS status. The exact command is EXTRACTED
+    # from action.yml so the test tracks the real guard, and exercised against real run dirs.
+    import subprocess as _sp, tempfile as _tf, json as _json, os as _os
+    act = (SKILL / "action.yml").read_text(encoding="utf-8")
+    line = [l.strip() for l in act.splitlines() if l.strip().startswith("secrets_ok=")][0]
+    assert line.startswith('secrets_ok="$(python -I -c'), ("guard must be isolated with -I", line)
+    cmd = line[len('secrets_ok="$('):-2]                       # strip the `secrets_ok="$(` … `)"`
+    def check(status):
+        d = _tf.mkdtemp(prefix="ar-guard-")
+        if status is not None:
+            _os.makedirs(_os.path.join(d, "gates"))
+            (Path(d) / "gates" / "secrets.json").write_text(_json.dumps({"status": status}))
+        r = _sp.run(["bash", "-c", cmd.replace('"$RUN_DIR"', d)], capture_output=True, text=True)
+        return r.stdout.strip()
+    assert check("PASS") == "1", "a recorded PASS secrets gate must authorize transmission"
+    assert check("FAIL") == "0", "a FAILED secrets scan must NOT authorize transmission"
+    assert check(None) == "0", "a missing secrets.json must NOT authorize transmission"
 
 
 def t_policy_pins_precedence():

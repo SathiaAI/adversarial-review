@@ -106,7 +106,8 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   locks in the secrets-transmission guard and the full-floor starter workflow below.
   Review hardening (CodeRabbit + Codex on #49): the composite **`action.yml` now gates diff
   transmission to the reviewer panel on a passing `secrets` gate** — mirroring the GitLab job, so a
-  committed credential is never sent to the panel unscanned, and every gate/panel/aggregate step is
+  correctly-configured secrets scan is required before the diff is transmitted, and every
+  gate/panel/aggregate step is
   pinned with `--run` to the exact run directory `panel.py init` created, so a repository-committed
   `.adversarial-review/run-*` in the checkout cannot forge the secrets gate or hijack the pipeline;
   the documented starter workflow
