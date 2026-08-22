@@ -92,6 +92,17 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   (OIDC, no stored token); an `action-selftest` workflow exercises the composite action keyless
   and asserts the honest BLOCKED verdict; a GitLab CI template (`examples/.gitlab-ci.yml`); and a
   `Changelog` project URL.
+- CI-integration guide + Marketplace steps (E2-S3): a new `docs/ci-integration.md` presents **both**
+  the GitHub Action and the GitLab template together — the Action's real inputs (`risk`,
+  `dev-providers`, `gates`, `fail-on`, `diff-ref`, `product`, `openrouter-api-key`) and outputs
+  (`verdict`, `exit-code`), the keyless→BLOCKED path, the verdict→exit-code (`0`/`1`/`2`) contract,
+  and an Action-input↔GitLab-variable mapping. It also documents the remaining **manual** GitHub
+  Marketplace publishing steps a maintainer performs by hand (publish from the repo's Releases page,
+  choose categories, and adopt a moving `v1` major tag; branding already lives in `action.yml`),
+  since Marketplace listing cannot be automated from this repo. Referenced from `README.md`,
+  `docs/using-on-your-platform.md`, and the docs-site footer. A `t_ci_docs_and_gitlab_mirror_action`
+  guard test asserts the guide names every real `action.yml` input (no invented inputs) and that the
+  GitLab template keeps `aggregate.py` as its terminal command so the job exit code is the verdict.
 - Reviewer robustness & cost control (E4): `build_request` is now capability-driven — a model whose
   profile forbids `temperature` is sent none, `max_tokens` is floored at the profile's
   `max_tokens_floor`, and a mandatory-reasoning model receives a `reasoning` budget

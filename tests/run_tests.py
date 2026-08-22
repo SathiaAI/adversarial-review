@@ -1719,6 +1719,39 @@ def t_action_definition_hygiene():
     assert "fetch-depth: 0" in wf, "panel needs full history"
 
 
+def t_ci_docs_and_gitlab_mirror_action():
+    # E2-S3 drift guard. The CI-integration guide must mirror the ACTUAL action.yml inputs (a new
+    # or renamed input forces a doc update instead of drifting), and the GitLab template must keep
+    # aggregate.py as its terminal pipeline command so the job exit code IS the verdict. Structural
+    # string checks (no YAML dep), doc/template-vs-code — the same discipline as gates.md/README.
+    act = (SKILL / "action.yml").read_text(encoding="utf-8")
+    inputs_block = act.split("\ninputs:", 1)[1].split("\noutputs:", 1)[0]
+    input_names = re.findall(r"(?m)^  ([a-z][a-z0-9-]*):", inputs_block)
+    assert len(input_names) >= 5, f"action.yml input extraction looks wrong: {input_names}"
+
+    doc = (SKILL / "docs" / "ci-integration.md").read_text(encoding="utf-8")
+    for name in input_names:  # every real Action input is documented by its backticked name
+        assert "`%s`" % name in doc, f"docs/ci-integration.md omits action input `{name}`"
+    for token in ("GitHub", "GitLab", "Marketplace", "v1",
+                  "examples/.gitlab-ci.yml", "examples/adversarial-review.yml"):
+        assert token in doc, f"docs/ci-integration.md missing {token!r}"
+
+    gl = (SKILL / "examples" / ".gitlab-ci.yml").read_text(encoding="utf-8")
+    for call in ("panel.py init", "gate.py plan", "aggregate.py"):
+        assert call in gl, f".gitlab-ci.yml missing real entrypoint {call!r}"
+    for fake in ("--fail-on", "--gates"):  # Action inputs, not script flags — never invented here
+        assert fake not in gl, f".gitlab-ci.yml invents a non-existent flag {fake!r}"
+    # aggregate.py is the terminal command → GitLab job exit code == the computed verdict.
+    # Compare the invocation paths ("scripts/gate.py" etc.); a bare "gate.py" is a substring of
+    # "aggregate.py", the "scripts/" prefix keeps the ordering comparison honest.
+    assert gl.rindex("scripts/aggregate.py") > gl.rindex("scripts/panel.py"), \
+        "aggregate.py must run after the panel"
+    assert gl.rindex("scripts/aggregate.py") > gl.rindex("scripts/gate.py"), \
+        "aggregate.py must run after the gates"
+    assert "OPENROUTER_API_KEY" in gl and "BLOCKED" in gl, "keyless→BLOCKED honesty must be documented"
+    assert "allow_failure" in gl and "exit_codes: 2" in gl, "fail-on=fail equivalent must be documented"
+
+
 def t_policy_pins_precedence():
     repo = fresh_repo()
     (repo / ".adversarial-review.yml").write_text(
