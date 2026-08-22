@@ -1775,14 +1775,25 @@ def t_ci_docs_and_gitlab_mirror_action():
     # AR_* variables (risk, dev-providers, diff-ref/base, gate set) so the two CI paths stay in lockstep.
     for var in ("AR_RISK", "AR_DEV_PROVIDERS", "AR_DIFF", "AR_REQUIRE"):
         assert var in gl, ".gitlab-ci.yml omits %s (Action-input equivalent)" % var
-    # E2-S3 (Codex finding): the GitHub Action must gate diff transmission on a passing secrets scan,
-    # mirroring the GitLab job — a committed credential must never reach the panel unscanned.
-    assert "gates/secrets.json" in act and "not recorded PASS" in act, \
-        "action.yml panel step must require a passing secrets gate before transmitting the diff"
-    # and the documented starter workflow must configure the full NORMAL floor incl. a secrets gate,
-    # so a copy-paste user gets a complete, non-leaking config (not build+unit that can only BLOCK).
+    # E2-S3 (CodeRabbit Critical + Minor): the secrets-before-transmit guard must be an EXECUTABLE
+    # check in the reviewer-panel STEP, bound to THIS run's exact directory (RUN_DIR from panel.py
+    # init) — never a glob a committed/older run-* could satisfy — and it must run before
+    # `panel.py run` transmits the diff. Assert on the extracted panel-step block, not the whole file.
+    panel_step = act.split("Independent reviewer panel", 1)[1].split("\n    - name:", 1)[0]
+    assert "secrets.json" in panel_step and '"$RUN_DIR"' in panel_step, \
+        "panel step must check THIS run's secrets.json pinned to RUN_DIR"
+    assert "glob.glob(" not in panel_step, \
+        "secrets check must not glob run-* (a committed run dir could satisfy it)"
+    assert panel_step.index("secrets.json") < panel_step.index('panel.py\" run'), \
+        "the secrets PASS check must occur before panel.py run transmits the diff"
+    # every gate/panel/aggregate step pins to the init run dir, so a committed .adversarial-review/
+    # run-* in the checkout cannot hijack the pipeline or forge the gate result.
+    assert "steps.init.outputs.run_dir" in act and act.count('--run "') >= 5, \
+        "action.yml must pin all steps to the run dir created by panel.py init"
+    # the documented starter workflow BLOCK must configure the full NORMAL floor incl. secrets.
+    starter = doc.split("```yaml", 1)[1].split("```", 1)[0]
     for g in ("build=", "unit=", "secrets=", "deps=", "sast="):
-        assert g in doc, "ci-integration.md starter workflow omits a `%s` gate" % g
+        assert g in starter, "ci-integration.md starter workflow omits a `%s` gate" % g
 
 
 def t_policy_pins_precedence():

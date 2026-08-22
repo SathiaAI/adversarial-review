@@ -56,6 +56,7 @@ runs:
   using: 'composite'
   steps:
     - name: Initialize run and plan gates
+      id: init
       shell: bash
       env:
         IN_RISK: ${{ inputs.risk }}
@@ -70,7 +71,16 @@ runs:
         [ -n "$IN_RISK" ] && args+=(--risk "$IN_RISK")
         [ -n "$IN_DEV" ] && args+=(--dev-providers "$IN_DEV")
         [ -n "$IN_PRODUCT" ] && args+=(--product "$IN_PRODUCT")
-        python "$AR_SCRIPTS/panel.py" init "${args[@]}"
+        # Capture the EXACT run directory init created (its first stdout line: "initialized <dir> ...").
+        # Every later step pins to it with --run, so a repository-committed .adversarial-review/run-*
+        # directory present in the checkout can never hijack the pipeline or forge a gate result.
+        init_out="$(python "$AR_SCRIPTS/panel.py" init "${args[@]}")"
+        printf '%s\n' "$init_out"
+        run_dir="$(printf '%s\n' "$init_out" | awk '/^initialized /{print $2; exit}')"
+        if [ -z "$run_dir" ] || [ ! -d "$run_dir" ]; then
+          echo "::error::adversarial-review: could not resolve the run directory created by panel.py init"; exit 1
+        fi
+        echo "run_dir=$run_dir" >> "$GITHUB_OUTPUT"
         names=""
         while IFS= read -r line; do
           line="${line%$'\r'}"                 # tolerate CRLF YAML
@@ -87,15 +97,16 @@ runs:
           names="${names:+$names,}$name"
         done <<< "$IN_GATES"
         if [ -n "$names" ]; then
-          python "$AR_SCRIPTS/gate.py" plan --require "$names"
+          python "$AR_SCRIPTS/gate.py" plan --run "$run_dir" --require "$names"
         else
-          python "$AR_SCRIPTS/gate.py" plan
+          python "$AR_SCRIPTS/gate.py" plan --run "$run_dir"
         fi
 
     - name: Run and record gates
       shell: bash
       env:
         IN_GATES: ${{ inputs.gates }}
+        RUN_DIR: ${{ steps.init.outputs.run_dir }}
         AR_SCRIPTS: ${{ github.action_path }}/scripts
       run: |
         set -uo pipefail
@@ -119,7 +130,7 @@ runs:
           # command is authored in the trusted workflow file (on fork PRs GitHub
           # takes it from the base repo), and its own $VARS expand inside this
           # inner bash -c exactly as the author intends.
-          python "$AR_SCRIPTS/gate.py" run --name "$name" -- bash -c "$cmd" || true
+          python "$AR_SCRIPTS/gate.py" run --run "$RUN_DIR" --name "$name" -- bash -c "$cmd" || true
         done <<< "$IN_GATES"
 
     - name: Independent reviewer panel (only with a key)
@@ -127,6 +138,7 @@ runs:
       env:
         OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
         IN_DIFF_REF: ${{ inputs.diff-ref }}
+        RUN_DIR: ${{ steps.init.outputs.run_dir }}
         AR_SCRIPTS: ${{ github.action_path }}/scripts
       run: |
         set -euo pipefail
@@ -138,9 +150,9 @@ runs:
         # third-party reviewer panel. Require a recorded, passing 'secrets' gate as the transmission
         # precondition (the NORMAL floor requires it anyway). Without it, skip the panel — the diff is
         # never sent unscanned and the verdict is BLOCKED for missing coverage (honest), not a leak.
-        secrets_ok="$(python -c 'import json,glob; f=sorted(glob.glob(".adversarial-review/run-*/gates/secrets.json")); print("1" if f and json.load(open(f[-1])).get("status")=="PASS" else "0")')"
+        secrets_ok="$(python -c 'import json,os,sys; p=os.path.join(sys.argv[1],"gates","secrets.json"); print("1" if os.path.isfile(p) and json.load(open(p)).get("status")=="PASS" else "0")' "$RUN_DIR")"
         if [ "$secrets_ok" != "1" ]; then
-          echo "::warning::adversarial-review: the 'secrets' gate is not recorded PASS — skipping the reviewer panel so the diff is NOT transmitted unscanned. Add a secrets scanner to 'gates' (e.g. secrets=gitleaks detect --no-banner --redact --source .); the verdict stays BLOCKED until it passes."
+          echo "::warning::adversarial-review: this run's 'secrets' gate is not recorded PASS — skipping the reviewer panel so the diff is NOT transmitted unscanned. Add a secrets scanner to 'gates' (e.g. secrets=gitleaks detect --no-banner --redact --source .); the verdict stays BLOCKED until it passes."
           exit 0
         fi
         # mktemp, not a fixed $RUNNER_TEMP/context.md name — standard temp-file
@@ -153,14 +165,15 @@ runs:
           git diff "$IN_DIFF_REF" || echo "(diff unavailable — check fetch-depth)"
           echo '```'
         } > "$context_file"
-        python "$AR_SCRIPTS/panel.py" assign
-        python "$AR_SCRIPTS/panel.py" run --context-file "$context_file"
+        python "$AR_SCRIPTS/panel.py" assign --run "$RUN_DIR"
+        python "$AR_SCRIPTS/panel.py" run --run "$RUN_DIR" --context-file "$context_file"
 
     - name: Compute verdict
       id: verdict
       shell: bash
       env:
         IN_FAIL_ON: ${{ inputs.fail-on }}
+        RUN_DIR: ${{ steps.init.outputs.run_dir }}
         AR_SCRIPTS: ${{ github.action_path }}/scripts
       run: |
         set -uo pipefail
@@ -168,7 +181,7 @@ runs:
         # explicitly (|| code=$?) so a FAIL/BLOCKED verdict maps through fail-on and writes
         # the step summary below, instead of aborting this step at the aggregate call.
         code=0
-        python "$AR_SCRIPTS/aggregate.py" || code=$?
+        python "$AR_SCRIPTS/aggregate.py" --run "$RUN_DIR" || code=$?
         case "$code" in
           0) verdict=PASS ;;
           1) verdict=FAIL ;;
@@ -177,7 +190,7 @@ runs:
         esac
         echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
         echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-        run_dir=$(ls -d .adversarial-review/run-* 2>/dev/null | sort | tail -1 || true)
+        run_dir="$RUN_DIR"
         if [ -n "$run_dir" ] && [ -f "$run_dir/verdict.md" ]; then
           cat "$run_dir/verdict.md" >> "$GITHUB_STEP_SUMMARY"
         fi
