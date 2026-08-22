@@ -4255,6 +4255,85 @@ def t_eval_live_harness_records_units_after_panel_failure():
     assert result["cases"] == [], result["cases"]
 
 
+def t_eval_thresholds_offline_gate():
+    # E1-S5: `thresholds.py check` runs the full offline corpus and must exit 0 — proving the committed
+    # evals/thresholds.json floors are DESCRIPTIVE (met by the current corpus), not aspirational, and
+    # exercising the exact command the CI evals job runs. Then check_offline flags regressions.
+    r = subprocess.run([sys.executable, str(SKILL / "evals" / "thresholds.py"), "check"],
+                       env=ENV, capture_output=True, text=True)
+    assert r.returncode == 0 and "OK" in r.stderr, (r.returncode, r.stderr[-300:])
+    sys.path.insert(0, str(SKILL / "evals"))
+    import thresholds as th
+    thr = th.load_thresholds()
+    good = {"aggregate": {"overall": {"detection_rate": 0.5, "fp": 1},
+                          "by_category": {"security": {"detection_rate": 1.0},
+                                          "correctness": {"detection_rate": 1.0}}}}
+    assert th.check_offline(good, thr) == [], th.check_offline(good, thr)
+    bad = json.loads(json.dumps(good))
+    bad["aggregate"]["overall"]["detection_rate"] = 0.25
+    bad["aggregate"]["overall"]["fp"] = 2
+    breaches = th.check_offline(bad, thr)
+    assert any("detection_rate" in b for b in breaches) and any("fp" in b for b in breaches), breaches
+    bad2 = json.loads(json.dumps(good))
+    bad2["aggregate"]["by_category"]["security"]["detection_rate"] = 0.0
+    assert any("security" in b for b in th.check_offline(bad2, thr)), th.check_offline(bad2, thr)
+
+
+def t_eval_thresholds_compare_live():
+    # E1-S5: compare_live flags overall/category detection drops past max_drop and per-model TP drops
+    # (the "model degraded" alarm), tolerates drops within budget, and unwraps the report wrapper.
+    sys.path.insert(0, str(SKILL / "evals"))
+    import thresholds as th
+    base = {"aggregate": {"overall": {"detection_rate": 1.0},
+                          "by_category": {"security": {"detection_rate": 1.0}},
+                          "by_model": {"m-a": {"tp": 2}, "m-b": {"tp": 1}}}}
+    cur = {"aggregate": {"overall": {"detection_rate": 0.6},
+                         "by_category": {"security": {"detection_rate": 1.0}},
+                         "by_model": {"m-a": {"tp": 0}, "m-b": {"tp": 1}}}}
+    regs = th.compare_live(base, cur, 0.2)
+    assert any("overall detection dropped" in r for r in regs), regs
+    assert any("m-a" in r and "true positives fell" in r for r in regs), regs
+    assert th.compare_live(base, base, 0.2) == []
+    near = {"aggregate": {"overall": {"detection_rate": 0.85}, "by_category": {}, "by_model": {}}}
+    base2 = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
+    assert th.compare_live(base2, near, 0.2) == [], "a drop within max_drop must not flag"
+    assert th.compare_live({"result": base}, {"result": cur}, 0.2), "must unwrap {result: ...} reports"
+
+
+def t_eval_thresholds_cli():
+    # E1-S5: exit codes — check passes at the floor and fails past it; compare fails on a regression
+    # and passes when clean. (Uses crafted result files so it adds no full-corpus run.)
+    thr_py = str(SKILL / "evals" / "thresholds.py")
+    d = Path(tempfile.mkdtemp(prefix="ar-thr-"))
+    try:
+        good = {"aggregate": {"overall": {"detection_rate": 0.5, "fp": 1},
+                              "by_category": {"security": {"detection_rate": 1.0},
+                                              "correctness": {"detection_rate": 1.0}}}}
+        (d / "good.json").write_text(json.dumps(good))
+        r = subprocess.run([sys.executable, thr_py, "check", "--result", str(d / "good.json")],
+                           env=ENV, capture_output=True, text=True)
+        assert r.returncode == 0 and "OK" in r.stderr, (r.returncode, r.stderr[-200:])
+        bad = {"aggregate": {"overall": {"detection_rate": 0.0, "fp": 9}, "by_category": {}}}
+        (d / "bad.json").write_text(json.dumps(bad))
+        r2 = subprocess.run([sys.executable, thr_py, "check", "--result", str(d / "bad.json")],
+                            env=ENV, capture_output=True, text=True)
+        assert r2.returncode == 1 and "BREACH" in r2.stderr, (r2.returncode, r2.stderr[-200:])
+        base = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {},
+                              "by_model": {"m": {"tp": 2}}}}
+        cur = {"aggregate": {"overall": {"detection_rate": 0.2}, "by_category": {},
+                             "by_model": {"m": {"tp": 0}}}}
+        (d / "base.json").write_text(json.dumps(base))
+        (d / "cur.json").write_text(json.dumps(cur))
+        r3 = subprocess.run([sys.executable, thr_py, "compare", "--baseline", str(d / "base.json"),
+                             "--current", str(d / "cur.json")], env=ENV, capture_output=True, text=True)
+        assert r3.returncode == 1 and "DEGRAD" in r3.stderr, (r3.returncode, r3.stderr[-200:])
+        r4 = subprocess.run([sys.executable, thr_py, "compare", "--baseline", str(d / "base.json"),
+                             "--current", str(d / "base.json")], env=ENV, capture_output=True, text=True)
+        assert r4.returncode == 0, (r4.returncode, r4.stderr[-200:])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

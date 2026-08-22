@@ -41,3 +41,5 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Offline meta-eval harness over the full corpus
         run: python evals/run.py --mode offline --no-write
+      - name: Regression thresholds gate (E1-S5 — fail if detection/FP metrics regress)
+        run: python evals/thresholds.py check

@@ -162,6 +162,39 @@ python evals/run.py --mode live --budget-usd 5 --only sec-idor-invoice
   detail is kept so the aggregate stays auditable. The corpus is synthetic and carries no secrets,
   so reports are committable under `evals/report/` as the project's standing evidence base.
 
+## Regression thresholds & the model-degraded runbook (`thresholds.py`)
+
+`evals/thresholds.json` holds **descriptive** floors and `evals/thresholds.py` enforces them (E1-S5).
+Thresholds are seeded from real, reproducible numbers and updated deliberately — never invented as an
+aspirational target (mirrors the mutation-threshold rule in `references/gates.md`).
+
+**Offline gate (automated, in CI).** The `evals` job runs:
+
+```bash
+python evals/thresholds.py check     # runs the offline harness; exit 1 if any metric regressed
+```
+
+It fails the build when the offline harness's overall / per-category **detection rate** drops below,
+or its **false-positive** count rises above, the floors in `thresholds.json`. Because offline serves
+scripted findings, this guards the **harness / scorer / dispatch** against regressions — a change to
+`score.py`, the corpus scripts, or the panel wiring that quietly weakens detection is caught. It does
+**not** measure model quality. When you intentionally change the corpus, update `thresholds.json` in
+the same PR (the floors are the recorded contract).
+
+**Model-degraded alarm (live calibration, monthly).** After a live calibration (`--mode live`), compare
+the new report against the last committed one:
+
+```bash
+python evals/thresholds.py compare --baseline evals/report/<old>-live.json --current evals/report/<new>-live.json
+```
+
+It flags any overall or per-category detection-rate drop greater than `live.max_detection_drop`
+(default 20%) and lists any model whose true-positive contribution fell — a **candidate for pin removal
+/ substitution**. Runbook: when a model is flagged, first rule out a transport blip (re-run that case);
+if the drop holds, drop the model from the pool or pin a replacement family and note it in the PR. The
+baseline live report is committed after the **first** calibration (the E1-S4 `$20` run); until then
+`compare` has nothing to diff against.
+
 ## Scoring (`score.py`)
 
 `evals/score.py` grades a list of reviewer findings (a report's `findings` array) against a case's

@@ -75,6 +75,19 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   rather than spend a run on no-op panels without one. Live results are non-deterministic by nature (the per-rep raw detail
   keeps the aggregate auditable); the harness code itself is exercised offline against the mock router
   with no network and no keys. Regression thresholds seeded from the first live report are E1-S5.
+- Reviewer meta-evaluation regression thresholds (E1-S5): `evals/thresholds.json` records **descriptive**
+  floors and `evals/thresholds.py` enforces them. `thresholds.py check` runs the offline harness and fails
+  (exit 1) when the overall or per-category detection rate drops below, or the false-positive count rises
+  above, the committed floor, so a change to `score.py`, the corpus scripts, or the panel wiring that
+  quietly weakens detection is caught in CI (the `evals` job now runs it on 3.9 and 3.12). Because offline
+  serves scripted findings this guards harness/scorer/dispatch correctness, not model quality; the floors
+  are seeded from the current deterministic offline run (overall detection >= 0.5 and <= 1 FP; security and
+  correctness >= 1.0) and are updated deliberately, never invented (mirrors the mutation-threshold rule in
+  `references/gates.md`). `thresholds.py compare` is the **model-degraded alarm**: it diffs two live
+  calibration reports and flags any overall/per-category detection drop past `live.max_detection_drop`
+  (default 20%) plus any model whose true-positive contribution fell — a candidate for pin removal /
+  substitution — with a runbook in `evals/README.md`. The baseline live report is committed after the first
+  live calibration (the E1-S4 $20 run). Stdlib-only, 3.9-safe.
 - Distribution: a `release` workflow publishes to PyPI on a `v*` tag via **Trusted Publishing**
   (OIDC, no stored token); an `action-selftest` workflow exercises the composite action keyless
   and asserts the honest BLOCKED verdict; a GitLab CI template (`examples/.gitlab-ci.yml`); and a
