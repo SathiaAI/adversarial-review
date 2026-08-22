@@ -80,7 +80,7 @@ def family_of(slug):
 
 POLICY_BASENAMES = (".adversarial-review.yml", ".adversarial-review.json")
 POLICY_KEYS = ("risk", "dev_providers", "rebuttal_policy", "required_gates", "pins",
-               "mutation", "max_cost_usd")
+               "mutation", "max_cost_usd", "high_samples")
 VALID_RISKS = ("NORMAL", "SENSITIVE", "CRITICAL")
 VALID_REBUTTAL = ("critical", "contention", "any")
 # Scoped/bounded mutation budget — a repo-tunable cost cap so mutation testing survives
@@ -350,6 +350,15 @@ def _validate_policy(data, name):
             if n is None or n < 0:
                 die(f"{name}: max_cost_usd must be a finite non-negative number or "
                     f"'none'/'off'/'unlimited', got {v!r}")
+    if "high_samples" in data:
+        # Multi-sample corroboration count (E4-S3), informational-only: a positive integer.
+        # 1 (the default) disables resampling — exactly today's behavior. Rejected at load so a
+        # typo can't silently change the count. 2**53 is float64's exact-integer ceiling: at or
+        # above it a fractional value rounds to a whole float and would slip the `!= int(n)` check.
+        n = _policy_number(data["high_samples"])
+        if n is None or n < 1 or n >= 2 ** 53 or n != int(n):
+            die(f"{name}: high_samples must be a positive integer (>= 1), "
+                f"got {data['high_samples']!r}")
 
 
 def load_policy(root=None):
