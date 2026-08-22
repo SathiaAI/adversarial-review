@@ -724,8 +724,9 @@ def t_sign_additive_and_sidecar_over_verdict():
         set(files_after) - set(files_before)
     # verdict + attestation are byte-identical across the off/on runs (computed_at aside): additive
     v_on = read(run / "verdict.json")
-    strip = lambda v: {k: x for k, x in v.items() if k != "computed_at"}
-    assert strip(v_on) == strip(v_off), "signing changed the verdict/attestation"
+    def _strip(v):
+        return {k: x for k, x in v.items() if k != "computed_at"}
+    assert _strip(v_on) == _strip(v_off), "signing changed the verdict/attestation"
     assert v_on["attestation"]["digest"] == digest, "signing changed the digest"
     assert "attestation.sig" not in v_on["attestation"]["files"], "the signature must NOT be attested"
     assert (run / "verdict.md").read_text() == md_off, "signing changed verdict.md"
@@ -798,6 +799,7 @@ def t_sign_cosign_verify_requires_identity():
     importlib.reload(aggregate)
     orig_which = aggregate.shutil.which
     aggregate.shutil.which = lambda name: "/usr/bin/cosign" if name == "cosign" else orig_which(name)
+    saved = {k: os.environ.get(k) for k in ("AR_COSIGN_IDENTITY", "AR_COSIGN_ISSUER")}
     try:
         for k in ("AR_COSIGN_IDENTITY", "AR_COSIGN_ISSUER"):
             os.environ.pop(k, None)
@@ -809,8 +811,8 @@ def t_sign_cosign_verify_requires_identity():
         assert argv and "--certificate-identity" in argv and "--certificate-oidc-issuer" in argv, argv
     finally:
         aggregate.shutil.which = orig_which
-        os.environ.pop("AR_COSIGN_IDENTITY", None)
-        os.environ.pop("AR_COSIGN_ISSUER", None)
+        for _k, _v in saved.items():
+            os.environ.pop(_k, None) if _v is None else os.environ.__setitem__(_k, _v)
 
 
 def t_sign_signer_command_failure_fails_loudly():
@@ -903,6 +905,7 @@ def t_minisign_verify_flag_inline_vs_file():
     import importlib
     import aggregate
     importlib.reload(aggregate)
+    _saved_pub = os.environ.get("AR_MINISIGN_PUBKEY")
     orig_which = aggregate.shutil.which
     aggregate.shutil.which = lambda name: "/usr/bin/minisign" if name == "minisign" else orig_which(name)
     keyfile = Path(tempfile.mkdtemp(prefix="ar-minipub-")) / "ar.pub"
@@ -916,7 +919,8 @@ def t_minisign_verify_flag_inline_vs_file():
         assert argv and "-p" in argv and "-P" not in argv, argv
     finally:
         aggregate.shutil.which = orig_which
-        os.environ.pop("AR_MINISIGN_PUBKEY", None)
+        os.environ.pop("AR_MINISIGN_PUBKEY", None) if _saved_pub is None else \
+            os.environ.__setitem__("AR_MINISIGN_PUBKEY", _saved_pub)
 
 
 def t_gate_blocked_status_yields_blocked_not_fail():
