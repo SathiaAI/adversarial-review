@@ -41,8 +41,8 @@ def _finite_rate(x):
 
 
 def _is_count(x):
-    """True if x is a real (non-bool), finite number usable as a true-positive count."""
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    """True if x is a real (non-bool), finite, non-negative number usable as a true-positive count."""
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x >= 0
 
 
 def check_offline(result, thresholds):

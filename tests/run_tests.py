@@ -4369,6 +4369,10 @@ def t_eval_thresholds_compare_live():
     assert any("invalid" in r for r in rb) and not any("fell" in r for r in rb), rb
     cgone = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
     assert any("fell 3 -> 0" in r for r in th.compare_live(bval, cgone, 0.2)), th.compare_live(bval, cgone, 0.2)
+    # E1-S5 bot round 4 (CodeRabbit Major): a negative tp is not a valid count -> not comparable.
+    cneg = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {"m": {"tp": -1}}}}
+    rn = th.compare_live(bval, cneg, 0.2)
+    assert any("invalid" in r for r in rn) and not any("fell" in r for r in rn), rn
 
 
 def t_eval_thresholds_cli():
