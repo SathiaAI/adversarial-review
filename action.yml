@@ -134,6 +134,15 @@ runs:
           echo "::notice::adversarial-review: no openrouter-api-key provided — skipping the reviewer panel. The verdict will be BLOCKED for missing panel coverage (honest for an un-reviewed change)."
           exit 0
         fi
+        # A committed credential in the diff must be caught BEFORE the diff is transmitted to the
+        # third-party reviewer panel. Require a recorded, passing 'secrets' gate as the transmission
+        # precondition (the NORMAL floor requires it anyway). Without it, skip the panel — the diff is
+        # never sent unscanned and the verdict is BLOCKED for missing coverage (honest), not a leak.
+        secrets_ok="$(python -c 'import json,glob; f=sorted(glob.glob(".adversarial-review/run-*/gates/secrets.json")); print("1" if f and json.load(open(f[-1])).get("status")=="PASS" else "0")')"
+        if [ "$secrets_ok" != "1" ]; then
+          echo "::warning::adversarial-review: the 'secrets' gate is not recorded PASS — skipping the reviewer panel so the diff is NOT transmitted unscanned. Add a secrets scanner to 'gates' (e.g. secrets=gitleaks detect --no-banner --redact --source .); the verdict stays BLOCKED until it passes."
+          exit 0
+        fi
         # mktemp, not a fixed $RUNNER_TEMP/context.md name — standard temp-file
         # hygiene (no predictable path, honors the runner's temp dir).
         context_file="$(mktemp "${RUNNER_TEMP:-/tmp}/ar-context.XXXXXX")"

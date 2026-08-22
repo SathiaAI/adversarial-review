@@ -101,8 +101,16 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   choose categories, and adopt a moving `v1` major tag; branding already lives in `action.yml`),
   since Marketplace listing cannot be automated from this repo. Referenced from `README.md`,
   `docs/using-on-your-platform.md`, and the docs-site footer. A `t_ci_docs_and_gitlab_mirror_action`
-  guard test asserts the guide names every real `action.yml` input (no invented inputs) and that the
-  GitLab template keeps `aggregate.py` as its terminal command so the job exit code is the verdict.
+  guard test asserts the guide names every real `action.yml` input and output (no invented inputs),
+  proves `aggregate.py` is ar-panel's terminal command (so the job exit code is the verdict), and
+  locks in the secrets-transmission guard and the full-floor starter workflow below.
+  Review hardening (CodeRabbit + Codex on #49): the composite **`action.yml` now gates diff
+  transmission to the reviewer panel on a passing `secrets` gate** — mirroring the GitLab job, so a
+  committed credential is never sent to the panel unscanned; the documented starter workflow
+  configures the whole NORMAL floor (build/unit/secrets/deps/sast) with explicit `risk`/`dev-providers`
+  so it is a complete, safe copy; and the guide now distinguishes the computed **verdict / `exit-code`**
+  from the **job pass/fail status** that `fail-on` (GitHub) / `allow_failure` (GitLab) derive from it,
+  noting that a failed deterministic gate takes precedence over BLOCKED.
 - Reviewer robustness & cost control (E4): `build_request` is now capability-driven — a model whose
   profile forbids `temperature` is sent none, `max_tokens` is floored at the profile's
   `max_tokens_floor`, and a mandatory-reasoning model receives a `reasoning` budget

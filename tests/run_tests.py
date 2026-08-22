@@ -1741,13 +1741,23 @@ def t_ci_docs_and_gitlab_mirror_action():
         assert call in gl, f".gitlab-ci.yml missing real entrypoint {call!r}"
     for fake in ("--fail-on", "--gates"):  # Action inputs, not script flags — never invented here
         assert fake not in gl, f".gitlab-ci.yml invents a non-existent flag {fake!r}"
-    # aggregate.py is the terminal command → GitLab job exit code == the computed verdict.
-    # Compare the invocation paths ("scripts/gate.py" etc.); a bare "gate.py" is a substring of
-    # "aggregate.py", the "scripts/" prefix keeps the ordering comparison honest.
-    assert gl.rindex("scripts/aggregate.py") > gl.rindex("scripts/panel.py"), \
-        "aggregate.py must run after the panel"
-    assert gl.rindex("scripts/aggregate.py") > gl.rindex("scripts/gate.py"), \
-        "aggregate.py must run after the gates"
+    # E2-S3 (panel/Codex): aggregate.py must be the TERMINAL command of ar-panel's script — not
+    # merely appear after the panel textually. A command appended after it could replace the job's
+    # exit status and defeat the verdict contract. Extract ar-panel's `script:` list and assert its
+    # LAST item runs aggregate.py, and that nothing else does.
+    panel_block = gl.split("\nar-panel:", 1)[1]
+    m0 = re.search(r"(?m)^  script:\s*$", panel_block)
+    assert m0, "ar-panel has no script: block"
+    script_body = panel_block[m0.end():]
+    m1 = re.search(r"(?m)^  \w[\w-]*:", script_body)   # next job-level (2-space) key, e.g. artifacts:
+    if m1:
+        script_body = script_body[:m1.start()]
+    items = re.findall(r"(?m)^    - (.+)$", script_body)   # 4-space script list items only
+    assert items, "ar-panel script has no commands"
+    assert "aggregate.py" in items[-1], \
+        f"aggregate.py must be ar-panel's LAST command, got: {items[-1]!r}"
+    assert not any("aggregate.py" in it for it in items[:-1]), \
+        "aggregate.py must appear only as the terminal command"
     assert "OPENROUTER_API_KEY" in gl and "BLOCKED" in gl, "keyless→BLOCKED honesty must be documented"
     assert "allow_failure" in gl and "exit_codes: 2" in gl, "fail-on=fail equivalent must be documented"
     # E2-S3 (panel test_quality-1): the doc must document the Action's OUTPUTS too, not just inputs,
@@ -1765,6 +1775,14 @@ def t_ci_docs_and_gitlab_mirror_action():
     # AR_* variables (risk, dev-providers, diff-ref/base, gate set) so the two CI paths stay in lockstep.
     for var in ("AR_RISK", "AR_DEV_PROVIDERS", "AR_DIFF", "AR_REQUIRE"):
         assert var in gl, ".gitlab-ci.yml omits %s (Action-input equivalent)" % var
+    # E2-S3 (Codex finding): the GitHub Action must gate diff transmission on a passing secrets scan,
+    # mirroring the GitLab job — a committed credential must never reach the panel unscanned.
+    assert "gates/secrets.json" in act and "not recorded PASS" in act, \
+        "action.yml panel step must require a passing secrets gate before transmitting the diff"
+    # and the documented starter workflow must configure the full NORMAL floor incl. a secrets gate,
+    # so a copy-paste user gets a complete, non-leaking config (not build+unit that can only BLOCK).
+    for g in ("build=", "unit=", "secrets=", "deps=", "sast="):
+        assert g in doc, "ci-integration.md starter workflow omits a `%s` gate" % g
 
 
 def t_policy_pins_precedence():

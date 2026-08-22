@@ -5,9 +5,13 @@ human's optimism. The same deterministic gates, the same independent panel, and 
 `aggregate.py` verdict run on **GitHub** and **GitLab** — the only thing that differs is the
 YAML around them. On both platforms the rule is identical:
 
-> **The job's exit code is exactly what `aggregate.py` computed: `0` PASS, `1` FAIL, `2` BLOCKED.**
-> No wrapper reinterprets it. Without a reviewer key the panel is skipped and the verdict is
-> **BLOCKED** — the honest result for an un-reviewed change, not a soft pass.
+> **The verdict is exactly what `aggregate.py` computes — `0` PASS, `1` FAIL, `2` BLOCKED — exposed
+> verbatim as the Action's `exit-code` output and as the GitLab job's exit status.** Whether that
+> verdict *fails the job* is a separate, explicit policy: `fail-on` (GitHub) and `allow_failure`
+> (GitLab) decide whether a **BLOCKED** blocks the merge or is tolerated during adoption. Without a
+> reviewer key the panel is skipped and the verdict is **BLOCKED** — the honest result for an
+> un-reviewed change, not a soft pass — unless a deterministic gate already **FAILED**, which takes
+> precedence and yields **FAIL**.
 
 - **GitHub** → the composite [`action.yml`](https://github.com/SathiaAI/adversarial-review/blob/main/action.yml), used via [`examples/adversarial-review.yml`](https://github.com/SathiaAI/adversarial-review/blob/main/examples/adversarial-review.yml).
 - **GitLab** → the [`examples/.gitlab-ci.yml`](https://github.com/SathiaAI/adversarial-review/blob/main/examples/.gitlab-ci.yml) template.
@@ -39,12 +43,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - uses: SathiaAI/adversarial-review@v1   # moving major tag; or pin a full SHA
+      - uses: SathiaAI/adversarial-review@main   # early adopters use @main; switch to @v1 once the first major tag exists, or pin a full SHA
         with:
-          gates: |
+          risk: NORMAL              # or leave empty to resolve from .adversarial-review.yml
+          dev-providers: anthropic  # families that wrote/advised the change — barred from the panel
+          gates: |                  # the NORMAL floor is build, unit, secrets, deps, sast — provide all five (adjust commands to your stack)
             build=python -m py_compile $(git ls-files '*.py')
             unit=python -m pytest -q
-          fail-on: fail             # tolerate BLOCKED while adopting; tighten to 'blocked'
+            secrets=gitleaks detect --no-banner --redact --source .
+            deps=pip-audit
+            sast=bandit -ll -q -r .
+          fail-on: blocked          # gate the merge on FAIL or BLOCKED; use 'fail' to tolerate BLOCKED while adopting
           openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
 ```
 
@@ -77,6 +86,10 @@ These mirror `action.yml` exactly — do not pass anything not listed here.
 - **Keyless path needs no secret.** With no `openrouter-api-key`, the reviewer panel step is
   skipped and the verdict is BLOCKED for missing panel coverage. The gate-only path needs no
   network — good for a first, honest signal.
+- **The diff is transmitted only after a passing secrets scan.** The reviewer-panel step refuses to
+  send the diff to the panel unless a `secrets` gate is recorded PASS — so a committed credential is
+  caught before anything leaves your runner. Include a `secrets=…` gate (the example does); the
+  NORMAL floor requires it anyway.
 - **The verdict is written to the job summary** (`verdict.md`), and `verdict` / `exit-code` are
   exposed as step outputs you can branch on.
 
@@ -93,9 +106,12 @@ repository-controlled code never runs in the same job as the reviewer key:
   **no key present**, and saves the recorded gates as an artifact.
 - **`ar-panel`** (stage `review`) has the key and a **fresh, pinned** copy of the tooling. It
   runs the secrets scan (which authorizes transmitting the diff), the independent panel, and
-  `aggregate.py`. It executes no repository-provided commands, so a malicious change cannot
-  tamper with the panel or read `OPENROUTER_API_KEY`. **`aggregate.py` is the job's last command,
-  so the job result is its verdict: `0` PASS / `1` FAIL / `2` BLOCKED.**
+  `aggregate.py`. It executes no repository-provided commands and re-runs the secrets scan itself
+  with a pinned, off-repo scanner, so a malicious change cannot read `OPENROUTER_API_KEY` or forge
+  the secrets gate that authorizes transmission. (Pin `risk`/`dev-providers` via protected CI/CD
+  variables or a protected `.adversarial-review.yml`, so an MR author cannot weaken the panel
+  through the policy the gates job resolves.) **`aggregate.py` is the job's last command, so the job
+  result is its verdict: `0` PASS / `1` FAIL / `2` BLOCKED.**
 
 ### CI/CD variables (Settings → CI/CD → Variables)
 
@@ -130,6 +146,11 @@ repository-controlled code never runs in the same job as the reviewer key:
 | `risk` / `dev-providers` | `AR_RISK` / `AR_DEV_PROVIDERS` (or, preferably, `.adversarial-review.yml`) |
 | _the action ref_ `@v1` / `@<sha>` | `AR_REF` (pin to a tag or full SHA) |
 | `product` | recorded via the policy file / `run.json`; no separate variable in the template |
+
+> **Supported GitLab gate names.** The template runs exactly **`build`, `unit`, `deps`, `sast`, and
+> `secrets`**. A gate with any other name (e.g. `lint`) has no step in the template — add a matching
+> `run_gate` line and CI/CD variable, or run it as its own job — otherwise it stays unrecorded and,
+> if required, the verdict is BLOCKED.
 
 ---
 
