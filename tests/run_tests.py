@@ -4645,8 +4645,9 @@ def t_high_samples_resume_does_not_recharge():
 
 
 def t_corroboration_enriched_report_is_schema_valid():
-    # E4-S3 (Codex): adding the `corroboration` record to a finding must keep the canonical report
-    # schema-valid — FINDING_SCHEMA (additionalProperties:false) now declares it.
+    # E4-S3 (Codex + CodeRabbit): the persisted (enriched) report validates against the ENRICHED
+    # schema, but corroboration is NOT part of the reviewer-INPUT schema — a reviewer cannot supply
+    # its own corroboration (additionalProperties:false rejects it).
     import panel
     mock_router.reset()
     def provider(m):
@@ -4660,8 +4661,12 @@ def t_corroboration_enriched_report_is_schema_valid():
         sh(["panel.py", "run", "--context-file", "context.md"], repo, env={**ENV, "AR_HIGH_SAMPLES": "3"})
         rep = read(latest_run(repo) / "panel" / "security.json")
         assert "corroboration" in rep["findings"][0], rep["findings"][0]
-        errs = panel.validate_obj(rep, panel.REPORT_SCHEMA)
-        assert not errs, ("enriched report is not schema-valid", errs)
+        # the persisted, enriched report validates against the ENRICHED schema (superset)...
+        assert not panel.validate_obj(rep, panel.REPORT_SCHEMA_ENRICHED), "enriched report not schema-valid"
+        # ...and the reviewer-INPUT schema REJECTS a report carrying corroboration, so a reviewer
+        # cannot inject its own agreement record (CodeRabbit: keep corroboration out of reviewer input).
+        assert panel.validate_obj(rep, panel.REPORT_SCHEMA), \
+            "reviewer-input REPORT_SCHEMA must reject a report carrying corroboration"
     finally:
         mock_router.reset()
 
@@ -4676,13 +4681,14 @@ def t_sample_policy_persisted():
         sh(["panel.py", "assign"], repo)
         sh(["panel.py", "run", "--context-file", "context.md"], repo)                  # default 1
         sp = read(latest_run(repo) / "sample_policy.json")
-        assert sp["high_samples"] == 1 and sp["source"], sp
+        assert sp["high_samples"] == 1 and sp["source"] == "default", sp
         repo2 = fresh_repo()
         sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo2)
         sh(["panel.py", "assign"], repo2)
         sh(["panel.py", "run", "--context-file", "context.md"], repo2, env={**ENV, "AR_HIGH_SAMPLES": "2"})
         sp2 = read(latest_run(repo2) / "sample_policy.json")
-        assert sp2["high_samples"] == 2, sp2
+        assert sp2["high_samples"] == 2 and sp2["source"] == "env", sp2
+        assert sp2["source"] != sp["source"], (sp["source"], sp2["source"])  # configured != default
     finally:
         mock_router.reset()
 

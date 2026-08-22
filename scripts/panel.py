@@ -80,11 +80,6 @@ FINDING_SCHEMA = {
         "reproduction": {"type": "array", "items": {"type": "string"}},
         "fix": {"type": "string"}, "regression_test": {"type": "string"},
         "release_blocking": {"type": "boolean"},
-        # E4-S3: cross-sample agreement record added by corroborate_role (informational; never gates).
-        # Declared so an ENRICHED report stays schema-valid; absent on unsampled findings.
-        "corroboration": {"type": "object", "additionalProperties": False, "properties": {
-            "samples": {"type": "integer"}, "agreed": {"type": "integer"},
-            "rate": {"type": "number"}}},
     },
     "required": ["id", "title", "severity", "confidence", "file", "line", "evidence",
                  "scenario", "reproduction", "fix", "regression_test", "release_blocking"],
@@ -125,6 +120,22 @@ REPORT_SCHEMA = {
                  "additional_tests", "areas_reviewed", "areas_not_reviewed",
                  "top_residual_risks", "injection_suspected", "output_statements_checked"],
 }
+# E4-S3: the cross-sample agreement record corroborate_role adds to a flagged finding is produced
+# INTERNALLY from recorded samples and is NEVER accepted from a reviewer — so it is absent from the
+# reviewer-input FINDING_SCHEMA/REPORT_SCHEMA above (which stay additionalProperties:false and reject
+# any reviewer-supplied `corroboration`). REPORT_SCHEMA_ENRICHED describes the persisted
+# panel/<role>.json AFTER enrichment; a schema-enforcing consumer of that artifact validates against
+# this superset.
+CORROBORATION_SCHEMA = {"type": "object", "additionalProperties": False,
+                        "properties": {"samples": {"type": "integer"}, "agreed": {"type": "integer"},
+                                       "rate": {"type": "number"}},
+                        "required": ["samples", "agreed", "rate"]}
+FINDING_SCHEMA_ENRICHED = {**FINDING_SCHEMA,
+                           "properties": {**FINDING_SCHEMA["properties"],
+                                          "corroboration": CORROBORATION_SCHEMA}}
+REPORT_SCHEMA_ENRICHED = {**REPORT_SCHEMA,
+                          "properties": {**REPORT_SCHEMA["properties"],
+                                         "findings": {"type": "array", "items": FINDING_SCHEMA_ENRICHED}}}
 REBUTTAL_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {
