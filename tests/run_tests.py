@@ -4121,6 +4121,11 @@ def t_eval_live_harness_cli_guards():
                         env=ENV, capture_output=True, text=True)
     assert r2.returncode != 0 and "reps" in r2.stderr.lower(), r2.stderr[-300:]
 
+    r_neg = subprocess.run([sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "live",
+                            "--only", "sec-idor-invoice", "--no-write", "--quiet", "--budget-usd", "-1"],
+                           env=ENV, capture_output=True, text=True)
+    assert r_neg.returncode != 0 and "budget" in r_neg.stderr.lower(), r_neg.stderr[-200:]
+
     mock_router.reset()
     try:
         r3 = subprocess.run([sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "live",
@@ -4131,6 +4136,39 @@ def t_eval_live_harness_cli_guards():
     assert r3.returncode == 0, r3.stderr[-400:]
     parsed = json.loads(r3.stdout)   # entire stdout parses; progress went to stderr
     assert parsed["cases"][0]["case_id"] == "sec-idor-invoice", parsed
+
+
+def t_eval_live_harness_rejects_malformed_case():
+    # E1-S4 (PR #46, test_quality-1): live mode, like offline, must FAIL on a malformed case, not skip
+    # it. Validation runs before any panel, so this needs no network.
+    base = Path(tempfile.mkdtemp(prefix="ar-livecorp-"))
+    try:
+        bad = base / "bad"
+        bad.mkdir()
+        (bad / "meta.json").write_text(json.dumps({"id": "WRONGID", "title": "x", "tier": "NORMAL",
+            "category": "clean", "language": "python", "source": "seeded"}))
+        (bad / "context.md").write_text("x")
+        (bad / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1}))
+        r = subprocess.run([sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "live",
+                            "--corpus", str(base), "--no-write", "--quiet"],
+                           env=ENV, capture_output=True, text=True)
+        assert r.returncode != 0, "a malformed case must fail the live run, not be skipped"
+        assert "invalid" in (r.stdout + r.stderr).lower(), (r.stdout + r.stderr)[-300:]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def t_eval_live_harness_fails_closed_without_cost_telemetry():
+    # E1-S4 (PR #46, security-1): when --budget-usd is set but a completed panel reports no cost
+    # telemetry (reviewer_cost 0), the harness can't enforce the dollar cap by summing costs, so it
+    # stops and records why rather than silently spending on under an ineffective cap.
+    result, _ = _run_eval_live(["sec-idor-invoice"], extra=["--reps", "3", "--budget-usd", "5"],
+                               reviewer_cost=0.0)
+    assert result["complete"] is False, result
+    assert result["spent_usd"] == 0.0, result["spent_usd"]
+    assert "telemetry" in (result.get("stop_reason") or ""), result.get("stop_reason")
+    assert result["cases"][0]["reps"] == 1, result["cases"]        # one panel ran, then stopped
+    assert [u["rep"] for u in result["not_run"]] == [2, 3], result["not_run"]
 
 
 def main():

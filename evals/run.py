@@ -350,7 +350,7 @@ def run_live(corpus_dir, only=None, reps=1, line_tol=score.DEFAULT_LINE_TOL,
 
     env = _panel_env_live()
     units, score_pairs, cases_out, not_run = [], [], [], []
-    spent, stopped = 0.0, False
+    spent, stopped, stop_reason = 0.0, False, None
     for name in names:
         cdir = corpus_dir / name
         problems = validate_case(str(cdir))
@@ -361,9 +361,11 @@ def run_live(corpus_dir, only=None, reps=1, line_tol=score.DEFAULT_LINE_TOL,
         tier = meta.get("tier", "NORMAL")
         case_units = []
         for k in range(1, reps + 1):
-            if budget_usd is not None and spent >= budget_usd:
+            if stopped or (budget_usd is not None and spent >= budget_usd):
+                if not stopped:
+                    stopped = True
+                    stop_reason = "budget reached ($%.4f of $%.2f)" % (spent, budget_usd)
                 not_run.append({"case": name, "rep": k})
-                stopped = True
                 continue
             repo, run_dir = _run_panel(cdir, tier, None, env=env)
             try:
@@ -390,6 +392,13 @@ def run_live(corpus_dir, only=None, reps=1, line_tol=score.DEFAULT_LINE_TOL,
                 print("  %-28s rep %d/%d tp=%d partial=%d fn=%d fp=%d cost=$%.4f"
                       % (name, k, reps, unit["tp"], unit["partial"], unit["fn"],
                          unit["fp"], rep_cost), file=sys.stderr)
+            if budget_usd is not None and rep_cost <= 0:
+                # Fail closed: a completed panel reported no usable cost telemetry, so a dollar budget
+                # can't be enforced by summing costs. Stop rather than risk unbounded spend, and say
+                # why -- never silently keep spending under a cap that isn't actually binding (PR #46).
+                stopped = True
+                stop_reason = ("cost telemetry unavailable -- a completed panel reported $0, so "
+                               "--budget-usd cannot be enforced")
         if case_units:
             cases_out.append(_case_rollup(name, meta, case_units))
 
@@ -405,7 +414,7 @@ def run_live(corpus_dir, only=None, reps=1, line_tol=score.DEFAULT_LINE_TOL,
     return {
         "corpus": corpus_dir.name, "line_tol": line_tol, "reps": reps,
         "budget_usd": budget_usd, "spent_usd": round(spent, 6),
-        "complete": not stopped, "not_run": not_run,
+        "complete": not stopped, "stop_reason": stop_reason, "not_run": not_run,
         "clean_fp": sum(u["fp"] for u in clean), "clean_units": len(clean),
         "cases": cases_out, "aggregate": agg,
     }
@@ -491,12 +500,15 @@ def _live_summary_md(result, generated_at):
     lines.append("Generated: %s \u00b7 corpus: %s \u00b7 reps/case: %d \u00b7 line tolerance: \u00b1%d"
                  % (generated_at, _md_cell(result["corpus"]), result["reps"], result["line_tol"]))
     lines.append("")
+    ran = ("Each case ran %d rep(s)" % result["reps"] if result["complete"]
+           else "Up to %d rep(s) per case were requested; the run stopped early, so later cases ran "
+                "fewer -- see the per-case table and not_run" % result["reps"])
     lines.append("Live mode runs **real** model panels, so these numbers reflect model + panel quality, "
-                 "not just harness assembly. Each case ran %d rep(s); per-rep detail is in the JSON so "
-                 "single-run noise stays visible." % result["reps"])
+                 "not just harness assembly. %s; per-rep detail is in the JSON so single-run noise "
+                 "stays visible." % ran)
     lines.append("")
     cap = "none" if result["budget_usd"] is None else "$%.2f" % result["budget_usd"]
-    tail = "" if result["complete"] else " \u00b7 **stopped early (budget reached)**"
+    tail = "" if result["complete"] else " \u00b7 **stopped early: %s**" % (result.get("stop_reason") or "budget reached")
     lines.append("Budget: %s \u00b7 spent: **$%.4f**%s" % (cap, result["spent_usd"], tail))
     if result["not_run"]:
         skipped = ", ".join("%s#%d" % (_md_cell(u["case"]), u["rep"]) for u in result["not_run"])
@@ -588,7 +600,10 @@ def main(argv=None):
         if not _live_credentialed():
             ap.error("--mode live needs a provider: set OPENROUTER_API_KEY (or AR_API_KEY / "
                      "AR_KEY_FILE), or AR_BASE_URL for a proxy. Offline mode needs neither.")
-        budget = args.budget_usd if args.budget_usd and args.budget_usd > 0 else None
+        b = args.budget_usd
+        if b is not None and (b != b or b < 0 or b == float("inf")):
+            ap.error("--budget-usd must be finite and >= 0 (0 disables the cap; omit for the $20 default)")
+        budget = b if (b and b > 0) else None
         result = run_live(args.corpus, only=args.only, reps=args.reps, line_tol=args.line_tol,
                           budget_usd=budget, quiet=args.quiet)
         summarize = _live_summary_md
@@ -615,9 +630,10 @@ def main(argv=None):
         if not args.quiet:  # diagnostics on stderr so --print-result keeps stdout pure JSON
             ov = result["aggregate"]["overall"]
             print("report: %s" % (out / (base + ".json")), file=sys.stderr)
-            print("detection=%s fp=%d over %d panel(s)"
+            noun = "panel(s)" if args.mode == "live" else "case(s)"
+            print("detection=%s fp=%d over %d %s"
                   % ("n/a" if ov["detection_rate"] is None else "%.0f%%" % (ov["detection_rate"] * 100),
-                     ov["fp"], ov["cases"]), file=sys.stderr)
+                     ov["fp"], ov["cases"], noun), file=sys.stderr)
 
     if args.print_result:
         print(canonical)
