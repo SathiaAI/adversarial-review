@@ -782,6 +782,43 @@ def t_sign_no_signer_fails_loudly():
     assert (run / "verdict.json").exists(), "verdict is still written (signing is a post-step)"
 
 
+def t_sign_cosign_verify_requires_identity():
+    # E6-S1 (panel security-1): cosign keyless `verify-blob` WITHOUT --certificate-identity /
+    # --certificate-oidc-issuer accepts ANY valid Fulcio certificate, so _cosign_verify_argv must NOT
+    # auto-select cosign unless BOTH identity and issuer are set; otherwise it returns None so verify
+    # falls through to minisign / a loud "no verifier available".
+    import importlib
+    import aggregate
+    importlib.reload(aggregate)
+    orig_which = aggregate.shutil.which
+    aggregate.shutil.which = lambda name: "/usr/bin/cosign" if name == "cosign" else orig_which(name)
+    try:
+        for k in ("AR_COSIGN_IDENTITY", "AR_COSIGN_ISSUER"):
+            os.environ.pop(k, None)
+        assert aggregate._cosign_verify_argv() is None, "cosign selected without identity+issuer"
+        os.environ["AR_COSIGN_IDENTITY"] = "ci@example.com"
+        assert aggregate._cosign_verify_argv() is None, "issuer is still required"
+        os.environ["AR_COSIGN_ISSUER"] = "https://token.actions.githubusercontent.com"
+        argv = aggregate._cosign_verify_argv()
+        assert argv and "--certificate-identity" in argv and "--certificate-oidc-issuer" in argv, argv
+    finally:
+        aggregate.shutil.which = orig_which
+        os.environ.pop("AR_COSIGN_IDENTITY", None)
+        os.environ.pop("AR_COSIGN_ISSUER", None)
+
+
+def t_sign_signer_command_failure_fails_loudly():
+    # E6-S1 (panel test_quality-1): a signer whose external command RUNS but exits non-zero must fail
+    # loudly (exit 3, clear message) and write NO sidecar -- never a false success. Deterministic via
+    # an AR_SIGNER_CMD that runs /bin/false over the {msg}/{sig} tokens.
+    repo, run = _pass_run_for_signing()
+    env = {**ENV, "AR_SIGNER_CMD": "false {msg} {sig}"}
+    r = sh(["aggregate.py", "--sign"], repo, expect=None, env=env)
+    assert r.returncode == 3, (r.returncode, r.stderr)
+    assert "exited" in r.stderr or "signer" in r.stderr, r.stderr
+    assert not (run / "attestation.sig").exists(), "no sidecar on signer failure"
+
+
 def t_gate_blocked_status_yields_blocked_not_fail():
     repo = _complete_sensitive_repo()
     run = latest_run(repo)
