@@ -4053,6 +4053,208 @@ def t_eval_summary_escapes_untrusted_identifiers():
     assert "corpus: `" not in md, md
 
 
+def _run_eval_live(only, extra=(), reviewer_cost=0.0, env=None):
+    """Invoke evals/run.py --mode live against the SUITE mock router (ENV's AR_BASE_URL) with a set
+    per-reviewer cost, so live-mode machinery (reps, budget, per-model/cost rollups) is exercised with
+    no network and no keys. Returns (parsed_result, raw_stdout)."""
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = reviewer_cost
+    try:
+        r = subprocess.run(
+            [sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "live",
+             "--no-write", "--print-result", "--quiet", "--only", *only, *extra],
+            env=env or ENV, capture_output=True, text=True)
+    finally:
+        mock_router.reset()
+    assert r.returncode == 0, "evals/run.py --mode live failed (exit %d)\n%s" % (r.returncode, r.stderr)
+    return json.loads(r.stdout.strip().splitlines()[-1]), r.stdout
+
+
+def t_eval_live_harness_scores_and_attributes():
+    # E1-S4: live mode drives REAL panels (here against the mock router, no keys) N times per case and
+    # scores each; per-model attribution, cost, and reps must all reconcile. sec-idor-invoice's IDOR is
+    # exactly what the mock's default security report raises, so detection is 1.0 and deterministic here.
+    result, _ = _run_eval_live(["sec-idor-invoice"], extra=["--reps", "2", "--budget-usd", "20"],
+                               reviewer_cost=0.05)
+    assert result["reps"] == 2, result["reps"]
+    ov = result["aggregate"]["overall"]
+    assert ov["detection_rate"] == 1.0 and ov["tp"] == 2 and ov["fp"] == 0, ov
+    bm = result["aggregate"]["by_model"]
+    assert bm, "per-model rollup must be populated"
+    assert sum(m["tp"] for m in bm.values()) == 2, bm          # security caught the IDOR both reps
+    assert sum(m["emitted"] for m in bm.values()) == 2, bm     # only the security role emits by default
+    total = result["spent_usd"]
+    assert total > 0, total
+    # cost reconciles three ways: run total == sum per-model == sum per-case
+    assert round(sum(m["cost_usd"] for m in bm.values()), 6) == total, (bm, total)
+    assert round(sum(c["cost_usd"] for c in result["cases"]), 6) == total, total
+    assert result["cases"][0]["reps"] == 2 and result["cases"][0]["detection_rate"] == 1.0, result["cases"]
+    assert result["complete"] is True and result["not_run"] == [], result
+
+
+def t_eval_live_harness_budget_guard_stops():
+    # E1-S4: the cumulative USD budget caps the whole run. With a budget below one panel's cost, the
+    # first rep still runs (pre-panel check), then the rest are recorded in not_run — never silently
+    # dropped, and overspend is bounded by the one in-flight panel.
+    result, _ = _run_eval_live(["sec-idor-invoice"], extra=["--reps", "3", "--budget-usd", "0.01"],
+                               reviewer_cost=0.05)
+    assert result["complete"] is False, result
+    assert result["cases"][0]["reps"] == 1, result["cases"]            # exactly one panel ran
+    assert [u["rep"] for u in result["not_run"]] == [2, 3], result["not_run"]
+    assert result["spent_usd"] > 0.01, result["spent_usd"]
+
+
+def t_eval_live_harness_cli_guards():
+    # E1-S4: live mode is opt-in and fails loudly when misconfigured — no key/base-url means no provider
+    # (don't spend a run on no-op panels); --reps must be >= 1; and --print-result keeps stdout pure JSON
+    # (progress on stderr) so `... --print-result | jq` works without --quiet.
+    bare = {k: v for k, v in ENV.items()
+            if k not in ("AR_BASE_URL", "AR_API_KEY", "OPENROUTER_API_KEY",
+                         "OPENAI_API_KEY", "AR_KEY_FILE")}
+    r = subprocess.run([sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "live",
+                        "--only", "sec-idor-invoice", "--no-write", "--quiet"],
+                       env=bare, capture_output=True, text=True)
+    assert r.returncode != 0 and "provider" in r.stderr.lower(), r.stderr[-300:]
+
+    r2 = subprocess.run([sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "live",
+                         "--only", "sec-idor-invoice", "--no-write", "--quiet", "--reps", "0"],
+                        env=ENV, capture_output=True, text=True)
+    assert r2.returncode != 0 and "reps" in r2.stderr.lower(), r2.stderr[-300:]
+
+    r_neg = subprocess.run([sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "live",
+                            "--only", "sec-idor-invoice", "--no-write", "--quiet", "--budget-usd", "-1"],
+                           env=ENV, capture_output=True, text=True)
+    assert r_neg.returncode != 0 and "budget" in r_neg.stderr.lower(), r_neg.stderr[-200:]
+
+    mock_router.reset()
+    try:
+        r3 = subprocess.run([sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "live",
+                             "--only", "sec-idor-invoice", "--no-write", "--print-result"],
+                            env=ENV, capture_output=True, text=True)
+    finally:
+        mock_router.reset()
+    assert r3.returncode == 0, r3.stderr[-400:]
+    parsed = json.loads(r3.stdout)   # entire stdout parses; progress went to stderr
+    assert parsed["cases"][0]["case_id"] == "sec-idor-invoice", parsed
+
+
+def t_eval_live_harness_rejects_malformed_case():
+    # E1-S4 (PR #46, test_quality-1): live mode, like offline, must FAIL on a malformed case, not skip
+    # it. Validation runs before any panel, so this needs no network.
+    base = Path(tempfile.mkdtemp(prefix="ar-livecorp-"))
+    try:
+        bad = base / "bad"
+        bad.mkdir()
+        (bad / "meta.json").write_text(json.dumps({"id": "WRONGID", "title": "x", "tier": "NORMAL",
+            "category": "clean", "language": "python", "source": "seeded"}))
+        (bad / "context.md").write_text("x")
+        (bad / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1}))
+        r = subprocess.run([sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "live",
+                            "--corpus", str(base), "--no-write", "--quiet"],
+                           env=ENV, capture_output=True, text=True)
+        assert r.returncode != 0, "a malformed case must fail the live run, not be skipped"
+        assert "invalid" in (r.stdout + r.stderr).lower(), (r.stdout + r.stderr)[-300:]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def t_eval_live_harness_fails_closed_without_cost_telemetry():
+    # E1-S4 (PR #46, security-1): when --budget-usd is set but a completed panel reports no cost
+    # telemetry (reviewer_cost 0), the harness can't enforce the dollar cap by summing costs, so it
+    # stops and records why rather than silently spending on under an ineffective cap.
+    result, _ = _run_eval_live(["sec-idor-invoice"], extra=["--reps", "3", "--budget-usd", "5"],
+                               reviewer_cost=0.0)
+    assert result["complete"] is False, result
+    assert result["spent_usd"] == 0.0, result["spent_usd"]
+    assert "telemetry" in (result.get("stop_reason") or ""), result.get("stop_reason")
+    assert result["cases"][0]["reps"] == 1, result["cases"]        # one panel ran, then stopped
+    assert [u["rep"] for u in result["not_run"]] == [2, 3], result["not_run"]
+
+
+def t_eval_live_harness_ignores_inherited_run_dir():
+    # E1-S4 (PR #46, CodeRabbit/Codex): a live run must not break when the operator has AR_RUN_DIR set.
+    # _panel_env_live drops it so each child panel writes its run dir inside its own throwaway repo.
+    env = dict(ENV)
+    env["AR_RUN_DIR"] = "/tmp/ar-inherited-run-dir-should-be-ignored"
+    result, _ = _run_eval_live(["sec-idor-invoice"], extra=["--reps", "1", "--budget-usd", "20"],
+                               reviewer_cost=0.05, env=env)
+    assert result["cases"][0]["reps"] == 1, result       # panel ran and produced a run dir
+    assert result["complete"] is True, result
+
+
+def t_eval_live_harness_preflights_before_paid_calls():
+    # E1-S4 (PR #46, Codex): a malformed case sorted AFTER a valid one must fail the live run BEFORE any
+    # panel runs — no wasted spend. Proven by the mock router receiving zero chat calls.
+    base = Path(tempfile.mkdtemp(prefix="ar-livepre-"))
+    try:
+        good = base / "aaa-good"
+        good.mkdir()
+        (good / "meta.json").write_text(json.dumps({"id": "aaa-good", "title": "x", "tier": "NORMAL",
+            "category": "clean", "language": "python", "source": "seeded"}))
+        (good / "context.md").write_text("diff\n+x\n")
+        (good / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1}))
+        bad = base / "zzz-bad"
+        bad.mkdir()
+        (bad / "meta.json").write_text(json.dumps({"id": "WRONGID", "title": "x", "tier": "NORMAL",
+            "category": "clean", "language": "python", "source": "seeded"}))
+        (bad / "context.md").write_text("x")
+        (bad / "expected.json").write_text(json.dumps({"defects": [], "fp_budget": 1}))
+        mock_router.reset()
+        try:
+            r = subprocess.run([sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "live",
+                                "--corpus", str(base), "--no-write", "--quiet"],
+                               env=ENV, capture_output=True, text=True)
+            assert r.returncode != 0 and "invalid" in (r.stdout + r.stderr).lower(), (r.stdout + r.stderr)[-200:]
+            assert mock_router.STATE["calls"] == {}, "preflight must reject before any paid panel call"
+        finally:
+            mock_router.reset()
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def t_eval_live_summary_is_stop_neutral():
+    # E1-S4 (PR #46, CodeRabbit): after a NON-budget early stop (cost telemetry) on a single-case run,
+    # the summary must not claim "later cases ran fewer", must surface the real stop reason, and must
+    # label skipped units stop-neutrally (not "budget").
+    sys.path.insert(0, str(SKILL / "evals"))
+    import run as evalrun
+    result = {
+        "corpus": "c", "line_tol": 3, "reps": 3, "budget_usd": 5.0, "spent_usd": 0.0,
+        "complete": False, "stop_reason": "cost telemetry unavailable -- a completed panel reported $0",
+        "not_run": [{"case": "only", "rep": 2}, {"case": "only", "rep": 3}],
+        "clean_fp": 0, "clean_units": 0, "clean_fp_rate": None,
+        "cases": [{"case_id": "only", "category": "security", "tier": "SENSITIVE", "reps": 1,
+                   "detection_rate": 1.0, "cost_usd": 0.0}],
+        "aggregate": {"overall": {"cases": 1, "must_detect_total": 1, "detection_rate": 1.0,
+                                  "tp": 1, "partial": 0, "fn": 0, "fp": 0, "noise": 0},
+                      "by_category": {}, "by_tier": {}, "by_role": {}, "by_model": {}}}
+    md = evalrun._live_summary_md(result, "test")
+    assert "later cases ran fewer" not in md, md
+    assert "Not run (budget)" not in md and "Not run (early stop)" in md, md
+    assert "cost telemetry" in md, md
+
+
+def t_eval_live_harness_records_units_after_panel_failure():
+    # E1-S4 (PR #46, CodeRabbit): when a live panel fails on the last/only case, its remaining reps must
+    # still be recorded in not_run (continue, not break), and the run must stop with a report rather than
+    # a traceback. Every reviewer 500s so the panel dies after retry + substitution.
+    mock_router.reset()
+    mock_router.STATE["fail_models"] = {m["id"] for m in mock_router.CATALOG["data"]}
+    try:
+        r = subprocess.run([sys.executable, str(SKILL / "evals" / "run.py"), "--mode", "live",
+                            "--only", "sec-idor-invoice", "--reps", "2", "--budget-usd", "20",
+                            "--no-write", "--print-result", "--quiet"],
+                           env=ENV, capture_output=True, text=True)
+    finally:
+        mock_router.reset()
+    assert r.returncode == 0, r.stderr[-400:]      # a panel failure yields a report, not a crash
+    result = json.loads(r.stdout.strip().splitlines()[-1])
+    assert result["complete"] is False, result
+    assert [u["rep"] for u in result["not_run"]] == [1, 2], result["not_run"]   # BOTH reps recorded
+    assert "live panel failed" in (result.get("stop_reason") or ""), result.get("stop_reason")
+    assert result["cases"] == [], result["cases"]
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
