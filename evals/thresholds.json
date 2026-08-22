@@ -1,0 +1,21 @@
+{
+  "_comment": "Descriptive regression floors, seeded from the deterministic OFFLINE harness on main (commit a78c3c2d). The offline corpus serves SCRIPTED reviewer findings, so these guard harness / scorer / dispatch correctness, NOT model quality. The `evals` CI job runs `evals/thresholds.py check` and fails when a metric regresses past a floor here. Update these deliberately, in the same PR, when the corpus changes; never invent an aspirational number (mirrors the mutation-threshold rule in references/gates.md). Live per-model baselines are committed after the first live calibration (the E1-S4 $20 run); see the runbook in evals/README.md.",
+  "offline": {
+    "overall": {
+      "min_detection_rate": 0.5,
+      "max_fp": 1
+    },
+    "by_category": {
+      "security": {
+        "min_detection_rate": 1.0
+      },
+      "correctness": {
+        "min_detection_rate": 1.0
+      }
+    }
+  },
+  "live": {
+    "max_detection_drop": 0.2,
+    "_comment": "`evals/thresholds.py compare` flags any overall/per-category detection-rate drop greater than this fraction, and any model whose true-positive contribution fell, between two live calibration reports. No baseline live report is committed yet (pending the first run)."
+  }
+}

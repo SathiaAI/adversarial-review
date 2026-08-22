@@ -4255,6 +4255,164 @@ def t_eval_live_harness_records_units_after_panel_failure():
     assert result["cases"] == [], result["cases"]
 
 
+def t_eval_thresholds_offline_gate():
+    # E1-S5: `thresholds.py check` runs the full offline corpus and must exit 0 — proving the committed
+    # evals/thresholds.json floors are DESCRIPTIVE (met by the current corpus), not aspirational, and
+    # exercising the exact command the CI evals job runs. Then check_offline flags regressions.
+    r = subprocess.run([sys.executable, str(SKILL / "evals" / "thresholds.py"), "check"],
+                       env=ENV, capture_output=True, text=True)
+    assert r.returncode == 0 and "OK" in r.stderr, (r.returncode, r.stderr[-300:])
+    sys.path.insert(0, str(SKILL / "evals"))
+    import thresholds as th
+    thr = th.load_thresholds()
+    good = {"aggregate": {"overall": {"detection_rate": 0.5, "fp": 1},
+                          "by_category": {"security": {"detection_rate": 1.0},
+                                          "correctness": {"detection_rate": 1.0}}}}
+    assert th.check_offline(good, thr) == [], th.check_offline(good, thr)
+    bad = json.loads(json.dumps(good))
+    bad["aggregate"]["overall"]["detection_rate"] = 0.25
+    bad["aggregate"]["overall"]["fp"] = 2
+    breaches = th.check_offline(bad, thr)
+    assert any("detection_rate" in b for b in breaches) and any("fp" in b for b in breaches), breaches
+    bad2 = json.loads(json.dumps(good))
+    bad2["aggregate"]["by_category"]["security"]["detection_rate"] = 0.0
+    assert any("security" in b for b in th.check_offline(bad2, thr)), th.check_offline(bad2, thr)
+    # E1-S5 fail-safe (test_quality-1): a category in thresholds but ABSENT from the result breaches.
+    thr_cat = {"offline": {"overall": {}, "by_category": {"security": {"min_detection_rate": 1.0}}}}
+    miss = {"aggregate": {"overall": {}, "by_category": {}}}
+    assert any("security" in b and "absent" in b for b in th.check_offline(miss, thr_cat)), \
+        th.check_offline(miss, thr_cat)
+    # E1-S5 fail-safe (correctness-1): a null overall fp breaches instead of raising TypeError.
+    thr_ofp = {"offline": {"overall": {"max_fp": 1}, "by_category": {}}}
+    nullfp = {"aggregate": {"overall": {"detection_rate": 0.5, "fp": None}, "by_category": {}}}
+    assert any("fp" in b for b in th.check_offline(nullfp, thr_ofp)), th.check_offline(nullfp, thr_ofp)
+    # E1-S5 bot round (Codex): a present-but-non-numeric fp also fail-closes (isinstance guard).
+    strfp = {"aggregate": {"overall": {"detection_rate": 0.5, "fp": "x"}, "by_category": {}}}
+    assert any("fp" in b for b in th.check_offline(strfp, thr_ofp)), th.check_offline(strfp, thr_ofp)
+    # E1-S5 (test_quality-5): per-category max_fp ceiling is enforced.
+    thr_cfp = {"offline": {"overall": {}, "by_category": {"security": {"max_fp": 0}}}}
+    catfp = {"aggregate": {"overall": {}, "by_category": {"security": {"detection_rate": 1.0, "fp": 3}}}}
+    assert any("security" in b and "fp" in b for b in th.check_offline(catfp, thr_cfp)), \
+        th.check_offline(catfp, thr_cfp)
+    # E1-S5 (test_quality-3): a corrupt thresholds.json fails LOUD (fail-closed config), never silently.
+    badthr = Path(tempfile.mkdtemp(prefix="ar-thr3-")) / "bad.json"
+    badthr.write_text("{ not: valid json ]")
+    try:
+        raised = False
+        try:
+            th.load_thresholds(str(badthr))
+        except ValueError:
+            raised = True
+        assert raised, "load_thresholds must raise on malformed JSON, not pass silently"
+    finally:
+        shutil.rmtree(badthr.parent, ignore_errors=True)
+
+
+def t_eval_thresholds_compare_live():
+    # E1-S5: compare_live flags overall/category detection drops past max_drop and per-model TP drops
+    # (the "model degraded" alarm), tolerates drops within budget, and unwraps the report wrapper.
+    sys.path.insert(0, str(SKILL / "evals"))
+    import thresholds as th
+    base = {"aggregate": {"overall": {"detection_rate": 1.0},
+                          "by_category": {"security": {"detection_rate": 1.0}},
+                          "by_model": {"m-a": {"tp": 2}, "m-b": {"tp": 1}}}}
+    cur = {"aggregate": {"overall": {"detection_rate": 0.6},
+                         "by_category": {"security": {"detection_rate": 1.0}},
+                         "by_model": {"m-a": {"tp": 0}, "m-b": {"tp": 1}}}}
+    regs = th.compare_live(base, cur, 0.2)
+    assert any("overall detection dropped" in r for r in regs), regs
+    assert any("m-a" in r and "true positives fell" in r for r in regs), regs
+    assert th.compare_live(base, base, 0.2) == []
+    near = {"aggregate": {"overall": {"detection_rate": 0.85}, "by_category": {}, "by_model": {}}}
+    base2 = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
+    assert th.compare_live(base2, near, 0.2) == [], "a drop within max_drop must not flag"
+    assert th.compare_live({"result": base}, {"result": cur}, 0.2), "must unwrap {result: ...} reports"
+    # E1-S5 robustness (correctness-2): a null tp in either report is coerced, not a TypeError.
+    bnull = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {},
+                           "by_model": {"m-a": {"tp": None}}}}
+    assert th.compare_live(bnull, bnull, 0.2) == [], "null tp must not crash or spuriously flag"
+    # E1-S5 (test_quality-4): a model new in current (absent from baseline) is not flagged.
+    bmod = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {},
+                          "by_model": {"m-a": {"tp": 2}}}}
+    cmod = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {},
+                          "by_model": {"m-a": {"tp": 2}, "m-new": {"tp": 5}}}}
+    assert th.compare_live(bmod, cmod, 0.2) == [], "a model new in current must not flag"
+    # E1-S5 (test_quality-2): a bare result and the {result: ...} wrapper unwrap to identical output.
+    assert th.compare_live(base, cur, 0.2) == th.compare_live({"result": base}, {"result": cur}, 0.2), \
+        "wrapped and bare reports must compare identically"
+    # E1-S5 bot round (CodeRabbit Major / Codex): a baseline category absent from current is flagged.
+    babs = {"aggregate": {"overall": {"detection_rate": 1.0},
+                          "by_category": {"security": {"detection_rate": 1.0}}, "by_model": {}}}
+    cabs = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
+    assert any("security" in r and "absent" in r for r in th.compare_live(babs, cabs, 0.2)), \
+        th.compare_live(babs, cabs, 0.2)
+    # an incomplete current report (stopped early) is itself flagged, never a silent "no regression".
+    cinc = {"complete": False, "stop_reason": "budget reached",
+            "aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
+    assert any("incomplete" in r for r in th.compare_live(babs, cinc, 0.2)), th.compare_live(babs, cinc, 0.2)
+    # E1-S5 bot round 2 (CodeRabbit Major): a non-numeric / NaN detection_rate is reported, never a
+    # crash and never a silent clean pass.
+    bstr = {"aggregate": {"overall": {"detection_rate": "0.9"}, "by_category": {}, "by_model": {}}}
+    cstr = {"aggregate": {"overall": {"detection_rate": "0.1"}, "by_category": {}, "by_model": {}}}
+    assert any("invalid" in r for r in th.compare_live(bstr, cstr, 0.2)), th.compare_live(bstr, cstr, 0.2)
+    cnan = {"aggregate": {"overall": {"detection_rate": float("nan")}, "by_category": {}, "by_model": {}}}
+    bok = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
+    assert any("invalid" in r for r in th.compare_live(bok, cnan, 0.2)), "NaN current rate must not silently pass"
+    # a non-numeric tp is coerced to no-signal, never a TypeError.
+    btpstr = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {"m": {"tp": "5"}}}}
+    assert th.compare_live(btpstr, btpstr, 0.2) == [], "string tp must not crash"
+    # E1-S5 bot round 3 (CodeRabbit Major): an invalid CURRENT tp must not fake a "fell to 0"
+    # degradation; it is reported as not-comparable. An absent tp still reads as no-contribution.
+    bval = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {"m": {"tp": 3}}}}
+    cbad = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {"m": {"tp": "x"}}}}
+    rb = th.compare_live(bval, cbad, 0.2)
+    assert any("invalid" in r for r in rb) and not any("fell" in r for r in rb), rb
+    cgone = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
+    assert any("fell 3 -> 0" in r for r in th.compare_live(bval, cgone, 0.2)), th.compare_live(bval, cgone, 0.2)
+    # E1-S5 bot round 4 (CodeRabbit Major): a negative tp is not a valid count -> not comparable.
+    cneg = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {"m": {"tp": -1}}}}
+    rn = th.compare_live(bval, cneg, 0.2)
+    assert any("invalid" in r for r in rn) and not any("fell" in r for r in rn), rn
+
+
+def t_eval_thresholds_cli():
+    # E1-S5: exit codes — check passes at the floor and fails past it; compare fails on a regression
+    # and passes when clean. (Uses crafted result files so it adds no full-corpus run.)
+    thr_py = str(SKILL / "evals" / "thresholds.py")
+    d = Path(tempfile.mkdtemp(prefix="ar-thr-"))
+    try:
+        good = {"aggregate": {"overall": {"detection_rate": 0.5, "fp": 1},
+                              "by_category": {"security": {"detection_rate": 1.0},
+                                              "correctness": {"detection_rate": 1.0}}}}
+        (d / "good.json").write_text(json.dumps(good))
+        r = subprocess.run([sys.executable, thr_py, "check", "--result", str(d / "good.json")],
+                           env=ENV, capture_output=True, text=True)
+        assert r.returncode == 0 and "OK" in r.stderr, (r.returncode, r.stderr[-200:])
+        bad = {"aggregate": {"overall": {"detection_rate": 0.0, "fp": 9}, "by_category": {}}}
+        (d / "bad.json").write_text(json.dumps(bad))
+        r2 = subprocess.run([sys.executable, thr_py, "check", "--result", str(d / "bad.json")],
+                            env=ENV, capture_output=True, text=True)
+        assert r2.returncode == 1 and "BREACH" in r2.stderr, (r2.returncode, r2.stderr[-200:])
+        base = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {},
+                              "by_model": {"m": {"tp": 2}}}}
+        cur = {"aggregate": {"overall": {"detection_rate": 0.2}, "by_category": {},
+                             "by_model": {"m": {"tp": 0}}}}
+        (d / "base.json").write_text(json.dumps(base))
+        (d / "cur.json").write_text(json.dumps(cur))
+        r3 = subprocess.run([sys.executable, thr_py, "compare", "--baseline", str(d / "base.json"),
+                             "--current", str(d / "cur.json")], env=ENV, capture_output=True, text=True)
+        assert r3.returncode == 1 and "DEGRAD" in r3.stderr, (r3.returncode, r3.stderr[-200:])
+        r4 = subprocess.run([sys.executable, thr_py, "compare", "--baseline", str(d / "base.json"),
+                             "--current", str(d / "base.json")], env=ENV, capture_output=True, text=True)
+        assert r4.returncode == 0, (r4.returncode, r4.stderr[-200:])
+        r5 = subprocess.run([sys.executable, thr_py, "compare", "--baseline", str(d / "base.json"),
+                             "--current", str(d / "cur.json"), "--max-drop", "nan"],
+                            env=ENV, capture_output=True, text=True)
+        assert r5.returncode == 2 and "finite fraction" in r5.stderr, (r5.returncode, r5.stderr[-200:])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
