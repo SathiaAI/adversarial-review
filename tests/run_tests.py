@@ -4277,6 +4277,32 @@ def t_eval_thresholds_offline_gate():
     bad2 = json.loads(json.dumps(good))
     bad2["aggregate"]["by_category"]["security"]["detection_rate"] = 0.0
     assert any("security" in b for b in th.check_offline(bad2, thr)), th.check_offline(bad2, thr)
+    # E1-S5 fail-safe (test_quality-1): a category in thresholds but ABSENT from the result breaches.
+    thr_cat = {"offline": {"overall": {}, "by_category": {"security": {"min_detection_rate": 1.0}}}}
+    miss = {"aggregate": {"overall": {}, "by_category": {}}}
+    assert any("security" in b and "absent" in b for b in th.check_offline(miss, thr_cat)), \
+        th.check_offline(miss, thr_cat)
+    # E1-S5 fail-safe (correctness-1): a null overall fp breaches instead of raising TypeError.
+    thr_ofp = {"offline": {"overall": {"max_fp": 1}, "by_category": {}}}
+    nullfp = {"aggregate": {"overall": {"detection_rate": 0.5, "fp": None}, "by_category": {}}}
+    assert any("fp" in b for b in th.check_offline(nullfp, thr_ofp)), th.check_offline(nullfp, thr_ofp)
+    # E1-S5 (test_quality-5): per-category max_fp ceiling is enforced.
+    thr_cfp = {"offline": {"overall": {}, "by_category": {"security": {"max_fp": 0}}}}
+    catfp = {"aggregate": {"overall": {}, "by_category": {"security": {"detection_rate": 1.0, "fp": 3}}}}
+    assert any("security" in b and "fp" in b for b in th.check_offline(catfp, thr_cfp)), \
+        th.check_offline(catfp, thr_cfp)
+    # E1-S5 (test_quality-3): a corrupt thresholds.json fails LOUD (fail-closed config), never silently.
+    badthr = Path(tempfile.mkdtemp(prefix="ar-thr3-")) / "bad.json"
+    badthr.write_text("{ not: valid json ]")
+    try:
+        raised = False
+        try:
+            th.load_thresholds(str(badthr))
+        except ValueError:
+            raised = True
+        assert raised, "load_thresholds must raise on malformed JSON, not pass silently"
+    finally:
+        shutil.rmtree(badthr.parent, ignore_errors=True)
 
 
 def t_eval_thresholds_compare_live():
@@ -4298,6 +4324,19 @@ def t_eval_thresholds_compare_live():
     base2 = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
     assert th.compare_live(base2, near, 0.2) == [], "a drop within max_drop must not flag"
     assert th.compare_live({"result": base}, {"result": cur}, 0.2), "must unwrap {result: ...} reports"
+    # E1-S5 robustness (correctness-2): a null tp in either report is coerced, not a TypeError.
+    bnull = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {},
+                           "by_model": {"m-a": {"tp": None}}}}
+    assert th.compare_live(bnull, bnull, 0.2) == [], "null tp must not crash or spuriously flag"
+    # E1-S5 (test_quality-4): a model new in current (absent from baseline) is not flagged.
+    bmod = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {},
+                          "by_model": {"m-a": {"tp": 2}}}}
+    cmod = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {},
+                          "by_model": {"m-a": {"tp": 2}, "m-new": {"tp": 5}}}}
+    assert th.compare_live(bmod, cmod, 0.2) == [], "a model new in current must not flag"
+    # E1-S5 (test_quality-2): a bare result and the {result: ...} wrapper unwrap to identical output.
+    assert th.compare_live(base, cur, 0.2) == th.compare_live({"result": base}, {"result": cur}, 0.2), \
+        "wrapped and bare reports must compare identically"
 
 
 def t_eval_thresholds_cli():

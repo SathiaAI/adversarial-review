@@ -45,8 +45,9 @@ def check_offline(result, thresholds):
     dr = ov.get("detection_rate")
     if "min_detection_rate" in o and (dr is None or dr < o["min_detection_rate"]):
         breaches.append("overall detection_rate %s < floor %s" % (dr, o["min_detection_rate"]))
-    if "max_fp" in o and ov.get("fp", 0) > o["max_fp"]:
-        breaches.append("overall fp %d > ceiling %d" % (ov.get("fp", 0), o["max_fp"]))
+    ofp = ov.get("fp")
+    if "max_fp" in o and (ofp is None or ofp > o["max_fp"]):
+        breaches.append("overall fp %s > ceiling %d" % (ofp, o["max_fp"]))
     for cat, cthr in (off.get("by_category") or {}).items():
         c = (agg.get("by_category") or {}).get(cat)
         if c is None:
@@ -56,8 +57,9 @@ def check_offline(result, thresholds):
         if "min_detection_rate" in cthr and (cdr is None or cdr < cthr["min_detection_rate"]):
             breaches.append("category %s detection_rate %s < floor %s"
                             % (cat, cdr, cthr["min_detection_rate"]))
-        if "max_fp" in cthr and c.get("fp", 0) > cthr["max_fp"]:
-            breaches.append("category %s fp %d > ceiling %d" % (cat, c.get("fp", 0), cthr["max_fp"]))
+        cfp = c.get("fp")
+        if "max_fp" in cthr and (cfp is None or cfp > cthr["max_fp"]):
+            breaches.append("category %s fp %s > ceiling %d" % (cat, cfp, cthr["max_fp"]))
     return breaches
 
 
@@ -88,7 +90,7 @@ def compare_live(baseline, current, max_drop):
     bm = (b.get("aggregate", {}) or {}).get("by_model", {}) or {}
     cm = (c.get("aggregate", {}) or {}).get("by_model", {}) or {}
     for m in sorted(bm):
-        btp, ctp = bm[m].get("tp", 0), cm.get(m, {}).get("tp", 0)
+        btp, ctp = bm[m].get("tp") or 0, cm.get(m, {}).get("tp") or 0
         if btp > 0 and ctp < btp:
             out.append("model %s true positives fell %d -> %d (candidate for pin removal / substitution)"
                        % (m, btp, ctp))
@@ -101,7 +103,10 @@ def _run_offline():
     if r.returncode != 0:
         sys.stderr.write(r.stderr)
         raise SystemExit("offline harness failed (exit %d)" % r.returncode)
-    return json.loads(r.stdout.strip().splitlines()[-1])
+    lines = r.stdout.strip().splitlines()
+    if not lines:
+        raise SystemExit("offline harness produced no result on stdout")
+    return json.loads(lines[-1])
 
 
 def main(argv=None):
