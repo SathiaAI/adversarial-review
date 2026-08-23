@@ -5,9 +5,11 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -5358,18 +5360,19 @@ def t_mcp_http_missing_or_empty_content_length_is_safe():
 
 def t_mcp_http_non_loopback_bind_is_refused():
     # test_quality-6 / security-1: E3-S2a ships NO authentication, so HttpTransport.bind() must REFUSE
-    # any non-loopback host (0.0.0.0 / LAN / hostname) rather than expose an unauthenticated tool
-    # surface to the network. Loopback targets still bind normally.
-    for host in ("0.0.0.0", "192.168.1.10", "10.0.0.1", "example.com", "::"):
+    # any non-loopback host (0.0.0.0 / LAN / hostname / "::") rather than expose an unauthenticated tool
+    # surface to the network. An EMPTY host is refused too: the socket layer binds "" to 0.0.0.0 (all
+    # interfaces), so it must NOT count as loopback. Loopback targets still bind normally.
+    for host in ("0.0.0.0", "192.168.1.10", "10.0.0.1", "example.com", "::", ""):
         try:
             mcpsrv.HttpTransport(host=host, port=0).bind()
         except ValueError as e:
             assert "non-loopback" in str(e), (host, str(e))
         else:
             raise AssertionError("bind(%r) must refuse a non-loopback host but did not" % host)
-    for ok in ("127.0.0.1", "127.0.0.5", "::1", "localhost", ""):
+    for ok in ("127.0.0.1", "127.0.0.5", "::1", "localhost"):
         assert mcpsrv.is_loopback_host(ok), ok
-    for bad in ("0.0.0.0", "192.168.0.1", "8.8.8.8", "example.com", "::"):
+    for bad in ("0.0.0.0", "192.168.0.1", "8.8.8.8", "example.com", "::", "", "  "):
         assert not mcpsrv.is_loopback_host(bad), bad
     t = mcpsrv.HttpTransport(host="127.0.0.1", port=0)  # a loopback bind still succeeds
     try:
@@ -5378,6 +5381,64 @@ def t_mcp_http_non_loopback_bind_is_refused():
     finally:
         if t.httpd is not None:
             t.httpd.server_close()
+
+
+def t_mcp_http_ipv6_loopback_binds():
+    # CodeRabbit: is_loopback_host('::1') is accepted, so bind() must actually bind it on an AF_INET6
+    # server rather than crash on the default AF_INET socket. Skip only where the runner has no IPv6.
+    if not socket.has_ipv6:
+        return
+    t = mcpsrv.HttpTransport(host="::1", port=0, origins=(), max_bytes=4096)
+    try:
+        host, port = t.bind()
+    except OSError:
+        return  # IPv6 stack present but ::1 not bindable in this sandbox — environment, not a code bug
+    try:
+        assert port > 0 and t.httpd.address_family == socket.AF_INET6, (host, port)
+    finally:
+        t.httpd.server_close()
+
+
+def t_mcp_http_transfer_encoding_is_rejected():
+    # CodeRabbit: framing is Content-Length only. A chunked body is left unread (length parses as 0) and
+    # would desync into the next request on a keep-alive connection (smuggling). Any Transfer-Encoding —
+    # alone OR combined with Content-Length — is refused with a closed 400.
+    t, port = _http_transport()
+    try:
+        chunked = (b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+                   b"Connection: close\r\n\r\n4\r\nWiki\r\n0\r\n\r\n")
+        s1, r1 = _http_raw(port, chunked)
+        head1 = r1.lower().split(b"\r\n\r\n", 1)[0]
+        assert s1 == 400 and b"connection: close" in head1, (s1, r1[:200])
+        combined = (b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n"
+                    b"Connection: close\r\n\r\n4\r\nWiki\r\n0\r\n\r\n")
+        s2, r2 = _http_raw(port, combined)
+        assert s2 == 400, (s2, r2[:200])
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_concurrent_requests_are_correct():
+    # CodeRabbit: ThreadingHTTPServer accepts concurrent connections; _HTTP_DISPATCH_LOCK serializes the
+    # stateful serve_message() core so runs can't race. Functionally, every concurrent POST must still
+    # get its OWN correct JSON-RPC result (id echoed back), never a crossed/dropped response.
+    t, port = _http_transport()
+    try:
+        results = {}
+        def hit(i):
+            body = json.dumps({"jsonrpc": "2.0", "id": i, "method": "server/discover"})
+            st, b, _ = _http_post(port, body)
+            results[i] = (st, json.loads(b).get("id"))
+        threads = [threading.Thread(target=hit, args=(i,)) for i in range(8)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(15)
+        assert len(results) == 8, results
+        for i, (st, rid) in results.items():
+            assert st == 200 and rid == i, (i, st, rid)
+    finally:
+        t.shutdown()
 
 
 def t_mcp_http_error_paths_close_connection():

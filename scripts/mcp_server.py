@@ -44,9 +44,11 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -735,14 +737,22 @@ def is_loopback_host(host):
     """True only for a loopback bind target — 'localhost', 127.0.0.0/8, or ::1. E3-S2a has NO auth,
     so binding anywhere else would expose an unauthenticated tool surface to the network; bind()
     refuses it. A hostname other than 'localhost' is treated as non-loopback (refused) — we do not
-    resolve DNS to decide safety."""
+    resolve DNS to decide safety. An EMPTY host is NOT loopback: the socket layer binds "" to 0.0.0.0
+    (all interfaces), so it is refused too — the resolved default (http_config) is always 127.0.0.1."""
     h = (host or "").strip().lower()
-    if h in ("localhost", ""):
+    if h == "localhost":
         return True
     try:
         return ipaddress.ip_address(h).is_loopback
     except ValueError:
         return False
+
+
+# Dispatch is serialized process-wide: the MCP tool handlers are stateful (they write context.md and
+# spawn subprocesses under a run dir), and stdio drives them one message at a time. ThreadingHTTPServer
+# accepts connections concurrently, so this lock preserves that one-at-a-time invariant for the HTTP
+# path and prevents two runs from racing the same on-disk state.
+_HTTP_DISPATCH_LOCK = threading.Lock()
 
 
 class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
@@ -795,7 +805,13 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._json(400, {"error": "unsupported MCP-Protocol-Version",
                              "supportedVersions": list(ALL_PROTOCOLS)})
             return
-        # (3) Bound the body (DoS): refuse an oversized or unparseable declared length outright.
+        # (3) Frame strictly by Content-Length: reject any Transfer-Encoding (chunked et al.), even when
+        #     combined with Content-Length. We do not decode a chunked body, so it would sit unread on a
+        #     keep-alive connection and desync into the next request (smuggling) — refuse with a closed 400.
+        if self.headers.get("Transfer-Encoding") is not None:
+            self._json(400, {"error": "Transfer-Encoding not supported; frame the body with Content-Length"})
+            return
+        # (4) Bound the body (DoS): refuse an oversized or unparseable declared length outright.
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -804,9 +820,11 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._json(413, {"error": "request body too large"})
             return
         raw = self.rfile.read(length) if length else b""
-        # (4) Dispatch through the transport-agnostic core. serve_message() accepts bytes and never
-        #     raises: a malformed body frames as -32700, a handler crash as -32603.
-        out = serve_message(raw)
+        # (5) Dispatch through the transport-agnostic core, serialized (see _HTTP_DISPATCH_LOCK) so the
+        #     stateful tool handlers keep stdio's one-at-a-time invariant. serve_message() accepts bytes
+        #     and never raises: a malformed body frames as -32700, a handler crash as -32603.
+        with _HTTP_DISPATCH_LOCK:
+            out = serve_message(raw)
         if out is None:
             # A notification (or any message handle() declines to answer) -> 202 Accepted, no body.
             self.send_response(202)
@@ -847,10 +865,21 @@ class HttpTransport:
                 "refusing to bind the ar-mcp HTTP transport to non-loopback host %r: E3-S2a has NO "
                 "authentication, so a network-reachable bind is refused. Keep AR_MCP_HTTP_HOST on "
                 "loopback (127.0.0.1 / ::1 / localhost) until auth lands (E3-S2c)." % (self.host,))
-        httpd = http.server.ThreadingHTTPServer((self.host, self.port), _MCPHTTPHandler)
+        # Pick the address family from the host so an IPv6 loopback (::1) actually binds — the default
+        # ThreadingHTTPServer is AF_INET, which cannot bind an IPv6 address. Defer bind/activate so the
+        # family can be set first, and clean up the socket if the bind itself fails.
+        httpd = http.server.ThreadingHTTPServer((self.host, self.port), _MCPHTTPHandler,
+                                                bind_and_activate=False)
+        httpd.address_family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
         httpd.daemon_threads = True
         httpd.allowed_origins = self.origins
         httpd.max_bytes = self.max_bytes
+        try:
+            httpd.server_bind()
+            httpd.server_activate()
+        except BaseException:
+            httpd.server_close()
+            raise
         self.httpd = httpd
         return httpd.server_address
 
