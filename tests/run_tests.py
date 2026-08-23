@@ -1771,6 +1771,10 @@ def t_ci_docs_and_gitlab_mirror_action():
     assert "exit code" in doc.lower()
     for word in ("PASS", "FAIL", "BLOCKED"):
         assert word in doc, "verdict word %r missing from ci-integration.md" % word
+    # (CodeRabbit): assert the EXACT verdict->exit-code mapping is documented, not just the words,
+    # so a drifted mapping (e.g. BLOCKED renumbered) forces a doc update instead of passing silently.
+    for pair in ("`0` PASS", "`1` FAIL", "`2` BLOCKED"):
+        assert pair in doc, "ci-integration.md must state the exact exit-code mapping %r" % pair
     # (panel test_quality-2): the GitLab template must surface the Action's required inputs through its
     # AR_* variables (risk, dev-providers, diff-ref/base, gate set) so the two CI paths stay in lockstep.
     for var in ("AR_RISK", "AR_DEV_PROVIDERS", "AR_DIFF", "AR_REQUIRE"):
@@ -1800,26 +1804,32 @@ def t_ci_docs_and_gitlab_mirror_action():
 
 
 def t_action_secrets_guard_behaviour():
-    # E2-S3 (panel security-1 + test_quality-1): the reviewer-panel secrets precondition must (a) run
-    # ISOLATED (`python -I`, so a repo-committed json.py/sitecustomize.py can't execute with the key
-    # in env) and (b) actually gate transmission — return "1" only when THIS run's gates/secrets.json
-    # is recorded PASS, "0" for a missing file or any non-PASS status. The exact command is EXTRACTED
-    # from action.yml so the test tracks the real guard, and exercised against real run dirs.
-    import subprocess as _sp, tempfile as _tf, json as _json, os as _os
+    # E2-S3 (panel security-1 + test_quality-1; CodeRabbit): the reviewer-panel secrets precondition
+    # must (a) run ISOLATED (`python -I`, so a repo-committed json.py/sitecustomize.py can't execute
+    # with the key in env), (b) authorize transmission ("1") ONLY when THIS run's gates/secrets.json is
+    # recorded PASS, and (c) fail SAFE — a missing, malformed, or non-object record returns "0" WITHOUT
+    # crashing (a raise under `set -euo pipefail` would abort the step before aggregate.py emits BLOCKED).
+    # The guard spans multiple lines, so it is EXTRACTED whole from action.yml and run against real dirs.
+    import subprocess as _sp, tempfile as _tf, json as _json, os as _os, re as _re
     act = (SKILL / "action.yml").read_text(encoding="utf-8")
-    line = [l.strip() for l in act.splitlines() if l.strip().startswith("secrets_ok=")][0]
-    assert line.startswith('secrets_ok="$(python -I -c'), ("guard must be isolated with -I", line)
-    cmd = line[len('secrets_ok="$('):-2]                       # strip the `secrets_ok="$(` … `)"`
-    def check(status):
+    m = _re.search(r'secrets_ok="\$\((.*?)\)"', act, _re.S)
+    assert m, 'secrets guard (secrets_ok="$(...)") not found in action.yml'
+    cmd = m.group(1)
+    assert "python -I -c" in cmd, ("guard must be isolated with -I", cmd)
+    def check(body, raw=False):
         d = _tf.mkdtemp(prefix="ar-guard-")
-        if status is not None:
+        if body is not None:
             _os.makedirs(_os.path.join(d, "gates"))
-            (Path(d) / "gates" / "secrets.json").write_text(_json.dumps({"status": status}))
-        r = _sp.run(["bash", "-c", cmd.replace('"$RUN_DIR"', d)], capture_output=True, text=True)
+            content = body if raw else _json.dumps({"status": body})
+            (Path(d) / "gates" / "secrets.json").write_text(content)
+        r = _sp.run(["bash", "-c", cmd.replace('"$RUN_DIR"', '"%s"' % d)], capture_output=True, text=True)
+        assert r.returncode == 0, ("guard must exit 0, never crash the panel step", r.returncode, r.stderr)
         return r.stdout.strip()
     assert check("PASS") == "1", "a recorded PASS secrets gate must authorize transmission"
     assert check("FAIL") == "0", "a FAILED secrets scan must NOT authorize transmission"
     assert check(None) == "0", "a missing secrets.json must NOT authorize transmission"
+    assert check("{not valid json", raw=True) == "0", "a malformed secrets.json must DENY, not crash"
+    assert check("[1, 2, 3]", raw=True) == "0", "a non-object secrets.json must DENY, not crash"
 
 
 def t_policy_pins_precedence():
