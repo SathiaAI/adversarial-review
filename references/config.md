@@ -235,6 +235,14 @@ keyless `panel.py prepare` + `ingest` (MCP) transport does **not** take corrobor
 | `AR_PINS` | — | Comma list `role=model-slug` to pin specific models |
 | `AR_REBUTTAL` | `contention` | Rebuttal policy at init: `critical`, `contention`, `any` |
 | `AR_CAP_OVERRIDES` | — | Path to a capability-overrides file (see *Model capability profiles*) |
+| `AR_SIGNER_CMD` | auto | `aggregate.py --sign` signer command template (`{msg}`/`{sig}` tokens); overrides cosign/minisign auto-detect (see *Signing the verdict*) |
+| `AR_VERIFIER_CMD` | auto | `aggregate.py --verify-signature` verifier command template (`{msg}`/`{sig}` tokens); overrides auto-detect |
+| `AR_MINISIGN_KEY` | — | Path to a minisign secret key; enables the minisign signing fallback |
+| `AR_MINISIGN_PUBKEY` | — | minisign **inline** public-key value for `--verify-signature` (`-P`) |
+| `AR_MINISIGN_PUBKEY_FILE` | — | Path to a minisign public-key **file** for `--verify-signature` (`-p`); wins over `AR_MINISIGN_PUBKEY` when both are set |
+| `AR_SIGN_TIMEOUT` | `120` | Bounded timeout (seconds) for each signer/verifier subprocess; expiry converts to the tooling-error exit (3) |
+| `AR_COSIGN_IDENTITY` | — | Expected signer identity (SAN) for cosign keyless `--verify-signature` |
+| `AR_COSIGN_ISSUER` | — | Expected OIDC issuer for cosign keyless `--verify-signature` |
 
 An empty env var counts as unset. Note one precedence fix shipped with the policy
 feature: `--pin` now beats `AR_PINS` for the same role (previously the env var

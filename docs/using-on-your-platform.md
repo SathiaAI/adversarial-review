@@ -283,7 +283,10 @@ Use `"command": "python", "args": [".../adversarial-review/scripts/mcp_server.py
 - **BLOCKED when review is incomplete** — unknown is treated as unshippable, so you won't
   get false confidence from a half-run.
 - **A tamper-evident audit trail** — coverage + attestation in every `verdict.json`,
-  verifiable with `aggregate.py --check-digest`.
+  verifiable with `aggregate.py --check-digest`, and optionally a detached cryptographic
+  signature over the `verdict.json` (`aggregate.py --sign`, cosign-keyless / minisign,
+  out-of-process) that binds the verdict decision and that a third party can verify with
+  `--verify-signature`. See `references/config.md`.
 - **Cost:** typically a few cents of reviewer tokens per run (it reports usage).
 - **What it is *not*:** a replacement for your scanners or your own judgment. It's the layer
   that makes their results *and* an independent AI review converge into one honest verdict.
