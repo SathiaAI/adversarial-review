@@ -708,19 +708,31 @@ HTTP_DEFAULT_PORT = 8730
 HTTP_DEFAULT_MAX_BYTES = 1_048_576  # 1 MiB: a JSON-RPC control message is tiny; caps an oversized-body DoS
 
 
-def _http_int_env(name, default):
-    try:
-        return int((os.environ.get(name, "") or "").strip() or default)
-    except ValueError:
+def _http_int_env(name, default, minimum=None, maximum=None):
+    """Parse an integer env setting. An unset/blank var takes the default; a NON-BLANK but invalid or
+    out-of-range value is a loud error, never a silent fallback — a typo'd cap must not quietly widen the
+    oversized-body DoS bound, and a negative/oversized value must not start a broken listener."""
+    v = (os.environ.get(name, "") or "").strip()
+    if not v:
         return default
+    try:
+        n = int(v)
+    except ValueError:
+        raise ValueError("%s must be an integer, got %r" % (name, v))
+    if minimum is not None and n < minimum:
+        raise ValueError("%s must be >= %d, got %d" % (name, minimum, n))
+    if maximum is not None and n > maximum:
+        raise ValueError("%s must be <= %d, got %d" % (name, maximum, n))
+    return n
 
 
 def http_config():
-    """Resolve HTTP transport config from env — localhost-only and restrictive by default."""
+    """Resolve HTTP transport config from env — localhost-only and restrictive by default. Invalid
+    numeric settings fail loudly (see _http_int_env) rather than silently reverting to a default."""
     host = (os.environ.get("AR_MCP_HTTP_HOST", "").strip() or HTTP_DEFAULT_HOST)
-    port = _http_int_env("AR_MCP_HTTP_PORT", HTTP_DEFAULT_PORT)
+    port = _http_int_env("AR_MCP_HTTP_PORT", HTTP_DEFAULT_PORT, minimum=0, maximum=65535)
     origins = tuple(o.strip() for o in os.environ.get("AR_MCP_HTTP_ORIGINS", "").split(",") if o.strip())
-    max_bytes = _http_int_env("AR_MCP_HTTP_MAX_BYTES", HTTP_DEFAULT_MAX_BYTES)
+    max_bytes = _http_int_env("AR_MCP_HTTP_MAX_BYTES", HTTP_DEFAULT_MAX_BYTES, minimum=1)
     return host, port, origins, max_bytes
 
 

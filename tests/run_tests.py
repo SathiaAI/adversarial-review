@@ -5441,6 +5441,34 @@ def t_mcp_http_concurrent_requests_are_correct():
         t.shutdown()
 
 
+def t_mcp_http_config_rejects_invalid_numeric_env():
+    # Codex: a typo'd AR_MCP_HTTP_PORT / AR_MCP_HTTP_MAX_BYTES must fail LOUDLY, not silently fall back to
+    # the default — a mistyped small cap silently becoming 1 MiB would widen the DoS bound, and a negative
+    # cap / out-of-range port would start a broken listener. Range is validated too.
+    def with_env(**kv):
+        old = {k: os.environ.get(k) for k in kv}
+        try:
+            for k, v in kv.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+            return mcpsrv.http_config()
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    _h, port, _o, mx = with_env(AR_MCP_HTTP_PORT=None, AR_MCP_HTTP_MAX_BYTES=None)  # unset -> defaults
+    assert port == 8730 and mx == 1048576, (port, mx)
+    _h, port2, _o, mx2 = with_env(AR_MCP_HTTP_PORT="0", AR_MCP_HTTP_MAX_BYTES="4096")  # valid override
+    assert port2 == 0 and mx2 == 4096, (port2, mx2)
+    for env in ({"AR_MCP_HTTP_PORT": "80x0"}, {"AR_MCP_HTTP_PORT": "99999"}, {"AR_MCP_HTTP_PORT": "-1"},
+                {"AR_MCP_HTTP_MAX_BYTES": "0"}, {"AR_MCP_HTTP_MAX_BYTES": "-5"},
+                {"AR_MCP_HTTP_MAX_BYTES": "1O24"}):
+        try:
+            with_env(**env)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("http_config silently accepted invalid env %r" % env)
+
+
 def t_mcp_http_error_paths_close_connection():
     # security-2: rejection paths (Origin / protocol-version / oversized) and non-POST methods do NOT
     # drain the request body, so each MUST close the connection — an undrained body on a keep-alive
