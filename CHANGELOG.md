@@ -10,6 +10,7 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
 ## [Unreleased]
 
 ### Added
+- **Experimental local Streamable-HTTP transport for `ar-mcp` (E3-S2a).** `AR_MCP_TRANSPORT=http` (or `--http`) starts a stdlib `http.server` MCP endpoint that reuses the same `serve_message()`/`handle()` dispatch as stdio: a **POST** carrying JSON-RPC returns `application/json` for a response or **202** for a notification; requests are `Origin`-validated (DNS-rebinding defense) and the listener binds `127.0.0.1` by default — a **non-loopback bind is refused** (there is no auth yet), so the endpoint cannot be exposed to the network from here. Non-POST methods → `405`, an oversized body → `413`, an unsupported `MCP-Protocol-Version` → `400`, and a rejected request closes its connection (no keep-alive desync). **No authentication or session yet** — it is localhost-only (enforced) and MUST NOT be exposed remotely until the auth sub-story (E3-S2c) lands; `stdio` stays the default. New env: `AR_MCP_HTTP_HOST` / `AR_MCP_HTTP_PORT` / `AR_MCP_HTTP_ORIGINS` / `AR_MCP_HTTP_MAX_BYTES`. Still **not** a command-execution surface.
 - Multi-sample corroboration of high/critical findings (E4-S3): the opt-in `AR_HIGH_SAMPLES=N`
   (integer, default `1`; also the policy key `high_samples`) makes `panel.py run` re-run any role
   that raised a `high`/`critical` finding to `N` low-temperature samples and record a

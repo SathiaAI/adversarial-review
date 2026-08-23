@@ -5,9 +5,11 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -5185,6 +5187,309 @@ def t_ingest_notes_corroboration_not_applied_on_mcp():
         assert "corroboration applies only" in r.stderr, r.stderr
     finally:
         mock_router.reset()
+
+
+def _http_transport(origins=(), max_bytes=4096):
+    """Start an HttpTransport on an ephemeral localhost port in a daemon thread; return (transport, port).
+    Offline — binds 127.0.0.1 only, no external network."""
+    import threading
+    t = mcpsrv.HttpTransport(host="127.0.0.1", port=0, origins=origins, max_bytes=max_bytes)
+    _host, port = t.bind()
+    threading.Thread(target=t.serve_forever, daemon=True).start()
+    return t, port
+
+
+def _http_post(port, body, headers=None):
+    import urllib.request
+    import urllib.error
+    data = body if isinstance(body, (bytes, bytearray)) else body.encode("utf-8")
+    req = urllib.request.Request("http://127.0.0.1:%d/" % port, data=data, method="POST",
+                                 headers=headers or {})
+    try:
+        r = urllib.request.urlopen(req, timeout=5)
+        return r.status, r.read(), {k.lower(): v for k, v in r.headers.items()}
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), {k.lower(): v for k, v in e.headers.items()}
+
+
+def _http_method(port, method):
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request("http://127.0.0.1:%d/" % port, method=method)
+    try:
+        r = urllib.request.urlopen(req, timeout=5)
+        return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def _http_raw(port, request_bytes):
+    """Send a hand-built raw HTTP request and read the full response until the server closes the
+    connection. Needed because urllib always sets Content-Length — a MISSING or EMPTY Content-Length
+    header can only be exercised at the socket level. Returns (status_code, full_response_bytes)."""
+    import socket
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        s.sendall(request_bytes)
+        s.settimeout(5)
+        buf = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        s.close()
+    status = int(buf.split(b" ", 2)[1]) if buf.startswith(b"HTTP/") else 0
+    return status, buf
+
+
+def t_mcp_http_post_parity_with_stdio():
+    # E3-S2a: a POST dispatches through the SAME serve_message()/handle() core as stdio, so the JSON-RPC
+    # result is identical and the HTTP layer is a framing surface only (never command execution).
+    t, port = _http_transport()
+    try:
+        req = {"jsonrpc": "2.0", "id": 7, "method": "server/discover"}
+        status, body, hdrs = _http_post(port, json.dumps(req))
+        assert status == 200, status
+        assert hdrs.get("content-type") == "application/json", hdrs
+        got = json.loads(body)
+        assert got == json.loads(mcpsrv.serve_message(json.dumps(req))), got  # identical to the core
+        assert got["id"] == 7 and "result" in got, got
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_notification_is_202():
+    # A notification (no id) has nothing to return -> 202 Accepted with an empty body (serve_message->None).
+    t, port = _http_transport()
+    try:
+        status, body, _ = _http_post(port, json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        assert status == 202, status
+        assert body == b"", body
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_malformed_body_is_parse_error():
+    # A malformed body frames as a JSON-RPC -32700 parse error (HTTP 200) and never crashes the listener.
+    t, port = _http_transport()
+    try:
+        status, body, _ = _http_post(port, "not json {{{")
+        assert status == 200, status
+        err = json.loads(body)
+        assert err["error"]["code"] == -32700 and err["id"] is None, err
+        status2, body2, _ = _http_post(port, b"\xff\xfe")   # invalid UTF-8 bytes -> parse error, not 500
+        assert status2 == 200 and json.loads(body2)["error"]["code"] == -32700, body2
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_non_post_is_405():
+    # No server->client SSE stream yet (E3-S2b); non-POST methods are 405.
+    t, port = _http_transport()
+    try:
+        for method in ("GET", "DELETE", "PUT"):
+            assert _http_method(port, method) == 405, method
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_origin_allowlist():
+    # DNS-rebinding defense: a present Origin must be allow-listed; an absent Origin (non-browser client)
+    # is allowed. Rejection is 403, before any dispatch.
+    t, port = _http_transport(origins=("https://ok.example",))
+    try:
+        good = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
+        assert _http_post(port, good)[0] == 200                                    # absent Origin -> allowed
+        assert _http_post(port, good, {"Origin": "https://ok.example"})[0] == 200   # allow-listed -> allowed
+        assert _http_post(port, good, {"Origin": "https://evil.example"})[0] == 403  # disallowed -> 403
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_oversized_body_is_413():
+    # DoS bound: a declared body over max_bytes (the test server caps at 4096) is refused with 413.
+    t, port = _http_transport()
+    try:
+        big = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"x": "A" * 5000}})
+        assert _http_post(port, big)[0] == 413
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_protocol_version_header():
+    # HTTP-level version negotiation: an unsupported MCP-Protocol-Version -> 400 naming supportedVersions;
+    # a supported one is echoed on the response.
+    t, port = _http_transport()
+    try:
+        good = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
+        s_bad, b_bad, _ = _http_post(port, good, {"MCP-Protocol-Version": "1999-01-01"})
+        assert s_bad == 400 and "2026-07-28" in json.loads(b_bad)["supportedVersions"], b_bad
+        s_ok, _, h_ok = _http_post(port, good, {"MCP-Protocol-Version": "2026-07-28"})
+        assert s_ok == 200 and h_ok.get("mcp-protocol-version") == "2026-07-28", h_ok
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_transport_selection_defaults_to_stdio():
+    # main() picks stdio unless AR_MCP_TRANSPORT=http or --http; pure selector, no server started.
+    assert mcpsrv.select_transport(argv=["mcp"], env={}) == "stdio"
+    assert mcpsrv.select_transport(argv=["mcp"], env={"AR_MCP_TRANSPORT": "http"}) == "http"
+    assert mcpsrv.select_transport(argv=["mcp"], env={"AR_MCP_TRANSPORT": "STDIO"}) == "stdio"
+    assert mcpsrv.select_transport(argv=["mcp", "--http"], env={}) == "http"
+
+
+def t_mcp_http_missing_or_empty_content_length_is_safe():
+    # test_quality-1: the Content-Length parse path must fail closed — never hang, never 500.
+    #   * zero-length body           -> serve_message(b"") frames a -32700 parse error at HTTP 200
+    #   * MISSING Content-Length     -> defaults to 0 -> same graceful -32700 (raw socket; urllib always
+    #                                   sets the header, so only a hand-built request reaches this path)
+    #   * EMPTY  "Content-Length:"   -> int("") is unparseable -> refused 413, not a crash/hang/500
+    t, port = _http_transport()
+    try:
+        s0, b0, _ = _http_post(port, b"")  # Content-Length: 0
+        assert s0 == 200 and json.loads(b0)["error"]["code"] == -32700, (s0, b0)
+        sm, rm = _http_raw(port, b"POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        assert sm == 200 and b"-32700" in rm, (sm, rm[:120])
+        se, _re = _http_raw(port, b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: \r\nConnection: close\r\n\r\n")
+        assert se == 413, (se, _re[:120])  # fail-closed on a malformed length, never 200/500
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_non_loopback_bind_is_refused():
+    # test_quality-6 / security-1: E3-S2a ships NO authentication, so HttpTransport.bind() must REFUSE
+    # any non-loopback host (0.0.0.0 / LAN / hostname / "::") rather than expose an unauthenticated tool
+    # surface to the network. An EMPTY host is refused too: the socket layer binds "" to 0.0.0.0 (all
+    # interfaces), so it must NOT count as loopback. Loopback targets still bind normally.
+    for host in ("0.0.0.0", "192.168.1.10", "10.0.0.1", "example.com", "::", ""):
+        try:
+            mcpsrv.HttpTransport(host=host, port=0).bind()
+        except ValueError as e:
+            assert "non-loopback" in str(e), (host, str(e))
+        else:
+            raise AssertionError("bind(%r) must refuse a non-loopback host but did not" % host)
+    for ok in ("127.0.0.1", "127.0.0.5", "::1", "localhost"):
+        assert mcpsrv.is_loopback_host(ok), ok
+    for bad in ("0.0.0.0", "192.168.0.1", "8.8.8.8", "example.com", "::", "", "  "):
+        assert not mcpsrv.is_loopback_host(bad), bad
+    t = mcpsrv.HttpTransport(host="127.0.0.1", port=0)  # a loopback bind still succeeds
+    try:
+        host, port = t.bind()
+        assert host == "127.0.0.1" and port > 0, (host, port)
+    finally:
+        if t.httpd is not None:
+            t.httpd.server_close()
+
+
+def t_mcp_http_ipv6_loopback_binds():
+    # CodeRabbit: is_loopback_host('::1') is accepted, so bind() must actually bind it on an AF_INET6
+    # server rather than crash on the default AF_INET socket. Skip only where the runner has no IPv6.
+    if not socket.has_ipv6:
+        return
+    t = mcpsrv.HttpTransport(host="::1", port=0, origins=(), max_bytes=4096)
+    try:
+        host, port = t.bind()
+    except OSError:
+        return  # IPv6 stack present but ::1 not bindable in this sandbox — environment, not a code bug
+    try:
+        assert port > 0 and t.httpd.address_family == socket.AF_INET6, (host, port)
+    finally:
+        t.httpd.server_close()
+
+
+def t_mcp_http_transfer_encoding_is_rejected():
+    # CodeRabbit: framing is Content-Length only. A chunked body is left unread (length parses as 0) and
+    # would desync into the next request on a keep-alive connection (smuggling). Any Transfer-Encoding —
+    # alone OR combined with Content-Length — is refused with a closed 400.
+    t, port = _http_transport()
+    try:
+        chunked = (b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+                   b"Connection: close\r\n\r\n4\r\nWiki\r\n0\r\n\r\n")
+        s1, r1 = _http_raw(port, chunked)
+        head1 = r1.lower().split(b"\r\n\r\n", 1)[0]
+        assert s1 == 400 and b"connection: close" in head1, (s1, r1[:200])
+        combined = (b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n"
+                    b"Connection: close\r\n\r\n4\r\nWiki\r\n0\r\n\r\n")
+        s2, r2 = _http_raw(port, combined)
+        assert s2 == 400, (s2, r2[:200])
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_concurrent_requests_are_correct():
+    # CodeRabbit: ThreadingHTTPServer accepts concurrent connections; _HTTP_DISPATCH_LOCK serializes the
+    # stateful serve_message() core so runs can't race. Functionally, every concurrent POST must still
+    # get its OWN correct JSON-RPC result (id echoed back), never a crossed/dropped response.
+    t, port = _http_transport()
+    try:
+        results = {}
+        def hit(i):
+            body = json.dumps({"jsonrpc": "2.0", "id": i, "method": "server/discover"})
+            st, b, _ = _http_post(port, body)
+            results[i] = (st, json.loads(b).get("id"))
+        threads = [threading.Thread(target=hit, args=(i,)) for i in range(8)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(15)
+        assert len(results) == 8, results
+        for i, (st, rid) in results.items():
+            assert st == 200 and rid == i, (i, st, rid)
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_config_rejects_invalid_numeric_env():
+    # Codex: a typo'd AR_MCP_HTTP_PORT / AR_MCP_HTTP_MAX_BYTES must fail LOUDLY, not silently fall back to
+    # the default — a mistyped small cap silently becoming 1 MiB would widen the DoS bound, and a negative
+    # cap / out-of-range port would start a broken listener. Range is validated too.
+    def with_env(**kv):
+        old = {k: os.environ.get(k) for k in kv}
+        try:
+            for k, v in kv.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+            return mcpsrv.http_config()
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    _h, port, _o, mx = with_env(AR_MCP_HTTP_PORT=None, AR_MCP_HTTP_MAX_BYTES=None)  # unset -> defaults
+    assert port == 8730 and mx == 1048576, (port, mx)
+    _h, port2, _o, mx2 = with_env(AR_MCP_HTTP_PORT="0", AR_MCP_HTTP_MAX_BYTES="4096")  # valid override
+    assert port2 == 0 and mx2 == 4096, (port2, mx2)
+    # Each case controls BOTH vars (the untested one reset to unset -> its default), so the only reason
+    # http_config can raise is the injected-invalid value — never an ambient env var leaking in.
+    for bad in ({"AR_MCP_HTTP_PORT": "80x0"}, {"AR_MCP_HTTP_PORT": "99999"}, {"AR_MCP_HTTP_PORT": "-1"},
+                {"AR_MCP_HTTP_MAX_BYTES": "0"}, {"AR_MCP_HTTP_MAX_BYTES": "-5"},
+                {"AR_MCP_HTTP_MAX_BYTES": "1O24"}):
+        env = {"AR_MCP_HTTP_PORT": None, "AR_MCP_HTTP_MAX_BYTES": None}
+        env.update(bad)
+        try:
+            with_env(**env)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("http_config silently accepted invalid env %r" % bad)
+
+
+def t_mcp_http_error_paths_close_connection():
+    # security-2: rejection paths (Origin / protocol-version / oversized) and non-POST methods do NOT
+    # drain the request body, so each MUST close the connection — an undrained body on a keep-alive
+    # HTTP/1.1 connection would desync (smuggle into) the next request.
+    t, port = _http_transport(origins=("https://ok.example",), max_bytes=64)
+    try:
+        good = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
+        s403, _b, h403 = _http_post(port, good, {"Origin": "https://evil.example"})
+        assert s403 == 403 and h403.get("connection", "").lower() == "close", (s403, h403)
+        big = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "x", "params": {"p": "A" * 200}})
+        s413, _b2, h413 = _http_post(port, big)
+        assert s413 == 413 and h413.get("connection", "").lower() == "close", (s413, h413)
+        s405, r405 = _http_raw(port, b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+        head405 = r405.lower().split(b"\r\n\r\n", 1)[0]
+        assert s405 == 405 and b"connection: close" in head405, r405[:200]
+    finally:
+        t.shutdown()
 
 
 def main():

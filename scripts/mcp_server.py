@@ -39,12 +39,16 @@ Operates on the .adversarial-review/ directory in the server's working directory
 so launch it with the repository under review as the current directory.
 """
 
+import http.server
+import ipaddress
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -694,9 +698,235 @@ class StdioTransport:
                 self.stdout.flush()
 
 
+# --- Streamable-HTTP transport (MCP 2026-07-28) — E3-S2a: endpoint + framing only ---------------
+# Reuses serve_message()/handle() (the E3-S1 seam), so HTTP inherits stdio's exact dispatch and error
+# semantics and stays a framing surface, never a command-execution one. There is NO authentication and
+# NO session yet (those are E3-S2c / E3-S2b): the listener binds 127.0.0.1 by default and MUST NOT be
+# exposed to a network until auth lands. See the committed threat model in docs/.
+HTTP_DEFAULT_HOST = "127.0.0.1"
+HTTP_DEFAULT_PORT = 8730
+HTTP_DEFAULT_MAX_BYTES = 1_048_576  # 1 MiB: a JSON-RPC control message is tiny; caps an oversized-body DoS
+
+
+def _http_int_env(name, default, minimum=None, maximum=None):
+    """Parse an integer env setting. An unset/blank var takes the default; a NON-BLANK but invalid or
+    out-of-range value is a loud error, never a silent fallback — a typo'd cap must not quietly widen the
+    oversized-body DoS bound, and a negative/oversized value must not start a broken listener."""
+    v = (os.environ.get(name, "") or "").strip()
+    if not v:
+        return default
+    try:
+        n = int(v)
+    except ValueError:
+        raise ValueError("%s must be an integer, got %r" % (name, v)) from None
+    if minimum is not None and n < minimum:
+        raise ValueError("%s must be >= %d, got %d" % (name, minimum, n))
+    if maximum is not None and n > maximum:
+        raise ValueError("%s must be <= %d, got %d" % (name, maximum, n))
+    return n
+
+
+def http_config():
+    """Resolve HTTP transport config from env — localhost-only and restrictive by default. Invalid
+    numeric settings fail loudly (see _http_int_env) rather than silently reverting to a default."""
+    host = (os.environ.get("AR_MCP_HTTP_HOST", "").strip() or HTTP_DEFAULT_HOST)
+    port = _http_int_env("AR_MCP_HTTP_PORT", HTTP_DEFAULT_PORT, minimum=0, maximum=65535)
+    origins = tuple(o.strip() for o in os.environ.get("AR_MCP_HTTP_ORIGINS", "").split(",") if o.strip())
+    max_bytes = _http_int_env("AR_MCP_HTTP_MAX_BYTES", HTTP_DEFAULT_MAX_BYTES, minimum=1)
+    return host, port, origins, max_bytes
+
+
+def origin_allowed(origin, allowed):
+    """DNS-rebinding defense. A browser page attacking a localhost server ALWAYS sends an Origin
+    header on a cross-origin fetch, so a *present* Origin must be in the allowlist; an *absent* Origin
+    (curl or a programmatic MCP host — never a browser cross-origin request) is allowed."""
+    if origin is None:
+        return True
+    return origin in allowed
+
+
+def is_loopback_host(host):
+    """True only for a loopback bind target — 'localhost', 127.0.0.0/8, or ::1. E3-S2a has NO auth,
+    so binding anywhere else would expose an unauthenticated tool surface to the network; bind()
+    refuses it. A hostname other than 'localhost' is treated as non-loopback (refused) — we do not
+    resolve DNS to decide safety. An EMPTY host is NOT loopback: the socket layer binds "" to 0.0.0.0
+    (all interfaces), so it is refused too — the resolved default (http_config) is always 127.0.0.1."""
+    h = (host or "").strip().lower()
+    if h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+# Dispatch is serialized process-wide: the MCP tool handlers are stateful (they write context.md and
+# spawn subprocesses under a run dir), and stdio drives them one message at a time. ThreadingHTTPServer
+# accepts connections concurrently, so this lock preserves that one-at-a-time invariant for the HTTP
+# path and prevents two runs from racing the same on-disk state.
+_HTTP_DISPATCH_LOCK = threading.Lock()
+
+
+class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
+    """One Streamable-HTTP request. The owning server carries `allowed_origins` and `max_bytes`."""
+    protocol_version = "HTTP/1.1"
+
+    def version_string(self):
+        return SERVER_NAME  # minimal Server header — do not leak the Python/http.server version
+
+    def log_message(self, fmt, *args):
+        return  # quiet; serve_message() already logs handler crashes via log()
+
+    def _json(self, status, payload, extra=None):
+        # Every _json() response is a rejection (Origin/version/size) or a non-POST method — none of
+        # them drains the request body. On a keep-alive HTTP/1.1 connection an undrained body would
+        # desync the next request (request smuggling), and for the 413 path draining an oversized body
+        # would itself be the DoS we are refusing. So close the connection after any _json() response.
+        # The 200/202 success paths read the full declared body and may keep-alive normally.
+        body = json.dumps(payload).encode("utf-8")
+        self.close_connection = True
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _not_allowed(self):
+        # No GET/SSE server->client stream yet (that is E3-S2b); the endpoint accepts only POST.
+        self._json(405, {"error": "method not allowed; the MCP endpoint accepts POST"}, {"Allow": "POST"})
+
+    do_GET = _not_allowed
+    do_HEAD = _not_allowed
+    do_PUT = _not_allowed
+    do_DELETE = _not_allowed
+    do_PATCH = _not_allowed
+    do_OPTIONS = _not_allowed
+
+    def do_POST(self):
+        # (1) DNS-rebinding defense first: reject a disallowed browser Origin before touching the body.
+        if not origin_allowed(self.headers.get("Origin"), self.server.allowed_origins):
+            self._json(403, {"error": "origin not allowed"})
+            return
+        # (2) HTTP-level protocol-version negotiation. Absent is fine (the modern per-request _meta path
+        #     negotiates in-band); a present-but-unsupported version is rejected with what we speak.
+        pv = self.headers.get("MCP-Protocol-Version")
+        if pv is not None and pv not in ALL_PROTOCOLS:
+            self._json(400, {"error": "unsupported MCP-Protocol-Version",
+                             "supportedVersions": list(ALL_PROTOCOLS)})
+            return
+        # (3) Frame strictly by Content-Length: reject any Transfer-Encoding (chunked et al.), even when
+        #     combined with Content-Length. We do not decode a chunked body, so it would sit unread on a
+        #     keep-alive connection and desync into the next request (smuggling) — refuse with a closed 400.
+        if self.headers.get("Transfer-Encoding") is not None:
+            self._json(400, {"error": "Transfer-Encoding not supported; frame the body with Content-Length"})
+            return
+        # (4) Bound the body (DoS): refuse an oversized or unparseable declared length outright.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0 or length > self.server.max_bytes:
+            self._json(413, {"error": "request body too large"})
+            return
+        raw = self.rfile.read(length) if length else b""
+        # (5) Dispatch through the transport-agnostic core, serialized (see _HTTP_DISPATCH_LOCK) so the
+        #     stateful tool handlers keep stdio's one-at-a-time invariant. serve_message() accepts bytes
+        #     and never raises: a malformed body frames as -32700, a handler crash as -32603.
+        with _HTTP_DISPATCH_LOCK:
+            out = serve_message(raw)
+        if out is None:
+            # A notification (or any message handle() declines to answer) -> 202 Accepted, no body.
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = out.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if pv is not None:
+            self.send_header("MCP-Protocol-Version", pv)  # echo the negotiated version
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class HttpTransport:
+    """Streamable-HTTP framing (MCP 2026-07-28) over stdlib http.server, reusing serve_message() — the
+    E3-S2a endpoint. POST only: application/json for a response, 202 for a notification. NO auth and NO
+    session yet (E3-S2c / E3-S2b): binds 127.0.0.1 by default and MUST NOT be exposed remotely until
+    auth lands. Binding is split from serving so the framing is testable offline on an ephemeral port."""
+
+    def __init__(self, host=None, port=None, origins=None, max_bytes=None):
+        h, p, o, m = http_config()
+        self.host = h if host is None else host
+        self.port = p if port is None else port
+        self.origins = tuple(o) if origins is None else tuple(origins)
+        self.max_bytes = m if max_bytes is None else max_bytes
+        self.httpd = None
+
+    def bind(self):
+        """Create + bind the server (no serving yet); return the actual (host, port) — the port is
+        OS-assigned when 0 was requested. Split out so offline tests can bind an ephemeral port.
+        Refuses a non-loopback host: E3-S2a has no authentication, so a network-reachable bind is
+        never allowed here (it becomes possible only once auth lands, E3-S2c)."""
+        if not is_loopback_host(self.host):
+            raise ValueError(
+                "refusing to bind the ar-mcp HTTP transport to non-loopback host %r: E3-S2a has NO "
+                "authentication, so a network-reachable bind is refused. Keep AR_MCP_HTTP_HOST on "
+                "loopback (127.0.0.1 / ::1 / localhost) until auth lands (E3-S2c)." % (self.host,))
+        # Pick the address family from the host so an IPv6 loopback (::1) actually binds — the default
+        # ThreadingHTTPServer is AF_INET, which cannot bind an IPv6 address. Defer bind/activate so the
+        # family can be set first, and clean up the socket if the bind itself fails.
+        httpd = http.server.ThreadingHTTPServer((self.host, self.port), _MCPHTTPHandler,
+                                                bind_and_activate=False)
+        httpd.address_family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
+        httpd.daemon_threads = True
+        httpd.allowed_origins = self.origins
+        httpd.max_bytes = self.max_bytes
+        try:
+            httpd.server_bind()
+            httpd.server_activate()
+        except BaseException:
+            httpd.server_close()
+            raise
+        self.httpd = httpd
+        return httpd.server_address
+
+    def serve_forever(self):
+        if self.httpd is None:
+            self.bind()
+        addr = self.httpd.server_address
+        log(f"http transport ready on {addr[0]}:{addr[1]} "
+            "(localhost-only, NO auth — E3-S2a; do not expose remotely until E3-S2c)")
+        try:
+            self.httpd.serve_forever()
+        finally:
+            self.httpd.server_close()
+
+    def shutdown(self):
+        if self.httpd is not None:
+            self.httpd.shutdown()
+
+
+def select_transport(argv=None, env=None):
+    """stdio unless AR_MCP_TRANSPORT=http or --http is passed. Pure + tiny so main()'s choice is
+    unit-testable without starting a server."""
+    argv = sys.argv if argv is None else argv
+    env = os.environ if env is None else env
+    if (env.get("AR_MCP_TRANSPORT", "").strip().lower() == "http") or ("--http" in argv):
+        return "http"
+    return "stdio"
+
+
 def main():
-    log(f"v{VERSION} ready on stdio (cwd={os.getcwd()})")
-    StdioTransport().serve_forever()
+    if select_transport() == "http":
+        HttpTransport().serve_forever()
+    else:
+        log(f"v{VERSION} ready on stdio (cwd={os.getcwd()})")
+        StdioTransport().serve_forever()
 
 
 if __name__ == "__main__":

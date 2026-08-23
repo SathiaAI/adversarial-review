@@ -221,6 +221,11 @@ keyless `panel.py prepare` + `ingest` (MCP) transport does **not** take corrobor
 | `AR_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible router base URL |
 | `AR_API_KEY` | — | Key for `AR_BASE_URL` (falls back to OpenRouter key) |
 | `AR_TRANSPORT` | auto | `http` or `mcp` |
+| `AR_MCP_TRANSPORT` | `stdio` | `ar-mcp` transport: `stdio` (default) or `http` (experimental **local** Streamable-HTTP endpoint, E3-S2a — no auth/session yet, localhost-only, never expose remotely). Also selectable with `--http`. |
+| `AR_MCP_HTTP_HOST` | `127.0.0.1` | Bind host for the `http` transport. Keep it loopback until auth lands. |
+| `AR_MCP_HTTP_PORT` | `8730` | Bind port for the `http` transport (`0` = OS-assigned). |
+| `AR_MCP_HTTP_ORIGINS` | — | Comma list of allowed `Origin` values (DNS-rebinding defense). An absent Origin (non-browser client) is allowed; any *present* Origin must be listed, else `403`. |
+| `AR_MCP_HTTP_MAX_BYTES` | `1048576` | Max POST body bytes for the `http` transport; a larger declared length is refused with `413`. |
 | `AR_PRIVACY` | by tier | `default`, `deny`, or `zdr` |
 | `AR_TEMPERATURE` | `0.1` | Reviewer sampling temperature |
 | `AR_MAX_TOKENS` | `8000` | Reviewer response cap (floored per model by `max_tokens_floor`) |
