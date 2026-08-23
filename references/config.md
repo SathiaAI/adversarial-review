@@ -239,8 +239,9 @@ directory) — `aggregate.py --verify-signature` performs the complete check:
    - **cosign keyless:** reads the expected identity/issuer from `AR_COSIGN_IDENTITY` /
      `AR_COSIGN_ISSUER` (**both required** — without them cosign `verify-blob` accepts *any* valid
      Fulcio certificate, so cosign is not auto-selected as the verifier until both are set).
-   - **minisign:** set `AR_MINISIGN_PUBKEY` to either a **public-key file** or an **inline key**
-     value — `-p` vs `-P` is chosen automatically by whether the value names an existing file.
+   - **minisign:** set `AR_MINISIGN_PUBKEY_FILE` to a **public-key file** (`-p`) **or**
+     `AR_MINISIGN_PUBKEY` to an **inline key** value (`-P`) — the key is chosen by which var is set,
+     never by probing the filesystem (a key file wins when both are set).
 2. A verifier that runs and returns non-zero yields exit **1** (a bad/absent signature, a relabeled
    verdict, or a verifier misconfiguration — the stderr is surfaced); a verifier that cannot start,
    has a malformed template, or times out yields exit **3**.
@@ -275,7 +276,8 @@ recorded artifacts — is unchanged, because a signature attests a verdict but c
 | `AR_SIGNER_CMD` | auto | `aggregate.py --sign` signer command template (`{msg}`/`{sig}` tokens); overrides cosign/minisign auto-detect (see *Signing the attestation*) |
 | `AR_VERIFIER_CMD` | auto | `aggregate.py --verify-signature` verifier command template (`{msg}`/`{sig}` tokens); overrides auto-detect |
 | `AR_MINISIGN_KEY` | — | Path to a minisign secret key; enables the minisign signing fallback |
-| `AR_MINISIGN_PUBKEY` | — | minisign public key for `--verify-signature`: a key **file** (`-p`) or an **inline** key value (`-P`), auto-selected by whether it names an existing file |
+| `AR_MINISIGN_PUBKEY` | — | minisign **inline** public-key value for `--verify-signature` (`-P`) |
+| `AR_MINISIGN_PUBKEY_FILE` | — | Path to a minisign public-key **file** for `--verify-signature` (`-p`); wins over `AR_MINISIGN_PUBKEY` when both are set |
 | `AR_SIGN_TIMEOUT` | `120` | Bounded timeout (seconds) for each signer/verifier subprocess; expiry converts to the tooling-error exit (3) |
 | `AR_COSIGN_IDENTITY` | — | Expected signer identity (SAN) for cosign keyless `--verify-signature` |
 | `AR_COSIGN_ISSUER` | — | Expected OIDC issuer for cosign keyless `--verify-signature` |

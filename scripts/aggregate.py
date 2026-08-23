@@ -322,14 +322,22 @@ def _cosign_verify_argv():
 
 
 def _minisign_verify_argv():
-    pub = os.environ.get("AR_MINISIGN_PUBKEY", "").strip()
-    if not (shutil.which("minisign") and pub):
+    # AR_MINISIGN_PUBKEY_FILE names a public-key FILE (minisign `-p`); AR_MINISIGN_PUBKEY carries an
+    # INLINE key value (minisign `-P`). They are SEPARATE vars by design: choosing `-p` vs `-P` by
+    # whether the value happens to name an existing file (an earlier os.path.exists heuristic) let an
+    # attacker who can drop a file into the verifier's working directory — named exactly the operator's
+    # PUBLIC inline key — make minisign read an attacker-chosen key file, so a verdict signed with the
+    # attacker's key would verify (panel finding security-1). Filesystem state must never select the
+    # verification key. An explicit key file wins when both are set.
+    if not shutil.which("minisign"):
         return None
-    # AR_MINISIGN_PUBKEY may be a public-key FILE or an inline key value. minisign's `-p` expects a
-    # key file and `-P` an inline key on the command line; pick by whether the value names an existing
-    # file, so an inline "RW..." key is not misread as a (missing) filename (Codex minisign -p vs -P).
-    flag = "-p" if os.path.exists(pub) else "-P"
-    return ["minisign", "-V", flag, pub, "-m", "{msg}", "-x", "{sig}"]
+    keyfile = os.environ.get("AR_MINISIGN_PUBKEY_FILE", "").strip()
+    if keyfile:
+        return ["minisign", "-V", "-p", keyfile, "-m", "{msg}", "-x", "{sig}"]
+    inline = os.environ.get("AR_MINISIGN_PUBKEY", "").strip()
+    if inline:
+        return ["minisign", "-V", "-P", inline, "-m", "{msg}", "-x", "{sig}"]
+    return None
 
 
 def _load_verdict(run):
@@ -359,7 +367,8 @@ def _canonical_verdict_bytes(verdict):
 
 def _run_tool(argv_tmpl, msg_path, sig_path):
     """Substitute `{msg}`/`{sig}` in the argv template and run the external tool. When the template
-    references `{msg}` the digest file is substituted there, else it is appended as the final arg.
+    references `{msg}` the canonical verdict.json (the signed bytes) is substituted there, else it is
+    appended as the final arg.
     Returns the completed process; exits 3 (loud) if the tool cannot even be started."""
     argv = [a.replace("{msg}", str(msg_path)).replace("{sig}", str(sig_path)) for a in argv_tmpl]
     if not any("{msg}" in a for a in argv_tmpl):
@@ -418,8 +427,8 @@ def sign_attestation(run):
 
 def verify_signature(run):
     """Verify the detached `attestation.sig` sidecar against the run's verdict.json, then exit:
-    0 valid, 1 not verified (a tampered verdict.json, a tampered/absent signature, or drifted input
-    artifacts), 2 a missing prerequisite (no verdict / no sidecar), 3 no verifier available / verifier
+    0 valid, 1 not verified (a tampered verdict.json, a tampered signature, or drifted input
+    artifacts), 2 a missing prerequisite (no verdict / no sidecar; an absent sidecar exits 2, not 1), 3 no verifier available / verifier
     tooling error. Verification is COMPLETE: it (a) recomputes the attestation from the on-disk
     artifacts and requires it matches the digest recorded in verdict.json — so a tampered input
     artifact is caught even though the sidecar is untouched — and (b) verifies the signature over the
@@ -441,7 +450,7 @@ def verify_signature(run):
     if argv_tmpl is None:
         _sign_fail("no verifier available: set AR_VERIFIER_CMD (using the {msg} and {sig} tokens), "
                    "or install cosign (keyless; set AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER) or minisign "
-                   "(with AR_MINISIGN_PUBKEY set).")
+                   "(with AR_MINISIGN_PUBKEY inline or AR_MINISIGN_PUBKEY_FILE set).")
     with tempfile.TemporaryDirectory() as td:
         msg = Path(td) / "verdict.canonical.json"
         msg.write_bytes(_canonical_verdict_bytes(verdict))

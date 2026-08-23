@@ -900,27 +900,45 @@ def t_sign_subprocess_timeout_exits_3():
 
 
 def t_minisign_verify_flag_inline_vs_file():
-    # E6-S1 (Codex): AR_MINISIGN_PUBKEY may be a key FILE (-p) or an inline key (-P); _minisign_verify_argv
-    # picks the flag by whether the value names an existing file, so an inline key is not misread as a path.
+    # E6-S1 (panel security-1): the minisign verify key is chosen by WHICH env var is set, never by
+    # probing the filesystem. AR_MINISIGN_PUBKEY_FILE -> `-p <file>`; AR_MINISIGN_PUBKEY -> `-P <inline>`.
+    # Regression: an inline value that happens to equal an existing filename in CWD must STILL verify
+    # with `-P`, so an attacker who plants a file named like the operator's PUBLIC inline key cannot
+    # swap in an attacker-chosen verification key.
     import importlib
     import aggregate
     importlib.reload(aggregate)
     _saved_pub = os.environ.get("AR_MINISIGN_PUBKEY")
+    _saved_file = os.environ.get("AR_MINISIGN_PUBKEY_FILE")
     orig_which = aggregate.shutil.which
     aggregate.shutil.which = lambda name: "/usr/bin/minisign" if name == "minisign" else orig_which(name)
-    keyfile = Path(tempfile.mkdtemp(prefix="ar-minipub-")) / "ar.pub"
+    tmpd = Path(tempfile.mkdtemp(prefix="ar-minipub-"))
+    keyfile = tmpd / "ar.pub"
     keyfile.write_text("RWQexampleexamplekey\n")
+    _cwd = os.getcwd()
     try:
-        os.environ["AR_MINISIGN_PUBKEY"] = "RWQinlinekeyvaluenofilehere123456"   # not a path
+        os.environ.pop("AR_MINISIGN_PUBKEY_FILE", None)
+        os.environ["AR_MINISIGN_PUBKEY"] = "RWQinlinekeyvaluenofilehere123456"   # inline -> -P
         argv = aggregate._minisign_verify_argv()
         assert argv and "-P" in argv and "-p" not in argv, argv
-        os.environ["AR_MINISIGN_PUBKEY"] = str(keyfile)                          # an existing file
+        # regression: inline value collides with a real file in CWD -> STILL -P (attack closed)
+        os.chdir(tmpd)
+        collide = "RWQcollide12345"
+        Path(collide).write_text("attacker key\n")
+        os.environ["AR_MINISIGN_PUBKEY"] = collide
         argv = aggregate._minisign_verify_argv()
-        assert argv and "-p" in argv and "-P" not in argv, argv
+        assert argv and "-P" in argv and collide in argv and "-p" not in argv, argv
+        os.chdir(_cwd)
+        # explicit key FILE -> -p <file>
+        os.environ.pop("AR_MINISIGN_PUBKEY", None)
+        os.environ["AR_MINISIGN_PUBKEY_FILE"] = str(keyfile)
+        argv = aggregate._minisign_verify_argv()
+        assert argv and "-p" in argv and str(keyfile) in argv and "-P" not in argv, argv
     finally:
+        os.chdir(_cwd)
         aggregate.shutil.which = orig_which
-        os.environ.pop("AR_MINISIGN_PUBKEY", None) if _saved_pub is None else \
-            os.environ.__setitem__("AR_MINISIGN_PUBKEY", _saved_pub)
+        for _var, _saved in (("AR_MINISIGN_PUBKEY", _saved_pub), ("AR_MINISIGN_PUBKEY_FILE", _saved_file)):
+            os.environ.pop(_var, None) if _saved is None else os.environ.__setitem__(_var, _saved)
 
 
 def t_gate_blocked_status_yields_blocked_not_fail():
