@@ -718,7 +718,7 @@ def _http_int_env(name, default, minimum=None, maximum=None):
     try:
         n = int(v)
     except ValueError:
-        raise ValueError("%s must be an integer, got %r" % (name, v))
+        raise ValueError("%s must be an integer, got %r" % (name, v)) from None
     if minimum is not None and n < minimum:
         raise ValueError("%s must be >= %d, got %d" % (name, minimum, n))
     if maximum is not None and n > maximum:

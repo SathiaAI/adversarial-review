@@ -5458,15 +5458,19 @@ def t_mcp_http_config_rejects_invalid_numeric_env():
     assert port == 8730 and mx == 1048576, (port, mx)
     _h, port2, _o, mx2 = with_env(AR_MCP_HTTP_PORT="0", AR_MCP_HTTP_MAX_BYTES="4096")  # valid override
     assert port2 == 0 and mx2 == 4096, (port2, mx2)
-    for env in ({"AR_MCP_HTTP_PORT": "80x0"}, {"AR_MCP_HTTP_PORT": "99999"}, {"AR_MCP_HTTP_PORT": "-1"},
+    # Each case controls BOTH vars (the untested one reset to unset -> its default), so the only reason
+    # http_config can raise is the injected-invalid value — never an ambient env var leaking in.
+    for bad in ({"AR_MCP_HTTP_PORT": "80x0"}, {"AR_MCP_HTTP_PORT": "99999"}, {"AR_MCP_HTTP_PORT": "-1"},
                 {"AR_MCP_HTTP_MAX_BYTES": "0"}, {"AR_MCP_HTTP_MAX_BYTES": "-5"},
                 {"AR_MCP_HTTP_MAX_BYTES": "1O24"}):
+        env = {"AR_MCP_HTTP_PORT": None, "AR_MCP_HTTP_MAX_BYTES": None}
+        env.update(bad)
         try:
             with_env(**env)
         except ValueError:
             pass
         else:
-            raise AssertionError("http_config silently accepted invalid env %r" % env)
+            raise AssertionError("http_config silently accepted invalid env %r" % bad)
 
 
 def t_mcp_http_error_paths_close_connection():
