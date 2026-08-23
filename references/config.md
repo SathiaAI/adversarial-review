@@ -171,85 +171,46 @@ default **`$20`**; set any of them to `0`, `none`, `off`, or `unlimited` to disa
 negative value is rejected loudly (it would otherwise silently remove the guard). A provider that
 omits `cost` is metered as `$0`.
 
-## Signing the verdict (detached signature)
+## Multi-sample corroboration of high/critical findings
 
-Every aggregation records a tamper-evident **attestation digest** — a reproducible SHA-256 over
-the run's recorded `*.json` artifacts (see `references/schemas.md`). `--check-digest` proves those
-bytes have not drifted *since the verdict was computed*, but it proves nothing about **who** stands
-behind them. `aggregate.py --sign` closes that gap: it produces a **detached cryptographic
-signature over the run's `verdict.json`**, so a third party who never ran the pipeline can verify
-both that the run is intact **and** that a specific identity signed this exact verdict.
+`AR_HIGH_SAMPLES=N` (integer, default **`1`**) makes `panel.py run` **corroborate** high/critical
+findings across `N` low-temperature samples: after the primary review, each such finding is
+re-sampled and its cross-sample agreement rate is recorded on the finding. It is **informational
+only** — it enriches findings after they are raised and never changes the gate; a single primary
+high/critical finding still gates, whatever its agreement rate.
 
-```bash
-python <skill>/scripts/aggregate.py                      # aggregate first: writes verdict.json
-python <skill>/scripts/aggregate.py --sign               # then sign: writes attestation.sig
-python <skill>/scripts/aggregate.py --verify-signature   # 0 valid, 1 not verified, 2 missing, 3 no verifier
-```
+- **`N=1` (default) changes no reviewer output**: no resampling happens and no `corroboration`
+  field is written, so every reviewer report is byte-identical to pre-E4-S3. (`run` still records
+  the resolved `sample_policy.json` — value `1`, source `default` — as it does at any `N`; see below.)
+- With `N>1`, after every primary reviewer completes, each role that raised a `high`/`critical`
+  finding (only those roles — a thin loop, not the whole panel) is re-run to `N` total samples.
+  Each extra sample is recorded under `panel/samples/<role>.<i>.json` (its raw response and cost
+  metadata alongside the primary, under `panel/raw/` and `panel/meta/`), so the agreement rate
+  reproduces from the recorded artifacts.
+- Each flagged finding gains a `corroboration` object: `{ "samples": N, "agreed": k, "rate": k/N }`.
+  `agreed` counts the samples whose own high/critical findings **match** this one; sample 1 is the
+  primary report itself, so it always counts. Two findings match when they cite the **same file**
+  (case-insensitive) **and** their titles are similar — a `difflib` ratio ≥ `0.6` over
+  whitespace/case-normalized titles. A sample that fails to produce a valid report simply does not
+  match, which honestly lowers the rate.
+- **The verdict is unchanged.** `aggregate.py` alone decides PASS/FAIL/BLOCKED from the recorded
+  artifacts; a low agreement rate is **not** a majority-vote override and never flips the gate. The
+  agreement rate is recorded for downstream variance measurement, not for gating.
+- **Cost-aware.** Resamples are billed calls that count against and honor the per-run cost cap
+  (see *Per-run cost cap*): each sample is gated *before* the call, and if the cap is already
+  reached the resampling stops, records a `cost_abort.json` with phase `corroboration`, and the run
+  exits BLOCKED — a resample never silently exceeds the ceiling. Because it runs only after every
+  primary report is complete, corroboration never starves primary coverage of the budget.
 
-Design guarantees (each enforced by a regression test):
+Precedence is `AR_HIGH_SAMPLES` > policy `high_samples` > default **`1`**. The value is validated
+identically at policy load (`init`) and at `run` — an integer in `[1, 25]`; an integral-looking
+float such as `3.0` or `1e1` is rejected in **both** places, so a value that passes `init` can never
+be rejected later at `run`. The resolved count and its source are recorded to `sample_policy.json`
+in the run directory (even at the default `1`), so the audit shows exactly which value applied.
 
-- **Standalone, not a re-aggregation.** `--sign` and `--verify-signature` are post-verdict modes
-  (like `--check-digest`): they operate on the **existing** `verdict.json` and never re-run the
-  aggregation. Adding a signature changes no verdict or attestation state, and the verdict never
-  depends on whether a signature exists.
-- **Signs the verdict decision, not only its input digest.** The signed message is the canonical
-  `verdict.json` (sorted keys; the non-reproducible `computed_at` excluded so re-aggregating an
-  untouched run reproduces the signable bytes). This binds the computed **verdict / reasons /
-  coverage** and the attestation digest together — a relabeled verdict (`BLOCKED`→`PASS`) no longer
-  verifies, even though the input artifacts are untouched.
-- **Refuses to sign — and to accept — a drifted run.** Before signing, `--sign` recomputes the
-  attestation from the on-disk artifacts and **refuses** (exit 1) unless it still matches the digest
-  recorded in `verdict.json`; it never silently re-attests changed state. `--verify-signature`
-  performs the same recompute, so a tampered **input** artifact fails verification even when the
-  sidecar and `verdict.json` are untouched.
-- **The signature is a sidecar, not an attested input.** It is written as `attestation.sig`
-  alongside `verdict.json`. Because it is not a `*.json` file, the attestation (which hashes only
-  `*.json`) never folds it back in — `--check-digest` stays intact with the sidecar present, and
-  re-aggregating an untouched run reproduces the same digest. The signature is **not** self-attesting.
-- **Zero runtime dependency preserved.** The signer is invoked **out-of-process** via `subprocess`
-  under a bounded timeout (`AR_SIGN_TIMEOUT`, default 120s — a hung signer converts to the
-  tooling-error exit rather than wedging the gate); `scripts/*.py` import no third-party signing
-  library. cosign / minisign are executed, never imported.
-- **Fails loudly, never silently.** No signer/verifier available, a malformed `AR_SIGNER_CMD` /
-  `AR_VERIFIER_CMD` template (unbalanced quotes), a signer that cannot start, or a subprocess
-  timeout all exit non-zero (**3**) with a clear message and write no signature — never a silent
-  skip, never a false success.
-
-**Signer resolution** (first match wins):
-
-1. **`AR_SIGNER_CMD`** — an explicit command template, the override and the test seam. `{msg}` is
-   substituted with a temp file holding the canonical `verdict.json` to sign; `{sig}` with the path
-   the detached signature must be written to. A template with no `{sig}` token has its signature
-   read from stdout instead; a template with unbalanced quotes exits 3.
-   Example: `AR_SIGNER_CMD='cosign sign-blob --yes --bundle {sig} {msg}'`.
-2. **cosign, keyless (primary)** — auto-detected when `cosign` is on `PATH`. Uses
-   `cosign sign-blob --yes --bundle {sig} {msg}`: an ephemeral Fulcio certificate tied to an
-   ambient OIDC identity plus a Rekor transparency-log entry, packaged into one self-contained
-   `--bundle` sidecar. No long-lived private key to manage — ideal for CI with an OIDC identity.
-3. **minisign, Ed25519 (fallback)** — auto-detected when `minisign` is on `PATH` **and**
-   `AR_MINISIGN_KEY` points to a secret key. Uses `minisign -S -s $AR_MINISIGN_KEY -m {msg} -x {sig}`.
-   Use a password-less key for non-interactive runs.
-
-**Outside-verifier path** (someone who did *not* run the pipeline, holding only the shipped run
-directory) — `aggregate.py --verify-signature` performs the complete check:
-
-1. It recomputes the attestation from the artifacts, requires it to match `verdict.json`'s recorded
-   digest, and verifies `attestation.sig` against the canonical `verdict.json` with the **expected
-   signer identity** — the trust decision the verifier owns, not the script.
-   - **cosign keyless:** reads the expected identity/issuer from `AR_COSIGN_IDENTITY` /
-     `AR_COSIGN_ISSUER` (**both required** — without them cosign `verify-blob` accepts *any* valid
-     Fulcio certificate, so cosign is not auto-selected as the verifier until both are set).
-   - **minisign:** set `AR_MINISIGN_PUBKEY_FILE` to a **public-key file** (`-p`) **or**
-     `AR_MINISIGN_PUBKEY` to an **inline key** value (`-P`) — the key is chosen by which var is set,
-     never by probing the filesystem (a key file wins when both are set).
-2. A verifier that runs and returns non-zero yields exit **1** (a bad/absent signature, a relabeled
-   verdict, or a verifier misconfiguration — the stderr is surfaced); a verifier that cannot start,
-   has a malformed template, or times out yields exit **3**.
-
-The verifier command is resolved exactly like the signer: `AR_VERIFIER_CMD` override (same
-`{msg}`/`{sig}` tokens) > cosign `verify-blob` > minisign `-V`. Signing and verifying are always
-out-of-process; the enforcement guarantee — that only `aggregate.py` computes the verdict from
-recorded artifacts — is unchanged, because a signature attests a verdict but can never author one.
+**Transport scope.** Corroboration resampling runs only on the direct-HTTP `panel.py run` path. The
+keyless `panel.py prepare` + `ingest` (MCP) transport does **not** take corroboration samples; when
+`AR_HIGH_SAMPLES > 1` is set, `ingest` prints a note saying so rather than silently ignoring it.
 
 ## Environment variables
 
@@ -264,7 +225,8 @@ recorded artifacts — is unchanged, because a signature attests a verdict but c
 | `AR_TEMPERATURE` | `0.1` | Reviewer sampling temperature |
 | `AR_MAX_TOKENS` | `8000` | Reviewer response cap (floored per model by `max_tokens_floor`) |
 | `AR_REASONING_EFFORT` | `high` | Reasoning budget for models whose profile marks `reasoning: mandatory` |
-| `AR_MAX_COST_USD` | `20` | Per-run USD ceiling (pre-call gate across panel/rebuttal/concurrence; BLOCKS the remaining calls once reached and may overshoot by the in-flight call). `0`/`none`/`off`/`unlimited` disables; non-finite/negative is rejected. Also settable via the policy key `max_cost_usd`. |
+| `AR_MAX_COST_USD` | `20` | Per-run USD ceiling (pre-call gate across panel/rebuttal/concurrence/corroboration; BLOCKS the remaining calls once reached and may overshoot by the in-flight call). `0`/`none`/`off`/`unlimited` disables; non-finite/negative is rejected. Also settable via the policy key `max_cost_usd`. |
+| `AR_HIGH_SAMPLES` | `1` | Number of low-temperature samples to corroborate each high/critical finding (see *Multi-sample corroboration*). `1` = today's behavior (no resampling). Informational-only: records an agreement rate, never changes the verdict. Resamples honor `AR_MAX_COST_USD`. Also settable via the policy key `high_samples`. |
 | `AR_TIMEOUT_S` | `240` | Per-request timeout |
 | `AR_RUN_DIR` | `.adversarial-review` | Artifact root |
 | `AR_RISK` | — | Default risk tier for `init` (below `--risk`, above policy) |

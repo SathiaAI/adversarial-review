@@ -10,24 +10,25 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
 ## [Unreleased]
 
 ### Added
-- Detached signature over the verdict (E6-S1): `aggregate.py --sign` writes a detached cryptographic
-  signature (`attestation.sig`) over the run's canonical `verdict.json`, and
-  `aggregate.py --verify-signature` checks it (exit 0 valid / 1 not verified / 2 missing / 3 no
-  verifier). `--sign` and `--verify-signature` are **standalone** post-verdict modes (like
-  `--check-digest`): they operate on the existing `verdict.json` and never re-aggregate. Signing the
-  canonical `verdict.json` — not merely its input digest — **binds the computed verdict decision**
-  (verdict / reasons / coverage) to the signature, so a relabeled verdict no longer verifies; both
-  `--sign` and `--verify-signature` first **recompute the attestation** from the artifacts and refuse
-  a drifted run, so a tampered input is caught even when the sidecar is untouched and signing never
-  silently re-attests changed state. The signature is a sidecar, not a `*.json` file, so it is never
-  folded back into the attestation and the digest algorithm is unchanged. The signer/verifier is
-  invoked **out-of-process** under a bounded timeout (`AR_SIGN_TIMEOUT`, default 120s; sigstore/cosign
-  keyless primary, minisign fallback, `AR_SIGNER_CMD`/`AR_VERIFIER_CMD` override with `{msg}`/`{sig}`
-  tokens), preserving the stdlib-only runtime contract; no signer, a malformed command template, a
-  signer that cannot start, or a subprocess timeout all fail loudly (exit 3) rather than silently
-  skipping. cosign keyless verification requires `AR_COSIGN_IDENTITY` + `AR_COSIGN_ISSUER` (else it is
-  not auto-selected); a minisign public key is supplied inline via `AR_MINISIGN_PUBKEY` (`-P`) or as a key file via `AR_MINISIGN_PUBKEY_FILE` (`-p`) — the key is never chosen by probing the filesystem.
-  Documented in `references/config.md` (with the outside-verifier path) and `references/schemas.md`.
+- Multi-sample corroboration of high/critical findings (E4-S3): the opt-in `AR_HIGH_SAMPLES=N`
+  (integer, default `1`; also the policy key `high_samples`) makes `panel.py run` re-run any role
+  that raised a `high`/`critical` finding to `N` low-temperature samples and record a
+  `corroboration: {samples, agreed, rate}` object on that finding — the share of samples whose own
+  high/critical findings match it (same file + similar title via a `difflib` ratio). Only flagged
+  roles are resampled, each sample is recorded under `panel/samples/` (with cost metered under
+  `panel/meta/`, honoring the per-run cost cap — a resample that would cross the cap records a
+  `corroboration`-phase `cost_abort.json` and BLOCKS rather than overspend), and `N=1` is a strict
+  no-op (byte-identical reviewer artifacts). The agreement rate is **informational only**:
+  `aggregate.py` alone still decides the verdict, so disagreement never overrides the gate. See
+  `references/config.md`. Review hardening (CodeRabbit + Codex on #48): `high_samples` is validated
+  at policy-load exactly as `panel.py run` resolves it (`int(str(value))`), so an integral-looking
+  float (`3.0`, `1e1`) that `init` would accept can no longer be rejected later at `run`; a plain
+  `run` resume no longer re-buys corroboration samples (only roles produced in that invocation are
+  resampled, so recorded cost can't undercount real spend); the `corroboration` object is declared in
+  the finding schema so an enriched report stays schema-valid; the resolved count + source are
+  persisted to `sample_policy.json` (even at the default `1`) for the audit; a cost-cap abort during
+  corroboration names every later flagged role it skipped; and the keyless prepare/ingest (MCP) path
+  now surfaces that corroboration is not applied there instead of silently ignoring `high_samples`.
 - Release hygiene: this changelog and a "cutting a release" ritual in `CONTRIBUTING.md`.
 - Documentation drift guards: `tests/run_tests.py` now asserts the gate matrix in
   `references/gates.md` stays consistent with `MINIMUM_GATES` in `scripts/gate.py`, and that
