@@ -4526,6 +4526,368 @@ def t_eval_thresholds_cli():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def t_high_samples_corroborates_flagged_role():
+    # E4-S3: with AR_HIGH_SAMPLES=3, a role that raised a high finding is resampled to 3 total
+    # samples and the cross-sample agreement rate is recorded ON that finding. Roles that raised no
+    # high/critical finding are NOT resampled (a thin loop). Asserts observable artifact contents.
+    mock_router.reset()
+
+    def provider(m):
+        if m["kind"] != "report" or m["role"] != "security":
+            return None  # other roles -> default canned report (no findings) -> not resampled
+        # do_POST increments STATE["calls"] before calling us, so this is the 1-based call index for
+        # the security model: 1 = primary, 2 = sample-2, 3 = sample-3.
+        rep = mock_router._report("security", m["model"])
+        if mock_router.STATE["calls"][m["model"]] <= 2:
+            return rep  # primary + sample-2: the SAME IDOR finding -> corroborates
+        rep["findings"] = [{**rep["findings"][0], "id": "security-9",
+                            "title": "Unrelated race in worker pool", "file": "workers/pool.py"}]
+        return rep  # sample-3: a high finding on a DIFFERENT file -> does not corroborate
+
+    mock_router.STATE["response_provider"] = provider
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo,
+           env={**ENV, "AR_HIGH_SAMPLES": "3"})
+        run = latest_run(repo)
+        plan = read(run / "panel" / "plan.json")
+        sec_model = plan["roles"]["security"]["model"]
+        corr_model = plan["roles"]["correctness"]["model"]
+        # the primary finding carries the agreement record: 2 of 3 samples agreed (primary + s2)
+        fin = read(run / "panel" / "security.json")["findings"][0]
+        assert fin["id"] == "security-1", fin
+        assert fin["corroboration"]["samples"] == 3 and fin["corroboration"]["agreed"] == 2, fin
+        assert abs(fin["corroboration"]["rate"] - round(2 / 3, 4)) < 1e-9, fin["corroboration"]
+        # each extra sample was RECORDED, so the rate reproduces from the recorded artifacts
+        assert read(run / "panel" / "samples" / "security.2.json")["findings"][0]["id"] == "security-1"
+        assert read(run / "panel" / "samples" / "security.3.json")["findings"][0]["id"] == "security-9"
+        # exactly 3 calls to the security model (primary + 2 corroboration samples)
+        assert mock_router.STATE["calls"][sec_model] == 3, mock_router.STATE["calls"]
+        # a role with no high/critical finding is NOT resampled: one call, no sample artifacts
+        assert mock_router.STATE["calls"][corr_model] == 1, mock_router.STATE["calls"]
+        assert not (run / "panel" / "samples" / "correctness.2.json").exists()
+        # sample cost is metered under panel/meta so it counts against the cap + coverage
+        assert (run / "panel" / "meta" / "security.sample2.json").exists()
+        assert (run / "panel" / "meta" / "security.sample3.json").exists()
+    finally:
+        mock_router.reset()
+
+
+def t_high_samples_default_one_is_unchanged():
+    # E4-S3: AR_HIGH_SAMPLES defaults to 1 = exactly today's behavior. No resampling, no
+    # corroboration field, no sample artifacts; the recorded report is byte-identical to the mock's
+    # canned report. Explicit AR_HIGH_SAMPLES=1 is identical to the unset default.
+    mock_router.reset()
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo)  # env unset -> default 1
+        run = latest_run(repo)
+        sec_model = read(run / "panel" / "plan.json")["roles"]["security"]["model"]
+        sec = read(run / "panel" / "security.json")
+        assert sec == mock_router._report("security", sec_model), sec  # byte-identical canned report
+        assert "corroboration" not in sec["findings"][0]
+        assert not (run / "panel" / "samples").exists()
+        assert mock_router.STATE["calls"][sec_model] == 1, mock_router.STATE["calls"]
+        # explicit "1" behaves identically to the default (re-run the same repo with --force)
+        sh(["panel.py", "run", "--context-file", "context.md", "--force"], repo,
+           env={**ENV, "AR_HIGH_SAMPLES": "1"})
+        assert read(run / "panel" / "security.json") == mock_router._report("security", sec_model)
+        assert not (run / "panel" / "samples").exists()
+    finally:
+        mock_router.reset()
+
+
+def t_high_samples_disagreement_does_not_change_verdict():
+    # E4-S3: corroboration is INFORMATIONAL. Whether the extra samples agree (3/3) or disagree
+    # (1/3), aggregate.py returns the SAME verdict — a low agreement rate is not a majority-vote
+    # override and never flips the gate.
+    def run_with(sample_findings):
+        mock_router.reset()
+
+        def provider(m):
+            if m["kind"] != "report" or m["role"] != "security":
+                return None
+            rep = mock_router._report("security", m["model"])
+            if mock_router.STATE["calls"][m["model"]] == 1:
+                return rep  # primary always raises the high finding (this is what gates)
+            rep["findings"] = sample_findings  # samples 2..N
+            return rep
+
+        mock_router.STATE["response_provider"] = provider
+        try:
+            repo = fresh_repo()
+            sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+            sh(["panel.py", "assign"], repo)
+            sh(["panel.py", "run", "--context-file", "context.md"], repo,
+               env={**ENV, "AR_HIGH_SAMPLES": "3"})
+            run = latest_run(repo)
+            sh(["aggregate.py"], repo, expect=None)
+            v = read(run / "verdict.json")
+            corr = read(run / "panel" / "security.json")["findings"][0]["corroboration"]
+            return v["verdict"], corr
+        finally:
+            mock_router.reset()
+
+    agree = mock_router._report("security", "x")["findings"]  # same IDOR finding -> agrees
+    v_agree, c_agree = run_with(agree)
+    v_dis, c_dis = run_with([])  # samples raise nothing -> disagree
+    assert v_agree == v_dis == "BLOCKED", (v_agree, v_dis)  # verdict identical either way
+    assert c_agree["agreed"] == 3 and abs(c_agree["rate"] - 1.0) < 1e-9, c_agree
+    assert c_dis["agreed"] == 1 and abs(c_dis["rate"] - round(1 / 3, 4)) < 1e-9, c_dis
+
+
+def t_high_samples_cost_cap_honored_during_resampling():
+    # E4-S3: resampling is billed and honors the per-run cost cap. When corroboration would cross
+    # the ceiling it stops BEFORE the next sample, records a cost_abort (phase 'corroboration'), and
+    # the run BLOCKS — never a silent overspend. A failure-path assertion on real artifacts.
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.20
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        # 4 primary reviewers * $0.20 = $0.80: the panel finishes (last pre-call check saw
+        # $0.60 < $0.90). Corroborating security then spends sample-2 ($0.80<$0.90 -> runs, total
+        # $1.00 >= $0.90 -> the post-record check aborts (sample-3 never starts). One sample, BLOCK.
+        env = {**ENV, "AR_MAX_COST_USD": "0.90", "AR_HIGH_SAMPLES": "3"}
+        r = sh(["panel.py", "run", "--context-file", "context.md"], repo, expect=2, env=env)
+        assert "cost cap" in r.stderr.lower(), r.stderr
+        run = latest_run(repo)
+        abort = read(run / "cost_abort.json")
+        assert abort["phase"] == "corroboration", abort
+        assert abort["cap_usd"] == 0.90 and abort["not_run"], abort
+        # the panel itself finished — all four primary reports exist; the cap tripped in resampling
+        for role in ("security", "correctness", "test_quality", "output_fidelity"):
+            assert (run / "panel" / f"{role}.json").exists(), role
+        # exactly one corroboration sample was recorded before the abort
+        assert (run / "panel" / "samples" / "security.2.json").exists()
+        assert not (run / "panel" / "samples" / "security.3.json").exists()
+        # aggregate BLOCKS with the cost reason surfaced on coverage + reasons
+        sh(["aggregate.py"], repo, expect=2, env=env)
+        vj = read(run / "verdict.json")
+        assert vj["verdict"] == "BLOCKED" and vj["coverage"]["cost_aborted"] is True
+        assert any("cost cap" in reason.lower() for reason in vj["reasons"]), vj["reasons"]
+    finally:
+        mock_router.reset()
+
+
+def t_high_samples_cost_cap_final_sample_blocks():
+    # E4-S3 (CodeRabbit): the cost cap must hold even when the FINAL corroboration sample is the one
+    # that crosses it. With high_samples=2, sample 2 is the last: the pre-call gate lets it start
+    # (under cap), it records over the cap, and only the post-record check can catch the crossing —
+    # so without that check the run would silently finish over budget instead of BLOCKING.
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.20
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        # 4 primaries * $0.20 = $0.80 < $0.90 -> panel finishes. Corroboration sample 2 pre-call sees
+        # $0.80 < $0.90 -> runs, total $1.00. n=2, so there is NO sample-3 pre-call to catch it.
+        env = {**ENV, "AR_MAX_COST_USD": "0.90", "AR_HIGH_SAMPLES": "2"}
+        r = sh(["panel.py", "run", "--context-file", "context.md"], repo, expect=2, env=env)
+        assert "cost cap" in r.stderr.lower(), r.stderr
+        run = latest_run(repo)
+        abort = read(run / "cost_abort.json")
+        assert abort["phase"] == "corroboration", abort
+        # the crossing sample WAS recorded before the abort; there is no sample 3
+        assert (run / "panel" / "samples" / "security.2.json").exists()
+        assert not (run / "panel" / "samples" / "security.3.json").exists()
+        sh(["aggregate.py"], repo, expect=2, env=env)
+        vj = read(run / "verdict.json")
+        assert vj["verdict"] == "BLOCKED" and vj["coverage"]["cost_aborted"] is True
+    finally:
+        mock_router.reset()
+
+
+def t_call_reviewer_exposes_usage_on_validation_failure():
+    # E4-S3 (panel security-1): call_reviewer must attach the billed usage to the exception it raises
+    # when reviewer output fails validation after the retry, so a corroboration sample that was billed
+    # but then failed can be cost-metered (otherwise the pre-call cost gate under-counts and the cap
+    # could be silently exceeded). The mock bills reviewer_cost on every call and the provider returns
+    # an invalid report both times, forcing the after-retry failure path.
+    import panel
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.05
+    mock_router.STATE["response_provider"] = lambda meta: {"not": "a valid report"}
+    try:
+        body = {"model": "x/y", "messages": [{"role": "system", "content": "Your role: security"},
+                                             {"role": "user", "content": "go"}]}
+        try:
+            panel.call_reviewer("http://127.0.0.1:%d" % PORT, "k", body, panel.REPORT_SCHEMA)
+            raise AssertionError("expected a validation failure")
+        except ValueError as e:
+            u = getattr(e, "usage", None)
+            assert u and (u.get("cost") or 0) > 0, ("billed usage not attached to failure", u)
+            # both the initial call and the corrective retry bill $0.05: the exception must carry the
+            # ACCUMULATED usage ($0.10), not just the last attempt's, or the cost cap under-counts a
+            # failed-but-billed sample (CodeRabbit).
+            assert abs(u["cost"] - 0.10) < 1e-9, ("retry usage was not accumulated", u)
+    finally:
+        mock_router.reset()
+
+
+def t_high_samples_rejects_invalid_values():
+    # E4-S3: a non-integer / < 1 AR_HIGH_SAMPLES is rejected loudly (like the cost cap), so a typo
+    # can never silently change the sampling count. Also validated at policy load.
+    import panel
+    import _common
+    for bad in ("0", "-1", "1.5", "abc", "  ", "26", "3.0", "1e1"):   # 3.0/1e1: run rejects, so init must too
+        os.environ["AR_HIGH_SAMPLES"] = bad
+        try:
+            panel.high_samples()
+            raise AssertionError(f"high_samples accepted {bad!r}")
+        except SystemExit:
+            pass
+        finally:
+            os.environ.pop("AR_HIGH_SAMPLES", None)
+    try:
+        os.environ["AR_HIGH_SAMPLES"] = "3"
+        assert panel.high_samples() == 3
+        os.environ["AR_HIGH_SAMPLES"] = str(_common.MAX_HIGH_SAMPLES)   # upper bound is inclusive
+        assert panel.high_samples() == _common.MAX_HIGH_SAMPLES
+    finally:
+        os.environ.pop("AR_HIGH_SAMPLES", None)
+    for bad in (0, -1, 1.5, "2.5", float("nan"), True, _common.MAX_HIGH_SAMPLES + 1, 3.0, "3.0", "1e1"):
+        try:
+            _common._validate_policy({"high_samples": bad}, "policy")
+            raise AssertionError(f"policy load accepted {bad!r}")
+        except SystemExit:
+            pass
+    _common._validate_policy({"high_samples": 3}, "policy")    # positive integer OK
+    _common._validate_policy({"high_samples": "4"}, "policy")  # YAML-subset string integer OK
+    _common._validate_policy({"high_samples": _common.MAX_HIGH_SAMPLES}, "policy")  # upper bound OK
+
+
+def t_high_samples_resume_does_not_recharge():
+    # E4-S3 (panel/Codex): a plain `panel.py run` resume (no --force) must NOT re-buy corroboration
+    # samples — the sample files overwrite in place, so a repeat would spend without the recorded cost
+    # accumulating. Only roles whose PRIMARY was produced in THIS invocation are corroborated.
+    mock_router.reset()
+    def provider(m):
+        return None if (m["kind"] != "report" or m["role"] != "security") \
+            else mock_router._report("security", m["model"])
+    mock_router.STATE["response_provider"] = provider
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        env = {**ENV, "AR_HIGH_SAMPLES": "3"}
+        sh(["panel.py", "run", "--context-file", "context.md"], repo, env=env)
+        run = latest_run(repo)
+        sec = read(run / "panel" / "plan.json")["roles"]["security"]["model"]
+        assert mock_router.STATE["calls"][sec] == 3, mock_router.STATE["calls"]        # primary + 2
+        r = sh(["panel.py", "run", "--context-file", "context.md"], repo, env=env)     # resume
+        assert "already complete" in r.stdout, r.stdout
+        assert mock_router.STATE["calls"][sec] == 3, ("resume re-bought samples", mock_router.STATE["calls"])
+        sh(["panel.py", "run", "--context-file", "context.md", "--force"], repo, env=env)  # --force redoes
+        assert mock_router.STATE["calls"][sec] == 6, mock_router.STATE["calls"]        # +3 (primary+2)
+    finally:
+        mock_router.reset()
+
+
+def t_corroboration_enriched_report_is_schema_valid():
+    # E4-S3 (Codex + CodeRabbit): the persisted (enriched) report validates against the ENRICHED
+    # schema, but corroboration is NOT part of the reviewer-INPUT schema — a reviewer cannot supply
+    # its own corroboration (additionalProperties:false rejects it).
+    import panel
+    mock_router.reset()
+    def provider(m):
+        return None if (m["kind"] != "report" or m["role"] != "security") \
+            else mock_router._report("security", m["model"])
+    mock_router.STATE["response_provider"] = provider
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo, env={**ENV, "AR_HIGH_SAMPLES": "3"})
+        rep = read(latest_run(repo) / "panel" / "security.json")
+        assert "corroboration" in rep["findings"][0], rep["findings"][0]
+        # the persisted, enriched report validates against the ENRICHED schema (superset)...
+        assert not panel.validate_obj(rep, panel.REPORT_SCHEMA_ENRICHED), "enriched report not schema-valid"
+        # ...and the reviewer-INPUT schema REJECTS a report carrying corroboration, so a reviewer
+        # cannot inject its own agreement record (CodeRabbit: keep corroboration out of reviewer input).
+        assert panel.validate_obj(rep, panel.REPORT_SCHEMA), \
+            "reviewer-input REPORT_SCHEMA must reject a report carrying corroboration"
+    finally:
+        mock_router.reset()
+
+
+def t_sample_policy_persisted():
+    # E4-S3 (Codex): the run records which high_samples applied (value + source), even at the default
+    # 1 where no corroboration fields exist, so an auditor can tell a policy edit from a no-op.
+    mock_router.reset()
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo)                  # default 1
+        sp = read(latest_run(repo) / "sample_policy.json")
+        assert sp["high_samples"] == 1 and sp["source"] == "default", sp
+        repo2 = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo2)
+        sh(["panel.py", "assign"], repo2)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo2, env={**ENV, "AR_HIGH_SAMPLES": "2"})
+        sp2 = read(latest_run(repo2) / "sample_policy.json")
+        assert sp2["high_samples"] == 2 and sp2["source"] == "env", sp2
+        assert sp2["source"] != sp["source"], (sp["source"], sp2["source"])  # configured != default
+    finally:
+        mock_router.reset()
+
+
+def t_corroboration_cost_abort_names_later_flagged_roles():
+    # E4-S3 (Codex): when the cap is hit while corroborating an earlier flagged role, _cost_abort exits
+    # and every LATER flagged role is skipped too — the audit record must name them all.
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.05
+    def provider(m):
+        if m["kind"] != "report" or m["role"] not in ("security", "correctness"):
+            return None
+        rep = mock_router._report("security", m["model"])          # a high finding
+        rep["role"] = m["role"]
+        rep["findings"] = [{**rep["findings"][0], "id": m["role"] + "-1"}]
+        return rep
+    mock_router.STATE["response_provider"] = provider
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        # 4 primaries * 0.05 = 0.20 reaches the cap before any corroboration sample is bought
+        sh(["panel.py", "run", "--context-file", "context.md"], repo,
+           env={**ENV, "AR_HIGH_SAMPLES": "3", "AR_MAX_COST_USD": "0.20"}, expect=None)
+        abort = read(latest_run(repo) / "cost_abort.json")
+        assert abort["phase"] == "corroboration", abort
+        joined = " ".join(str(x) for x in abort["not_run"])
+        assert "security#sample" in joined and "correctness#sample" in joined, abort["not_run"]
+    finally:
+        mock_router.reset()
+
+
+def t_ingest_notes_corroboration_not_applied_on_mcp():
+    # E4-S3 (Codex): corroboration runs only on the direct-HTTP run path; the keyless prepare/ingest
+    # (MCP) path must SURFACE that it isn't applied rather than silently ignore high_samples.
+    mock_router.reset()
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        sh(["panel.py", "prepare", "--context-file", "context.md"], repo)
+        run = latest_run(repo)
+        model = read(run / "panel" / "plan.json")["roles"]["security"]["model"]
+        rep = mock_router._report("security", model)
+        respfile = repo / "resp.json"
+        write(respfile, {"choices": [{"message": {"content": json.dumps(rep)}}], "usage": {"cost": 0.0}})
+        r = sh(["panel.py", "ingest", "--role", "security", "--response-file", str(respfile)], repo,
+               env={**ENV, "AR_HIGH_SAMPLES": "2"})
+        assert "corroboration applies only" in r.stderr, r.stderr
+    finally:
+        mock_router.reset()
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

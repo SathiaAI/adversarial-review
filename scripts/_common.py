@@ -80,9 +80,11 @@ def family_of(slug):
 
 POLICY_BASENAMES = (".adversarial-review.yml", ".adversarial-review.json")
 POLICY_KEYS = ("risk", "dev_providers", "rebuttal_policy", "required_gates", "pins",
-               "mutation", "max_cost_usd")
+               "mutation", "max_cost_usd", "high_samples")
 VALID_RISKS = ("NORMAL", "SENSITIVE", "CRITICAL")
 VALID_REBUTTAL = ("critical", "contention", "any")
+MAX_HIGH_SAMPLES = 25  # practical upper bound on corroboration samples (E4-S3): bounds the
+                       # cost blast radius and the not_run list built on a cost-abort.
 # Scoped/bounded mutation budget — a repo-tunable cost cap so mutation testing survives
 # large or resource-constrained repos. A flat mapping (the strict YAML subset allows one
 # nested level); every field is optional. The configured budget is snapshotted into the
@@ -350,6 +352,20 @@ def _validate_policy(data, name):
             if n is None or n < 0:
                 die(f"{name}: max_cost_usd must be a finite non-negative number or "
                     f"'none'/'off'/'unlimited', got {v!r}")
+    if "high_samples" in data:
+        # Multi-sample corroboration count (E4-S3), informational-only: an integer in
+        # [1, MAX_HIGH_SAMPLES]; 1 (the default) disables resampling. Validate EXACTLY as
+        # panel.high_samples() resolves it — int(str(value)) — so an integral-looking float ("3.0",
+        # 1e1) or any non-integer that `init` would accept here cannot be rejected later at `run`
+        # time; the two must agree (panel/Codex E4-S3).
+        hv = data["high_samples"]
+        try:
+            n = int(str(hv).strip())
+        except (TypeError, ValueError):
+            n = None
+        if n is None or n < 1 or n > MAX_HIGH_SAMPLES:
+            die(f"{name}: high_samples must be an integer in [1, {MAX_HIGH_SAMPLES}], "
+                f"got {hv!r}")
 
 
 def load_policy(root=None):

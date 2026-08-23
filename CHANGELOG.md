@@ -10,6 +10,25 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
 ## [Unreleased]
 
 ### Added
+- Multi-sample corroboration of high/critical findings (E4-S3): the opt-in `AR_HIGH_SAMPLES=N`
+  (integer, default `1`; also the policy key `high_samples`) makes `panel.py run` re-run any role
+  that raised a `high`/`critical` finding to `N` low-temperature samples and record a
+  `corroboration: {samples, agreed, rate}` object on that finding — the share of samples whose own
+  high/critical findings match it (same file + similar title via a `difflib` ratio). Only flagged
+  roles are resampled, each sample is recorded under `panel/samples/` (with cost metered under
+  `panel/meta/`, honoring the per-run cost cap — a resample that would cross the cap records a
+  `corroboration`-phase `cost_abort.json` and BLOCKS rather than overspend), and `N=1` is a strict
+  no-op (byte-identical reviewer artifacts). The agreement rate is **informational only**:
+  `aggregate.py` alone still decides the verdict, so disagreement never overrides the gate. See
+  `references/config.md`. Review hardening (CodeRabbit + Codex on #48): `high_samples` is validated
+  at policy-load exactly as `panel.py run` resolves it (`int(str(value))`), so an integral-looking
+  float (`3.0`, `1e1`) that `init` would accept can no longer be rejected later at `run`; a plain
+  `run` resume no longer re-buys corroboration samples (only roles produced in that invocation are
+  resampled, so recorded cost can't undercount real spend); the `corroboration` object is declared in
+  the finding schema so an enriched report stays schema-valid; the resolved count + source are
+  persisted to `sample_policy.json` (even at the default `1`) for the audit; a cost-cap abort during
+  corroboration names every later flagged role it skipped; and the keyless prepare/ingest (MCP) path
+  now surfaces that corroboration is not applied there instead of silently ignoring `high_samples`.
 - Release hygiene: this changelog and a "cutting a release" ritual in `CONTRIBUTING.md`.
 - Documentation drift guards: `tests/run_tests.py` now asserts the gate matrix in
   `references/gates.md` stays consistent with `MINIMUM_GATES` in `scripts/gate.py`, and that
