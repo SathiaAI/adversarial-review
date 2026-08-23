@@ -197,7 +197,7 @@ is not a `*.json` file, so it is never folded back into the digest. `--sign` and
 `--verify-signature` are standalone post-verdict modes that refuse a drifted run;
 `--verify-signature` recomputes this digest **and** checks the signature over `verdict.json`.
 The full outside-verifier path (identity/issuer, cosign/minisign commands) is in
-`references/config.md`, *Signing the attestation*.
+`references/config.md`, *Signing the verdict*.
 
 The `coverage` block is the machine-readable manifest of what the run did and did not
 verify. It is assembled exclusively from recorded artifacts — the same inputs as the

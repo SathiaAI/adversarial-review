@@ -273,7 +273,7 @@ recorded artifacts — is unchanged, because a signature attests a verdict but c
 | `AR_PINS` | — | Comma list `role=model-slug` to pin specific models |
 | `AR_REBUTTAL` | `contention` | Rebuttal policy at init: `critical`, `contention`, `any` |
 | `AR_CAP_OVERRIDES` | — | Path to a capability-overrides file (see *Model capability profiles*) |
-| `AR_SIGNER_CMD` | auto | `aggregate.py --sign` signer command template (`{msg}`/`{sig}` tokens); overrides cosign/minisign auto-detect (see *Signing the attestation*) |
+| `AR_SIGNER_CMD` | auto | `aggregate.py --sign` signer command template (`{msg}`/`{sig}` tokens); overrides cosign/minisign auto-detect (see *Signing the verdict*) |
 | `AR_VERIFIER_CMD` | auto | `aggregate.py --verify-signature` verifier command template (`{msg}`/`{sig}` tokens); overrides auto-detect |
 | `AR_MINISIGN_KEY` | — | Path to a minisign secret key; enables the minisign signing fallback |
 | `AR_MINISIGN_PUBKEY` | — | minisign **inline** public-key value for `--verify-signature` (`-P`) |
