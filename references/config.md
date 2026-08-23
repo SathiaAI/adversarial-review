@@ -174,12 +174,14 @@ omits `cost` is metered as `$0`.
 ## Multi-sample corroboration of high/critical findings
 
 `AR_HIGH_SAMPLES=N` (integer, default **`1`**) makes `panel.py run` **corroborate** high/critical
-findings across `N` low-temperature samples before they gate, so single-sample reviewer variance
-does not flap verdicts. It is **informational only** — it enriches findings and never changes the
-gate.
+findings across `N` low-temperature samples: after the primary review, each such finding is
+re-sampled and its cross-sample agreement rate is recorded on the finding. It is **informational
+only** — it enriches findings after they are raised and never changes the gate; a single primary
+high/critical finding still gates, whatever its agreement rate.
 
-- **`N=1` (default) is a strict no-op**: exactly today's behavior, byte-identical artifacts. No
-  resampling happens and no `corroboration` field is written.
+- **`N=1` (default) changes no reviewer output**: no resampling happens and no `corroboration`
+  field is written, so every reviewer report is byte-identical to pre-E4-S3. (`run` still records
+  the resolved `sample_policy.json` — value `1`, source `default` — as it does at any `N`; see below.)
 - With `N>1`, after every primary reviewer completes, each role that raised a `high`/`critical`
   finding (only those roles — a thin loop, not the whole panel) is re-run to `N` total samples.
   Each extra sample is recorded under `panel/samples/<role>.<i>.json` (its raw response and cost
