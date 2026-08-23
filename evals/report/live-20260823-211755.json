@@ -1,0 +1,395 @@
+{
+  "generated_at": "2026-08-23T21:17:55Z",
+  "mode": "live",
+  "python": "3.11",
+  "result": {
+    "aggregate": {
+      "by_category": {
+        "clean": {
+          "cases": 4,
+          "detection_rate": null,
+          "fn": 0,
+          "fp": 2,
+          "must_detect_total": 0,
+          "noise": 0,
+          "partial": 0,
+          "partial_rate": null,
+          "tp": 0
+        },
+        "correctness": {
+          "cases": 2,
+          "detection_rate": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "must_detect_total": 2,
+          "noise": 0,
+          "partial": 0,
+          "partial_rate": 0.0,
+          "tp": 2
+        },
+        "output_fidelity": {
+          "cases": 2,
+          "detection_rate": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "must_detect_total": 2,
+          "noise": 0,
+          "partial": 0,
+          "partial_rate": 0.0,
+          "tp": 2
+        },
+        "security": {
+          "cases": 2,
+          "detection_rate": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "must_detect_total": 2,
+          "noise": 0,
+          "partial": 0,
+          "partial_rate": 0.0,
+          "tp": 2
+        },
+        "test_quality": {
+          "cases": 2,
+          "detection_rate": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "must_detect_total": 2,
+          "noise": 0,
+          "partial": 0,
+          "partial_rate": 0.0,
+          "tp": 2
+        }
+      },
+      "by_model": {
+        "deepseek/deepseek-v4-pro-0813": {
+          "cost_usd": 0.036051147,
+          "emitted": 2,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "google/gemini-3.7-flash": {
+          "cost_usd": 0.0544965,
+          "emitted": 6,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "mistralai/mistral-medium-3-5": {
+          "cost_usd": 0.090147,
+          "emitted": 16,
+          "partial": 0,
+          "tp": 6,
+          "unmatched": 2
+        },
+        "qwen/qwen3.8-27b": {
+          "cost_usd": 0.14011695000000002,
+          "emitted": 26,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 3
+        },
+        "x-ai/grok-4.6": {
+          "cost_usd": 0.1603,
+          "emitted": 4,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "z-ai/glm-5.2": {
+          "cost_usd": 0.001680365,
+          "emitted": 2,
+          "partial": 0,
+          "tp": 2,
+          "unmatched": 0
+        }
+      },
+      "by_role": {
+        "correctness": {
+          "emitted": 14,
+          "partial": 0,
+          "tp": 8,
+          "unmatched": 2
+        },
+        "data_privacy": {
+          "emitted": 2,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "output_fidelity": {
+          "emitted": 6,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "reliability": {
+          "emitted": 4,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "security": {
+          "emitted": 4,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "test_quality": {
+          "emitted": 26,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 3
+        }
+      },
+      "by_tier": {
+        "NORMAL": {
+          "cases": 10,
+          "detection_rate": 1.0,
+          "fn": 0,
+          "fp": 2,
+          "must_detect_total": 6,
+          "noise": 0,
+          "partial": 0,
+          "partial_rate": 0.0,
+          "tp": 6
+        },
+        "SENSITIVE": {
+          "cases": 2,
+          "detection_rate": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "must_detect_total": 2,
+          "noise": 0,
+          "partial": 0,
+          "partial_rate": 0.0,
+          "tp": 2
+        }
+      },
+      "overall": {
+        "cases": 12,
+        "detection_rate": 1.0,
+        "fn": 0,
+        "fp": 2,
+        "must_detect_total": 8,
+        "noise": 0,
+        "partial": 0,
+        "partial_rate": 0.0,
+        "tp": 8
+      }
+    },
+    "budget_usd": 20.0,
+    "cases": [
+      {
+        "case_id": "clean-clamp-helper",
+        "category": "clean",
+        "cost_usd": 0.067746,
+        "detection_rate": null,
+        "fn": 0,
+        "fp": 2,
+        "noise": 0,
+        "partial": 0,
+        "per_rep": [
+          {
+            "cost_usd": 0.032973,
+            "fn": 0,
+            "fp": 1,
+            "noise": 0,
+            "partial": 0,
+            "rep": 1,
+            "tp": 0
+          },
+          {
+            "cost_usd": 0.034773,
+            "fn": 0,
+            "fp": 1,
+            "noise": 0,
+            "partial": 0,
+            "rep": 2,
+            "tp": 0
+          }
+        ],
+        "reps": 2,
+        "tier": "NORMAL",
+        "tp": 0
+      },
+      {
+        "case_id": "clean-refactor-total",
+        "category": "clean",
+        "cost_usd": 0.041595,
+        "detection_rate": null,
+        "fn": 0,
+        "fp": 0,
+        "noise": 0,
+        "partial": 0,
+        "per_rep": [
+          {
+            "cost_usd": 0.020612,
+            "fn": 0,
+            "fp": 0,
+            "noise": 0,
+            "partial": 0,
+            "rep": 1,
+            "tp": 0
+          },
+          {
+            "cost_usd": 0.020984,
+            "fn": 0,
+            "fp": 0,
+            "noise": 0,
+            "partial": 0,
+            "rep": 2,
+            "tp": 0
+          }
+        ],
+        "reps": 2,
+        "tier": "NORMAL",
+        "tp": 0
+      },
+      {
+        "case_id": "corr-offbyone-pagination",
+        "category": "correctness",
+        "cost_usd": 0.099476,
+        "detection_rate": 1.0,
+        "fn": 0,
+        "fp": 0,
+        "noise": 0,
+        "partial": 0,
+        "per_rep": [
+          {
+            "cost_usd": 0.048422,
+            "fn": 0,
+            "fp": 0,
+            "noise": 0,
+            "partial": 0,
+            "rep": 1,
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.051054,
+            "fn": 0,
+            "fp": 0,
+            "noise": 0,
+            "partial": 0,
+            "rep": 2,
+            "tp": 1
+          }
+        ],
+        "reps": 2,
+        "tier": "NORMAL",
+        "tp": 2
+      },
+      {
+        "case_id": "out-inverted-finalize",
+        "category": "output_fidelity",
+        "cost_usd": 0.078281,
+        "detection_rate": 1.0,
+        "fn": 0,
+        "fp": 0,
+        "noise": 0,
+        "partial": 0,
+        "per_rep": [
+          {
+            "cost_usd": 0.036251,
+            "fn": 0,
+            "fp": 0,
+            "noise": 0,
+            "partial": 0,
+            "rep": 1,
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.04203,
+            "fn": 0,
+            "fp": 0,
+            "noise": 0,
+            "partial": 0,
+            "rep": 2,
+            "tp": 1
+          }
+        ],
+        "reps": 2,
+        "tier": "NORMAL",
+        "tp": 2
+      },
+      {
+        "case_id": "sec-idor-invoice",
+        "category": "security",
+        "cost_usd": 0.127261,
+        "detection_rate": 1.0,
+        "fn": 0,
+        "fp": 0,
+        "noise": 0,
+        "partial": 0,
+        "per_rep": [
+          {
+            "cost_usd": 0.065204,
+            "fn": 0,
+            "fp": 0,
+            "noise": 0,
+            "partial": 0,
+            "rep": 1,
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.062057,
+            "fn": 0,
+            "fp": 0,
+            "noise": 0,
+            "partial": 0,
+            "rep": 2,
+            "tp": 1
+          }
+        ],
+        "reps": 2,
+        "tier": "SENSITIVE",
+        "tp": 2
+      },
+      {
+        "case_id": "test-weak-assert-charge",
+        "category": "test_quality",
+        "cost_usd": 0.068433,
+        "detection_rate": 1.0,
+        "fn": 0,
+        "fp": 0,
+        "noise": 0,
+        "partial": 0,
+        "per_rep": [
+          {
+            "cost_usd": 0.03465,
+            "fn": 0,
+            "fp": 0,
+            "noise": 0,
+            "partial": 0,
+            "rep": 1,
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.033783,
+            "fn": 0,
+            "fp": 0,
+            "noise": 0,
+            "partial": 0,
+            "rep": 2,
+            "tp": 1
+          }
+        ],
+        "reps": 2,
+        "tier": "NORMAL",
+        "tp": 2
+      }
+    ],
+    "clean_fp": 2,
+    "clean_fp_rate": 0.5,
+    "clean_units": 4,
+    "complete": true,
+    "corpus": "corpus",
+    "line_tol": 3,
+    "not_run": [],
+    "reps": 2,
+    "spent_usd": 0.482792,
+    "stop_reason": null
+  },
+  "schema": "adversarial-review/eval-report/1"
+}
