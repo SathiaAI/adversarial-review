@@ -4539,7 +4539,7 @@ def t_high_samples_cost_cap_honored_during_resampling():
         sh(["panel.py", "assign"], repo)
         # 4 primary reviewers * $0.20 = $0.80: the panel finishes (last pre-call check saw
         # $0.60 < $0.90). Corroborating security then spends sample-2 ($0.80<$0.90 -> runs, total
-        # $1.00); sample-3's pre-call check sees $1.00>=$0.90 -> abort. One extra sample, then BLOCK.
+        # $1.00 >= $0.90 -> the post-record check aborts (sample-3 never starts). One sample, BLOCK.
         env = {**ENV, "AR_MAX_COST_USD": "0.90", "AR_HIGH_SAMPLES": "3"}
         r = sh(["panel.py", "run", "--context-file", "context.md"], repo, expect=2, env=env)
         assert "cost cap" in r.stderr.lower(), r.stderr
@@ -4558,6 +4558,35 @@ def t_high_samples_cost_cap_honored_during_resampling():
         vj = read(run / "verdict.json")
         assert vj["verdict"] == "BLOCKED" and vj["coverage"]["cost_aborted"] is True
         assert any("cost cap" in reason.lower() for reason in vj["reasons"]), vj["reasons"]
+    finally:
+        mock_router.reset()
+
+
+def t_high_samples_cost_cap_final_sample_blocks():
+    # E4-S3 (CodeRabbit): the cost cap must hold even when the FINAL corroboration sample is the one
+    # that crosses it. With high_samples=2, sample 2 is the last: the pre-call gate lets it start
+    # (under cap), it records over the cap, and only the post-record check can catch the crossing —
+    # so without that check the run would silently finish over budget instead of BLOCKING.
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.20
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        # 4 primaries * $0.20 = $0.80 < $0.90 -> panel finishes. Corroboration sample 2 pre-call sees
+        # $0.80 < $0.90 -> runs, total $1.00. n=2, so there is NO sample-3 pre-call to catch it.
+        env = {**ENV, "AR_MAX_COST_USD": "0.90", "AR_HIGH_SAMPLES": "2"}
+        r = sh(["panel.py", "run", "--context-file", "context.md"], repo, expect=2, env=env)
+        assert "cost cap" in r.stderr.lower(), r.stderr
+        run = latest_run(repo)
+        abort = read(run / "cost_abort.json")
+        assert abort["phase"] == "corroboration", abort
+        # the crossing sample WAS recorded before the abort; there is no sample 3
+        assert (run / "panel" / "samples" / "security.2.json").exists()
+        assert not (run / "panel" / "samples" / "security.3.json").exists()
+        sh(["aggregate.py"], repo, expect=2, env=env)
+        vj = read(run / "verdict.json")
+        assert vj["verdict"] == "BLOCKED" and vj["coverage"]["cost_aborted"] is True
     finally:
         mock_router.reset()
 
@@ -4581,6 +4610,10 @@ def t_call_reviewer_exposes_usage_on_validation_failure():
         except ValueError as e:
             u = getattr(e, "usage", None)
             assert u and (u.get("cost") or 0) > 0, ("billed usage not attached to failure", u)
+            # both the initial call and the corrective retry bill $0.05: the exception must carry the
+            # ACCUMULATED usage ($0.10), not just the last attempt's, or the cost cap under-counts a
+            # failed-but-billed sample (CodeRabbit).
+            assert abs(u["cost"] - 0.10) < 1e-9, ("retry usage was not accumulated", u)
     finally:
         mock_router.reset()
 

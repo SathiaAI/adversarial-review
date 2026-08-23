@@ -771,6 +771,23 @@ def corroboration_rate(finding, samples, n):
     return {"samples": n, "agreed": agreed, "rate": round(agreed / n, 4)}
 
 
+def _corroboration_cap_abort(run, cap, role, next_i, n, later_roles):
+    """BLOCK if resampling has reached the per-run cost cap. Called BEFORE each billed sample (so an
+    already-over run starts no new sample) AND after each billed sample is recorded (so the cap holds
+    even when the FINAL sample is the one that crosses it — the pre-call gate alone misses that,
+    CodeRabbit). ``next_i`` is the first sample that would NOT run; _cost_abort exits the process, so
+    name every skipped sample (this role's next_i..n and every later flagged role's 2..n)."""
+    if cap is None:
+        return
+    spent = panel_cost(run)
+    if spent < cap:
+        return
+    not_run = [f"{role}#sample{j}" for j in range(next_i, n + 1)]
+    for lr in (later_roles or []):
+        not_run += [f"{lr}#sample{j}" for j in range(2, n + 1)]
+    _cost_abort(run, cap, spent, "corroboration", not_run)
+
+
 def corroborate_role(run, meta, plan, role, context_text, base, key, cap, n, later_roles=None):
     """Re-run ONE role's reviewer up to N total samples and record the cross-sample agreement rate on
     each of its high/critical findings (E4-S3). INFORMATIONAL ONLY: aggregate.py alone decides the
@@ -791,17 +808,10 @@ def corroborate_role(run, meta, plan, role, context_text, base, key, cap, n, lat
     info = plan["roles"][role]
     samples = []
     for i in range(2, n + 1):
-        # Reuse the E4-S2 pre-call gate: a resample is billed, so stop BEFORE crossing the cap,
-        # record the reason, and BLOCK (aggregate.py then BLOCKS on it) — never silently exceed.
-        if cap is not None:
-            spent = panel_cost(run)
-            if spent >= cap:
-                # _cost_abort exits the process, so every LATER flagged role is skipped too — name
-                # them all in the audit record, not just this role's remaining samples (panel/Codex).
-                not_run = [f"{role}#sample{j}" for j in range(i, n + 1)]
-                for lr in (later_roles or []):
-                    not_run += [f"{lr}#sample{j}" for j in range(2, n + 1)]
-                _cost_abort(run, cap, spent, "corroboration", not_run)
+        # Cost gate (E4-S2 pre-call + E4-S3 post-record). A resample is billed: check BEFORE the
+        # call so an already-over run starts no new sample, and again AFTER each sample is recorded
+        # so the cap holds even when the FINAL sample crosses it (CodeRabbit) — then BLOCK.
+        _corroboration_cap_abort(run, cap, role, i, n, later_roles)
         boundary = secrets.token_hex(8)
         messages = reviewer_messages(role, meta, context_text, boundary)
         body, _ = build_request(info["model"], messages, REPORT_SCHEMA, "reviewer_report",
@@ -821,6 +831,7 @@ def corroborate_role(run, meta, plan, role, context_text, base, key, cap, n, lat
                     "sample": i, "status": "failed", "usage": failed_usage,
                     "cost": failed_usage.get("cost"), "completed_at": now_iso()})
             print(f"  {role}: corroboration sample {i} failed: {e}", file=sys.stderr)
+            _corroboration_cap_abort(run, cap, role, i + 1, n, later_roles)
             continue
         obj["role"], obj["model_id"] = role, info["model"]
         write_json(run / "panel" / "samples" / f"{role}.{i}.json", obj)
@@ -831,6 +842,7 @@ def corroborate_role(run, meta, plan, role, context_text, base, key, cap, n, lat
             "phase": "corroboration", "sample": i, "usage": usage, "cost": usage.get("cost"),
             "latency_ms": int((time.monotonic() - t0) * 1000), "completed_at": now_iso()})
         samples.append(obj)
+        _corroboration_cap_abort(run, cap, role, i + 1, n, later_roles)
     for f in flagged:
         f["corroboration"] = corroboration_rate(f, samples, n)
     write_json(report_path, report)
