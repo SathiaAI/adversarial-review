@@ -26,7 +26,7 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
   tokens), preserving the stdlib-only runtime contract; no signer, a malformed command template, a
   signer that cannot start, or a subprocess timeout all fail loudly (exit 3) rather than silently
   skipping. cosign keyless verification requires `AR_COSIGN_IDENTITY` + `AR_COSIGN_ISSUER` (else it is
-  not auto-selected); `AR_MINISIGN_PUBKEY` accepts a key file (`-p`) or an inline key (`-P`).
+  not auto-selected); a minisign public key is supplied inline via `AR_MINISIGN_PUBKEY` (`-P`) or as a key file via `AR_MINISIGN_PUBKEY_FILE` (`-p`) — the key is never chosen by probing the filesystem.
   Documented in `references/config.md` (with the outside-verifier path) and `references/schemas.md`.
 - Release hygiene: this changelog and a "cutting a release" ritual in `CONTRIBUTING.md`.
 - Documentation drift guards: `tests/run_tests.py` now asserts the gate matrix in

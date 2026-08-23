@@ -773,6 +773,24 @@ def t_sign_verify_accepts_good_rejects_tamper():
     assert "no signature sidecar" in r.stdout, r.stdout
 
 
+def t_sign_verify_rejects_malformed_signature():
+    # E6-S1 (panel test_quality-1): --verify-signature must REJECT a malformed sidecar (empty, or
+    # non-UTF8 / arbitrary binary garbage) as exit 1 — never crash, never false-pass. verify_signature
+    # hands the sidecar to the verifier by PATH (it never decodes the bytes itself), so a stub verifier
+    # that only accepts the exact good signature rejects anything else.
+    repo, run = _pass_run_for_signing()
+    env = _stub_signer_env()
+    sh(["aggregate.py"], repo, expect=0, env=env)
+    sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
+    sh(["aggregate.py", "--verify-signature"], repo, expect=0, env=env)          # good baseline
+    for label, blob in (("empty", b""),
+                        ("binary-garbage", bytes(range(256)) * 4),
+                        ("non-utf8", b"\xff\xfe\x00\x01not a signature")):
+        (run / "attestation.sig").write_bytes(blob)
+        r = sh(["aggregate.py", "--verify-signature"], repo, expect=1, env=env)
+        assert "INVALID" in r.stdout, (label, r.stdout, r.stderr)
+
+
 def t_sign_no_signer_fails_loudly():
     # E6-S1 AC(c): --sign with NO signer available fails loudly (non-zero, clear message), never a
     # silent skip and never a false success. "No signer" is forced deterministically: empty
