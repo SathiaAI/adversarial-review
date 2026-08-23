@@ -129,6 +129,10 @@ pipeline so it gates the merge, not a human's optimism:
     openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
 ```
 
+The Action and a mirrored **GitLab CI** template — the full input reference, the
+Action-input↔GitLab-variable mapping, and the manual GitHub Marketplace publishing steps — are
+covered in [ci-integration.md](ci-integration.md).
+
 ### Using the MCP server (`ar-mcp`) — for MCP hosts
 
 **When to reach for it.** If your host natively runs *skills* (Claude Code, Claude Cowork), use path A above — you don't need the MCP. Reach for `ar-mcp` when your host speaks **MCP** but not skills: **Claude Desktop**, MCP-native IDEs like **Cursor** and **Windsurf**, or **your own agent** (a LangChain / LlamaIndex / custom loop) that should drive the review as first-class tool calls instead of shell commands.

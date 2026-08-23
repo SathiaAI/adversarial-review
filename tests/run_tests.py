@@ -2018,6 +2018,119 @@ def t_action_definition_hygiene():
     assert "fetch-depth: 0" in wf, "panel needs full history"
 
 
+def t_ci_docs_and_gitlab_mirror_action():
+    # E2-S3 drift guard. The CI-integration guide must mirror the ACTUAL action.yml inputs (a new
+    # or renamed input forces a doc update instead of drifting), and the GitLab template must keep
+    # aggregate.py as its terminal pipeline command so the job exit code IS the verdict. Structural
+    # string checks (no YAML dep), doc/template-vs-code — the same discipline as gates.md/README.
+    act = (SKILL / "action.yml").read_text(encoding="utf-8")
+    inputs_block = act.split("\ninputs:", 1)[1].split("\noutputs:", 1)[0]
+    input_names = re.findall(r"(?m)^  ([a-z][a-z0-9-]*):", inputs_block)
+    assert len(input_names) >= 5, f"action.yml input extraction looks wrong: {input_names}"
+
+    doc = (SKILL / "docs" / "ci-integration.md").read_text(encoding="utf-8")
+    for name in input_names:  # every real Action input is documented by its backticked name
+        assert "`%s`" % name in doc, f"docs/ci-integration.md omits action input `{name}`"
+    for token in ("GitHub", "GitLab", "Marketplace", "v1",
+                  "examples/.gitlab-ci.yml", "examples/adversarial-review.yml"):
+        assert token in doc, f"docs/ci-integration.md missing {token!r}"
+
+    gl = (SKILL / "examples" / ".gitlab-ci.yml").read_text(encoding="utf-8")
+    for call in ("panel.py init", "gate.py plan", "aggregate.py"):
+        assert call in gl, f".gitlab-ci.yml missing real entrypoint {call!r}"
+    for fake in ("--fail-on", "--gates"):  # Action inputs, not script flags — never invented here
+        assert fake not in gl, f".gitlab-ci.yml invents a non-existent flag {fake!r}"
+    # E2-S3 (panel/Codex): aggregate.py must be the TERMINAL command of ar-panel's script — not
+    # merely appear after the panel textually. A command appended after it could replace the job's
+    # exit status and defeat the verdict contract. Extract ar-panel's `script:` list and assert its
+    # LAST item runs aggregate.py, and that nothing else does.
+    panel_block = gl.split("\nar-panel:", 1)[1]
+    m0 = re.search(r"(?m)^  script:\s*$", panel_block)
+    assert m0, "ar-panel has no script: block"
+    script_body = panel_block[m0.end():]
+    m1 = re.search(r"(?m)^  \w[\w-]*:", script_body)   # next job-level (2-space) key, e.g. artifacts:
+    if m1:
+        script_body = script_body[:m1.start()]
+    items = re.findall(r"(?m)^    - (.+)$", script_body)   # 4-space script list items only
+    assert items, "ar-panel script has no commands"
+    assert "aggregate.py" in items[-1], \
+        f"aggregate.py must be ar-panel's LAST command, got: {items[-1]!r}"
+    assert not any("aggregate.py" in it for it in items[:-1]), \
+        "aggregate.py must appear only as the terminal command"
+    assert "OPENROUTER_API_KEY" in gl and "BLOCKED" in gl, "keyless→BLOCKED honesty must be documented"
+    assert "allow_failure" in gl and "exit_codes: 2" in gl, "fail-on=fail equivalent must be documented"
+    # E2-S3 (panel test_quality-1): the doc must document the Action's OUTPUTS too, not just inputs,
+    # so a renamed/removed output forces a doc update instead of drifting.
+    outputs_block = act.split("\noutputs:", 1)[1].split("\nruns:", 1)[0]
+    output_names = re.findall(r"(?m)^  ([a-z][a-z0-9-]*):", outputs_block)
+    assert set(output_names) >= {"verdict", "exit-code"}, output_names
+    for name in output_names:
+        assert "`%s`" % name in doc, "docs/ci-integration.md omits Action output `%s`" % name
+    # (panel correctness-2): the verdict->exit-code contract is stated explicitly in the doc.
+    assert "exit code" in doc.lower()
+    for word in ("PASS", "FAIL", "BLOCKED"):
+        assert word in doc, "verdict word %r missing from ci-integration.md" % word
+    # (CodeRabbit): assert the EXACT verdict->exit-code mapping is documented, not just the words,
+    # so a drifted mapping (e.g. BLOCKED renumbered) forces a doc update instead of passing silently.
+    for pair in ("`0` PASS", "`1` FAIL", "`2` BLOCKED"):
+        assert pair in doc, "ci-integration.md must state the exact exit-code mapping %r" % pair
+    # (panel test_quality-2): the GitLab template must surface the Action's required inputs through its
+    # AR_* variables (risk, dev-providers, diff-ref/base, gate set) so the two CI paths stay in lockstep.
+    for var in ("AR_RISK", "AR_DEV_PROVIDERS", "AR_DIFF", "AR_REQUIRE"):
+        assert var in gl, ".gitlab-ci.yml omits %s (Action-input equivalent)" % var
+    # E2-S3 (CodeRabbit Critical + Minor): the secrets-before-transmit guard must be an EXECUTABLE
+    # check in the reviewer-panel STEP, bound to THIS run's exact directory (RUN_DIR from panel.py
+    # init) — never a glob a committed/older run-* could satisfy — and it must run before
+    # `panel.py run` transmits the diff. Assert on the extracted panel-step block, not the whole file.
+    panel_step = act.split("Independent reviewer panel", 1)[1].split("\n    - name:", 1)[0]
+    assert "secrets.json" in panel_step and '"$RUN_DIR"' in panel_step, \
+        "panel step must check THIS run's secrets.json pinned to RUN_DIR"
+    assert "glob.glob(" not in panel_step, \
+        "secrets check must not glob run-* (a committed run dir could satisfy it)"
+    assert panel_step.index("secrets.json") < panel_step.index('panel.py\" run'), \
+        "the secrets PASS check must occur before panel.py run transmits the diff"
+    # every gate/panel/aggregate step pins to the init run dir (panel test_quality-2: assert EACH
+    # step, not just a count), so a committed .adversarial-review/run-* can't hijack the pipeline.
+    assert "steps.init.outputs.run_dir" in act, "action.yml must expose init's run dir as an output"
+    for needle in ('gate.py" plan --run "$run_dir"', 'gate.py" run --run "$RUN_DIR"',
+                   'panel.py" assign --run "$RUN_DIR"', 'panel.py" run --run "$RUN_DIR"',
+                   'aggregate.py" --run "$RUN_DIR"'):
+        assert needle in act, "action.yml step not pinned to the run dir: %r" % needle
+    # the documented starter workflow BLOCK must configure the full NORMAL floor incl. secrets.
+    starter = doc.split("```yaml", 1)[1].split("```", 1)[0]
+    for g in ("build=", "unit=", "secrets=", "deps=", "sast="):
+        assert g in starter, "ci-integration.md starter workflow omits a `%s` gate" % g
+
+
+def t_action_secrets_guard_behaviour():
+    # E2-S3 (panel security-1 + test_quality-1; CodeRabbit): the reviewer-panel secrets precondition
+    # must (a) run ISOLATED (`python -I`, so a repo-committed json.py/sitecustomize.py can't execute
+    # with the key in env), (b) authorize transmission ("1") ONLY when THIS run's gates/secrets.json is
+    # recorded PASS, and (c) fail SAFE — a missing, malformed, or non-object record returns "0" WITHOUT
+    # crashing (a raise under `set -euo pipefail` would abort the step before aggregate.py emits BLOCKED).
+    # The guard spans multiple lines, so it is EXTRACTED whole from action.yml and run against real dirs.
+    import subprocess as _sp, tempfile as _tf, json as _json, os as _os, re as _re
+    act = (SKILL / "action.yml").read_text(encoding="utf-8")
+    m = _re.search(r'secrets_ok="\$\((.*?)\)"', act, _re.S)
+    assert m, 'secrets guard (secrets_ok="$(...)") not found in action.yml'
+    cmd = m.group(1)
+    assert "python -I -c" in cmd, ("guard must be isolated with -I", cmd)
+    def check(body, raw=False):
+        d = _tf.mkdtemp(prefix="ar-guard-")
+        if body is not None:
+            _os.makedirs(_os.path.join(d, "gates"))
+            content = body if raw else _json.dumps({"status": body})
+            (Path(d) / "gates" / "secrets.json").write_text(content)
+        r = _sp.run(["bash", "-c", cmd.replace('"$RUN_DIR"', '"%s"' % d)], capture_output=True, text=True)
+        assert r.returncode == 0, ("guard must exit 0, never crash the panel step", r.returncode, r.stderr)
+        return r.stdout.strip()
+    assert check("PASS") == "1", "a recorded PASS secrets gate must authorize transmission"
+    assert check("FAIL") == "0", "a FAILED secrets scan must NOT authorize transmission"
+    assert check(None) == "0", "a missing secrets.json must NOT authorize transmission"
+    assert check("{not valid json", raw=True) == "0", "a malformed secrets.json must DENY, not crash"
+    assert check("[1, 2, 3]", raw=True) == "0", "a non-object secrets.json must DENY, not crash"
+
+
 def t_policy_pins_precedence():
     repo = fresh_repo()
     (repo / ".adversarial-review.yml").write_text(

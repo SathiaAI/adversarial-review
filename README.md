@@ -328,7 +328,8 @@ written to the job summary:
 
 Starter workflow: [`examples/adversarial-review.yml`](examples/adversarial-review.yml). On
 GitLab, use [`examples/.gitlab-ci.yml`](examples/.gitlab-ci.yml) — same gate-recording and
-machine-computed verdict.
+machine-computed verdict. Full setup for both, the Action-input↔GitLab-variable mapping, and the
+manual GitHub Marketplace publishing steps: [docs/ci-integration.md](docs/ci-integration.md).
 Without a key the panel is skipped and the verdict is BLOCKED for missing
 panel coverage — the honest verdict for an un-reviewed change, downgradable
 to a warning via `fail-on: fail` while wiring up. High/critical findings
