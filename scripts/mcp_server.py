@@ -44,11 +44,13 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
+from collections import OrderedDict
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -698,14 +700,20 @@ class StdioTransport:
                 self.stdout.flush()
 
 
-# --- Streamable-HTTP transport (MCP 2026-07-28) — E3-S2a: endpoint + framing only ---------------
+# --- Streamable-HTTP transport (MCP 2026-07-28) — E3-S2a endpoint/framing + E3-S2b sessions --------
 # Reuses serve_message()/handle() (the E3-S1 seam), so HTTP inherits stdio's exact dispatch and error
-# semantics and stays a framing surface, never a command-execution one. There is NO authentication and
-# NO session yet (those are E3-S2c / E3-S2b): the listener binds 127.0.0.1 by default and MUST NOT be
-# exposed to a network until auth lands. See the committed threat model in docs/.
+# semantics and stays a framing surface, never a command-execution one. E3-S2b adds the session
+# lifecycle (Mcp-Session-Id minted at initialize, validated, DELETE-terminable, GET opens the SSE
+# channel, bounded+evicting store) — sessions are OPTIONAL per the revision, so the stateless path
+# keeps working; AR_MCP_HTTP_REQUIRE_SESSION makes them mandatory. There is still NO authentication
+# (that is E3-S2c): the listener binds 127.0.0.1 by default and MUST NOT be exposed to a network until
+# auth lands. See the committed threat model in docs/.
 HTTP_DEFAULT_HOST = "127.0.0.1"
 HTTP_DEFAULT_PORT = 8730
 HTTP_DEFAULT_MAX_BYTES = 1_048_576  # 1 MiB: a JSON-RPC control message is tiny; caps an oversized-body DoS
+HTTP_DEFAULT_MAX_SESSIONS = 128     # bounded session store: a flood of `initialize`s cannot exhaust memory
+SESSION_HEADER = "Mcp-Session-Id"   # MCP 2026-07-28 Streamable-HTTP session id header (issued at initialize)
+SSE_KEEPALIVE_SECONDS = 15          # GET/SSE idle keepalive-comment cadence; also the shutdown re-check tick
 
 
 def _http_int_env(name, default, minimum=None, maximum=None):
@@ -724,6 +732,13 @@ def _http_int_env(name, default, minimum=None, maximum=None):
     if maximum is not None and n > maximum:
         raise ValueError("%s must be <= %d, got %d" % (name, maximum, n))
     return n
+
+
+def _http_bool_env(name):
+    """A boolean env flag: true only for an explicit affirmative ('1'/'true'/'yes'/'on'); anything
+    else — unset, blank, '0', 'false', or a typo — is off. AR_MCP_HTTP_REQUIRE_SESSION must fail
+    *safe* on a typo rather than silently flipping a security posture."""
+    return (os.environ.get(name, "") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def http_config():
@@ -758,6 +773,54 @@ def is_loopback_host(host):
         return ipaddress.ip_address(h).is_loopback
     except ValueError:
         return False
+
+
+class _SessionStore:
+    """Bounded, evicting, thread-safe store of live Streamable-HTTP session ids (MCP 2026-07-28,
+    E3-S2b). Ids are cryptographically random and *server-minted*: a client-supplied id the server
+    never issued is never honored (anti-hijack). The store is the ONLY per-session state — the tool
+    surface itself stays stateless — and it is bounded with LRU eviction so a flood of `initialize`s
+    cannot exhaust memory. All access is under one lock: ThreadingHTTPServer dispatches concurrently."""
+
+    def __init__(self, capacity):
+        self._cap = max(1, int(capacity))
+        self._ids = OrderedDict()  # sid -> negotiated protocol version (metadata for the audit log)
+        self._lock = threading.Lock()
+
+    def create(self, protocol=None):
+        """Mint a fresh id (256 bits from `secrets`), evicting the least-recently-used if at capacity."""
+        sid = secrets.token_urlsafe(32)
+        with self._lock:
+            self._ids[sid] = protocol
+            self._ids.move_to_end(sid)
+            while len(self._ids) > self._cap:
+                self._ids.popitem(last=False)  # evict least-recently-used
+        return sid
+
+    def valid(self, sid):
+        """True iff `sid` is a live, server-minted id; touches it as most-recently-used (so an active
+        session is not evicted out from under a client)."""
+        if not sid:
+            return False
+        with self._lock:
+            if sid in self._ids:
+                self._ids.move_to_end(sid)
+                return True
+            return False
+
+    def terminate(self, sid):
+        """Remove a session (client DELETE). True iff it existed; a repeat/unknown terminate is False."""
+        if not sid:
+            return False
+        with self._lock:
+            if sid in self._ids:
+                del self._ids[sid]
+                return True
+            return False
+
+    def __len__(self):
+        with self._lock:
+            return len(self._ids)
 
 
 # Dispatch is serialized process-wide: the MCP tool handlers are stateful (they write context.md and
@@ -795,20 +858,27 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _not_allowed(self):
-        # No GET/SSE server->client stream yet (that is E3-S2b); the endpoint accepts only POST.
-        self._json(405, {"error": "method not allowed; the MCP endpoint accepts POST"}, {"Allow": "POST"})
+        # The MCP endpoint speaks POST (JSON-RPC in), GET (SSE server->client stream, E3-S2b), and
+        # DELETE (terminate a session, E3-S2b). Any other method is 405.
+        self._json(405, {"error": "method not allowed; the MCP endpoint accepts POST, GET, DELETE"},
+                   {"Allow": "POST, GET, DELETE"})
 
-    do_GET = _not_allowed
     do_HEAD = _not_allowed
     do_PUT = _not_allowed
-    do_DELETE = _not_allowed
     do_PATCH = _not_allowed
     do_OPTIONS = _not_allowed
 
+    def _origin_ok(self):
+        # DNS-rebinding defense, shared by every verb: a present browser Origin must be allow-listed
+        # (reject -> closed 403); an absent Origin (curl / a programmatic MCP host) is allowed.
+        if origin_allowed(self.headers.get("Origin"), self.server.allowed_origins):
+            return True
+        self._json(403, {"error": "origin not allowed"})
+        return False
+
     def do_POST(self):
         # (1) DNS-rebinding defense first: reject a disallowed browser Origin before touching the body.
-        if not origin_allowed(self.headers.get("Origin"), self.server.allowed_origins):
-            self._json(403, {"error": "origin not allowed"})
+        if not self._origin_ok():
             return
         # (2) HTTP-level protocol-version negotiation. Absent is fine (the modern per-request _meta path
         #     negotiates in-band); a present-but-unsupported version is rejected with what we speak.
@@ -832,7 +902,28 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._json(413, {"error": "request body too large"})
             return
         raw = self.rfile.read(length) if length else b""
-        # (5) Dispatch through the transport-agnostic core, serialized (see _HTTP_DISPATCH_LOCK) so the
+        # (5) Session gating (E3-S2b). Peek the JSON-RPC method to tell an `initialize` (which MINTS a
+        #     session) from a subsequent request (which may CARRY one). A present Mcp-Session-Id must be
+        #     one the server minted — a forged/terminated id is refused with 404, never silently honored.
+        sid = self.headers.get(SESSION_HEADER)
+        try:
+            peeked = json.loads(raw) if raw else None
+            method = peeked.get("method") if isinstance(peeked, dict) else None
+        except (ValueError, RecursionError):
+            method = None  # unparseable -> let serve_message() frame the -32700 (non-strict mode)
+        is_initialize = (method == "initialize")
+        if sid is not None and not self.server.sessions.valid(sid):
+            self._json(404, {"error": "unknown or terminated session"})
+            return
+        # Strict mode (AR_MCP_HTTP_REQUIRE_SESSION, default off; turned on with the bearer token in
+        # E3-S2c): a request other than the `initialize` handshake or the version-agnostic
+        # `server/discover` probe must carry a valid session, else 400. Off by default so the stateless
+        # 2026-07-28 path keeps working unchanged.
+        if (self.server.require_session and sid is None
+                and not is_initialize and method != "server/discover"):
+            self._json(400, {"error": "Mcp-Session-Id required"})
+            return
+        # (6) Dispatch through the transport-agnostic core, serialized (see _HTTP_DISPATCH_LOCK) so the
         #     stateful tool handlers keep stdio's one-at-a-time invariant. serve_message() accepts bytes
         #     and never raises: a malformed body frames as -32700, a handler crash as -32603.
         with _HTTP_DISPATCH_LOCK:
@@ -843,28 +934,107 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        # (7) On a SUCCESSFUL `initialize`, mint and return a session id (rotatable: a fresh id per
+        #     handshake). Only on success — an errored initialize starts no session.
+        session_id = None
+        if is_initialize:
+            try:
+                resp = json.loads(out)
+                if isinstance(resp, dict) and isinstance(resp.get("result"), dict):
+                    session_id = self.server.sessions.create(resp["result"].get("protocolVersion"))
+            except (ValueError, RecursionError):
+                session_id = None
         body = out.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         if pv is not None:
             self.send_header("MCP-Protocol-Version", pv)  # echo the negotiated version
+        if session_id is not None:
+            self.send_header(SESSION_HEADER, session_id)
         self.end_headers()
         self.wfile.write(body)
 
+    def do_GET(self):
+        # GET opens the server->client SSE channel for a session (MCP 2026-07-28, E3-S2b). Origin
+        # defense applies (a browser EventSource sends Origin). A missing session id -> 400; a
+        # forged/terminated one -> 404: the stream is never opened for an id the server did not mint.
+        if not self._origin_ok():
+            return
+        sid = self.headers.get(SESSION_HEADER)
+        if sid is None:
+            self._json(400, {"error": "Mcp-Session-Id required for the event stream"})
+            return
+        if not self.server.sessions.valid(sid):
+            self._json(404, {"error": "unknown or terminated session"})
+            return
+        # This server emits no server-initiated messages yet (the tool surface is request/response),
+        # so the stream is a valid, idle channel: an initial comment confirms it is live, then it is
+        # held open (periodic keepalive comments) until the session is terminated, the client
+        # disconnects, or the server shuts down (sse_stop). text/event-stream, uncached, closed at end.
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        # Bound the stream's lifetime against a wedged client (reliability review, run-20260824-013958):
+        # a peer that stops reading fills the TCP send buffer, and without a socket timeout `wfile.write`
+        # would block forever, pinning this thread + fd. A write timeout turns that into a bounded OSError
+        # that ends the handler. (Localhost-only for now, so the realistic trigger is a local client that
+        # opens a stream and stalls; still worth bounding before S2c exposes this remotely.)
+        self.connection.settimeout(SSE_KEEPALIVE_SECONDS)
+        stop = self.server.sse_stop
+        try:
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+            while not stop.is_set() and self.server.sessions.valid(sid):
+                if stop.wait(SSE_KEEPALIVE_SECONDS):
+                    break
+                self.wfile.write(b": keepalive\n\n")  # a stuck write now raises socket.timeout -> break
+                self.wfile.flush()
+        except OSError:
+            pass  # client disconnected / stalled mid-stream — end the handler quietly
+
+    def do_DELETE(self):
+        # DELETE terminates a session (MCP 2026-07-28, E3-S2b). Missing id -> 400; unknown/already-
+        # terminated -> 404; success -> 204 No Content. Once terminated the id is dead: a later request
+        # bearing it is refused 404 by the validation in do_POST/do_GET.
+        if not self._origin_ok():
+            return
+        sid = self.headers.get(SESSION_HEADER)
+        if sid is None:
+            self._json(400, {"error": "Mcp-Session-Id required to terminate a session"})
+            return
+        if not self.server.sessions.terminate(sid):
+            self._json(404, {"error": "unknown or terminated session"})
+            return
+        self.close_connection = True
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
 
 class HttpTransport:
-    """Streamable-HTTP framing (MCP 2026-07-28) over stdlib http.server, reusing serve_message() — the
-    E3-S2a endpoint. POST only: application/json for a response, 202 for a notification. NO auth and NO
-    session yet (E3-S2c / E3-S2b): binds 127.0.0.1 by default and MUST NOT be exposed remotely until
-    auth lands. Binding is split from serving so the framing is testable offline on an ephemeral port."""
+    """Streamable-HTTP transport (MCP 2026-07-28) over stdlib http.server, reusing serve_message() —
+    the E3-S2a endpoint plus E3-S2b sessions. POST (JSON-RPC: json response / 202 notification), GET
+    (per-session SSE channel), DELETE (terminate a session); `initialize` mints an Mcp-Session-Id from a
+    bounded, evicting store. NO auth yet (E3-S2c): binds 127.0.0.1 by default and MUST NOT be exposed
+    remotely until auth lands. Binding is split from serving so the framing is testable offline."""
 
-    def __init__(self, host=None, port=None, origins=None, max_bytes=None):
+    def __init__(self, host=None, port=None, origins=None, max_bytes=None,
+                 max_sessions=None, require_session=None):
         h, p, o, m = http_config()
         self.host = h if host is None else host
         self.port = p if port is None else port
         self.origins = tuple(o) if origins is None else tuple(origins)
         self.max_bytes = m if max_bytes is None else max_bytes
+        self.max_sessions = (_http_int_env("AR_MCP_HTTP_MAX_SESSIONS", HTTP_DEFAULT_MAX_SESSIONS, minimum=1)
+                             if max_sessions is None else max_sessions)
+        self.require_session = (_http_bool_env("AR_MCP_HTTP_REQUIRE_SESSION")
+                                if require_session is None else require_session)
+        self.sessions = _SessionStore(self.max_sessions)
         self.httpd = None
 
     def bind(self):
@@ -886,6 +1056,9 @@ class HttpTransport:
         httpd.daemon_threads = True
         httpd.allowed_origins = self.origins
         httpd.max_bytes = self.max_bytes
+        httpd.sessions = self.sessions
+        httpd.require_session = self.require_session
+        httpd.sse_stop = threading.Event()  # set on shutdown so open SSE streams end promptly
         try:
             httpd.server_bind()
             httpd.server_activate()
@@ -900,14 +1073,16 @@ class HttpTransport:
             self.bind()
         addr = self.httpd.server_address
         log(f"http transport ready on {addr[0]}:{addr[1]} "
-            "(localhost-only, NO auth — E3-S2a; do not expose remotely until E3-S2c)")
+            "(localhost-only, sessions but NO auth — E3-S2b; do not expose remotely until E3-S2c)")
         try:
             self.httpd.serve_forever()
         finally:
+            self.httpd.sse_stop.set()  # release any open SSE handler threads
             self.httpd.server_close()
 
     def shutdown(self):
         if self.httpd is not None:
+            self.httpd.sse_stop.set()  # wake any open SSE stream so it stops promptly
             self.httpd.shutdown()
 
 

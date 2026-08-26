@@ -5189,14 +5189,51 @@ def t_ingest_notes_corroboration_not_applied_on_mcp():
         mock_router.reset()
 
 
-def _http_transport(origins=(), max_bytes=4096):
+def _http_transport(origins=(), max_bytes=4096, require_session=None, max_sessions=None):
     """Start an HttpTransport on an ephemeral localhost port in a daemon thread; return (transport, port).
-    Offline — binds 127.0.0.1 only, no external network."""
+    Offline — binds 127.0.0.1 only, no external network. require_session/max_sessions (E3-S2b) default to
+    None so the transport reads the env (require off, 128 sessions); tests inject explicit values."""
     import threading
-    t = mcpsrv.HttpTransport(host="127.0.0.1", port=0, origins=origins, max_bytes=max_bytes)
+    t = mcpsrv.HttpTransport(host="127.0.0.1", port=0, origins=origins, max_bytes=max_bytes,
+                             require_session=require_session, max_sessions=max_sessions)
     _host, port = t.bind()
     threading.Thread(target=t.serve_forever, daemon=True).start()
     return t, port
+
+
+def _http_get(port, session_id=None, origin=None):
+    """Open a GET (SSE) and read the FIRST response chunk (status line + headers + any initial SSE
+    comment) in a single recv, then close — so a live text/event-stream never blocks the test. Raw
+    socket because urllib.urlopen would drain the open stream. Returns (status, raw_response_bytes)."""
+    import socket
+    req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+    if origin is not None:
+        req += b"Origin: " + origin.encode("ascii") + b"\r\n"
+    if session_id is not None:
+        req += b"Mcp-Session-Id: " + session_id.encode("ascii") + b"\r\n"
+    req += b"\r\n"
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        s.sendall(req)
+        s.settimeout(5)
+        data = b""
+        for _ in range(10):  # headers and the initial SSE comment can arrive in separate TCP reads
+            try:
+                chunk = s.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            data += chunk
+            head, sep, body = data.partition(b"\r\n\r\n")
+            if sep:
+                status = int(head.split(b" ", 2)[1])
+                if status != 200 or body:  # error bodies are self-contained; a 200 SSE needs its first byte
+                    break
+    finally:
+        s.close()
+    status = int(data.split(b" ", 2)[1]) if data.startswith(b"HTTP/") else 0
+    return status, data
 
 
 def _http_post(port, body, headers=None):
@@ -5212,10 +5249,10 @@ def _http_post(port, body, headers=None):
         return e.code, e.read(), {k.lower(): v for k, v in e.headers.items()}
 
 
-def _http_method(port, method):
+def _http_method(port, method, headers=None):
     import urllib.request
     import urllib.error
-    req = urllib.request.Request("http://127.0.0.1:%d/" % port, method=method)
+    req = urllib.request.Request("http://127.0.0.1:%d/" % port, method=method, headers=headers or {})
     try:
         r = urllib.request.urlopen(req, timeout=5)
         return r.status
@@ -5285,11 +5322,14 @@ def t_mcp_http_malformed_body_is_parse_error():
         t.shutdown()
 
 
-def t_mcp_http_non_post_is_405():
-    # No server->client SSE stream yet (E3-S2b); non-POST methods are 405.
+def t_mcp_http_unsupported_verbs_are_405():
+    # E3-S2b: GET (SSE stream) and DELETE (terminate a session) are real verbs now — without a session
+    # they are 400 (Mcp-Session-Id required), not 405. Every OTHER verb stays 405 (Allow: POST,GET,DELETE).
     t, port = _http_transport()
     try:
-        for method in ("GET", "DELETE", "PUT"):
+        assert _http_get(port)[0] == 400              # GET, no session -> 400 (not 405)
+        assert _http_method(port, "DELETE") == 400    # DELETE, no session -> 400 (not 405)
+        for method in ("PUT", "PATCH", "OPTIONS"):
             assert _http_method(port, method) == 405, method
     finally:
         t.shutdown()
@@ -5485,9 +5525,130 @@ def t_mcp_http_error_paths_close_connection():
         big = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "x", "params": {"p": "A" * 200}})
         s413, _b2, h413 = _http_post(port, big)
         assert s413 == 413 and h413.get("connection", "").lower() == "close", (s413, h413)
-        s405, r405 = _http_raw(port, b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
-        head405 = r405.lower().split(b"\r\n\r\n", 1)[0]
-        assert s405 == 405 and b"connection: close" in head405, r405[:200]
+        # GET with no session id -> 400 (Mcp-Session-Id required, E3-S2b), still a closed connection.
+        s400, r400 = _http_raw(port, b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+        head400 = r400.lower().split(b"\r\n\r\n", 1)[0]
+        assert s400 == 400 and b"connection: close" in head400, r400[:200]
+    finally:
+        t.shutdown()
+
+
+def _http_initialize(port, headers=None):
+    """POST a legacy `initialize` handshake; return (status, minted_session_id_or_None, parsed_response)."""
+    req = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+           "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                      "clientInfo": {"name": "t", "version": "0"}}}
+    status, body, hdrs = _http_post(port, json.dumps(req), headers)
+    return status, hdrs.get("mcp-session-id"), (json.loads(body) if body else None)
+
+
+def t_mcp_http_session_issued_at_initialize():
+    # E3-S2b: a successful `initialize` mints a server session and returns it in the Mcp-Session-Id
+    # response header. The id is cryptographically random (long, url-safe) — never a client value — and
+    # a subsequent request bearing it is accepted.
+    t, port = _http_transport()
+    try:
+        status, sid, result = _http_initialize(port)
+        assert status == 200 and "result" in result, (status, result)
+        assert sid and len(sid) >= 40 and re.match(r"^[A-Za-z0-9_-]+$", sid), sid
+        s2, _b2, _h2 = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+                                  {"Mcp-Session-Id": sid})
+        assert s2 == 200, s2
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_forged_session_is_404():
+    # A client-supplied session id the server never minted is refused with 404 — never silently honored —
+    # across POST, GET and DELETE, even for the version-agnostic server/discover probe.
+    t, port = _http_transport()
+    try:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
+        assert _http_post(port, body, {"Mcp-Session-Id": "forged-not-a-real-session"})[0] == 404
+        assert _http_get(port, session_id="forged")[0] == 404
+        assert _http_method(port, "DELETE", {"Mcp-Session-Id": "forged"}) == 404
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_session_delete_terminates():
+    # DELETE terminates a session (204). The id is then dead: a later request bearing it -> 404, and a
+    # repeat DELETE -> 404; a DELETE with no id -> 400.
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        assert _http_method(port, "DELETE", {"Mcp-Session-Id": sid}) == 204
+        reuse = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+                           {"Mcp-Session-Id": sid})
+        assert reuse[0] == 404, reuse[0]
+        assert _http_method(port, "DELETE", {"Mcp-Session-Id": sid}) == 404  # repeat
+        assert _http_method(port, "DELETE") == 400                            # missing id
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_get_opens_sse_for_valid_session():
+    # GET opens the server->client SSE channel for a valid session: 200 text/event-stream + an initial
+    # comment. Missing session -> 400; forged -> 404. The initial chunk is read once and the socket is
+    # closed, so the live stream never blocks the test.
+    t, port = _http_transport()
+    try:
+        assert _http_get(port)[0] == 400                    # no session
+        assert _http_get(port, session_id="nope")[0] == 404  # forged
+        _s, sid, _r = _http_initialize(port)
+        status, raw = _http_get(port, session_id=sid)
+        assert status == 200, (status, raw[:200])
+        head = raw.lower().split(b"\r\n\r\n", 1)[0]
+        assert b"content-type: text/event-stream" in head, raw[:200]
+        assert b": connected" in raw, raw[:200]
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_session_store_bounded_evicts():
+    # The session store is bounded with LRU eviction: minting past capacity drops the least-recently-used
+    # id (so an `initialize` flood cannot exhaust memory), and the evicted id no longer validates.
+    store = mcpsrv._SessionStore(3)
+    a, b, c = store.create(), store.create(), store.create()
+    assert len(store) == 3 and store.valid(a) and store.valid(b) and store.valid(c)
+    store.valid(a)      # touch `a` -> `b` becomes least-recently-used
+    d = store.create()  # over capacity -> evict LRU (`b`)
+    assert len(store) == 3, len(store)
+    assert not store.valid(b), "LRU victim should be evicted"
+    assert store.valid(a) and store.valid(c) and store.valid(d)
+    assert store.terminate(d) and not store.valid(d)
+
+
+def t_mcp_http_require_session_flag():
+    # AR_MCP_HTTP_REQUIRE_SESSION (strict mode; off by default, on with auth in E3-S2c): a request other
+    # than the initialize handshake or the server/discover probe must carry a valid session, else 400.
+    t, port = _http_transport(require_session=True)
+    try:
+        bare = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        assert bare[0] == 400, bare[0]                                            # no session -> 400
+        disc = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 2, "method": "server/discover"}))
+        assert disc[0] == 200, disc[0]                                            # probe is exempt
+        s_init, sid, _r = _http_initialize(port)
+        assert s_init == 200 and sid                                             # handshake is exempt
+        ok = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+                        {"Mcp-Session-Id": sid})
+        assert ok[0] == 200, ok[0]                                                # with session -> 200
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_session_rotates():
+    # Rotatable: each initialize mints a FRESH id; both remain independently valid until terminated.
+    t, port = _http_transport()
+    try:
+        _s1, sid1, _r1 = _http_initialize(port)
+        _s2, sid2, _r2 = _http_initialize(port)
+        assert sid1 and sid2 and sid1 != sid2, (sid1, sid2)
+        for sid in (sid1, sid2):
+            s = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/list"}),
+                           {"Mcp-Session-Id": sid})
+            assert s[0] == 200, (sid, s[0])
     finally:
         t.shutdown()
 

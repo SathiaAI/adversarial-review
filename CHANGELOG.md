@@ -9,6 +9,9 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
 
 ## [Unreleased]
 
+### Added
+- **Streamable-HTTP sessions for `ar-mcp` (E3-S2b).** The local HTTP transport now implements the MCP 2026-07-28 session lifecycle. A successful `initialize` mints a cryptographically-random `Mcp-Session-Id` (via `secrets`, returned in the response header; a fresh id per handshake, so sessions rotate). A request that *presents* a session id must present a **valid, server-minted** one — a forged or already-terminated id is refused with **404**, never silently honored (anti-hijack). **GET** opens the server→client `text/event-stream` channel for a valid session (missing id → `400`, forged → `404`); **DELETE** terminates a session (**204**; reuse → `404`). The session store is **bounded with LRU eviction** (`AR_MCP_HTTP_MAX_SESSIONS`, default 128), so an `initialize` flood cannot exhaust memory; the GET/SSE stream carries a **bounded socket write timeout** so a stalled client cannot pin a server thread indefinitely. Sessions are **optional** per the revision — the stateless path keeps working unchanged — with `AR_MCP_HTTP_REQUIRE_SESSION` (default off) making a session mandatory on every request except the `initialize` handshake and the `server/discover` probe; it composes with, and defaults on alongside, the bearer token in E3-S2c. Still localhost-only and **not** a command-execution surface; **no authentication yet** (E3-S2c). New env: `AR_MCP_HTTP_MAX_SESSIONS` / `AR_MCP_HTTP_REQUIRE_SESSION`.
+
 ## [0.2.0]
 
 ### Added
