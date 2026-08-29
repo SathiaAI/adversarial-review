@@ -120,8 +120,17 @@ def log(msg):
 
 def _safe_run(args):
     run = args.get("run")
-    if run is None:  # key omitted (or null) — target the newest run
-        return []
+    if run is None:  # key omitted (or null) — resolve the newest run ONCE and pin it explicitly
+        # so every subprocess (and every helper) binds to the SAME run this server selected.
+        # panel.py / aggregate.py resolve "newest" with a lexicographic sort that disagrees with
+        # our numeric _run_key once a -N disambiguator exists (run-...-10 vs run-...-9); resolving
+        # here and passing --run to each CLI keeps every pipeline phase on one audit record and
+        # closes the concurrent-init TOCTOU. If no run exists yet, fall back to no argument so the
+        # CLI emits its own "call ar_init first".
+        try:
+            return ["--run", _run_dir([]).name]
+        except ToolError:
+            return []
     # A provided run must be exactly a minted id. An empty/whitespace string is a
     # caller error, not a silent "newest": reject it so an ambiguous value can never
     # slip past RUN_RE into resolve_run().
@@ -163,20 +172,31 @@ def _add_confined_catalog(args, argv):
             or cf.startswith(("/", "\\")) or "\\" in cf or _DRIVE_RE.match(cf)):
         raise ToolError("catalog_file must be a relative path within the repository "
                         "(no traversal, no absolute or drive-letter path, no backslashes)")
+    # The string checks above stop only lexical escapes. A relative path can still be a symlink
+    # whose target lives outside the tree, so resolve it (following symlinks) and confirm it
+    # stays within the working directory before handing it to panel.py — otherwise a crafted
+    # symlink could make the CLI read an arbitrary file.
+    root = Path.cwd().resolve()
+    target = (root / cf).resolve()
+    if target != root and root not in target.parents:
+        raise ToolError("catalog_file must resolve to a path within the repository "
+                        "(its symlink target escapes the working tree)")
     argv.extend(["--catalog-file", cf])
 
 
 def _panel_timeout():
-    """Subprocess wrapper timeout for a reviewer-calling panel run. A full panel calls each
-    reviewer with its own AR_TIMEOUT_S budget, retries once on malformed JSON, and may
-    substitute a provider — up to ~3 calls per role across up to 6 roles (SENSITIVE/CRITICAL),
-    run sequentially. Derive the outer deadline from that so a legitimately slow-but-valid run
-    is never killed before panel.py's own retry protocol finishes."""
+    """Subprocess wrapper timeout for a reviewer-calling panel run. panel.py can spend up to
+    EIGHT AR_TIMEOUT_S request budgets on a single role before giving up: run_one_role makes two
+    outer attempts, each call_reviewer may issue one corrective-JSON retry (2 requests), and a
+    failed role is then substituted to another family and the whole sequence repeats (2 × 2 × 2).
+    Across up to 6 roles (SENSITIVE/CRITICAL) run sequentially that is 8 × 6 request budgets, so
+    derive the outer deadline from that — never from an under-count — so a legitimately slow but
+    valid run is not killed before panel.py's own retry/substitution protocol finishes."""
     try:
         req = max(1, int(os.environ.get("AR_TIMEOUT_S", "240")))
     except (TypeError, ValueError):
         req = 240
-    return max(1800, req * 3 * 6 + 600)
+    return max(1800, req * 8 * 6 + 600)
 
 
 def _run_cli(module, argv, timeout=120):
@@ -271,11 +291,17 @@ def h_init(args):
     rc, out, err = _run_cli("panel", argv)
     if rc != 0:
         return _result(f"init failed:\n{(out + err).strip()}", is_error=True)
-    # Report the EXACT run id init just created by parsing its stdout ("initialized <path>
-    # …"), not the newest run-* directory: a directory scan races a concurrent init and
-    # mis-sorts run-...-9 vs run-...-10, so it can name another run's id.
-    m = RUN_ID_RE.search(out or "")
-    run_id = m.group(0) if m else None
+    # Report the EXACT run id init just created by parsing its stdout ("initialized <run-dir
+    # path>  …"): take the BASENAME of that path, not the first run-... substring in stdout.
+    # A directory scan races a concurrent init and mis-sorts run-...-9 vs run-...-10, and an
+    # unanchored substring search would match a run-YYYYMMDD-HHMMSS segment inside AR_RUN_DIR or
+    # any ancestor directory rather than the run just created.
+    run_id = None
+    m = re.search(r"(?m)^initialized\s+(\S+)", out or "")
+    if m:
+        base = os.path.basename(m.group(1).rstrip("/\\"))
+        if RUN_ID_RE.fullmatch(base):
+            run_id = base
     return _result((out or "").strip() or f"initialized {run_id}",
                    structured={"run_id": run_id})
 
@@ -407,8 +433,11 @@ def h_panel_ingest(args):
 
 
 def h_panel_rebuttal(args):
+    """Run the adversarial rebuttal round. With prepare=True, write per-reviewer rebuttal
+    request bodies for a keyless host to execute and ingest; otherwise call the reviewers over
+    HTTP using the router key in the environment (with the scaled panel timeout)."""
     run_args = _safe_run(args)
-    argv = ["rebuttal"] + run_args
+    argv = ["rebuttal", *run_args]
     if args.get("prepare"):
         # Keyless path: write per-reviewer rebuttal request bodies for the host to execute,
         # then ingest each with ar_panel_ingest phase='rebuttal'. No network -> default timeout.
@@ -419,14 +448,29 @@ def h_panel_rebuttal(args):
 
 
 def h_aggregate(args):
+    """Aggregate the run into a fresh verdict. _safe_run pins the target run so aggregate.py binds
+    to the same run whose freshness is checked here (no lexicographic-vs-numeric or concurrent-init
+    split). Freshness is proven by moving any pre-existing verdict.json ASIDE and requiring
+    aggregate to write a NEW one — never by an mtime bump, which a coarse-granularity filesystem
+    can leave unchanged on a same-quantum rewrite — so a stale PASS is never surfaced as this run's
+    result. A failed aggregate restores the prior verdict and surfaces the error."""
     run_args = _safe_run(args)
-    # Capture verdict.json's mtime BEFORE aggregating so a fresh computation can be told from
-    # a pre-existing (stale) verdict left by an earlier run.
     try:
-        vf = _run_dir(run_args) / "verdict.json"
+        run_dir = _run_dir(run_args)
     except ToolError:
-        vf = None
-    before = vf.stat().st_mtime_ns if (vf and vf.is_file()) else None
+        run_dir = None
+    vf = (run_dir / "verdict.json") if run_dir is not None else None
+    # Move any existing verdict aside so a fresh computation is proven by the NEW file's existence.
+    # If the move cannot be performed, fall back to an mtime check rather than losing the signal.
+    stash = None
+    before_mtime = None
+    if vf is not None and vf.is_file():
+        cand = vf.parent / (vf.name + ".prev")
+        try:
+            vf.replace(cand)
+            stash = cand
+        except OSError:
+            before_mtime = vf.stat().st_mtime_ns
     rc, out, err = _run_cli("aggregate", run_args)
     body = (out or "").strip()
     if err and err.strip():
@@ -436,21 +480,32 @@ def h_aggregate(args):
             vf = _run_dir(run_args) / "verdict.json"
         except ToolError:
             vf = None
-    # aggregate exits 0 PASS / 1 FAIL / 2 BLOCKED for a real verdict and rewrites verdict.json
-    # as its final step. If it exited some other way (e.g. crashed on a malformed artifact) or
-    # did NOT freshly rewrite verdict.json, never surface a pre-existing verdict as success — a
-    # stale PASS must not reach the host.
-    fresh = bool(vf and vf.is_file() and (before is None or vf.stat().st_mtime_ns != before))
+    # aggregate exits 0 PASS / 1 FAIL / 2 BLOCKED for a real verdict and writes verdict.json as its
+    # final step. If it exited some other way (e.g. crashed on a malformed artifact) or did NOT
+    # write a fresh verdict, never surface a pre-existing verdict as success.
+    fresh = bool(vf and vf.is_file()
+                 and (before_mtime is None or vf.stat().st_mtime_ns != before_mtime))
     if rc not in (0, 1, 2) or not fresh:
+        # No fresh verdict — restore the stashed one so the run keeps its prior verdict.json.
+        if stash is not None and stash.is_file() and vf is not None and not vf.is_file():
+            try:
+                stash.replace(vf)
+            except OSError:
+                pass
         return _result(f"aggregate exited {rc} without writing a fresh verdict:\n{body}",
                        is_error=True)
+    if stash is not None and stash.is_file():  # success — discard the superseded verdict
+        try:
+            stash.unlink()
+        except OSError:
+            pass
     structured = json.loads(vf.read_text(encoding="utf-8"))
     return _result(body or structured.get("verdict", ""), structured=structured)
 
 
 def h_check_digest(args):
     run_args = _safe_run(args)
-    rc, out, err = _run_cli("aggregate", run_args + ["--check-digest"])
+    rc, out, err = _run_cli("aggregate", [*run_args, "--check-digest"])
     body = ((out or "") + (err or "")).strip()
     # aggregate --check-digest exits 0 = intact, 1 = drifted (a definitive mismatch), 2 = the
     # digest could not be checked at all (no verdict.json, or a verdict from before

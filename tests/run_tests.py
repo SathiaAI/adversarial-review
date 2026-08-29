@@ -5591,13 +5591,13 @@ def t_mcp_aggregate_rejects_stale_verdict():
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
-    # happy path: a fresh rewrite (mtime advances) + a verdict exit code -> success
+    # happy path: aggregate writes a NEW verdict.json (h_aggregate moved the prior one aside) +
+    # a verdict exit code -> success
     os.chdir(repo)
 
     def fresh(module, argv, timeout=120):
-        st = vf.stat()
-        vf.write_text(json.dumps({"verdict": "FAIL", "run_id": "run-20260101-010101"}))
-        os.utime(vf, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        (rundir / "verdict.json").write_text(
+            json.dumps({"verdict": "FAIL", "run_id": "run-20260101-010101"}))
         return (1, "FAIL", "")
 
     orig = mcpsrv._run_cli
@@ -5616,9 +5616,9 @@ def t_mcp_panel_timeout_scales_with_env():
     old = os.environ.get("AR_TIMEOUT_S")
     try:
         os.environ["AR_TIMEOUT_S"] = "240"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 3 * 6 + 600) > 300
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 8 * 6 + 600) > 300
         os.environ["AR_TIMEOUT_S"] = "garbage"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 3 * 6 + 600)  # bad value -> default
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 8 * 6 + 600)  # bad value -> default
     finally:
         if old is None:
             os.environ.pop("AR_TIMEOUT_S", None)
@@ -5692,6 +5692,144 @@ def t_mcp_panel_run_forwards_catalog_file():
     finally:
         mcpsrv._run_cli = orig_cli
         mcpsrv._write_context = orig_ctx
+
+
+def t_mcp_catalog_file_rejects_symlink_escape():
+    # A relative catalog_file that passes the string checks but is a SYMLINK whose target lives
+    # outside the tree must still be rejected — resolving it escapes the repo, so panel.py must
+    # never be handed it. A real in-tree file is still accepted (control).
+    outside = Path(tempfile.mkdtemp(prefix="ar-outside-"))
+    (outside / "secret.json").write_text("{}")
+    repo = Path(tempfile.mkdtemp(prefix="ar-repo-"))
+    link = repo / "evil.json"
+    try:
+        link.symlink_to(outside / "secret.json")
+    except (OSError, NotImplementedError):
+        return  # platform/user without symlink privilege -> nothing to assert here
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        argv = []
+        raised = False
+        try:
+            mcpsrv._add_confined_catalog({"catalog_file": "evil.json"}, argv)
+        except mcpsrv.ToolError as e:
+            raised = True
+            assert "escapes the working tree" in str(e), e
+        assert raised and argv == [], "symlink-escaping catalog_file must be rejected"
+        # control: a real file INSIDE the tree resolves within cwd and is forwarded
+        (repo / "ok.json").write_text("{}")
+        argv2 = []
+        mcpsrv._add_confined_catalog({"catalog_file": "ok.json"}, argv2)
+        assert argv2 == ["--catalog-file", "ok.json"], argv2
+    finally:
+        os.chdir(cwd0)
+
+
+def t_mcp_aggregate_pins_run_against_concurrent_init():
+    # h_aggregate must resolve the newest run ONCE and pin --run <id> before invoking
+    # aggregate.py, so a concurrent ar_init creating a newer run mid-call cannot make the child
+    # aggregate a different run than the one whose freshness is verified here (TOCTOU).
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-toctou-"))
+    arroot = repo / ".adversarial-review"
+    older = arroot / "run-20260101-010101"
+    older.mkdir(parents=True)
+    (older / "verdict.json").write_text(
+        json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    cap = []
+
+    def fake(module, argv, timeout=120):
+        cap.append({"module": module, "argv": list(argv), "timeout": timeout})
+        # simulate a concurrent ar_init creating a NEWER run between resolution and child exec
+        newer = arroot / "run-20260101-020202"
+        newer.mkdir(parents=True, exist_ok=True)
+        (newer / "verdict.json").write_text(
+            json.dumps({"verdict": "BLOCKED", "run_id": "run-20260101-020202"}))
+        # write a fresh verdict into the PINNED (older) run (h_aggregate moved the prior one aside)
+        (older / "verdict.json").write_text(
+            json.dumps({"verdict": "FAIL", "run_id": "run-20260101-010101"}))
+        return (1, "FAIL", "")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        r = mcpsrv.h_aggregate({})  # no explicit run -> must pin the newest-at-entry (older)
+        assert cap and cap[0]["argv"] == ["--run", "run-20260101-010101"], cap
+        assert not r["isError"], r
+        assert r["structuredContent"]["run_id"] == "run-20260101-010101", r
+        assert r["structuredContent"]["verdict"] == "FAIL", r
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
+def t_mcp_panel_run_pins_newest_run():
+    # With 'run' omitted, the numeric-newest run (run-...-10) must be pinned as --run to the
+    # subprocess AND used for context.md, so panel.py's lexicographic newest-sort (which would
+    # pick run-...-9) cannot split the context file and the reviewer artifacts across two runs.
+    repo = Path(tempfile.mkdtemp(prefix="ar-pin-run-"))
+    arroot = repo / ".adversarial-review"
+    for name in ("run-20260101-010101-9", "run-20260101-010101-10"):
+        (arroot / name).mkdir(parents=True)
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    cap = []
+    orig = _patch_run_cli(0, out="ok", capture=cap)
+    try:
+        mcpsrv.h_panel_run({"context": "the diff"})
+        argv = cap[-1]["argv"]
+        assert argv[:3] == ["run", "--run", "run-20260101-010101-10"], argv
+        assert (arroot / "run-20260101-010101-10" / "context.md").is_file(), "context in pinned run"
+        assert not (arroot / "run-20260101-010101-9" / "context.md").exists(), "not lexicographic run"
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
+def t_mcp_init_run_id_parsed_from_path_basename():
+    # h_init takes the run id from the BASENAME of the path init printed ("initialized <path>"),
+    # not the first run-... substring in stdout — an ancestor dir (e.g. AR_RUN_DIR) can itself
+    # contain a run-YYYYMMDD-HHMMSS segment that an unanchored search would wrongly return.
+    orig = _patch_run_cli(
+        0, out="initialized /tmp/run-20000101-000000/runs/run-20260829-120000  (risk=NORMAL)\n")
+    try:
+        r = mcpsrv.h_init({"risk": "NORMAL", "dev_providers": ["anthropic"],
+                           "diff_ref": "main...HEAD"})
+        assert r["structuredContent"]["run_id"] == "run-20260829-120000", r
+    finally:
+        mcpsrv._run_cli = orig
+
+
+def t_mcp_aggregate_fresh_verdict_independent_of_mtime():
+    # Freshness must not depend on mtime changing: on a coarse-mtime filesystem a same-quantum
+    # rewrite leaves st_mtime_ns unchanged. h_aggregate moves the old verdict aside and proves
+    # freshness by the NEW verdict.json's existence, so an unchanged mtime is still 'fresh'.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-mtime-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    vf = rundir / "verdict.json"
+    vf.write_text(json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+    frozen = vf.stat().st_mtime_ns
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fake(module, argv, timeout=120):
+        p = rundir / "verdict.json"
+        p.write_text(json.dumps({"verdict": "FAIL", "run_id": "run-20260101-010101"}))
+        os.utime(p, ns=(frozen, frozen))  # coarse FS: mtime identical to the prior verdict
+        return (1, "FAIL", "")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert not r["isError"], r
+        assert r["structuredContent"]["verdict"] == "FAIL", r
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
 
 
 def main():
