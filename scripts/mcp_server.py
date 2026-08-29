@@ -250,7 +250,7 @@ def _run_dir(run_args):
         return root / run_args[1]
     if not root.is_dir():
         raise ToolError(f"no {root}/ directory — call ar_init first")
-    runs = sorted((d for d in root.iterdir() if d.is_dir() and d.name.startswith("run-")),
+    runs = sorted((d for d in root.iterdir() if d.is_dir() and RUN_RE.match(d.name)),
                   key=lambda d: _run_key(d.name))
     if not runs:
         raise ToolError(f"no runs under {root}/ — call ar_init first")
@@ -378,7 +378,7 @@ def _write_context(run_args, context):
         if not run_dir.is_dir():
             raise ToolError(f"run directory not found: {run_dir.name}")
     else:
-        runs = sorted((d for d in root.iterdir() if d.is_dir() and d.name.startswith("run-")),
+        runs = sorted((d for d in root.iterdir() if d.is_dir() and RUN_RE.match(d.name)),
                       key=lambda d: _run_key(d.name)) if root.is_dir() else []
         if not runs:
             raise ToolError("no runs yet — call ar_init first")
@@ -486,13 +486,19 @@ def h_aggregate(args):
     fresh = bool(vf and vf.is_file()
                  and (before_mtime is None or vf.stat().st_mtime_ns != before_mtime))
     if rc not in (0, 1, 2) or not fresh:
-        # No fresh verdict — restore the stashed one so the run keeps its prior verdict.json.
-        if stash is not None and stash.is_file() and vf is not None and not vf.is_file():
+        # Rejected result — never leave a verdict from a run we did not accept. If aggregate
+        # DID write a verdict.json but exited with an unrecognized code (e.g. rc 3), remove that
+        # rejected output first, then restore the prior verdict from the stash. (Guarding the
+        # restore on `not vf.is_file()` would strand the prior verdict in .prev and leave the
+        # rejected one active.)
+        if stash is not None and stash.is_file():
             try:
+                if vf is not None and vf.is_file():
+                    vf.unlink()
                 stash.replace(vf)
             except OSError:
                 pass
-        return _result(f"aggregate exited {rc} without writing a fresh verdict:\n{body}",
+        return _result(f"aggregate exited {rc} without an accepted verdict:\n{body}",
                        is_error=True)
     if stash is not None and stash.is_file():  # success — discard the superseded verdict
         try:

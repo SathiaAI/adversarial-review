@@ -5587,7 +5587,7 @@ def t_mcp_aggregate_rejects_stale_verdict():
     orig = _patch_run_cli(1, err="Traceback: boom")  # crash, does NOT rewrite verdict.json
     try:
         r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
-        assert r["isError"] and "without writing a fresh verdict" in r["content"][0]["text"], r
+        assert r["isError"] and "without an accepted verdict" in r["content"][0]["text"], r
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
@@ -5829,6 +5829,53 @@ def t_mcp_aggregate_fresh_verdict_independent_of_mtime():
         assert r["structuredContent"]["verdict"] == "FAIL", r
     finally:
         mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
+def t_mcp_aggregate_restores_prior_verdict_on_rejected_write():
+    # If aggregate WRITES a new verdict.json but exits with an unrecognized code (rc 3), the
+    # result is rejected AND the prior verdict must be restored: the rejected output must not be
+    # left active, and the prior must not be stranded in verdict.json.prev.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-reject-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    (rundir / "verdict.json").write_text(
+        json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fake(module, argv, timeout=120):
+        # aggregate writes a NEW (to-be-rejected) verdict but exits with an unrecognized code
+        (rundir / "verdict.json").write_text(json.dumps({"verdict": "PASS", "run_id": "REJECTED"}))
+        return (3, "", "boom: unrecognized exit")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert r["isError"] and "without an accepted verdict" in r["content"][0]["text"], r
+        restored = json.loads((rundir / "verdict.json").read_text())
+        assert restored["run_id"] == "run-20260101-010101" and restored["verdict"] == "PASS", restored
+        assert not (rundir / "verdict.json.prev").exists(), "prior verdict must not be stranded in .prev"
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
+def t_mcp_run_selection_ignores_non_minted_dirs():
+    # Implicit newest-run selection must ignore directories that are not minted run ids, so a
+    # stray 'run-zombie' (which sorts lexicographically after a real run) cannot hijack selection
+    # and pin an invalid --run on every subprocess.
+    repo = Path(tempfile.mkdtemp(prefix="ar-runsel-"))
+    arroot = repo / ".adversarial-review"
+    (arroot / "run-20260101-010101").mkdir(parents=True)
+    (arroot / "run-zombie").mkdir(parents=True)
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        assert mcpsrv._run_dir([]).name == "run-20260101-010101", mcpsrv._run_dir([]).name
+        assert mcpsrv._safe_run({}) == ["--run", "run-20260101-010101"], mcpsrv._safe_run({})
+    finally:
         os.chdir(cwd0)
 
 
