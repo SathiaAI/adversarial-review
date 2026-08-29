@@ -84,6 +84,13 @@ ROLE_RE = re.compile(r"^[a-z][a-z_]*$")
 PIN_RE = re.compile(r"^[A-Za-z0-9_]+=[A-Za-z0-9][A-Za-z0-9._/-]*$")
 PROVIDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 GATE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# The run id `panel.py init` mints, matched in its stdout so h_init reports the run it
+# actually created rather than inferring it from a directory listing (which races a
+# concurrent init and mis-sorts run-...-9 vs run-...-10).
+RUN_ID_RE = re.compile(r"run-\d{8}-\d{6}(?:-\d+)?")
+# A Windows drive-letter prefix (C:, \\server) — absolute on Windows but not caught by a
+# POSIX leading-"/" check; rejected so a confined relative path cannot be an absolute one.
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
 
 class ToolError(Exception):
@@ -132,6 +139,46 @@ def _req_str(args, key):
     return v
 
 
+def _opt_authorizer(args):
+    """Resolve the optional 'authorized_by' identity. A present value must be a non-empty
+    string: a schema-invalid value (bool, number, list) must NOT be stringified into a named
+    authorizer, or a malformed request could waive a gate / authorize a degraded panel and
+    still produce an apparently-authorized audit artifact."""
+    v = args.get("authorized_by")
+    if v is None:
+        return None
+    if not isinstance(v, str) or not v.strip():
+        raise ToolError("authorized_by must be a non-empty string")
+    return v
+
+
+def _add_confined_catalog(args, argv):
+    """Validate and forward an optional catalog_file. Confined to a relative path inside the
+    working tree so a crafted value cannot make the CLI read an arbitrary file: no traversal,
+    no POSIX-absolute path, and no Windows-absolute path (drive letter or backslash/UNC)."""
+    cf = args.get("catalog_file")
+    if cf is None:
+        return
+    if (not isinstance(cf, str) or not cf or "\x00" in cf or ".." in cf
+            or cf.startswith(("/", "\\")) or "\\" in cf or _DRIVE_RE.match(cf)):
+        raise ToolError("catalog_file must be a relative path within the repository "
+                        "(no traversal, no absolute or drive-letter path, no backslashes)")
+    argv.extend(["--catalog-file", cf])
+
+
+def _panel_timeout():
+    """Subprocess wrapper timeout for a reviewer-calling panel run. A full panel calls each
+    reviewer with its own AR_TIMEOUT_S budget, retries once on malformed JSON, and may
+    substitute a provider — up to ~3 calls per role across up to 6 roles (SENSITIVE/CRITICAL),
+    run sequentially. Derive the outer deadline from that so a legitimately slow-but-valid run
+    is never killed before panel.py's own retry protocol finishes."""
+    try:
+        req = max(1, int(os.environ.get("AR_TIMEOUT_S", "240")))
+    except (TypeError, ValueError):
+        req = 240
+    return max(1800, req * 3 * 6 + 600)
+
+
 def _run_cli(module, argv, timeout=120):
     """Invoke a pipeline CLI module as a subprocess (shell=False — no injection).
     Returns (returncode, stdout, stderr)."""
@@ -165,18 +212,34 @@ def _cli_result(module, argv, timeout=120, structured=None):
     return _result(body or f"{module} ok", structured=structured)
 
 
-def _read_json(run_args):
-    """Read verdict.json for the resolved run (explicit id, else newest)."""
+def _run_key(name):
+    """Sort key so run-...-10 orders after run-...-9 (numeric disambiguator), not
+    lexicographically. The zero-padded run-YYYYMMDD-HHMMSS base sorts chronologically as
+    text; only the optional -N suffix needs numeric ordering."""
+    parts = name.split("-")
+    if len(parts) == 4 and parts[3].isdigit():
+        return ("-".join(parts[:3]), int(parts[3]))
+    return (name, 0)
+
+
+def _run_dir(run_args):
+    """Resolve the run directory: the explicit --run id, else the newest run (numeric-suffix
+    aware, so run-...-10 beats run-...-9). Raises ToolError if there is no run to resolve."""
     root = Path(os.environ.get("AR_RUN_DIR", ".adversarial-review"))
     if run_args:  # ["--run", "<id>"]
-        run_dir = root / run_args[1]
-    else:
-        if not root.is_dir():
-            raise ToolError(f"no {root}/ directory — call ar_init first")
-        runs = sorted(d for d in root.iterdir() if d.is_dir() and d.name.startswith("run-"))
-        if not runs:
-            raise ToolError(f"no runs under {root}/ — call ar_init first")
-        run_dir = runs[-1]
+        return root / run_args[1]
+    if not root.is_dir():
+        raise ToolError(f"no {root}/ directory — call ar_init first")
+    runs = sorted((d for d in root.iterdir() if d.is_dir() and d.name.startswith("run-")),
+                  key=lambda d: _run_key(d.name))
+    if not runs:
+        raise ToolError(f"no runs under {root}/ — call ar_init first")
+    return runs[-1]
+
+
+def _read_json(run_args):
+    """Read verdict.json for the resolved run (explicit id, else newest)."""
+    run_dir = _run_dir(run_args)
     vf = run_dir / "verdict.json"
     if not vf.is_file():
         raise ToolError(f"no verdict yet for {run_dir.name} — call ar_aggregate first")
@@ -208,12 +271,11 @@ def h_init(args):
     rc, out, err = _run_cli("panel", argv)
     if rc != 0:
         return _result(f"init failed:\n{(out + err).strip()}", is_error=True)
-    # Report the run id that was just created (newest run-* dir).
-    root = Path(os.environ.get("AR_RUN_DIR", ".adversarial-review"))
-    run_id = None
-    if root.is_dir():
-        runs = sorted(d.name for d in root.iterdir() if d.is_dir() and d.name.startswith("run-"))
-        run_id = runs[-1] if runs else None
+    # Report the EXACT run id init just created by parsing its stdout ("initialized <path>
+    # …"), not the newest run-* directory: a directory scan races a concurrent init and
+    # mis-sorts run-...-9 vs run-...-10, so it can name another run's id.
+    m = RUN_ID_RE.search(out or "")
+    run_id = m.group(0) if m else None
     return _result((out or "").strip() or f"initialized {run_id}",
                    structured={"run_id": run_id})
 
@@ -232,8 +294,9 @@ def h_gate_plan(args):
         if not isinstance(w, str) or not GATE_NAME_RE.match(w):
             raise ToolError(f"invalid waive gate name {w!r}")
         argv += ["--waive", w]
-    if args.get("authorized_by"):
-        argv += ["--authorized-by", str(args["authorized_by"])]
+    auth = _opt_authorizer(args)
+    if auth:
+        argv += ["--authorized-by", auth]
     return _cli_result("gate", argv)
 
 
@@ -255,8 +318,9 @@ def h_gate_record(args):
         argv += ["--exit-code", str(ec)]
     if args.get("command"):
         argv += ["--command", str(args["command"])]
-    if args.get("authorized_by"):
-        argv += ["--authorized-by", str(args["authorized_by"])]
+    auth = _opt_authorizer(args)
+    if auth:
+        argv += ["--authorized-by", auth]
     return _cli_result("gate", argv)
 
 
@@ -271,17 +335,10 @@ def h_panel_assign(args):
         argv += ["--pin", pin]
     if args.get("allow_degraded"):
         argv.append("--allow-degraded")
-    if args.get("authorized_by"):
-        argv += ["--authorized-by", str(args["authorized_by"])]
-    cf = args.get("catalog_file")
-    if cf is not None:
-        # Untrusted path: confine it to a relative path inside the working tree so a
-        # crafted value ('../../etc/shadow', '/etc/passwd') cannot make the CLI read an
-        # arbitrary file. No traversal, no absolute paths, no NULs.
-        if not isinstance(cf, str) or not cf or ".." in cf or cf.startswith("/") or "\x00" in cf:
-            raise ToolError("catalog_file must be a relative path within the repository "
-                            "(no '..', no absolute path)")
-        argv += ["--catalog-file", cf]
+    auth = _opt_authorizer(args)
+    if auth:
+        argv += ["--authorized-by", auth]
+    _add_confined_catalog(args, argv)
     return _cli_result("panel", argv, timeout=300)
 
 
@@ -296,7 +353,7 @@ def _write_context(run_args, context):
             raise ToolError(f"run directory not found: {run_dir.name}")
     else:
         runs = sorted((d for d in root.iterdir() if d.is_dir() and d.name.startswith("run-")),
-                      key=lambda d: d.name) if root.is_dir() else []
+                      key=lambda d: _run_key(d.name)) if root.is_dir() else []
         if not runs:
             raise ToolError("no runs yet — call ar_init first")
         run_dir = runs[-1]
@@ -317,9 +374,14 @@ def h_panel_run(args):
     context = _req_str(args, "context")
     cf = _write_context(run_args, context)
     argv = ["run"] + run_args + ["--context-file", cf]
+    # Forward the same confined catalog the assign step may have used: when the router
+    # cannot serve /models, a reviewer failure makes panel.py run reload the catalog to pick
+    # its mandated substitute — without this it would attempt the unavailable live catalog
+    # and block instead of substituting.
+    _add_confined_catalog(args, argv)
     if args.get("force"):
         argv.append("--force")
-    return _cli_result("panel", argv, timeout=300)
+    return _cli_result("panel", argv, timeout=_panel_timeout())
 
 
 def h_panel_ingest(args):
@@ -344,21 +406,45 @@ def h_panel_ingest(args):
             pass
 
 
+def h_panel_rebuttal(args):
+    run_args = _safe_run(args)
+    argv = ["rebuttal"] + run_args
+    if args.get("prepare"):
+        # Keyless path: write per-reviewer rebuttal request bodies for the host to execute,
+        # then ingest each with ar_panel_ingest phase='rebuttal'. No network -> default timeout.
+        argv.append("--prepare")
+        return _cli_result("panel", argv)
+    # Direct path: call the reviewers over HTTP (needs the router key in the environment).
+    return _cli_result("panel", argv, timeout=_panel_timeout())
+
+
 def h_aggregate(args):
     run_args = _safe_run(args)
+    # Capture verdict.json's mtime BEFORE aggregating so a fresh computation can be told from
+    # a pre-existing (stale) verdict left by an earlier run.
+    try:
+        vf = _run_dir(run_args) / "verdict.json"
+    except ToolError:
+        vf = None
+    before = vf.stat().st_mtime_ns if (vf and vf.is_file()) else None
     rc, out, err = _run_cli("aggregate", run_args)
     body = (out or "").strip()
     if err and err.strip():
         body = (body + "\n" + err.strip()).strip()
-    structured = None
-    try:
-        structured = _read_json(run_args)
-    except ToolError:
-        pass
-    # aggregate exits 0 PASS, 1 FAIL, 2 BLOCKED — all are successful computations,
-    # not tool errors. Surface the verdict; only a missing verdict.json is an error.
-    if structured is None:
-        return _result(f"aggregate exited {rc} but wrote no verdict:\n{body}", is_error=True)
+    if vf is None:  # the run dir may not have resolved before the call — resolve it now
+        try:
+            vf = _run_dir(run_args) / "verdict.json"
+        except ToolError:
+            vf = None
+    # aggregate exits 0 PASS / 1 FAIL / 2 BLOCKED for a real verdict and rewrites verdict.json
+    # as its final step. If it exited some other way (e.g. crashed on a malformed artifact) or
+    # did NOT freshly rewrite verdict.json, never surface a pre-existing verdict as success — a
+    # stale PASS must not reach the host.
+    fresh = bool(vf and vf.is_file() and (before is None or vf.stat().st_mtime_ns != before))
+    if rc not in (0, 1, 2) or not fresh:
+        return _result(f"aggregate exited {rc} without writing a fresh verdict:\n{body}",
+                       is_error=True)
+    structured = json.loads(vf.read_text(encoding="utf-8"))
     return _result(body or structured.get("verdict", ""), structured=structured)
 
 
@@ -366,9 +452,16 @@ def h_check_digest(args):
     run_args = _safe_run(args)
     rc, out, err = _run_cli("aggregate", run_args + ["--check-digest"])
     body = ((out or "") + (err or "")).strip()
-    intact = rc == 0
-    return _result(body or ("attestation intact" if intact else "attestation drifted"),
-                   structured={"intact": intact})
+    # aggregate --check-digest exits 0 = intact, 1 = drifted (a definitive mismatch), 2 = the
+    # digest could not be checked at all (no verdict.json, or a verdict from before
+    # attestations existed). Only 0/1 are a real answer; anything else is a tool error, not a
+    # silent "drifted".
+    if rc == 0:
+        return _result(body or "attestation intact", structured={"intact": True})
+    if rc == 1:
+        return _result(body or "attestation drifted", structured={"intact": False})
+    return _result(body or f"cannot verify attestation (--check-digest exited {rc}); "
+                   "aggregate the run first", is_error=True)
 
 
 def h_get_verdict(args):
@@ -443,7 +536,7 @@ TOOLS = [
     _t("ar_panel_assign",
        "Assign the independent reviewer panel from the router's live model catalog, "
        "excluding every development provider family and giving each role a distinct "
-       "family. Pin models with entries like 'security=google/gemini-3.6-flash'.",
+       "family. Pin models with entries like 'security=<provider>/<model-slug>'.",
        {"run": _RUN_PROP,
         "pin": {"type": "array", "items": {"type": "string"},
                 "description": "Role pins, each 'role=provider/model-slug'."},
@@ -466,7 +559,8 @@ TOOLS = [
        "the server should execute the panel itself instead of prepare/ingest.",
        {"run": _RUN_PROP,
         "context": {"type": "string", "description": "The full review context (no secrets or .env content)."},
-        "force": {"type": "boolean", "description": "Re-run reviewers even if reports already exist."}},
+        "force": {"type": "boolean", "description": "Re-run reviewers even if reports already exist."},
+        "catalog_file": {"type": "string", "description": "Path to a cached catalog JSON (the same one passed to ar_panel_assign), so a reviewer substitution can resolve when the live catalog is unavailable."}},
        ["context"], _NET, h_panel_run),
 
     _t("ar_panel_ingest",
@@ -478,6 +572,18 @@ TOOLS = [
         "response": {"type": "string", "description": "The reviewer's raw JSON response text."},
         "phase": {"type": "string", "enum": ["panel", "rebuttal"], "description": "Which round this response belongs to. Default panel."}},
        ["role", "response"], _WRITE_LOCAL, h_panel_ingest),
+
+    _t("ar_panel_rebuttal",
+       "Run the adversarial rebuttal round: each reviewer now sees the others' high/critical "
+       "findings and must refute, corroborate, or extend each with evidence. Required (per the "
+       "run's rebuttal policy) before a SENSITIVE/CRITICAL run with high/critical findings can "
+       "reach a verdict. Set prepare=true to write per-reviewer rebuttal request bodies for your "
+       "host to execute, then ingest each with ar_panel_ingest phase='rebuttal' (the keyless "
+       "path); omit prepare to have the server call the reviewers directly over HTTP.",
+       {"run": _RUN_PROP,
+        "prepare": {"type": "boolean", "description": "Write rebuttal request bodies for host "
+                    "execution (keyless) instead of calling the reviewers directly over HTTP."}},
+       [], _NET, h_panel_rebuttal),
 
     _t("ar_aggregate",
        "Compute the deterministic release verdict (PASS/FAIL/BLOCKED) from all recorded "
@@ -638,8 +744,12 @@ def handle(msg):
         tool = TOOLS_BY_NAME.get(name)
         if not tool:
             return _error(id_, -32602, f"unknown tool: {name}")
-        arguments = params.get("arguments") or {}
-        if not isinstance(arguments, dict):
+        arguments = params.get("arguments")
+        if arguments is None:
+            arguments = {}
+        elif not isinstance(arguments, dict):
+            # A falsy non-dict ([], "", 0, false) must be rejected, not silently defaulted to
+            # {} by `or {}` — otherwise a malformed request becomes an empty-argument call.
             return _error(id_, -32602, "arguments must be an object")
         try:
             return _ok(id_, _finalize_result(tool["handler"](arguments), is_modern))

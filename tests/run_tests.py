@@ -5492,6 +5492,208 @@ def t_mcp_http_error_paths_close_connection():
         t.shutdown()
 
 
+# --- ar-mcp #7c review-follow-up regressions (PR #24) ---------------------------
+
+def _patch_run_cli(rc, out="", err="", capture=None):
+    """Stub mcp_server._run_cli to return (rc,out,err) and optionally record each call's
+    (module, argv, timeout). Returns the original so the caller can restore it."""
+    orig = mcpsrv._run_cli
+
+    def fake(module, argv, timeout=120):
+        if capture is not None:
+            capture.append({"module": module, "argv": list(argv), "timeout": timeout})
+        return (rc, out, err)
+
+    mcpsrv._run_cli = fake
+    return orig
+
+
+def t_mcp_init_reports_created_run_not_newest_dir():
+    # h_init must report the run it CREATED (parsed from init's stdout), not the
+    # lexicographically-newest run-* dir — a decoy or a -9/-10 collision skews that scan.
+    repo = fresh_repo()
+    (repo / ".adversarial-review" / "run-99999999-999999").mkdir(parents=True)  # sorts newest
+    res = _mcp_call(repo, "ar_init",
+                    {"risk": "NORMAL", "dev_providers": ["anthropic"], "diff_ref": "main...HEAD"})
+    assert not res.get("isError"), res
+    run_id = res["structuredContent"]["run_id"]
+    assert run_id and run_id != "run-99999999-999999", res
+    assert (repo / ".adversarial-review" / run_id).is_dir(), run_id
+
+
+def t_mcp_run_key_orders_numeric_suffix():
+    # run-...-10 sorts after run-...-9 (numeric disambiguator), not lexicographically.
+    names = ["run-20260101-000000", "run-20260101-000000-9", "run-20260101-000000-10",
+             "run-20260101-000000-2"]
+    assert sorted(names, key=mcpsrv._run_key)[-1] == "run-20260101-000000-10", names
+    assert sorted(["run-20260101-000000-10", "run-20260102-000000"],
+                  key=mcpsrv._run_key)[-1] == "run-20260102-000000"
+
+
+def t_mcp_check_digest_distinguishes_exit_codes():
+    # --check-digest: 0 intact, 1 drifted, 2 (no verdict/attestation) is cannot-verify -> error,
+    # not a silent {"intact": false}.
+    orig = _patch_run_cli(0, out="attestation OK")
+    try:
+        r = mcpsrv.h_check_digest({})
+        assert r["structuredContent"] == {"intact": True} and not r["isError"], r
+    finally:
+        mcpsrv._run_cli = orig
+    orig = _patch_run_cli(1, out="attestation MISMATCH")
+    try:
+        r = mcpsrv.h_check_digest({})
+        assert r["structuredContent"] == {"intact": False} and not r["isError"], r
+    finally:
+        mcpsrv._run_cli = orig
+    orig = _patch_run_cli(2, out="no verdict.json in run")
+    try:
+        r = mcpsrv.h_check_digest({})
+        assert r["isError"] and "structuredContent" not in r, r
+    finally:
+        mcpsrv._run_cli = orig
+
+
+def t_mcp_no_hardcoded_model_in_tool_schema():
+    # No concrete provider/model slug in any served tool schema — models resolve from the live
+    # catalog; a hardcoded slug goes stale and steers hosts to pin it.
+    blob = json.dumps([mcpsrv._public_tool(t) for t in mcpsrv.TOOLS])
+    for bad in ("gemini", "google/gemini-3.6-flash", "gpt-5", "claude-3"):
+        assert bad not in blob, f"hardcoded model reference {bad!r} in tool schema"
+    assert "<provider>/<model-slug>" in blob
+
+
+def t_mcp_falsy_arguments_rejected():
+    # A falsy non-dict arguments ([], "", 0, false) must be -32602, not silently defaulted to {}.
+    for bad in ([], "", 0, False):
+        r = mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "ar_get_verdict", "arguments": bad}})
+        assert r.get("error", {}).get("code") == -32602, (bad, r)
+    # missing/None arguments still dispatches (defaults to {}), it is not a protocol error
+    r = mcpsrv.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                       "params": {"name": "ar_get_verdict"}})
+    assert "result" in r, r
+
+
+def t_mcp_aggregate_rejects_stale_verdict():
+    # If aggregate does not FRESHLY write verdict.json (e.g. crashes on a malformed artifact),
+    # never surface the pre-existing verdict as success.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    vf = rundir / "verdict.json"
+    vf.write_text(json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    orig = _patch_run_cli(1, err="Traceback: boom")  # crash, does NOT rewrite verdict.json
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert r["isError"] and "without writing a fresh verdict" in r["content"][0]["text"], r
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    # happy path: a fresh rewrite (mtime advances) + a verdict exit code -> success
+    os.chdir(repo)
+
+    def fresh(module, argv, timeout=120):
+        st = vf.stat()
+        vf.write_text(json.dumps({"verdict": "FAIL", "run_id": "run-20260101-010101"}))
+        os.utime(vf, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        return (1, "FAIL", "")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fresh
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert not r["isError"] and r["structuredContent"]["verdict"] == "FAIL", r
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
+def t_mcp_panel_timeout_scales_with_env():
+    # The panel-run wrapper timeout scales with AR_TIMEOUT_S so a valid slow run isn't killed
+    # before panel.py's own retry protocol finishes.
+    old = os.environ.get("AR_TIMEOUT_S")
+    try:
+        os.environ["AR_TIMEOUT_S"] = "240"
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 3 * 6 + 600) > 300
+        os.environ["AR_TIMEOUT_S"] = "garbage"
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 3 * 6 + 600)  # bad value -> default
+    finally:
+        if old is None:
+            os.environ.pop("AR_TIMEOUT_S", None)
+        else:
+            os.environ["AR_TIMEOUT_S"] = old
+
+
+def t_mcp_rebuttal_tool_exposed():
+    # The rebuttal round is reachable via MCP: keyless prepare (--prepare) and direct HTTP.
+    assert "ar_panel_rebuttal" in mcpsrv.TOOLS_BY_NAME
+    cap = []
+    orig = _patch_run_cli(0, out="ok", capture=cap)
+    try:
+        mcpsrv.h_panel_rebuttal({})
+        assert cap[-1]["argv"][0] == "rebuttal" and "--prepare" not in cap[-1]["argv"], cap
+        assert cap[-1]["timeout"] > 300, cap
+        mcpsrv.h_panel_rebuttal({"prepare": True})
+        assert "--prepare" in cap[-1]["argv"], cap
+    finally:
+        mcpsrv._run_cli = orig
+
+
+def t_mcp_authorized_by_must_be_nonempty_string():
+    # A non-string authorized_by (bool/number/list) must be rejected, not stringified into a
+    # named authorizer that waives a gate / authorizes a degraded panel.
+    for tool in ("ar_gate_plan", "ar_gate_record", "ar_panel_assign"):
+        args = {"authorized_by": True}
+        if tool == "ar_gate_record":
+            args.update({"name": "build", "summary": "x"})
+        r = mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": tool, "arguments": args}})
+        res = r["result"]
+        assert res["isError"] and "authorized_by must be a non-empty string" \
+            in res["content"][0]["text"], (tool, res)
+
+
+def t_mcp_catalog_file_confined_cross_platform():
+    # catalog_file confinement also rejects Windows-absolute paths (drive letter, backslash,
+    # UNC) and NUL, not only POSIX-absolute and traversal.
+    for bad in ["/etc/passwd", "../x.json", "C:\\catalog.json", "\\\\srv\\share\\c.json",
+                "a\\b.json", "cat\x00.json"]:
+        r = mcpsrv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "ar_panel_assign", "arguments": {"catalog_file": bad}}})
+        res = r["result"]
+        assert res["isError"] and "catalog_file must be a relative path" \
+            in res["content"][0]["text"], (bad, res)
+    cap = []
+    orig = _patch_run_cli(0, out="ok", capture=cap)
+    try:
+        mcpsrv.h_panel_assign({"catalog_file": "catalogs/cat.json"})
+        assert "--catalog-file" in cap[-1]["argv"] and "catalogs/cat.json" in cap[-1]["argv"], cap
+    finally:
+        mcpsrv._run_cli = orig
+
+
+def t_mcp_panel_run_forwards_catalog_file():
+    # ar_panel_run forwards the confined catalog_file so a reviewer substitution can resolve
+    # when the live catalog is unavailable; a bad path is rejected here too.
+    cap = []
+    orig_cli = _patch_run_cli(0, out="ok", capture=cap)
+    orig_ctx = mcpsrv._write_context
+    mcpsrv._write_context = lambda run_args, ctx: "context.md"
+    try:
+        mcpsrv.h_panel_run({"context": "diff", "catalog_file": "catalogs/cat.json"})
+        assert "--catalog-file" in cap[-1]["argv"] and "catalogs/cat.json" in cap[-1]["argv"], cap
+        try:
+            mcpsrv.h_panel_run({"context": "diff", "catalog_file": "C:\\x.json"})
+            assert False, "expected ToolError for a Windows-absolute catalog path"
+        except mcpsrv.ToolError:
+            pass
+    finally:
+        mcpsrv._run_cli = orig_cli
+        mcpsrv._write_context = orig_ctx
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

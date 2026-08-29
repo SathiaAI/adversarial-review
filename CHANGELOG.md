@@ -9,6 +9,18 @@ this is enforced by a regression test (`t_version_matches_changelog` in `tests/r
 
 ## [Unreleased]
 
+### Fixed
+- **`ar-mcp` follow-up on the #7c review (PR #24, merged before its review landed).** Hardened the MCP tool handlers in `scripts/mcp_server.py` against ten issues raised by the automated reviewers:
+  - **`ar_init` returns the run it created**, parsed from `panel.py init`'s stdout, instead of the lexicographically-newest `run-*` directory — which races a concurrent init and mis-sorts `run-…-9` vs `run-…-10`. The "newest run" fallback (`ar_get_verdict`/`ar_panel_run` context) now sorts the `-N` disambiguator numerically too.
+  - **`ar_aggregate` never surfaces a stale verdict**: it now requires `verdict.json` to be *freshly* rewritten (mtime advanced) with a recognized exit code (0/1/2); an aggregation that crashes without recomputing is an error, not an apparently-successful pre-existing `PASS`.
+  - **`ar_check_digest`** distinguishes intact (`0`) / drifted (`1`) / cannot-verify (`2` = no verdict or no attestation → tool error), instead of collapsing a missing verdict into a false `{"intact": false}`.
+  - **`ar_panel_rebuttal` added** — the rebuttal round is now reachable over MCP (keyless `prepare=true` writing per-reviewer request bodies for `ar_panel_ingest phase="rebuttal"`, or a direct HTTP call), so an MCP-only host can carry a SENSITIVE/CRITICAL run with high/critical findings to a verdict instead of staying BLOCKED.
+  - **`authorized_by` must be a non-empty string** across `ar_gate_plan` / `ar_gate_record` / `ar_panel_assign`: a schema-invalid value (bool/number/list) is rejected rather than stringified (e.g. `true` → `"True"`) into a named authorizer that waives a gate.
+  - **`catalog_file` confinement** now also rejects Windows-absolute paths (drive letter, backslash, UNC), and **`ar_panel_run` forwards `catalog_file`** so a reviewer substitution can resolve when the live catalog is unavailable.
+  - **A falsy non-`dict` `arguments`** (`[]`, `""`, `0`, `false`) on `tools/call` is now a `-32602` error instead of being silently defaulted to `{}`.
+  - The **panel-run wrapper timeout scales with `AR_TIMEOUT_S`** (roles × attempts × per-request budget) so a legitimately slow run is not killed before `panel.py`'s retry/substitution protocol finishes.
+  - Removed the **hardcoded model slug** from the `ar_panel_assign` tool schema (a concrete `provider/model` goes stale and steers hosts to pin it); uses a `<provider>/<model-slug>` placeholder.
+
 ## [0.2.0]
 
 ### Added
