@@ -6018,6 +6018,44 @@ def t_mcp_aggregate_stash_invariant_across_exit_paths():
                 os.chdir(cwd0)
 
 
+def t_mcp_aggregate_preserves_prior_when_stash_move_fails():
+    # The stash-FAILED cell the invariant test can't reach: when verdict.json -> .prev raises OSError
+    # (here .prev is a directory), h_aggregate falls back to mtime tracking with stash=None and the
+    # prior verdict LEFT IN PLACE at vf. A rejected exit or a raised invocation must NOT delete that
+    # untouched prior — there is no stash to restore it, so ar_get_verdict would lose the last
+    # accepted verdict.
+    PRIOR = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    for outcome in ("reject", "raise"):
+        repo = Path(tempfile.mkdtemp(prefix="ar-agg-nostash-"))
+        rundir = repo / ".adversarial-review" / "run-20260101-010101"
+        rundir.mkdir(parents=True)
+        vf = rundir / "verdict.json"
+        vf.write_text(json.dumps(PRIOR))
+        (rundir / "verdict.json.prev").mkdir()  # force vf.replace(.prev) to raise OSError
+        cwd0 = os.getcwd()
+        os.chdir(repo)
+
+        def fake(module, argv, timeout=120, _o=outcome):
+            if _o == "raise":
+                raise mcpsrv.ToolError("aggregate timed out after 120s")
+            return (3, "", "boom")  # rejected WITHOUT writing verdict.json — prior stays untouched
+
+        orig = mcpsrv._run_cli
+        mcpsrv._run_cli = fake
+        try:
+            raised = False
+            try:
+                mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+            except mcpsrv.ToolError:
+                raised = True
+            assert raised == (outcome == "raise"), (outcome, raised)
+            assert vf.is_file(), (outcome, "prior verdict must survive a failed stash move")
+            assert json.loads(vf.read_text()) == PRIOR, (outcome, "prior verdict must be intact")
+        finally:
+            mcpsrv._run_cli = orig
+            os.chdir(cwd0)
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

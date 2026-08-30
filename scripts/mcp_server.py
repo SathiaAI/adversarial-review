@@ -517,11 +517,21 @@ def h_aggregate(args):
                 except OSError:
                     pass
         else:
+            # Remove a rejected/partial verdict, but NEVER the untouched prior. In the mtime-fallback
+            # branch (stash is None because vf.replace failed) the prior verdict is still at vf; an
+            # unchanged mtime proves aggregate did not overwrite it, so deleting it here would lose
+            # the last accepted verdict with no stash to restore from.
             if vf is not None and vf.is_file():
                 try:
-                    vf.unlink()
+                    untouched_prior = (stash is None and before_mtime is not None
+                                       and vf.stat().st_mtime_ns == before_mtime)
                 except OSError:
-                    pass
+                    untouched_prior = False
+                if not untouched_prior:
+                    try:
+                        vf.unlink()
+                    except OSError:
+                        pass
             if stash is not None and stash.is_file():
                 try:
                     stash.replace(vf)
