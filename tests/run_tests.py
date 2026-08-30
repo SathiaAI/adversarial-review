@@ -5879,6 +5879,30 @@ def t_mcp_run_selection_ignores_non_minted_dirs():
         os.chdir(cwd0)
 
 
+def t_mcp_aggregate_removes_rejected_output_when_no_prior_verdict():
+    # With NO prior verdict.json (stash is None), if aggregate writes a verdict but exits with an
+    # unrecognized code (rc 3), that rejected output must be REMOVED — never left active on disk.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-noprior-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)  # deliberately no verdict.json — no prior verdict
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fake(module, argv, timeout=120):
+        (rundir / "verdict.json").write_text(json.dumps({"verdict": "PASS", "run_id": "REJECTED"}))
+        return (3, "", "boom: unrecognized exit")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert r["isError"] and "without an accepted verdict" in r["content"][0]["text"], r
+        assert not (rundir / "verdict.json").exists(), "rejected verdict must be removed when no prior existed"
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

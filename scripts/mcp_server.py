@@ -486,15 +486,17 @@ def h_aggregate(args):
     fresh = bool(vf and vf.is_file()
                  and (before_mtime is None or vf.stat().st_mtime_ns != before_mtime))
     if rc not in (0, 1, 2) or not fresh:
-        # Rejected result — never leave a verdict from a run we did not accept. If aggregate
-        # DID write a verdict.json but exited with an unrecognized code (e.g. rc 3), remove that
-        # rejected output first, then restore the prior verdict from the stash. (Guarding the
-        # restore on `not vf.is_file()` would strand the prior verdict in .prev and leave the
-        # rejected one active.)
+        # Rejected result — never leave a verdict from a run we did not accept. Remove any newly
+        # written (rejected) verdict REGARDLESS of whether a prior existed, then restore the prior
+        # from the stash only when there was one. (A stash-guarded unlink would leave a rejected
+        # verdict active on a run that had no prior verdict.json.)
+        if vf is not None and vf.is_file():
+            try:
+                vf.unlink()
+            except OSError:
+                pass
         if stash is not None and stash.is_file():
             try:
-                if vf is not None and vf.is_file():
-                    vf.unlink()
                 stash.replace(vf)
             except OSError:
                 pass
