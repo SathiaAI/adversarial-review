@@ -297,7 +297,11 @@ def h_init(args):
     # unanchored substring search would match a run-YYYYMMDD-HHMMSS segment inside AR_RUN_DIR or
     # any ancestor directory rather than the run just created.
     run_id = None
-    m = re.search(r"(?m)^initialized\s+(\S+)", out or "")
+    # \S+ would stop at the first space, truncating a run path that contains one (a Windows
+    # "C:\\Users\\Jane Doe\\..." checkout, or a spaced AR_RUN_DIR) and yielding a basename that
+    # fails RUN_ID_RE — a null run_id on an otherwise-successful init. Capture up to the " (risk="
+    # status suffix panel.py appends, falling back to end-of-line if that suffix is ever absent.
+    m = re.search(r"(?m)^initialized\s+(.+?)(?:\s+\(risk=|\s*$)", out or "")
     if m:
         base = os.path.basename(m.group(1).rstrip("/\\"))
         if RUN_ID_RE.fullmatch(base):
@@ -471,44 +475,58 @@ def h_aggregate(args):
             stash = cand
         except OSError:
             before_mtime = vf.stat().st_mtime_ns
-    rc, out, err = _run_cli("aggregate", run_args)
-    body = (out or "").strip()
-    if err and err.strip():
-        body = (body + "\n" + err.strip()).strip()
-    if vf is None:  # the run dir may not have resolved before the call — resolve it now
-        try:
-            vf = _run_dir(run_args) / "verdict.json"
-        except ToolError:
-            vf = None
-    # aggregate exits 0 PASS / 1 FAIL / 2 BLOCKED for a real verdict and writes verdict.json as its
-    # final step. If it exited some other way (e.g. crashed on a malformed artifact) or did NOT
-    # write a fresh verdict, never surface a pre-existing verdict as success.
-    fresh = bool(vf and vf.is_file()
-                 and (before_mtime is None or vf.stat().st_mtime_ns != before_mtime))
-    if rc not in (0, 1, 2) or not fresh:
-        # Rejected result — never leave a verdict from a run we did not accept. Remove any newly
-        # written (rejected) verdict REGARDLESS of whether a prior existed, then restore the prior
-        # from the stash only when there was one. (A stash-guarded unlink would leave a rejected
-        # verdict active on a run that had no prior verdict.json.)
-        if vf is not None and vf.is_file():
+    # The moved-aside verdict is reconciled in the single finally below, which runs on EVERY exit
+    # path — the accepted return, the rejected return, and a raised invocation (e.g. _run_cli's
+    # subprocess timeout). Earlier revisions restored the prior in several separate branches and
+    # each added branch was a fresh chance to strand or leak one; routing every path through one
+    # settle point (the same try/finally shape h_panel_ingest and the http server already use)
+    # makes that class of bug unrepresentable. `accepted` flips true only once a fresh, well-formed
+    # verdict is actually in hand.
+    accepted = False
+    try:
+        rc, out, err = _run_cli("aggregate", run_args)
+        body = (out or "").strip()
+        if err and err.strip():
+            body = (body + "\n" + err.strip()).strip()
+        if vf is None:  # the run dir may not have resolved before the call — resolve it now
             try:
-                vf.unlink()
-            except OSError:
-                pass
-        if stash is not None and stash.is_file():
-            try:
-                stash.replace(vf)
-            except OSError:
-                pass
+                vf = _run_dir(run_args) / "verdict.json"
+            except ToolError:
+                vf = None
+        # aggregate exits 0 PASS / 1 FAIL / 2 BLOCKED for a real verdict and writes verdict.json as
+        # its final step. If it exited some other way (e.g. crashed on a malformed artifact) or did
+        # NOT write a fresh verdict, never surface a pre-existing verdict as success.
+        fresh = bool(vf and vf.is_file()
+                     and (before_mtime is None or vf.stat().st_mtime_ns != before_mtime))
+        if rc in (0, 1, 2) and fresh:
+            structured = json.loads(vf.read_text(encoding="utf-8"))
+            accepted = True  # only now: a fresh, parseable verdict is in hand
+            return _result(body or structured.get("verdict", ""), structured=structured)
         return _result(f"aggregate exited {rc} without an accepted verdict:\n{body}",
                        is_error=True)
-    if stash is not None and stash.is_file():  # success — discard the superseded verdict
-        try:
-            stash.unlink()
-        except OSError:
-            pass
-    structured = json.loads(vf.read_text(encoding="utf-8"))
-    return _result(body or structured.get("verdict", ""), structured=structured)
+    finally:
+        # Single settle point for the moved-aside verdict. On acceptance the stash is a superseded
+        # copy — discard it. On ANY non-acceptance (rejected exit, or a raised/timed-out invocation)
+        # remove whatever rejected verdict was written and restore the prior from the stash when
+        # there was one, so ar_get_verdict always sees either the freshly accepted verdict or the
+        # last accepted one — never a rejected/partial verdict, never a stranded .prev.
+        if accepted:
+            if stash is not None and stash.is_file():
+                try:
+                    stash.unlink()
+                except OSError:
+                    pass
+        else:
+            if vf is not None and vf.is_file():
+                try:
+                    vf.unlink()
+                except OSError:
+                    pass
+            if stash is not None and stash.is_file():
+                try:
+                    stash.replace(vf)
+                except OSError:
+                    pass
 
 
 def h_check_digest(args):
@@ -689,7 +707,9 @@ def _ok(id_, result):
 _INSTRUCTIONS = (
     "Drive an adversarial review: ar_init -> ar_gate_plan -> run your gates and "
     "ar_gate_record each -> ar_panel_assign -> ar_panel_prepare+ar_panel_ingest "
-    "(or ar_panel_run) -> ar_aggregate for the verdict. Launch this server with the "
+    "(or ar_panel_run) -> ar_panel_rebuttal when the run's rebuttal policy requires it "
+    "(high/critical findings; prepare+ingest its request bodies the same way) -> "
+    "ar_aggregate for the verdict. Launch this server with the "
     "repository under review as the working directory."
 )
 

@@ -5903,6 +5903,121 @@ def t_mcp_aggregate_removes_rejected_output_when_no_prior_verdict():
         os.chdir(cwd0)
 
 
+def t_mcp_init_run_id_parsed_from_path_with_spaces():
+    # A run path containing a space (a Windows "C:\\Users\\Jane Doe\\..." checkout, or a spaced
+    # AR_RUN_DIR) must still parse. \S+ truncated it at the first space, so an otherwise-successful
+    # init returned run_id=null; the parse now captures the full path up to the "  (risk=" suffix.
+    orig = _patch_run_cli(
+        0, out="initialized /tmp/review runs/.adversarial-review/run-20260830-131400  (risk=NORMAL)\n")
+    try:
+        r = mcpsrv.h_init({"risk": "NORMAL", "dev_providers": ["anthropic"],
+                           "diff_ref": "main...HEAD"})
+        assert r["structuredContent"]["run_id"] == "run-20260830-131400", r
+    finally:
+        mcpsrv._run_cli = orig
+
+
+def t_mcp_aggregate_restores_prior_verdict_when_invocation_raises():
+    # If the aggregate INVOCATION raises (e.g. _run_cli's 120s subprocess timeout -> ToolError) after
+    # the prior verdict was moved aside, the prior must be restored — not stranded in
+    # verdict.json.prev — and the error must propagate, so ar_get_verdict keeps returning the last
+    # accepted verdict.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-raise-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    (rundir / "verdict.json").write_text(
+        json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fake(module, argv, timeout=120):
+        raise mcpsrv.ToolError("aggregate timed out after 120s")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        raised = False
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except mcpsrv.ToolError:
+            raised = True
+        assert raised, "a raised aggregate invocation must propagate as ToolError"
+        restored = json.loads((rundir / "verdict.json").read_text())
+        assert restored["run_id"] == "run-20260101-010101" and restored["verdict"] == "PASS", restored
+        assert not (rundir / "verdict.json.prev").exists(), "prior verdict must not be stranded in .prev"
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
+def t_mcp_instructions_include_rebuttal_step():
+    # A host that follows _INSTRUCTIONS verbatim must be told to run ar_panel_rebuttal before
+    # ar_aggregate; omitting it deterministically BLOCKs runs whose rebuttal policy requires it.
+    instr = mcpsrv._INSTRUCTIONS
+    assert "ar_panel_rebuttal" in instr, instr
+    assert instr.index("ar_panel_rebuttal") < instr.index("ar_aggregate"), instr
+    # server/discover advertises the same instructions
+    assert mcpsrv._discover_result()["instructions"] == instr
+
+
+def t_mcp_aggregate_stash_invariant_across_exit_paths():
+    # Broader invariant over the WHOLE h_aggregate stash/restore path: after h_aggregate returns OR
+    # raises, verdict.json holds either the freshly accepted verdict (success) or the prior verdict
+    # (any rejection/raise), and verdict.json.prev is NEVER left on disk. Exercising the full matrix
+    # {prior, no-prior} x {accept, reject, raise} means every past AND future variant of the
+    # "some exit path forgot to reconcile the stash" bug lives in one cell of this test.
+    PRIOR = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    for has_prior in (True, False):
+        for outcome in ("accept", "reject", "raise"):
+            repo = Path(tempfile.mkdtemp(prefix="ar-agg-inv-"))
+            rundir = repo / ".adversarial-review" / "run-20260101-010101"
+            rundir.mkdir(parents=True)
+            vf = rundir / "verdict.json"
+            if has_prior:
+                vf.write_text(json.dumps(PRIOR))
+            cwd0 = os.getcwd()
+            os.chdir(repo)
+
+            def fake(module, argv, timeout=120, _o=outcome, _vf=vf):
+                if _o == "raise":
+                    raise mcpsrv.ToolError("aggregate timed out after 120s")
+                # accept and reject both WRITE a fresh verdict.json; only the exit code differs
+                _vf.write_text(json.dumps(
+                    {"verdict": "FAIL", "run_id": "run-20260101-010101"} if _o == "accept"
+                    else {"verdict": "PASS", "run_id": "REJECTED"}))
+                return (1, "FAIL", "") if _o == "accept" else (3, "", "boom")
+
+            orig = mcpsrv._run_cli
+            mcpsrv._run_cli = fake
+            try:
+                raised = False
+                r = None
+                try:
+                    r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+                except mcpsrv.ToolError:
+                    raised = True
+                case = (has_prior, outcome)
+                assert not (rundir / "verdict.json.prev").exists(), (case, "stray .prev")
+                if outcome == "accept":
+                    assert not raised and not r["isError"], (case, r)
+                    assert json.loads(vf.read_text())["run_id"] == "run-20260101-010101", case
+                elif outcome == "reject":
+                    assert not raised and r["isError"], (case, r)
+                    if has_prior:
+                        assert json.loads(vf.read_text()) == PRIOR, (case, "prior not restored")
+                    else:
+                        assert not vf.exists(), (case, "rejected output not removed")
+                else:  # raise
+                    assert raised, (case, "must propagate")
+                    if has_prior:
+                        assert json.loads(vf.read_text()) == PRIOR, (case, "prior not restored")
+                    else:
+                        assert not vf.exists(), (case, "no verdict should exist")
+            finally:
+                mcpsrv._run_cli = orig
+                os.chdir(cwd0)
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
