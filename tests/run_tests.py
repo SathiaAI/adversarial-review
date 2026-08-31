@@ -662,6 +662,24 @@ def t_attestation_unparseable_fallback():
     assert "DRIFT modified" in r.stdout and "blob.json" in r.stdout
 
 
+def t_check_digest_unreadable_verdict_is_cannot_verify_not_drift():
+    # A malformed verdict.json makes --check-digest unable to READ the stored attestation, so nothing
+    # is compared. That must exit 2 (cannot verify), never 1 (a definitive mismatch): the MCP wrapper
+    # maps exit 1 to {"intact": false}, so a crash-to-1 would report an unreadable verdict as detected
+    # tampering. (Codex, 39ddb1b.)
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+        "evidence": "reproduced", "reproduced": True, "regression_test": "t",
+        "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)                              # write verdict.json + attestation
+    sh(["aggregate.py", "--check-digest"], repo, expect=0)            # baseline: attestation intact
+    (run / "verdict.json").write_text("{ not valid json", encoding="utf-8")
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=2)        # cannot-verify, NOT drift (1)
+    assert "cannot read verdict.json" in (r.stdout + r.stderr), (r.stdout, r.stderr)
+
+
 # ---------------------------------------------------------------- E6-S1: detached signature
 
 def _stub_signer_env(extra=None):
@@ -5638,6 +5656,33 @@ def t_mcp_panel_timeout_scales_with_env():
                 os.environ[_k] = _v
 
 
+def t_mcp_panel_timeout_honors_policy_high_samples():
+    # high_samples can be set in the repo policy (.adversarial-review.yml), not only via
+    # AR_HIGH_SAMPLES. panel.py resolves env > policy > default, so the MCP wrapper timeout must
+    # budget for a policy-set value too — otherwise a policy-driven corroboration sweep is killed
+    # early. A set env var still wins over the policy.
+    repo = Path(tempfile.mkdtemp(prefix="ar-timeout-pol-"))
+    (repo / ".adversarial-review.yml").write_text("high_samples: 25\n", encoding="utf-8")
+    old_t = os.environ.get("AR_TIMEOUT_S")
+    old_h = os.environ.get("AR_HIGH_SAMPLES")
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        os.environ["AR_TIMEOUT_S"] = "240"
+        os.environ.pop("AR_HIGH_SAMPLES", None)           # env unset -> policy value must be honored
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (8 + 2 * 24) * 6 + 600), \
+            mcpsrv._panel_timeout()
+        os.environ["AR_HIGH_SAMPLES"] = "1"               # env set -> wins over the policy's 25
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 8 * 6 + 600), mcpsrv._panel_timeout()
+    finally:
+        os.chdir(cwd0)
+        for _k, _v in (("AR_TIMEOUT_S", old_t), ("AR_HIGH_SAMPLES", old_h)):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
+
 def t_mcp_panel_run_validates_catalog_before_writing_context():
     # A rejected ar_panel_run (escaping catalog_file) must NOT mutate the run's audit record:
     # catalog_file is validated BEFORE context.md is overwritten, so completed reviewer reports are
@@ -5661,6 +5706,46 @@ def t_mcp_panel_run_validates_catalog_before_writing_context():
         assert raised, "an escaping catalog_file must be rejected"
         assert ctx.read_text() == ORIGINAL, "a rejected ar_panel_run must not overwrite context.md"
     finally:
+        os.chdir(cwd0)
+
+
+def t_mcp_panel_run_validates_catalog_loadable_before_writing_context():
+    # A catalog_file that is CONFINED but not usable (missing, malformed, or empty after filtering)
+    # must be rejected BEFORE context.md is overwritten — panel.py only discovers it when it runs
+    # (after the write), which would pair completed reviewer reports with a new context on a call the
+    # host was told failed. (Codex, 39ddb1b — the fix-7 reorder only checked confinement.)
+    repo = Path(tempfile.mkdtemp(prefix="ar-panelrun-catload-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    ctx = rundir / "context.md"
+    ORIGINAL = "ORIGINAL CONTEXT — completed reviewer reports depend on this\n"
+    bad_catalogs = {
+        "missing.json": None,                          # never created -> missing file
+        "malformed.json": "{ this is not valid json",  # present but unreadable as JSON
+        "empty.json": json.dumps({"data": []}),        # valid JSON but empty after filtering
+    }
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    # If validation is skipped the code reaches the subprocess; make that a loud failure so the ONLY
+    # way context.md survives is validating the catalog before the write.
+    orig = _patch_run_cli(1, err="panel must not be reached for an unusable catalog")
+    try:
+        for name, body in bad_catalogs.items():
+            ctx.write_text(ORIGINAL, encoding="utf-8")
+            if body is not None:
+                (repo / name).write_text(body, encoding="utf-8")
+            raised = False
+            try:
+                mcpsrv.h_panel_run({"run": "run-20260101-010101",
+                                    "context": "NEW REPLACEMENT CONTEXT", "catalog_file": name})
+            except mcpsrv.ToolError as e:
+                raised = True
+                assert "catalog_file" in str(e), (name, e)
+            assert raised, f"a confined but unusable catalog_file must be rejected: {name}"
+            assert ctx.read_text() == ORIGINAL, \
+                f"a rejected ar_panel_run must not overwrite context.md: {name}"
+    finally:
+        mcpsrv._run_cli = orig
         os.chdir(cwd0)
 
 
@@ -5714,11 +5799,19 @@ def t_mcp_catalog_file_confined_cross_platform():
 
 def t_mcp_panel_run_forwards_catalog_file():
     # ar_panel_run forwards the confined catalog_file so a reviewer substitution can resolve
-    # when the live catalog is unavailable; a bad path is rejected here too.
+    # when the live catalog is unavailable; a bad path is rejected here too. The catalog must be a
+    # LOADABLE model catalog now (see t_mcp_panel_run_validates_catalog_loadable_before_writing_context),
+    # so point it at a real one on disk.
+    repo = Path(tempfile.mkdtemp(prefix="ar-panelrun-fwd-"))
+    (repo / "catalogs").mkdir()
+    (repo / "catalogs" / "cat.json").write_text(
+        json.dumps({"data": [{"id": "openai/gpt-4o"}]}), encoding="utf-8")
     cap = []
     orig_cli = _patch_run_cli(0, out="ok", capture=cap)
     orig_ctx = mcpsrv._write_context
     mcpsrv._write_context = lambda run_args, ctx: "context.md"
+    cwd0 = os.getcwd()
+    os.chdir(repo)
     try:
         mcpsrv.h_panel_run({"context": "diff", "catalog_file": "catalogs/cat.json"})
         assert "--catalog-file" in cap[-1]["argv"] and "catalogs/cat.json" in cap[-1]["argv"], cap
@@ -5728,6 +5821,7 @@ def t_mcp_panel_run_forwards_catalog_file():
         except mcpsrv.ToolError:
             pass
     finally:
+        os.chdir(cwd0)
         mcpsrv._run_cli = orig_cli
         mcpsrv._write_context = orig_ctx
 

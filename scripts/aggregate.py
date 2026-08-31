@@ -210,7 +210,17 @@ def check_digest(run):
     if not vpath.exists():
         print("no verdict.json in run — aggregate first")
         sys.exit(2)
-    stored = read_json(vpath).get("attestation")
+    try:
+        stored = read_json(vpath).get("attestation")
+    except (OSError, ValueError) as e:
+        # A malformed/unreadable verdict.json means the stored attestation cannot even be READ, so
+        # nothing was compared: that is "cannot verify" (exit 2), never a definitive mismatch (exit
+        # 1). Exit 1 is reserved for a recomputed attestation that DID compare and differed — the MCP
+        # wrapper maps exit 1 to {"intact": false}, so leaking a read failure as 1 would report an
+        # unreadable verdict as detected tampering.
+        print(f"cannot read verdict.json ({e}) — re-aggregate before checking the digest",
+              file=sys.stderr)
+        sys.exit(2)
     if not stored:
         print("verdict.json carries no attestation (computed before #5) — re-aggregate")
         sys.exit(2)

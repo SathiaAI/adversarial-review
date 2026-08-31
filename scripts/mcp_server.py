@@ -184,6 +184,42 @@ def _add_confined_catalog(args, argv):
     argv.extend(["--catalog-file", cf])
 
 
+def _require_loadable_catalog(cf):
+    """A confined catalog_file forwarded by h_panel_run must also be LOADABLE before context.md is
+    overwritten. panel.py loads it lazily (on reviewer substitution), AFTER the write, so a confined-
+    but-unusable catalog (missing, unreadable, malformed, or empty after family filtering) would
+    leave completed reviewer reports paired with a freshly-written context on a call the host was
+    told failed. Validate with panel.py's OWN loader so the check never drifts from the run's filter;
+    a file argument takes load_catalog's no-network path. cf is None when no catalog was supplied."""
+    if cf is None:
+        return
+    try:
+        from panel import load_catalog
+        load_catalog(cf)
+    except (Exception, SystemExit):  # SystemExit = panel's die() on an empty-after-filter catalog
+        raise ToolError("catalog_file is not a usable model catalog "
+                        "(missing, unreadable, malformed, or empty after filtering)")
+
+
+def _resolved_high_samples():
+    """The corroboration sample count panel.py will actually use, resolved with panel.py's own
+    precedence: AR_HIGH_SAMPLES env var > policy ``high_samples`` (.adversarial-review.yml/.json) >
+    default "1". Returned unparsed for the caller to int()+clamp. Never raises and never exits — a
+    malformed policy makes panel.py itself die when it runs, so here (merely sizing a subprocess
+    timeout) we fall back to the default rather than take the server down."""
+    env = os.environ.get("AR_HIGH_SAMPLES", "")
+    if env != "":            # matches resolve_setting: a set, non-empty env var wins over policy
+        return env
+    try:
+        from _common import load_policy
+        pol = load_policy()  # reads the policy file from the server's cwd (the repo under review)
+    except (Exception, SystemExit):  # SystemExit = load_policy's die() on a malformed policy
+        return "1"
+    if pol and "high_samples" in pol["data"]:
+        return pol["data"]["high_samples"]
+    return "1"
+
+
 def _panel_timeout():
     """Subprocess wrapper timeout for a reviewer-calling panel run. panel.py can spend up to
     EIGHT AR_TIMEOUT_S request budgets on a single role before giving up: run_one_role makes two
@@ -198,10 +234,12 @@ def _panel_timeout():
         req = max(1, int(os.environ.get("AR_TIMEOUT_S", "240")))
     except (TypeError, ValueError):
         req = 240
-    # AR_HIGH_SAMPLES is capped at 25 by panel.py (MAX_HIGH_SAMPLES); clamp the same way so an
-    # out-of-range value cannot inflate the deadline past what a real run could ever use.
+    # Resolve high_samples the way panel.py does — env var > policy `high_samples` > default — so a
+    # policy-driven corroboration sweep with no env var set is budgeted for, not killed early. The
+    # value is capped at 25 by panel.py (MAX_HIGH_SAMPLES); clamp the same way so an out-of-range
+    # value cannot inflate the deadline past what a real run could ever use.
     try:
-        hs = int(os.environ.get("AR_HIGH_SAMPLES", "1"))
+        hs = int(_resolved_high_samples())
     except (TypeError, ValueError):
         hs = 1
     hs = max(1, min(hs, 25))
@@ -420,6 +458,9 @@ def h_panel_run(args):
     # its mandated substitute — without this it would attempt the unavailable live catalog and block.
     catalog_argv = []
     _add_confined_catalog(args, catalog_argv)
+    # Confinement proves only WHERE the catalog is; also require it to be LOADABLE before persisting
+    # context, so a confined-but-unusable catalog cannot mutate the audit record on a rejected call.
+    _require_loadable_catalog(args.get("catalog_file"))
     cf = _write_context(run_args, context)
     argv = ["run"] + run_args + ["--context-file", cf] + catalog_argv
     if args.get("force"):
