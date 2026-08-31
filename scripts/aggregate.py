@@ -211,7 +211,7 @@ def check_digest(run):
         print("no verdict.json in run — aggregate first")
         sys.exit(2)
     try:
-        stored = read_json(vpath).get("attestation")
+        verdict = read_json(vpath)
     except (OSError, ValueError) as e:
         # A malformed/unreadable verdict.json means the stored attestation cannot even be READ, so
         # nothing was compared: that is "cannot verify" (exit 2), never a definitive mismatch (exit
@@ -221,7 +221,16 @@ def check_digest(run):
         print(f"cannot read verdict.json ({e}) — re-aggregate before checking the digest",
               file=sys.stderr)
         sys.exit(2)
-    if not stored:
+    if not isinstance(verdict, dict):
+        # Valid JSON that is not an object (e.g. a list) has no attestation to compare — that is
+        # cannot-verify (exit 2), not a crash that would leak to the wrapper as exit 1 "drifted".
+        print("verdict.json is not a JSON object — re-aggregate before checking the digest",
+              file=sys.stderr)
+        sys.exit(2)
+    stored = verdict.get("attestation")
+    if not stored or not isinstance(stored, dict):
+        # Missing, empty, OR a present-but-wrong-shape attestation (a truthy non-dict would otherwise
+        # crash on stored.get(...) below and leak as exit 1). All are "cannot verify" (exit 2).
         print("verdict.json carries no attestation (computed before #5) — re-aggregate")
         sys.exit(2)
     att = compute_attestation(run)

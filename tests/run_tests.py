@@ -680,6 +680,29 @@ def t_check_digest_unreadable_verdict_is_cannot_verify_not_drift():
     assert "cannot read verdict.json" in (r.stdout + r.stderr), (r.stdout, r.stderr)
 
 
+def t_check_digest_nonobject_verdict_or_attestation_is_cannot_verify():
+    # fix-8's guard caught an unreadable/malformed verdict.json, but a valid JSON that is not an
+    # object (e.g. []) makes read_json(...).get() raise AttributeError, and a truthy non-dict
+    # attestation crashes later at stored.get(...) — both leaked to the MCP wrapper as exit 1
+    # "drifted". Both must be cannot-verify (exit 2). (CodeRabbit, 356caff.)
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+        "evidence": "reproduced", "reproduced": True, "regression_test": "t",
+        "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)                             # real verdict.json + attestation
+    sh(["aggregate.py", "--check-digest"], repo, expect=0)           # baseline: intact
+    vf = run / "verdict.json"
+    good = read(vf)
+    vf.write_text(json.dumps([1, 2, 3]), encoding="utf-8")           # valid JSON, not an object
+    sh(["aggregate.py", "--check-digest"], repo, expect=2)           # not exit 1 (AttributeError)
+    bad = dict(good)
+    bad["attestation"] = "not-a-dict"                                # truthy, wrong-shape attestation
+    vf.write_text(json.dumps(bad), encoding="utf-8")
+    sh(["aggregate.py", "--check-digest"], repo, expect=2)           # not exit 1 (crash at stored.get)
+
+
 # ---------------------------------------------------------------- E6-S1: detached signature
 
 def _stub_signer_env(extra=None):
