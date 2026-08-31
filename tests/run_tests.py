@@ -5712,6 +5712,42 @@ def t_mcp_aggregate_rejects_nonobject_fresh_verdict():
         os.chdir(cwd0)
 
 
+def t_mcp_aggregate_rejects_malformed_fresh_verdict():
+    # aggregate can write a FRESH verdict.json that is not even valid JSON (a truncated/corrupt write
+    # while still exiting 0/1/2). An unguarded json.loads() would RAISE here and escape h_aggregate
+    # PAST the isError return — a crash, not a clean rejected result. It must be handled as a rejected
+    # outcome (isError) with the prior restored, like check_digest's read/parse guard. (CodeRabbit,
+    # 7da1420.)
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-badjson-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    vf = rundir / "verdict.json"
+    prior = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    vf.write_text(json.dumps(prior))
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def writes_malformed(module, argv, timeout=120):
+        # h_aggregate moved the prior aside to .prev; aggregate writes a FRESH but corrupt verdict.
+        vf.write_text("{ not valid json", encoding="utf-8")
+        return (0, "PASS", "")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = writes_malformed
+    try:
+        raised = None
+        try:
+            r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except Exception as e:  # noqa: BLE001 — must NOT raise; a raise is the very bug under test
+            raised = e
+        assert raised is None, f"h_aggregate must not raise on malformed fresh verdict JSON: {raised!r}"
+        assert r["isError"] and "without an accepted verdict" in r["content"][0]["text"], r
+        assert json.loads(vf.read_text()) == prior, vf.read_text()   # prior restored, not discarded
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
 def t_mcp_aggregate_preserves_prior_when_snapshot_fails():
     # If the prior verdict can be neither moved aside (a stale .prev DIRECTORY blocks vf.replace) NOR
     # byte-snapshotted (it is unreadable), h_aggregate has no way to restore it and running aggregate

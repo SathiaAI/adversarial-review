@@ -568,10 +568,18 @@ def h_aggregate(args):
         fresh = bool(vf and vf.is_file()
                      and (before_mtime is None or vf.stat().st_mtime_ns != before_mtime))
         if rc in (0, 1, 2) and fresh:
-            structured = json.loads(vf.read_text(encoding="utf-8"))
-            # A fresh file that is valid but non-object JSON (e.g. []) is NOT a verdict: accepting it
-            # would return a bogus list as structuredContent or crash at structured.get(), and the
-            # settle step would discard the prior. Only a JSON object is a verdict. (Codex, 52c686f.)
+            try:
+                structured = json.loads(vf.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                # A fresh file that is unreadable or MALFORMED JSON is not a usable verdict. Letting
+                # json.loads raise here would crash h_aggregate PAST the isError return below, rather
+                # than surface a clean rejected result (the settle step still restores the prior).
+                # Guard read/parse the same way check_digest does. (CodeRabbit, 7da1420.)
+                structured = None
+            # A fresh file that is valid but non-object JSON (e.g. []) is likewise NOT a verdict:
+            # accepting it would return a bogus list as structuredContent or crash at structured.get(),
+            # and the settle step would discard the prior. Only a JSON object is a verdict. (Codex,
+            # 52c686f.)
             if isinstance(structured, dict):
                 accepted = True  # only now: a fresh, well-formed (object) verdict is in hand
                 return _result(body or structured.get("verdict", ""), structured=structured)
