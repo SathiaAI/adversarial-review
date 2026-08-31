@@ -187,9 +187,12 @@ Re-aggregating an untouched run reproduces the digest bit-for-bit.
 `aggregate.py --check-digest` recomputes it against the stored value: exit 0 intact;
 exit 1 with each drifted artifact named `DRIFT modified|added|removed`; exit 2 when the
 digest cannot be checked at all — no verdict, an unreadable/malformed or non-object
-verdict.json, or no usable (dict-shaped) attestation. Exit 1 is reserved for a real
-recomputed mismatch, never a read/parse/shape failure, so a host that treats exit 1 as
-"tampered" is never misled by an uncheckable run. Third parties can verify a shipped run
+verdict.json, or an attestation that is not a usable object: not a dict, or a dict that
+lacks a string `digest` or a dict `files` (e.g. a legacy record computed before #5 — its
+absent/non-string digest would otherwise fall through to the exit-1 mismatch path, and a
+non-dict `files` would crash the drift report and leak as exit 1). Exit 1 is reserved for
+a real recomputed mismatch, never a read/parse/shape failure, so a host that treats exit 1
+as "tampered" is never misled by an uncheckable run. Third parties can verify a shipped run
 directory the same way.
 
 Optionally, `aggregate.py --sign` produces a **detached cryptographic signature over the

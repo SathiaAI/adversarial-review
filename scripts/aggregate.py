@@ -233,6 +233,16 @@ def check_digest(run):
         # crash on stored.get(...) below and leak as exit 1). All are "cannot verify" (exit 2).
         print("verdict.json carries no attestation (computed before #5) — re-aggregate")
         sys.exit(2)
+    if not isinstance(stored.get("digest"), str) or not isinstance(stored.get("files"), dict):
+        # `attestation` being a dict is not enough: the equality below needs a string `digest` to
+        # compare, and the drift report needs a dict `files` for set()/`.get()`. A record lacking a
+        # string digest (e.g. legacy, "computed before #5") makes that equality false and falls through
+        # to the exit-1 mismatch path — misreporting an UNVERIFIABLE record as drift — and a non-dict
+        # `files` makes set(old)/old.get() raise and leak to the wrapper as exit 1 too. Neither is a
+        # real recomputed mismatch, so both are cannot-verify (exit 2), never 1.
+        print("verdict.json attestation lacks a string digest or dict files (computed before #5, or "
+              "malformed) — re-aggregate before checking the digest", file=sys.stderr)
+        sys.exit(2)
     att = compute_attestation(run)
     if att["digest"] == stored.get("digest"):
         print(f"attestation OK: sha256 {att['digest']} over {att['inputs']} artifacts")

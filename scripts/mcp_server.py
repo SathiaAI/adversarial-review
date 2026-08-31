@@ -532,12 +532,18 @@ def h_aggregate(args):
             # Could not move the prior aside. Keep an mtime for the freshness check AND snapshot the
             # prior's bytes: an unchanged mtime is NOT proof the file is intact (a coarse-granularity
             # filesystem can leave st_mtime_ns unchanged on a same-quantum overwrite), so the restore
-            # below rewrites these bytes rather than trusting mtime.
-            before_mtime = vf.stat().st_mtime_ns
+            # below rewrites these bytes rather than trusting mtime. If the prior can be neither moved
+            # aside NOR read, there is no snapshot to restore from and letting aggregate run would
+            # overwrite the only copy — abort before aggregation so the prior is never lost (otherwise
+            # the settle step's "no prior existed" branch, seeing stash and stash_bytes both None,
+            # would unlink it even on a mere aggregate timeout). (Codex, 52c686f.)
             try:
+                before_mtime = vf.stat().st_mtime_ns
                 stash_bytes = vf.read_bytes()
             except OSError:
-                stash_bytes = None
+                raise ToolError("cannot snapshot the prior verdict.json to guarantee a restore "
+                                "(it could be neither moved aside nor read) — refusing to aggregate "
+                                "so a prior verdict is never lost")
     # The moved-aside verdict is reconciled in the single finally below, which runs on EVERY exit
     # path — the accepted return, the rejected return, and a raised invocation (e.g. _run_cli's
     # subprocess timeout). Earlier revisions restored the prior in several separate branches and
@@ -563,8 +569,12 @@ def h_aggregate(args):
                      and (before_mtime is None or vf.stat().st_mtime_ns != before_mtime))
         if rc in (0, 1, 2) and fresh:
             structured = json.loads(vf.read_text(encoding="utf-8"))
-            accepted = True  # only now: a fresh, parseable verdict is in hand
-            return _result(body or structured.get("verdict", ""), structured=structured)
+            # A fresh file that is valid but non-object JSON (e.g. []) is NOT a verdict: accepting it
+            # would return a bogus list as structuredContent or crash at structured.get(), and the
+            # settle step would discard the prior. Only a JSON object is a verdict. (Codex, 52c686f.)
+            if isinstance(structured, dict):
+                accepted = True  # only now: a fresh, well-formed (object) verdict is in hand
+                return _result(body or structured.get("verdict", ""), structured=structured)
         return _result(f"aggregate exited {rc} without an accepted verdict:\n{body}",
                        is_error=True)
     finally:

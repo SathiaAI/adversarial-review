@@ -703,6 +703,37 @@ def t_check_digest_nonobject_verdict_or_attestation_is_cannot_verify():
     sh(["aggregate.py", "--check-digest"], repo, expect=2)           # not exit 1 (crash at stored.get)
 
 
+def t_check_digest_attestation_inner_shape_is_cannot_verify_not_drift():
+    # fix-9 proved `attestation` is a non-empty dict, but check_digest still trusted its INNER shape.
+    # A stored attestation dict that omits `digest`/`files`, or carries a non-string `digest` or a
+    # non-dict `files`, is not a real recomputed mismatch: the digest equality turns false and falls
+    # through to exit 1 (misreporting an UNVERIFIABLE / legacy "computed before #5" record as drift),
+    # or set(old)/old.get() crashes on a non-dict `files` and leaks as exit 1. All are cannot-verify
+    # (exit 2). (CodeRabbit, 52c686f.)
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+        "evidence": "reproduced", "reproduced": True, "regression_test": "t",
+        "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)                             # real verdict.json + attestation
+    sh(["aggregate.py", "--check-digest"], repo, expect=0)           # baseline: intact
+    vf = run / "verdict.json"
+    good = read(vf)
+    assert isinstance(good.get("attestation"), dict), good           # fixture sanity
+
+    def check(mutate):
+        bad = json.loads(json.dumps(good))                           # deep copy of the good verdict
+        mutate(bad["attestation"])
+        vf.write_text(json.dumps(bad), encoding="utf-8")
+        sh(["aggregate.py", "--check-digest"], repo, expect=2)       # cannot-verify, never 1/crash/0
+
+    check(lambda a: a.pop("digest", None))                           # dict attestation, no digest
+    check(lambda a: a.update({"digest": 12345}))                     # non-string digest
+    check(lambda a: a.update({"digest": "0" * 64, "files": ["x"]}))  # non-dict files reaches the crash
+    check(lambda a: a.pop("files", None))                            # dict attestation, no files
+
+
 # ---------------------------------------------------------------- E6-S1: detached signature
 
 def _stub_signer_env(extra=None):
@@ -5649,6 +5680,80 @@ def t_mcp_aggregate_rejects_stale_verdict():
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
+
+
+def t_mcp_aggregate_rejects_nonobject_fresh_verdict():
+    # aggregate can write a FRESH verdict.json that is valid JSON but NOT an object (e.g. []). It must
+    # never be accepted: accepting flips `accepted` true, so the settle step discards the prior, and
+    # the return either surfaces a bogus list as structuredContent or crashes at structured.get().
+    # A non-object fresh verdict is a rejected outcome — the prior must be restored. (Codex, 52c686f.)
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-nonobj-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    vf = rundir / "verdict.json"
+    prior = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    vf.write_text(json.dumps(prior))
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def writes_nonobject(module, argv, timeout=120):
+        # h_aggregate moved the prior aside to .prev; aggregate writes a FRESH but non-object verdict.
+        vf.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+        return (0, "PASS", "")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = writes_nonobject
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert r["isError"] and "without an accepted verdict" in r["content"][0]["text"], r
+        assert json.loads(vf.read_text()) == prior, vf.read_text()   # prior restored, not discarded
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
+def t_mcp_aggregate_preserves_prior_when_snapshot_fails():
+    # If the prior verdict can be neither moved aside (a stale .prev DIRECTORY blocks vf.replace) NOR
+    # byte-snapshotted (it is unreadable), h_aggregate has no way to restore it and running aggregate
+    # would overwrite the only copy. It must ABORT (ToolError) before aggregation and leave the prior
+    # intact — NOT fall into the settle step's "no prior existed" branch, which unlinks the prior even
+    # on a mere aggregate timeout. (Codex, 52c686f.)
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-snap-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    vf = rundir / "verdict.json"
+    prior = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    vf.write_text(json.dumps(prior))
+    (rundir / "verdict.json.prev").mkdir()          # stale .prev DIRECTORY -> vf.replace() raises
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def crash_no_write(module, argv, timeout=120):  # like a timeout: does NOT write verdict.json
+        return (1, "", "Traceback: timeout")
+
+    RB = type(vf)
+    orig_rb = RB.read_bytes
+
+    def unreadable(self):                           # the prior verdict cannot be read either
+        if self.name == "verdict.json":
+            raise OSError("unreadable prior verdict")
+        return orig_rb(self)
+
+    orig_cli = mcpsrv._run_cli
+    RB.read_bytes = unreadable
+    mcpsrv._run_cli = crash_no_write
+    raised = False
+    try:
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except mcpsrv.ToolError:
+            raised = True
+    finally:
+        RB.read_bytes = orig_rb
+        mcpsrv._run_cli = orig_cli
+        os.chdir(cwd0)
+    assert raised, "h_aggregate must abort (ToolError) when the prior cannot be snapshotted"
+    assert json.loads(vf.read_text()) == prior, vf.read_text()      # prior left intact
 
 
 def t_mcp_panel_timeout_scales_with_env():
