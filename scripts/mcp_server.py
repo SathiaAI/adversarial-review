@@ -189,14 +189,23 @@ def _panel_timeout():
     EIGHT AR_TIMEOUT_S request budgets on a single role before giving up: run_one_role makes two
     outer attempts, each call_reviewer may issue one corrective-JSON retry (2 requests), and a
     failed role is then substituted to another family and the whole sequence repeats (2 × 2 × 2).
-    Across up to 6 roles (SENSITIVE/CRITICAL) run sequentially that is 8 × 6 request budgets, so
-    derive the outer deadline from that — never from an under-count — so a legitimately slow but
-    valid run is not killed before panel.py's own retry/substitution protocol finishes."""
+    On top of that, multi-sample corroboration (E4-S3) resamples each flagged role up to
+    AR_HIGH_SAMPLES times — (hs-1) extra samples, each a call plus one corrective retry (×2). Across
+    up to 6 roles (SENSITIVE/CRITICAL) run sequentially that is (8 + 2·(hs-1)) × 6 request budgets,
+    so derive the outer deadline from that — never from an under-count — so a legitimately slow but
+    valid run (including a large corroboration sweep) is not killed before panel.py finishes."""
     try:
         req = max(1, int(os.environ.get("AR_TIMEOUT_S", "240")))
     except (TypeError, ValueError):
         req = 240
-    return max(1800, req * 8 * 6 + 600)
+    # AR_HIGH_SAMPLES is capped at 25 by panel.py (MAX_HIGH_SAMPLES); clamp the same way so an
+    # out-of-range value cannot inflate the deadline past what a real run could ever use.
+    try:
+        hs = int(os.environ.get("AR_HIGH_SAMPLES", "1"))
+    except (TypeError, ValueError):
+        hs = 1
+    hs = max(1, min(hs, 25))
+    return max(1800, req * (8 + 2 * (hs - 1)) * 6 + 600)
 
 
 def _run_cli(module, argv, timeout=120):
@@ -402,13 +411,17 @@ def h_panel_prepare(args):
 def h_panel_run(args):
     run_args = _safe_run(args)
     context = _req_str(args, "context")
+    # Validate the optional catalog_file BEFORE persisting context: _write_context overwrites
+    # <run>/context.md, and a rejected call must not mutate the audit record (which would leave any
+    # completed reviewer reports paired with a freshly-overwritten context). Collect the confined
+    # catalog args first so an escaping value raises before the write; the CLI argv is then built in
+    # the original order. Forward the same confined catalog the assign step may have used: when the
+    # router cannot serve /models, a reviewer failure makes panel.py run reload the catalog to pick
+    # its mandated substitute — without this it would attempt the unavailable live catalog and block.
+    catalog_argv = []
+    _add_confined_catalog(args, catalog_argv)
     cf = _write_context(run_args, context)
-    argv = ["run"] + run_args + ["--context-file", cf]
-    # Forward the same confined catalog the assign step may have used: when the router
-    # cannot serve /models, a reviewer failure makes panel.py run reload the catalog to pick
-    # its mandated substitute — without this it would attempt the unavailable live catalog
-    # and block instead of substituting.
-    _add_confined_catalog(args, argv)
+    argv = ["run"] + run_args + ["--context-file", cf] + catalog_argv
     if args.get("force"):
         argv.append("--force")
     return _cli_result("panel", argv, timeout=_panel_timeout())
@@ -468,13 +481,22 @@ def h_aggregate(args):
     # If the move cannot be performed, fall back to an mtime check rather than losing the signal.
     stash = None
     before_mtime = None
+    stash_bytes = None
     if vf is not None and vf.is_file():
         cand = vf.parent / (vf.name + ".prev")
         try:
             vf.replace(cand)
             stash = cand
         except OSError:
+            # Could not move the prior aside. Keep an mtime for the freshness check AND snapshot the
+            # prior's bytes: an unchanged mtime is NOT proof the file is intact (a coarse-granularity
+            # filesystem can leave st_mtime_ns unchanged on a same-quantum overwrite), so the restore
+            # below rewrites these bytes rather than trusting mtime.
             before_mtime = vf.stat().st_mtime_ns
+            try:
+                stash_bytes = vf.read_bytes()
+            except OSError:
+                stash_bytes = None
     # The moved-aside verdict is reconciled in the single finally below, which runs on EVERY exit
     # path — the accepted return, the rejected return, and a raised invocation (e.g. _run_cli's
     # subprocess timeout). Earlier revisions restored the prior in several separate branches and
@@ -517,26 +539,36 @@ def h_aggregate(args):
                 except OSError:
                     pass
         else:
-            # Remove a rejected/partial verdict, but NEVER the untouched prior. In the mtime-fallback
-            # branch (stash is None because vf.replace failed) the prior verdict is still at vf; an
-            # unchanged mtime proves aggregate did not overwrite it, so deleting it here would lose
-            # the last accepted verdict with no stash to restore from.
-            if vf is not None and vf.is_file():
-                try:
-                    untouched_prior = (stash is None and before_mtime is not None
-                                       and vf.stat().st_mtime_ns == before_mtime)
-                except OSError:
-                    untouched_prior = False
-                if not untouched_prior:
+            # Non-acceptance: never surface a rejected/partial verdict, never lose the prior.
+            if stash is not None:
+                # Prior was moved aside to .prev — drop any rejected verdict aggregate wrote, then
+                # restore the prior from the stash.
+                if vf is not None and vf.is_file():
                     try:
                         vf.unlink()
                     except OSError:
                         pass
-            if stash is not None and stash.is_file():
-                try:
-                    stash.replace(vf)
-                except OSError:
-                    pass
+                if stash.is_file():
+                    try:
+                        stash.replace(vf)
+                    except OSError:
+                        pass
+            elif stash_bytes is not None:
+                # The aside-move failed, so we snapshotted the prior's bytes instead. Rewrite them
+                # verbatim, overwriting any rejected verdict aggregate may have written in the same
+                # mtime quantum — this restore never trusts mtime.
+                if vf is not None:
+                    try:
+                        vf.write_bytes(stash_bytes)
+                    except OSError:
+                        pass
+            else:
+                # No prior verdict existed — just remove any rejected verdict aggregate wrote.
+                if vf is not None and vf.is_file():
+                    try:
+                        vf.unlink()
+                    except OSError:
+                        pass
 
 
 def h_check_digest(args):

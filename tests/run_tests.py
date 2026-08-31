@@ -5611,19 +5611,57 @@ def t_mcp_aggregate_rejects_stale_verdict():
 
 
 def t_mcp_panel_timeout_scales_with_env():
-    # The panel-run wrapper timeout scales with AR_TIMEOUT_S so a valid slow run isn't killed
-    # before panel.py's own retry protocol finishes.
-    old = os.environ.get("AR_TIMEOUT_S")
+    # The panel-run wrapper timeout scales with AR_TIMEOUT_S AND AR_HIGH_SAMPLES, so a valid slow
+    # run — including a multi-sample corroboration sweep — isn't killed before panel.py finishes.
+    old_t = os.environ.get("AR_TIMEOUT_S")
+    old_h = os.environ.get("AR_HIGH_SAMPLES")
     try:
+        os.environ.pop("AR_HIGH_SAMPLES", None)  # hs defaults to 1 -> base 8 request budgets/role
         os.environ["AR_TIMEOUT_S"] = "240"
         assert mcpsrv._panel_timeout() == max(1800, 240 * 8 * 6 + 600) > 300
         os.environ["AR_TIMEOUT_S"] = "garbage"
         assert mcpsrv._panel_timeout() == max(1800, 240 * 8 * 6 + 600)  # bad value -> default
+        # Corroboration budget: hs samples add (hs-1) extra samples/role, each a call + retry (x2).
+        os.environ["AR_TIMEOUT_S"] = "240"
+        os.environ["AR_HIGH_SAMPLES"] = "25"
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (8 + 2 * 24) * 6 + 600)
+        assert mcpsrv._panel_timeout() > max(1800, 240 * 8 * 6 + 600)  # strictly larger than base
+        os.environ["AR_HIGH_SAMPLES"] = "1"
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 8 * 6 + 600)  # hs=1 == base
+        os.environ["AR_HIGH_SAMPLES"] = "999"  # clamped to the 25 cap, never unbounded
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (8 + 2 * 24) * 6 + 600)
     finally:
-        if old is None:
-            os.environ.pop("AR_TIMEOUT_S", None)
-        else:
-            os.environ["AR_TIMEOUT_S"] = old
+        for _k, _v in (("AR_TIMEOUT_S", old_t), ("AR_HIGH_SAMPLES", old_h)):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
+
+def t_mcp_panel_run_validates_catalog_before_writing_context():
+    # A rejected ar_panel_run (escaping catalog_file) must NOT mutate the run's audit record:
+    # catalog_file is validated BEFORE context.md is overwritten, so completed reviewer reports are
+    # never left paired with a freshly-written context on a call the host was told failed.
+    repo = Path(tempfile.mkdtemp(prefix="ar-panelrun-cat-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    ctx = rundir / "context.md"
+    ORIGINAL = "ORIGINAL CONTEXT — completed reviewer reports depend on this\n"
+    ctx.write_text(ORIGINAL, encoding="utf-8")
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        raised = False
+        try:
+            mcpsrv.h_panel_run({"run": "run-20260101-010101", "context": "NEW REPLACEMENT CONTEXT",
+                                "catalog_file": "../../etc/passwd"})
+        except mcpsrv.ToolError as e:
+            raised = True
+            assert "catalog_file" in str(e), e
+        assert raised, "an escaping catalog_file must be rejected"
+        assert ctx.read_text() == ORIGINAL, "a rejected ar_panel_run must not overwrite context.md"
+    finally:
+        os.chdir(cwd0)
 
 
 def t_mcp_rebuttal_tool_exposed():
@@ -6054,6 +6092,40 @@ def t_mcp_aggregate_preserves_prior_when_stash_move_fails():
         finally:
             mcpsrv._run_cli = orig
             os.chdir(cwd0)
+
+
+def t_mcp_aggregate_restores_prior_over_same_mtime_rejected_overwrite():
+    # Coarse-mtime-filesystem trap in the stash-FAILED fallback: aggregate overwrites verdict.json
+    # with a REJECTED verdict, but the new mtime lands in the same quantum as the prior (unchanged
+    # st_mtime_ns). An mtime check would treat that rejected output as the untouched prior and let
+    # ar_get_verdict surface it. The restore must snapshot the prior's BYTES and rewrite them.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-samemtime-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    vf = rundir / "verdict.json"
+    PRIOR = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    vf.write_text(json.dumps(PRIOR))
+    prior_mtime_ns = vf.stat().st_mtime_ns
+    (rundir / "verdict.json.prev").mkdir()  # force vf.replace(.prev) to raise OSError -> fallback
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fake(module, argv, timeout=120):
+        # aggregate overwrites with a rejected verdict, then the mtime lands unchanged (coarse FS)
+        vf.write_text(json.dumps({"verdict": "PASS", "run_id": "REJECTED"}))
+        os.utime(vf, ns=(prior_mtime_ns, prior_mtime_ns))
+        return (3, "", "boom")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert r["isError"], r
+        restored = json.loads(vf.read_text())
+        assert restored == PRIOR, ("rejected output with an unchanged mtime must not survive", restored)
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
 
 
 def main():
