@@ -603,6 +603,12 @@ def h_aggregate(args):
         # remove whatever rejected verdict was written and restore the prior from the stash when
         # there was one, so ar_get_verdict always sees either the freshly accepted verdict or the
         # last accepted one — never a rejected/partial verdict, never a stranded .prev.
+        # A restore that FAILS here (a transient OSError — a Windows file lock, a vanished parent)
+        # must NOT be swallowed: doing so silently strands the accepted prior at .prev while
+        # ar_get_verdict sees no verdict, or a rejected one, with no signal. Capture such a failure
+        # and, when exiting normally (not already unwinding another, louder exception), surface it as
+        # a ToolError naming .prev so the stranded prior can always be recovered. (Codex, 13d473f.)
+        reconcile_err = None
         if accepted:
             if stash is not None and stash.is_file():
                 try:
@@ -613,17 +619,15 @@ def h_aggregate(args):
             # Non-acceptance: never surface a rejected/partial verdict, never lose the prior.
             if stash is not None:
                 # Prior was moved aside to .prev — drop any rejected verdict aggregate wrote, then
-                # restore the prior from the stash.
-                if vf is not None and vf.is_file():
-                    try:
+                # restore the prior from the stash. BOTH steps run under one guard so a failure of
+                # EITHER (the unlink or the .prev -> verdict.json move) is recorded, not swallowed.
+                try:
+                    if vf is not None and vf.is_file():
                         vf.unlink()
-                    except OSError:
-                        pass
-                if stash.is_file():
-                    try:
+                    if stash.is_file():
                         stash.replace(vf)
-                    except OSError:
-                        pass
+                except OSError as e:
+                    reconcile_err = e
             elif stash_bytes is not None:
                 # The aside-move failed, so we snapshotted the prior's bytes instead. Rewrite them
                 # verbatim, overwriting any rejected verdict aggregate may have written in the same
@@ -631,15 +635,24 @@ def h_aggregate(args):
                 if vf is not None:
                     try:
                         vf.write_bytes(stash_bytes)
-                    except OSError:
-                        pass
+                    except OSError as e:
+                        reconcile_err = e
             else:
-                # No prior verdict existed — just remove any rejected verdict aggregate wrote.
+                # No prior verdict existed — just remove any rejected verdict aggregate wrote. A
+                # failure here loses nothing (there is no prior to strand), so it stays best-effort.
                 if vf is not None and vf.is_file():
                     try:
                         vf.unlink()
                     except OSError:
                         pass
+        # Surface a swallowed restore failure — but ONLY when exiting normally (a return). If the try
+        # is already unwinding an exception, that one is louder and must not be masked.
+        if reconcile_err is not None and sys.exc_info()[0] is None:
+            _prev = (vf.name + ".prev") if vf is not None else "verdict.json.prev"
+            raise ToolError(
+                "aggregate was rejected but the prior verdict could not be restored "
+                f"({reconcile_err}); the last accepted verdict is preserved at {_prev} — "
+                "restore it manually before trusting ar_get_verdict")
 
 
 def h_check_digest(args):

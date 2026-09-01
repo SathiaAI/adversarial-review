@@ -751,11 +751,13 @@ def t_check_digest_unreadable_artifact_is_cannot_verify_not_drift():
         "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
     sh(["aggregate.py"], repo, expect=0)                             # real verdict.json + attestation
     sh(["aggregate.py", "--check-digest"], repo, expect=0)          # baseline: intact
-    # A dangling symlink named *.json: rglob("*.json") still yields it (matched by name), but
-    # read_bytes() on it raises FileNotFoundError (an OSError) — a readable file cannot reproduce this.
+    # A DIRECTORY named *.json is the platform-independent unreadable artifact: rglob("*.json") still
+    # yields it (matched by name), but read_bytes() opens it 'rb' and raises IsADirectoryError (an
+    # OSError) — no symlink privilege needed, so this reproduces on Windows too, unlike a dangling
+    # symlink (Path.symlink_to raises without SeCreateSymbolicLinkPrivilege). (CodeRabbit, 13d473f.)
     victim = run / "unreadable.json"
-    victim.symlink_to(run / "no-such-attestation-target.json")      # dangling -> read_bytes OSError
-    assert victim.is_symlink() and not victim.exists(), victim       # confirm the fixture is dangling
+    victim.mkdir()                                                   # dir named *.json -> read_bytes OSError
+    assert victim.is_dir(), victim                                   # confirm the fixture is a directory
     r = sh(["aggregate.py", "--check-digest"], repo, expect=2)      # cannot-verify, NOT drift (1)/crash
     assert "cannot recompute attestation" in (r.stdout + r.stderr), (r.stdout, r.stderr)
 
@@ -6248,6 +6250,46 @@ def t_mcp_aggregate_restores_prior_verdict_on_rejected_write():
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
+
+
+def t_mcp_aggregate_surfaces_failed_prior_restore():
+    # If the run is rejected and restoring the prior from .prev FAILS (a transient OSError — a
+    # Windows lock, a vanished parent), the failure must be SURFACED, not swallowed: otherwise the
+    # accepted prior is stranded at .prev while ar_get_verdict sees no or a rejected verdict, with no
+    # signal. h_aggregate raises ToolError (-> isError at the server) naming .prev so the stranded
+    # prior can be recovered, AND the prior is never lost. (Codex, 13d473f.)
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-restorefail-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    prior = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    (rundir / "verdict.json").write_text(json.dumps(prior))
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fake(module, argv, timeout=120):
+        # h_aggregate has already moved the prior aside to verdict.json.prev. Simulate aggregate by
+        # replacing verdict.json with a DIRECTORY: it is not a fresh FILE (so the run is rejected),
+        # and the settle step's stash.replace(verdict.json) then raises OSError (renaming .prev onto
+        # a directory -> IsADirectoryError). rc 0 proves even a PASS-looking exit is rejected once no
+        # fresh verdict FILE exists. This deterministically forces the restore to fail.
+        (rundir / "verdict.json").mkdir()
+        return (0, "", "")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    raised = False
+    try:
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except mcpsrv.ToolError as e:
+            raised = True
+            assert ".prev" in str(e) and "could not be restored" in str(e), str(e)
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    assert raised, "h_aggregate must SURFACE (ToolError) a failed prior-verdict restore, not swallow it"
+    # The prior must still be recoverable at .prev — never lost, even though the restore failed.
+    assert json.loads((rundir / "verdict.json.prev").read_text()) == prior, "prior must survive at .prev"
 
 
 def t_mcp_run_selection_ignores_non_minted_dirs():
