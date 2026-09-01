@@ -734,6 +734,32 @@ def t_check_digest_attestation_inner_shape_is_cannot_verify_not_drift():
     check(lambda a: a.pop("files", None))                            # dict attestation, no files
 
 
+def t_check_digest_unreadable_artifact_is_cannot_verify_not_drift():
+    # fix-9/CodeRabbit hardened the STORED attestation's read; this is the RECOMPUTE side. check_digest
+    # recomputes over every recorded .json (compute_attestation -> p.read_bytes). If one artifact
+    # cannot be read — a broken symlink, a vanished/permission-denied file — read_bytes raises OSError,
+    # which is NOT the ValueError/UnicodeDecodeError compute_attestation folds into the digest. That
+    # OSError propagated out of an unguarded `att = compute_attestation(run)` and exited the process 1;
+    # the MCP wrapper maps exit 1 to {"intact": false}, so a bare read failure was reported as detected
+    # drift. A recompute that could not even READ the artifacts is cannot-verify (exit 2), never a
+    # definitive mismatch (1) and never an uncaught crash. (Codex, bdccc64.)
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+        "evidence": "reproduced", "reproduced": True, "regression_test": "t",
+        "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)                             # real verdict.json + attestation
+    sh(["aggregate.py", "--check-digest"], repo, expect=0)          # baseline: intact
+    # A dangling symlink named *.json: rglob("*.json") still yields it (matched by name), but
+    # read_bytes() on it raises FileNotFoundError (an OSError) — a readable file cannot reproduce this.
+    victim = run / "unreadable.json"
+    victim.symlink_to(run / "no-such-attestation-target.json")      # dangling -> read_bytes OSError
+    assert victim.is_symlink() and not victim.exists(), victim       # confirm the fixture is dangling
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=2)      # cannot-verify, NOT drift (1)/crash
+    assert "cannot recompute attestation" in (r.stdout + r.stderr), (r.stdout, r.stderr)
+
+
 # ---------------------------------------------------------------- E6-S1: detached signature
 
 def _stub_signer_env(extra=None):
@@ -5748,6 +5774,45 @@ def t_mcp_aggregate_rejects_malformed_fresh_verdict():
         os.chdir(cwd0)
 
 
+def t_mcp_aggregate_rejects_foreign_or_unrecognized_fresh_verdict():
+    # A fresh verdict.json can be a dict yet NOT be this run's verdict: an empty object, an
+    # unsupported verdict value, or another run's run_id. Accepting any of them would surface a stray
+    # result as THIS run's and discard the prior. Accept only a recognized PASS/FAIL/BLOCKED whose
+    # run_id matches the pinned run. (CodeRabbit, bdccc64.)
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-foreign-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    vf = rundir / "verdict.json"
+    prior = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def run_with(fresh_obj, rc):
+        vf.write_text(json.dumps(prior))                 # reset the prior before each aggregate
+        def writes(module, argv, timeout=120):
+            vf.write_text(json.dumps(fresh_obj), encoding="utf-8")
+            return (rc, str(fresh_obj.get("verdict", "")), "")
+        orig = mcpsrv._run_cli
+        mcpsrv._run_cli = writes
+        try:
+            return mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        finally:
+            mcpsrv._run_cli = orig
+
+    try:
+        for bad in ({},                                                  # empty object
+                    {"verdict": "MAYBE", "run_id": "run-20260101-010101"},   # unsupported verdict
+                    {"verdict": "PASS", "run_id": "run-99999999-999999"}):   # mismatched run_id
+            r = run_with(bad, 0)
+            assert r["isError"] and "without an accepted verdict" in r["content"][0]["text"], (bad, r)
+            assert json.loads(vf.read_text()) == prior, (bad, vf.read_text())   # prior restored
+        # sanity: a recognized verdict for the pinned run IS still accepted (no over-rejection)
+        r = run_with({"verdict": "FAIL", "run_id": "run-20260101-010101"}, 1)
+        assert not r["isError"] and r["structuredContent"]["verdict"] == "FAIL", r
+    finally:
+        os.chdir(cwd0)
+
+
 def t_mcp_aggregate_preserves_prior_when_snapshot_fails():
     # If the prior verdict can be neither moved aside (a stale .prev DIRECTORY blocks vf.replace) NOR
     # byte-snapshotted (it is unreadable), h_aggregate has no way to restore it and running aggregate
@@ -5798,20 +5863,20 @@ def t_mcp_panel_timeout_scales_with_env():
     old_t = os.environ.get("AR_TIMEOUT_S")
     old_h = os.environ.get("AR_HIGH_SAMPLES")
     try:
-        os.environ.pop("AR_HIGH_SAMPLES", None)  # hs defaults to 1 -> base 8 request budgets/role
+        os.environ.pop("AR_HIGH_SAMPLES", None)  # hs defaults to 1 -> base 9 request budgets/role
         os.environ["AR_TIMEOUT_S"] = "240"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 8 * 6 + 600) > 300
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600) > 300
         os.environ["AR_TIMEOUT_S"] = "garbage"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 8 * 6 + 600)  # bad value -> default
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600)  # bad value -> default
         # Corroboration budget: hs samples add (hs-1) extra samples/role, each a call + retry (x2).
         os.environ["AR_TIMEOUT_S"] = "240"
         os.environ["AR_HIGH_SAMPLES"] = "25"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * (8 + 2 * 24) * 6 + 600)
-        assert mcpsrv._panel_timeout() > max(1800, 240 * 8 * 6 + 600)  # strictly larger than base
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 24) * 6 + 600)
+        assert mcpsrv._panel_timeout() > max(1800, 240 * 9 * 6 + 600)  # strictly larger than base
         os.environ["AR_HIGH_SAMPLES"] = "1"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 8 * 6 + 600)  # hs=1 == base
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600)  # hs=1 == base
         os.environ["AR_HIGH_SAMPLES"] = "999"  # clamped to the 25 cap, never unbounded
-        assert mcpsrv._panel_timeout() == max(1800, 240 * (8 + 2 * 24) * 6 + 600)
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 24) * 6 + 600)
     finally:
         for _k, _v in (("AR_TIMEOUT_S", old_t), ("AR_HIGH_SAMPLES", old_h)):
             if _v is None:
@@ -5834,12 +5899,39 @@ def t_mcp_panel_timeout_honors_policy_high_samples():
     try:
         os.environ["AR_TIMEOUT_S"] = "240"
         os.environ.pop("AR_HIGH_SAMPLES", None)           # env unset -> policy value must be honored
-        assert mcpsrv._panel_timeout() == max(1800, 240 * (8 + 2 * 24) * 6 + 600), \
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 24) * 6 + 600), \
             mcpsrv._panel_timeout()
         os.environ["AR_HIGH_SAMPLES"] = "1"               # env set -> wins over the policy's 25
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 8 * 6 + 600), mcpsrv._panel_timeout()
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600), mcpsrv._panel_timeout()
     finally:
         os.chdir(cwd0)
+        for _k, _v in (("AR_TIMEOUT_S", old_t), ("AR_HIGH_SAMPLES", old_h)):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
+
+def t_mcp_panel_timeout_budgets_the_substitution_catalog_fetch():
+    # The per-role worst case is NINE AR_TIMEOUT_S request budgets, not eight: run_one_role spends 4
+    # (two attempts x one corrective retry), then substitution reloads the model catalog LIVE — one
+    # /models fetch, bounded by AR_TIMEOUT_S when no --catalog-file is cached (panel.py load_catalog
+    # via http_json, whose timeout defaults to AR_TIMEOUT_S) — then run_one_role repeats (4 more):
+    # 4 + 1 + 4 = 9. Omitting the catalog fetch (budgeting 8) under-counts the outer deadline by one
+    # request width PER ROLE, up to 6 roles, and can kill a legitimately slow but valid run mid-
+    # substitution. Assert the base budget is exactly 9 widths and STRICTLY exceeds an 8-width
+    # (catalog-fetch-omitting) deadline. (Codex, bdccc64.)
+    old_t = os.environ.get("AR_TIMEOUT_S")
+    old_h = os.environ.get("AR_HIGH_SAMPLES")
+    try:
+        os.environ["AR_TIMEOUT_S"] = "240"
+        os.environ["AR_HIGH_SAMPLES"] = "1"               # no resampling -> pure base budget
+        got = mcpsrv._panel_timeout()
+        assert got == max(1800, 240 * 9 * 6 + 600), got    # 9 widths/role x 6 roles + 600 headroom
+        assert got > max(1800, 240 * 8 * 6 + 600), got     # strictly more than the pre-fix 8-width budget
+        # The per-role width recovered from the deadline is 9 (4 primary + 1 catalog + 4 substitute).
+        assert (got - 600) // 6 // 240 == 9, got
+    finally:
         for _k, _v in (("AR_TIMEOUT_S", old_t), ("AR_HIGH_SAMPLES", old_h)):
             if _v is None:
                 os.environ.pop(_k, None)

@@ -222,14 +222,17 @@ def _resolved_high_samples():
 
 def _panel_timeout():
     """Subprocess wrapper timeout for a reviewer-calling panel run. panel.py can spend up to
-    EIGHT AR_TIMEOUT_S request budgets on a single role before giving up: run_one_role makes two
-    outer attempts, each call_reviewer may issue one corrective-JSON retry (2 requests), and a
-    failed role is then substituted to another family and the whole sequence repeats (2 × 2 × 2).
-    On top of that, multi-sample corroboration (E4-S3) resamples each flagged role up to
-    AR_HIGH_SAMPLES times — (hs-1) extra samples, each a call plus one corrective retry (×2). Across
-    up to 6 roles (SENSITIVE/CRITICAL) run sequentially that is (8 + 2·(hs-1)) × 6 request budgets,
-    so derive the outer deadline from that — never from an under-count — so a legitimately slow but
-    valid run (including a large corroboration sweep) is not killed before panel.py finishes."""
+    NINE AR_TIMEOUT_S request budgets on a single role before giving up: run_one_role makes two
+    outer attempts and each call_reviewer may issue one corrective-JSON retry (2 × 2 = 4 requests);
+    a failed role is then substituted, which FIRST reloads the model catalog live — one /models
+    fetch, also bounded by AR_TIMEOUT_S whenever no cached --catalog-file was supplied (the MCP
+    path leaves it optional) — and THEN repeats the whole run_one_role sequence (4 more): 4 + 1 + 4
+    = 9. On top of that, multi-sample corroboration (E4-S3) resamples each flagged role up to
+    AR_HIGH_SAMPLES times — (hs-1) extra samples, each a call plus one corrective retry (×2);
+    resampling re-calls the SAME model and never substitutes, so it adds no further catalog fetch.
+    Across up to 6 roles (SENSITIVE/CRITICAL) run sequentially that is (9 + 2·(hs-1)) × 6 request
+    budgets, so derive the outer deadline from that — never from an under-count — so a legitimately
+    slow but valid run (including a large corroboration sweep) is not killed before panel.py finishes."""
     try:
         req = max(1, int(os.environ.get("AR_TIMEOUT_S", "240")))
     except (TypeError, ValueError):
@@ -243,7 +246,7 @@ def _panel_timeout():
     except (TypeError, ValueError):
         hs = 1
     hs = max(1, min(hs, 25))
-    return max(1800, req * (8 + 2 * (hs - 1)) * 6 + 600)
+    return max(1800, req * (9 + 2 * (hs - 1)) * 6 + 600)
 
 
 def _run_cli(module, argv, timeout=120):
@@ -580,8 +583,17 @@ def h_aggregate(args):
             # accepting it would return a bogus list as structuredContent or crash at structured.get(),
             # and the settle step would discard the prior. Only a JSON object is a verdict. (Codex,
             # 52c686f.)
-            if isinstance(structured, dict):
-                accepted = True  # only now: a fresh, well-formed (object) verdict is in hand
+            # A fresh OBJECT is not enough: accept only a RECOGNIZED verdict value FOR THE PINNED RUN.
+            # A stray/foreign object — an empty {}, an unknown verdict, or another run's verdict —
+            # would otherwise be surfaced as THIS run's result and the prior discarded. run_args pins
+            # the run (--run <id>); the fresh verdict aggregate wrote must carry that same run_id.
+            # (CodeRabbit, bdccc64.) Attestation PRESENCE is deliberately not gated here — that is
+            # check_digest's integrity concern, and a verdict's identity is its recognized value + run.
+            pinned = run_args[run_args.index("--run") + 1] if "--run" in run_args else None
+            if (isinstance(structured, dict)
+                    and structured.get("verdict") in ("PASS", "FAIL", "BLOCKED")
+                    and (pinned is None or structured.get("run_id") == pinned)):
+                accepted = True  # only now: a fresh, recognized verdict for THIS run is in hand
                 return _result(body or structured.get("verdict", ""), structured=structured)
         return _result(f"aggregate exited {rc} without an accepted verdict:\n{body}",
                        is_error=True)

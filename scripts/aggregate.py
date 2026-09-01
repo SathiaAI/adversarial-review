@@ -243,7 +243,19 @@ def check_digest(run):
         print("verdict.json attestation lacks a string digest or dict files (computed before #5, or "
               "malformed) — re-aggregate before checking the digest", file=sys.stderr)
         sys.exit(2)
-    att = compute_attestation(run)
+    try:
+        att = compute_attestation(run)
+    except OSError as e:
+        # Recomputing the attestation reads every recorded .json artifact (compute_attestation ->
+        # p.read_bytes). An OSError here — a broken symlink, a vanished file, a permission denial —
+        # means the CURRENT artifacts could not even be READ, so nothing was compared. That is
+        # cannot-verify (exit 2), never a definitive mismatch (exit 1). compute_attestation folds a
+        # bytes-undecodable file INTO the digest (ValueError/UnicodeDecodeError), but an OSError is a
+        # read failure, not undecodable content; leaving it unguarded exited the process 1 and the MCP
+        # wrapper maps exit 1 to {"intact": false} — reporting an unreadable artifact as detected drift.
+        print(f"cannot recompute attestation ({e}) — a recorded artifact could not be read; "
+              "re-aggregate before checking the digest", file=sys.stderr)
+        sys.exit(2)
     if att["digest"] == stored.get("digest"):
         print(f"attestation OK: sha256 {att['digest']} over {att['inputs']} artifacts")
         sys.exit(0)
