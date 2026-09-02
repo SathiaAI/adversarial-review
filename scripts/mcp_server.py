@@ -87,7 +87,12 @@ META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 # value from reaching resolve_run() as a path (a value containing a separator, or
 # "..", would otherwise escape .adversarial-review/ and read/write an arbitrary
 # existing directory). Empty/None is allowed: the CLI then targets the newest run.
-RUN_RE = re.compile(r"^run-\d{8}-\d{6}(?:-\d+)?$")
+# RUN_RE anchors with \Z (end-of-string), NOT $: `$` also matches just before a trailing newline, so
+# RUN_RE.match("run-…\n") would admit a directory name ending in a newline. iterdir() yields untrusted
+# repository content, and such a name sorts as a normal run — a crafted `run-99999999-999999\n` dir
+# would then be selected as "newest" and pin every tool to that non-minted directory. \Z rejects it.
+# (Codex, fc4a701.)
+RUN_RE = re.compile(r"^run-\d{8}-\d{6}(?:-\d+)?\Z")
 ROLE_RE = re.compile(r"^[a-z][a-z_]*$")
 PIN_RE = re.compile(r"^[A-Za-z0-9_]+=[A-Za-z0-9][A-Za-z0-9._/-]*$")
 PROVIDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -166,7 +171,7 @@ def _opt_authorizer(args):
         return None
     if not isinstance(v, str) or not v.strip():
         raise ToolError("authorized_by must be a non-empty string")
-    return v
+    return v.strip()  # normalize: an audit authorizer must not carry incidental surrounding whitespace
 
 
 def _add_confined_catalog(args, argv):
@@ -201,6 +206,13 @@ def _require_loadable_catalog(cf):
     a file argument takes load_catalog's no-network path. cf is None when no catalog was supplied."""
     if cf is None:
         return
+    # Confinement proves WHERE the catalog is, not WHAT it is. A confined path can still be a
+    # NON-REGULAR file — a FIFO/device — and load_catalog opens it IN-PROCESS, on a path that no
+    # _run_cli timeout guards, so opening a FIFO would block the server forever waiting for a writer.
+    # Require a regular file first (is_file() stats without opening, so it never blocks; only open()
+    # on a FIFO does), so untrusted repo content cannot hang ar_panel_run. (Codex, fc4a701.)
+    if not (Path.cwd() / cf).resolve().is_file():
+        raise ToolError("catalog_file must be a regular file")
     try:
         from panel import load_catalog
         load_catalog(cf)
@@ -364,6 +376,14 @@ def h_init(args):
         base = os.path.basename(m.group(1).rstrip("/\\"))
         if RUN_ID_RE.fullmatch(base):
             run_id = base
+    if run_id is None:
+        # init SUCCEEDED (rc == 0) but its stdout could not be parsed for the run id — never report a
+        # null run_id on a successful init. Fall back to the newest run (which init just created);
+        # _run_dir orders the -N disambiguator numerically. (Fable, fc4a701.)
+        try:
+            run_id = _run_dir([]).name
+        except ToolError:
+            pass
     return _result((out or "").strip() or f"initialized {run_id}",
                    structured={"run_id": run_id})
 
@@ -563,6 +583,15 @@ def h_aggregate(args):
                 raise ToolError("cannot snapshot the prior verdict.json to guarantee a restore "
                                 "(it could be neither moved aside nor durably backed up) — refusing "
                                 "to aggregate so a prior verdict is never lost")
+    elif vf is not None:
+        # verdict.json is absent. If a .prev sidecar remains from a crash BETWEEN a prior run's
+        # move-aside and its settle, adopt it as this run's stash so the settle reconciles the
+        # stranded prior — restored on a rejected aggregate, discarded once a fresh verdict supersedes
+        # it. Without this, nothing would ever restore it and ar_get_verdict would keep seeing no
+        # verdict. (Fable, fc4a701.)
+        cand = vf.parent / (vf.name + ".prev")
+        if cand.is_file():
+            stash = cand
     # The moved-aside verdict is reconciled in the single finally below, which runs on EVERY exit
     # path — the accepted return, the rejected return, and a raised invocation (e.g. _run_cli's
     # subprocess timeout). Earlier revisions restored the prior in several separate branches and
@@ -586,33 +615,42 @@ def h_aggregate(args):
         # NOT write a fresh verdict, never surface a pre-existing verdict as success.
         fresh = bool(vf and vf.is_file()
                      and (before_mtime is None or vf.stat().st_mtime_ns != before_mtime))
-        if rc in (0, 1, 2) and fresh:
+        # Reject with a SPECIFIC reason (stale / crashed / malformed / unrecognized / wrong-run) so an
+        # operator can tell them apart — WITHOUT changing which verdicts are accepted. `reason` stays
+        # "" only when a fresh, recognized verdict for THIS run is in hand.
+        reason = ""
+        if rc not in (0, 1, 2):
+            reason = "exit code is not a verdict result (expected 0, 1, or 2)"
+        elif not fresh:
+            reason = "aggregate wrote no fresh verdict.json"
+        else:
             try:
                 structured = json.loads(vf.read_text(encoding="utf-8"))
             except (OSError, ValueError, RecursionError):
                 # A fresh file that is unreadable, MALFORMED, or pathologically deep (json.loads raises
-                # RecursionError on deep nesting — NOT a ValueError) is not a usable verdict. Letting
-                # it raise here would crash h_aggregate PAST the isError return below, rather than
-                # surface a clean rejected result (the settle step still restores the prior). Guard
-                # read/parse the same way check_digest does. (CodeRabbit, 7da1420; Codex, 60cb2c3.)
+                # RecursionError on deep nesting — NOT a ValueError) is not a usable verdict. Guarding
+                # read/parse here (as check_digest does) yields a clean rejected result rather than
+                # crashing h_aggregate past the return below. (CodeRabbit, 7da1420; Codex, 60cb2c3.)
                 structured = None
-            # A fresh file that is valid but non-object JSON (e.g. []) is likewise NOT a verdict:
-            # accepting it would return a bogus list as structuredContent or crash at structured.get(),
-            # and the settle step would discard the prior. Only a JSON object is a verdict. (Codex,
-            # 52c686f.)
             # A fresh OBJECT is not enough: accept only a RECOGNIZED verdict value FOR THE PINNED RUN.
-            # A stray/foreign object — an empty {}, an unknown verdict, or another run's verdict —
-            # would otherwise be surfaced as THIS run's result and the prior discarded. run_args pins
-            # the run (--run <id>); the fresh verdict aggregate wrote must carry that same run_id.
-            # (CodeRabbit, bdccc64.) Attestation PRESENCE is deliberately not gated here — that is
-            # check_digest's integrity concern, and a verdict's identity is its recognized value + run.
-            pinned = run_args[run_args.index("--run") + 1] if "--run" in run_args else None
-            if (isinstance(structured, dict)
-                    and structured.get("verdict") in ("PASS", "FAIL", "BLOCKED")
-                    and (pinned is None or structured.get("run_id") == pinned)):
+            # When run_args pins --run, verify that id. When it does NOT (aggregate was invoked with no
+            # run and none existed at entry, so aggregate resolved the newest itself), pin against the
+            # run dir actually resolved for vf — so a verdict for a DIFFERENT run (e.g. one a concurrent
+            # external init created) is never surfaced as THIS call's result. Attestation PRESENCE is
+            # deliberately not gated here — that is check_digest's concern. (CodeRabbit, bdccc64; Fable, fc4a701.)
+            pinned = (run_args[run_args.index("--run") + 1] if "--run" in run_args
+                      else (vf.parent.name if vf is not None else None))
+            if not isinstance(structured, dict):
+                reason = "the fresh verdict.json was unreadable, malformed, or not a JSON object"
+            elif structured.get("verdict") not in ("PASS", "FAIL", "BLOCKED"):
+                reason = f"unrecognized verdict value {structured.get('verdict')!r}"
+            elif not (pinned is None or structured.get("run_id") == pinned):
+                reason = (f"verdict run_id {structured.get('run_id')!r} does not match the resolved "
+                          f"run {pinned!r}")
+            else:
                 accepted = True  # only now: a fresh, recognized verdict for THIS run is in hand
                 return _result(body or structured.get("verdict", ""), structured=structured)
-        return _result(f"aggregate exited {rc} without an accepted verdict:\n{body}",
+        return _result(f"aggregate exited {rc} without an accepted verdict ({reason}):\n{body}",
                        is_error=True)
     finally:
         # Single settle point for the moved-aside verdict. On acceptance the stash is a superseded

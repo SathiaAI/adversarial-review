@@ -6690,6 +6690,161 @@ def t_attestation_recursionerror_artifact_is_raw_hashed_not_crash():
     assert att["files"].get("plan.json", "").startswith("raw:"), att["files"]
 
 
+def t_mcp_run_dir_rejects_trailing_newline_dir_name():
+    # Codex(fc4a701): RUN_RE used `$`, which matches just before a trailing newline, so RUN_RE.match
+    # admitted a directory named "run-…\n". iterdir() is untrusted repo content; a crafted
+    # run-99999999-999999\n dir sorts newest and would pin every tool to that non-minted directory.
+    # RUN_RE now anchors with \Z, so _run_dir selects only genuinely-minted names.
+    repo = Path(tempfile.mkdtemp(prefix="ar-nlrun-"))
+    arroot = repo / ".adversarial-review"
+    (arroot / "run-20260101-010101").mkdir(parents=True)
+    try:
+        (arroot / "run-99999999-999999\n").mkdir()  # trailing-newline decoy (POSIX allows newlines)
+    except OSError:
+        return  # platform disallows a newline in a filename (Windows) -> nothing to assert here
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        assert mcpsrv._run_dir([]).name == "run-20260101-010101", mcpsrv._run_dir([]).name
+        assert mcpsrv._safe_run({}) == ["--run", "run-20260101-010101"], mcpsrv._safe_run({})
+    finally:
+        os.chdir(cwd0)
+
+
+def t_mcp_require_loadable_catalog_rejects_fifo():
+    # Codex(fc4a701): a catalog_file that is a FIFO passes confinement, and load_catalog opens it
+    # IN-PROCESS with no _run_cli timeout, so the server blocks forever waiting for a writer. The
+    # loadable check now rejects a non-regular file first (is_file() stats without opening, so it never
+    # blocks). Run in a SUBPROCESS with a timeout so the base (unfixed) hang is caught as a failure,
+    # not a hung suite.
+    if not hasattr(os, "mkfifo"):
+        return  # no FIFOs on this platform (Windows) -> nothing to assert here
+    repo = Path(tempfile.mkdtemp(prefix="ar-fifo-"))
+    os.mkfifo(repo / "catalog.json")
+    script = (
+        "import sys; sys.path.insert(0, %r); import mcp_server as m\n"
+        "try:\n"
+        "    m._require_loadable_catalog('catalog.json'); print('NO_RAISE')\n"
+        "except m.ToolError as e:\n"
+        "    print('REJECTED' if 'regular file' in str(e) else 'OTHER:' + str(e))\n"
+        % str(SKILL / "scripts"))
+    try:
+        r = subprocess.run([sys.executable, "-c", script], cwd=str(repo),
+                           capture_output=True, text=True, timeout=8)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("_require_loadable_catalog hung on a FIFO catalog_file — it must reject "
+                             "a non-regular file before opening it")
+    assert "REJECTED" in r.stdout, (r.stdout, r.stderr)
+
+
+def t_mcp_opt_authorizer_strips_whitespace():
+    # Fable(fc4a701): a valid authorized_by must not carry incidental surrounding whitespace into the
+    # audit record; _opt_authorizer now strips it. (None / empty / non-string is still rejected.)
+    assert mcpsrv._opt_authorizer({"authorized_by": "  alice  "}) == "alice"
+    assert mcpsrv._opt_authorizer({"authorized_by": "bob"}) == "bob"
+    assert mcpsrv._opt_authorizer({}) is None
+
+
+def t_mcp_init_falls_back_to_newest_run_on_unparseable_stdout():
+    # Fable(fc4a701): a SUCCESSFUL ar_init whose stdout can't be parsed for the run id must not report
+    # run_id: null — it falls back to the newest run (which init just created).
+    repo = Path(tempfile.mkdtemp(prefix="ar-init-nullid-"))
+    (repo / ".adversarial-review" / "run-20260101-010101").mkdir(parents=True)
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fake(module, argv, timeout=120):
+        return (0, "some unparseable init output without the expected line", "")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        r = mcpsrv.h_init({"risk": "NORMAL", "dev_providers": ["anthropic"]})
+        assert not r["isError"], r
+        assert r["structuredContent"]["run_id"] == "run-20260101-010101", r["structuredContent"]
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
+def t_mcp_aggregate_rejects_verdict_for_unresolved_run_when_unpinned():
+    # Fable(fc4a701): when ar_aggregate is invoked with no run and none exists at entry (run_args==[]),
+    # aggregate resolves the newest run itself. If a concurrent external init produced a run, a fresh
+    # verdict carrying a DIFFERENT run_id must NOT be accepted as this call's result — the accept-check
+    # pins against the resolved run dir instead of `pinned is None` accepting anything.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-unpinned-"))
+    arroot = repo / ".adversarial-review"
+    arroot.mkdir(parents=True)  # exists but holds NO runs yet -> _safe_run({}) returns []
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fake(module, argv, timeout=120):
+        rd = arroot / "run-20260101-010101"                       # a run "appears" (concurrent init)
+        rd.mkdir(parents=True)
+        (rd / "verdict.json").write_text(json.dumps({"verdict": "PASS", "run_id": "run-somewhere-else"}))
+        return (0, "PASS", "")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        r = mcpsrv.h_aggregate({})  # run omitted; none at entry -> run_args == []
+        assert r["isError"] and "does not match the resolved run" in r["content"][0]["text"], r
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
+def t_mcp_aggregate_recovers_crash_stranded_prev():
+    # Fable(fc4a701): if the server was killed BETWEEN a prior run's move-aside and its settle,
+    # verdict.json is absent and the last accepted verdict is stranded at verdict.json.prev. The next
+    # ar_aggregate adopts that .prev as its stash, so a rejected aggregate restores it (never lost).
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-stranded-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    prior = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    (rundir / "verdict.json.prev").write_text(json.dumps(prior))   # stranded; verdict.json ABSENT
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fake(module, argv, timeout=120):
+        return (3, "", "boom")  # rejected WITHOUT writing a fresh verdict.json
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert r["isError"], r
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    assert json.loads((rundir / "verdict.json").read_text()) == prior, "stranded prior must be recovered"
+
+
+def t_mcp_aggregate_rejection_states_reason():
+    # Fable(fc4a701): a rejected aggregate now names WHY (stale / malformed / unrecognized / wrong-run),
+    # not just "without an accepted verdict". Here aggregate writes a fresh but UNRECOGNIZED verdict.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-reason-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    (rundir / "verdict.json").write_text(json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fake(module, argv, timeout=120):
+        (rundir / "verdict.json").write_text(json.dumps({"verdict": "MAYBE", "run_id": "run-20260101-010101"}))
+        return (0, "", "")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert r["isError"], r
+        assert "unrecognized verdict value" in r["content"][0]["text"], r["content"][0]["text"]
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
