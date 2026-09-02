@@ -195,7 +195,13 @@ def compute_attestation(run):
             canon = json.dumps(json.loads(raw.decode("utf-8")), sort_keys=True,
                                separators=(",", ":"), ensure_ascii=False)
             files[rel] = hashlib.sha256(canon.encode("utf-8")).hexdigest()
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            # A .json artifact that fails UTF-8 decoding or JSON parsing — including one nested so
+            # deeply json.loads raises RecursionError — is hashed over its RAW bytes rather than
+            # crashing the enforcement point. Folding RecursionError in here (not treating it as
+            # cannot-verify) keeps a legitimately deep-but-unchanged artifact verifiable and still
+            # surfaces real drift, and stops such an artifact from crashing aggregation itself.
+            # (Codex, 60cb2c3.)
             files[rel] = "raw:" + hashlib.sha256(raw).hexdigest()
     manifest = "\n".join(f"{sha}  {rel}" for rel, sha in sorted(files.items()))
     digest = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
@@ -212,12 +218,15 @@ def check_digest(run):
         sys.exit(2)
     try:
         verdict = read_json(vpath)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         # A malformed/unreadable verdict.json means the stored attestation cannot even be READ, so
         # nothing was compared: that is "cannot verify" (exit 2), never a definitive mismatch (exit
         # 1). Exit 1 is reserved for a recomputed attestation that DID compare and differed — the MCP
         # wrapper maps exit 1 to {"intact": false}, so leaking a read failure as 1 would report an
-        # unreadable verdict as detected tampering.
+        # unreadable verdict as detected tampering. A pathologically deep verdict.json makes json.loads
+        # raise RecursionError (a RuntimeError subclass, NOT ValueError); catch it here too so that
+        # distinct parser failure is cannot-verify, not a crash the wrapper reads as drift. (Codex,
+        # 60cb2c3.)
         print(f"cannot read verdict.json ({e}) — re-aggregate before checking the digest",
               file=sys.stderr)
         sys.exit(2)

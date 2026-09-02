@@ -5632,25 +5632,33 @@ def t_mcp_run_key_orders_numeric_suffix():
 
 def t_mcp_check_digest_distinguishes_exit_codes():
     # --check-digest: 0 intact, 1 drifted, 2 (no verdict/attestation) is cannot-verify -> error,
-    # not a silent {"intact": false}.
-    orig = _patch_run_cli(0, out="attestation OK")
+    # not a silent {"intact": false}. A REAL run dir must exist first: h_check_digest confirms the run
+    # before mapping exit 1 to drift, so a missing run can never read as {"intact": false}.
+    repo = Path(tempfile.mkdtemp(prefix="ar-cd-codes-"))
+    (repo / ".adversarial-review" / "run-20260101-010101").mkdir(parents=True)
+    cwd0 = os.getcwd()
+    os.chdir(repo)
     try:
-        r = mcpsrv.h_check_digest({})
-        assert r["structuredContent"] == {"intact": True} and not r["isError"], r
+        orig = _patch_run_cli(0, out="attestation OK")
+        try:
+            r = mcpsrv.h_check_digest({})
+            assert r["structuredContent"] == {"intact": True} and not r["isError"], r
+        finally:
+            mcpsrv._run_cli = orig
+        orig = _patch_run_cli(1, out="attestation MISMATCH")
+        try:
+            r = mcpsrv.h_check_digest({})
+            assert r["structuredContent"] == {"intact": False} and not r["isError"], r
+        finally:
+            mcpsrv._run_cli = orig
+        orig = _patch_run_cli(2, out="no verdict.json in run")
+        try:
+            r = mcpsrv.h_check_digest({})
+            assert r["isError"] and "structuredContent" not in r, r
+        finally:
+            mcpsrv._run_cli = orig
     finally:
-        mcpsrv._run_cli = orig
-    orig = _patch_run_cli(1, out="attestation MISMATCH")
-    try:
-        r = mcpsrv.h_check_digest({})
-        assert r["structuredContent"] == {"intact": False} and not r["isError"], r
-    finally:
-        mcpsrv._run_cli = orig
-    orig = _patch_run_cli(2, out="no verdict.json in run")
-    try:
-        r = mcpsrv.h_check_digest({})
-        assert r["isError"] and "structuredContent" not in r, r
-    finally:
-        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
 
 
 def t_mcp_no_hardcoded_model_in_tool_schema():
@@ -6518,6 +6526,168 @@ def t_mcp_aggregate_restores_prior_over_same_mtime_rejected_overwrite():
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
+
+
+def t_mcp_check_digest_missing_run_is_error_not_drift():
+    # A nonexistent/typo'd run makes aggregate.py's resolve_run die() with exit 1 — the SAME code
+    # --check-digest uses for a real attestation MISMATCH. Reporting "no run to verify" as
+    # {"intact": false} (drift) would flag a typo as tampering. h_check_digest must raise ToolError
+    # (-> isError, no structuredContent at the server), never a silent drift. (Fable, 60cb2c3.)
+    repo = Path(tempfile.mkdtemp(prefix="ar-cd-missing-"))
+    (repo / ".adversarial-review").mkdir(parents=True)   # root exists, but holds no runs
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        for args in ({"run": "run-20990909-090909"}, {}):  # explicit typo, then implicit-newest, no runs
+            raised = False
+            try:
+                mcpsrv.h_check_digest(args)
+            except mcpsrv.ToolError:
+                raised = True
+            assert raised, ("missing run must raise ToolError, not return a drift verdict", args)
+    finally:
+        os.chdir(cwd0)
+
+
+def t_mcp_inprocess_helpers_resolve_under_console_script():
+    # mcp_server's in-process helpers do `from panel import ...` / `from _common import ...`. Under the
+    # documented `ar-mcp` console script the package imports as adversarial_review.mcp_server, where
+    # those BARE imports resolve ONLY if mcp_server puts its own dir on sys.path (as panel.py /
+    # aggregate.py do). Without it, catalog validation always fails and policy `high_samples` is
+    # silently ignored (timeout under-budgeted). Emulate the console-script sys.path in a subprocess
+    # and assert the policy value is honored. (Fable, 60cb2c3.)
+    site = Path(tempfile.mkdtemp(prefix="ar-site-")) / "adversarial_review"
+    site.mkdir(parents=True)
+    scripts = Path(mcpsrv.__file__).resolve().parent
+    for py in scripts.glob("*.py"):
+        (site / py.name).write_bytes(py.read_bytes())
+    work = Path(tempfile.mkdtemp(prefix="ar-work-"))
+    (work / ".adversarial-review.yml").write_text("risk: SENSITIVE\nhigh_samples: 7\n")
+    env = {**os.environ, "PYTHONPATH": str(site.parent)}
+    env.pop("AR_HIGH_SAMPLES", None)   # so policy (not env) drives the value
+    r = subprocess.run(
+        [sys.executable, "-c",
+         "from adversarial_review import mcp_server as m; print(m._resolved_high_samples())"],
+        cwd=str(work), env=env, capture_output=True, text=True)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert r.stdout.strip() == "7", ("policy high_samples must be honored under the console script",
+                                     r.stdout, r.stderr)
+
+
+def t_mcp_aggregate_fallback_snapshot_is_durable_before_aggregation():
+    # CodeRabbit(60cb2c3): when verdict.json cannot be moved aside to .prev, the prior was kept ONLY
+    # in memory; if aggregate then overwrote verdict.json and the in-memory rewrite ALSO failed, the
+    # prior was lost — and the error misnamed .prev, never created in that path. The fallback must
+    # persist a DURABLE snapshot (verdict.json.bak) BEFORE aggregating, restore from it, and name it.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-durablebak-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    vf = rundir / "verdict.json"
+    prior = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    vf.write_text(json.dumps(prior))
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    RB = type(vf)
+    orig_replace = RB.replace
+
+    def blocked_move(self, target):            # rename-hostile FS: the .prev move fails, but a fresh
+        if str(target).endswith(".prev"):      # write (the .bak backup) still succeeds
+            raise OSError("simulated: cannot rename verdict.json -> .prev")
+        return orig_replace(self, target)
+
+    def fake(module, argv, timeout=120):
+        # aggregate replaces verdict.json with a DIRECTORY (the aside-move failed, so the prior file is
+        # still in place — remove it first). Result: not a fresh FILE (rejected) AND the write-back
+        # restore (vf.write_bytes) then fails, forcing the reconcile-failure path.
+        (rundir / "verdict.json").unlink()
+        (rundir / "verdict.json").mkdir()
+        return (0, "", "")
+
+    orig_cli = mcpsrv._run_cli
+    RB.replace = blocked_move
+    mcpsrv._run_cli = fake
+    raised = False
+    try:
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except mcpsrv.ToolError as e:
+            raised = True
+            assert ".bak" in str(e) and "could not be restored" in str(e), str(e)
+    finally:
+        RB.replace = orig_replace
+        mcpsrv._run_cli = orig_cli
+        os.chdir(cwd0)
+    assert raised, "h_aggregate must SURFACE a failed fallback restore, not swallow it"
+    # THE durability guarantee: the prior survives on disk at verdict.json.bak (in memory alone it
+    # would be gone once aggregate overwrote verdict.json). Fails on base (no .bak written).
+    bak = rundir / "verdict.json.bak"
+    assert bak.is_file() and json.loads(bak.read_text()) == prior, "prior must be durable at .bak"
+
+
+def t_mcp_aggregate_surfaces_restore_failure_during_unwind():
+    # Codex(60cb2c3): when _run_cli RAISES (e.g. a subprocess timeout) AND restoring the prior also
+    # fails, the settle step must not drop the restore failure — a client told only "aggregate timed
+    # out" would never learn its accepted verdict is stranded and ar_get_verdict can no longer return
+    # it. The restore failure is folded INTO the in-flight ToolError, and the prior survives at .prev.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-unwind-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    prior = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    (rundir / "verdict.json").write_text(json.dumps(prior))
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fake(module, argv, timeout=120):
+        # h_aggregate moved the prior aside to .prev. Replace verdict.json with a DIRECTORY so the
+        # settle step's stash.replace(verdict.json) raises, THEN raise like a subprocess timeout so the
+        # restore failure must be reconciled WHILE that exception unwinds.
+        (rundir / "verdict.json").mkdir()
+        raise mcpsrv.ToolError("aggregate timed out after 120s")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    raised = False
+    try:
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except mcpsrv.ToolError as e:
+            raised = True
+            msg = str(e)
+            assert "timed out" in msg, msg                                  # original error preserved
+            assert "could not be restored" in msg and ".prev" in msg, msg   # restore failure surfaced
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    assert raised, "h_aggregate must surface (not swallow) a restore failure during an unwind"
+    # The prior is never lost — it survives at .prev.
+    assert json.loads((rundir / "verdict.json.prev").read_text()) == prior, "prior must survive at .prev"
+
+
+def t_check_digest_deeply_nested_verdict_is_cannot_verify():
+    # Codex(60cb2c3): a valid but pathologically deep verdict.json makes json.loads raise
+    # RecursionError (NOT ValueError), which escaped check_digest's (OSError, ValueError) guard —
+    # aggregate.py --check-digest then crashed with exit 1, which the MCP wrapper maps to
+    # {"intact": false}, misreporting a parser failure as tampering. It must be cannot-verify (exit 2).
+    repo = Path(tempfile.mkdtemp(prefix="ar-cd-deep-"))
+    run = repo / ".adversarial-review" / "run-20260101-010101"
+    run.mkdir(parents=True)
+    (run / "verdict.json").write_text("[" * 100000 + "]" * 100000)  # deep nesting -> RecursionError
+    r = sh(["aggregate.py", "--check-digest", "--run", "run-20260101-010101"], repo, expect=2)
+    assert "cannot read verdict.json" in (r.stdout + r.stderr), (r.stdout, r.stderr)
+
+
+def t_attestation_recursionerror_artifact_is_raw_hashed_not_crash():
+    # Codex(60cb2c3): a recorded .json artifact nested deeply enough to raise RecursionError in
+    # json.loads must be hashed over its RAW bytes (like bad-UTF8 / bad-JSON), never crash
+    # compute_attestation — so aggregation and --check-digest both stay robust and a legitimately deep
+    # but unchanged artifact remains verifiable.
+    import aggregate as agg
+    run = Path(tempfile.mkdtemp(prefix="ar-att-deep-")) / "run"
+    run.mkdir(parents=True)
+    (run / "plan.json").write_text("[" * 100000 + "]" * 100000)  # deep artifact
+    att = agg.compute_attestation(run)                           # must NOT raise RecursionError
+    assert att["files"].get("plan.json", "").startswith("raw:"), att["files"]
 
 
 def main():
