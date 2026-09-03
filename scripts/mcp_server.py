@@ -561,207 +561,248 @@ def h_aggregate(args):
     except ToolError:
         run_dir = None
     vf = (run_dir / "verdict.json") if run_dir is not None else None
-    # Move any existing verdict aside so a fresh computation is proven by the NEW file's existence.
-    # If the move cannot be performed, fall back to an mtime check rather than losing the signal.
-    stash = None
-    before_mtime = None
-    stash_bytes = None
-    stash_backup = None  # durable on-disk copy of the prior when the aside-move fell back to bytes
-    if vf is not None and vf.is_file():
-        cand = vf.parent / (vf.name + ".prev")
-        cand_bak = vf.parent / (vf.name + ".bak")
-        if cand.is_file() or cand_bak.is_file():
-            # A recovery sidecar FILE (.prev/.bak) is ALREADY present next to verdict.json — a prior
-            # aggregate left it unreconciled. (A non-file at that path — e.g. a leftover .prev
-            # directory — is not a verdict sidecar; it is left to the move-aside fallback below, which
-            # already handles a rename that cannot land.) That state is AMBIGUOUS and unsafe to guess
-            # at: it is
-            # EITHER a run killed mid-settle (the sidecar is the last accepted verdict and THIS
-            # verdict.json is the crashed run's unreliable output) OR a run that SUCCEEDED whose
-            # best-effort sidecar cleanup then failed (verdict.json is the NEWER accepted verdict and
-            # the sidecar is obsolete). Disk state cannot tell the two apart, and guessing wrong loses
-            # data either way: restoring the sidecar on a later rejection would roll a newer accepted
-            # verdict BACK to an older one, while overwriting it would destroy the last accepted
-            # verdict. So refuse and surface it — the operator reconciles the sidecar and nothing is
-            # silently rolled back or lost. This fail-closed guard supersedes fix-16's preserve-and-
-            # track of an existing .prev (which rolled back a newer verdict) and removes the .bak
-            # overwrite (which clobbered a good backup). (Codex, 274b460.)
-            raise ToolError(
-                f"a recovery sidecar ({cand.name} or {cand_bak.name}) from a prior aggregate is "
-                "present next to verdict.json — the prior run did not reconcile it, so which file "
-                "holds the last accepted verdict is ambiguous. Inspect both and keep the accepted "
-                "verdict (remove the stale sidecar), then re-run ar_aggregate")
+    # Per-run interprocess lock: the process-wide HTTP dispatch lock does NOT serialize two
+    # independently launched ar-mcp processes aggregating the SAME run, so both could move the
+    # prior verdict to the one shared .prev and then race the settle below, unlinking each other's
+    # verdict with no stash left to restore (reproduced: neither verdict.json nor .prev survives).
+    # An O_EXCL lockfile makes the move-aside + aggregate + settle mutually exclusive per run: the
+    # second caller refuses here instead of adopting the first's sidecar. verdict.json.lock is NOT
+    # *.json, so it never enters the attestation. Held across the whole critical section and released
+    # in the enclosing finally on EVERY exit path (accepted, rejected, or raised). (Codex, <FIX19>.)
+    lock_fd = None
+    lock_path = None
+    if run_dir is not None and run_dir.is_dir():
+        lock_path = run_dir / "verdict.json.lock"
         try:
-            vf.replace(cand)
-            stash = cand
-        except OSError:
-            # Could not move the prior aside under its .prev name. Keep an mtime for the freshness
-            # check AND snapshot the prior's bytes (an unchanged mtime is NOT proof the file is
-            # intact — a coarse-granularity filesystem can leave st_mtime_ns unchanged on a
-            # same-quantum overwrite — so the restore rewrites these bytes rather than trusting
-            # mtime). Persist that snapshot to a DURABLE sidecar (verdict.json.bak) BEFORE
-            # aggregating: an in-memory copy alone is lost if the process is killed between
-            # aggregate's overwrite and the restore, or if the write-back itself fails. No .bak
-            # pre-exists here — the guard above refused if one did — so this never overwrites a good
-            # backup. If the prior can be neither read NOR durably backed up, abort before aggregation
-            # so it is never lost. (.bak, like .prev, is not *.json, so it never enters the
-            # attestation.) (Codex, 52c686f & 274b460; CodeRabbit, 60cb2c3.)
-            try:
-                before_mtime = vf.stat().st_mtime_ns
-                stash_bytes = vf.read_bytes()
-                cand_bak.write_bytes(stash_bytes)
-                stash_backup = cand_bak
-            except OSError as e:
-                # Surface the filesystem cause: the tools/call handler sends only str(ToolError)
-                # to the client, so include {e}; `from e` also satisfies Ruff B904. (CodeRabbit,
-                # 274b460.)
-                raise ToolError("cannot snapshot the prior verdict.json to guarantee a restore "
-                                "(it could be neither moved aside nor durably backed up) — refusing "
-                                f"to aggregate so a prior verdict is never lost: {e}") from e
-    elif vf is not None:
-        # verdict.json is absent — a prior aggregate was interrupted BETWEEN its move-aside and the
-        # settle that would have reconciled it, stranding the last accepted verdict at .prev. vf being
-        # ABSENT makes this unambiguous: a failed post-success cleanup always leaves vf present, so an
-        # absent vf can only mean the aggregate never completed its write. Adopt the stranded .prev as
-        # this run's stash — restored on a rejected aggregate, discarded once a fresh verdict
-        # supersedes it. (Fable, fc4a701; Codex, 9b93b4c.)
-        cand = vf.parent / (vf.name + ".prev")
-        if cand.is_file():
-            stash = cand
-    # The moved-aside verdict is reconciled in the single finally below, which runs on EVERY exit
-    # path — the accepted return, the rejected return, and a raised invocation (e.g. _run_cli's
-    # subprocess timeout). Earlier revisions restored the prior in several separate branches and
-    # each added branch was a fresh chance to strand or leak one; routing every path through one
-    # settle point (the same try/finally shape h_panel_ingest and the http server already use)
-    # makes that class of bug unrepresentable. `accepted` flips true only once a fresh, well-formed
-    # verdict is actually in hand.
-    accepted = False
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as e:
+            # Another aggregate holds the lock (or a prior one was killed before releasing it). Refuse
+            # rather than run concurrently and corrupt the shared sidecar. Do NOT unlink it — this
+            # process does not own it. `from e` satisfies Ruff B904.
+            raise ToolError(
+                "another ar_aggregate is in progress for this run (lock file "
+                f"{lock_path.name} is held). If no aggregate is running, a prior one was killed "
+                "before releasing it — remove the stale lock file and re-run ar_aggregate") from e
+        except OSError as e:
+            raise ToolError(
+                f"cannot acquire the aggregate lock ({lock_path.name}): {e}") from e
     try:
-        rc, out, err = _run_cli("aggregate", run_args)
-        body = (out or "").strip()
-        if err and err.strip():
-            body = (body + "\n" + err.strip()).strip()
-        if vf is None:  # the run dir may not have resolved before the call — resolve it now
+        # Move any existing verdict aside so a fresh computation is proven by the NEW file's existence.
+        # If the move cannot be performed, fall back to an mtime check rather than losing the signal.
+        stash = None
+        before_mtime = None
+        stash_bytes = None
+        stash_backup = None  # durable on-disk copy of the prior when the aside-move fell back to bytes
+        if vf is not None and vf.is_file():
+            cand = vf.parent / (vf.name + ".prev")
+            cand_bak = vf.parent / (vf.name + ".bak")
+            if cand.is_file() or cand_bak.is_file():
+                # A recovery sidecar FILE (.prev/.bak) is ALREADY present next to verdict.json — a prior
+                # aggregate left it unreconciled. (A non-file at that path — e.g. a leftover .prev
+                # directory — is not a verdict sidecar; it is left to the move-aside fallback below, which
+                # already handles a rename that cannot land.) That state is AMBIGUOUS and unsafe to guess
+                # at: it is
+                # EITHER a run killed mid-settle (the sidecar is the last accepted verdict and THIS
+                # verdict.json is the crashed run's unreliable output) OR a run that SUCCEEDED whose
+                # best-effort sidecar cleanup then failed (verdict.json is the NEWER accepted verdict and
+                # the sidecar is obsolete). Disk state cannot tell the two apart, and guessing wrong loses
+                # data either way: restoring the sidecar on a later rejection would roll a newer accepted
+                # verdict BACK to an older one, while overwriting it would destroy the last accepted
+                # verdict. So refuse and surface it — the operator reconciles the sidecar and nothing is
+                # silently rolled back or lost. This fail-closed guard supersedes fix-16's preserve-and-
+                # track of an existing .prev (which rolled back a newer verdict) and removes the .bak
+                # overwrite (which clobbered a good backup). (Codex, 274b460.)
+                raise ToolError(
+                    f"a recovery sidecar ({cand.name} or {cand_bak.name}) from a prior aggregate is "
+                    "present next to verdict.json — the prior run did not reconcile it, so which file "
+                    "holds the last accepted verdict is ambiguous. Inspect both and keep the accepted "
+                    "verdict (remove the stale sidecar), then re-run ar_aggregate")
             try:
-                vf = _run_dir(run_args) / "verdict.json"
-            except ToolError:
-                vf = None
-        # aggregate exits 0 PASS / 1 FAIL / 2 BLOCKED for a real verdict and writes verdict.json as
-        # its final step. If it exited some other way (e.g. crashed on a malformed artifact) or did
-        # NOT write a fresh verdict, never surface a pre-existing verdict as success.
-        fresh = bool(vf and vf.is_file()
-                     and (before_mtime is None or vf.stat().st_mtime_ns != before_mtime))
-        # Reject with a SPECIFIC reason (stale / crashed / malformed / unrecognized / wrong-run) so an
-        # operator can tell them apart — WITHOUT changing which verdicts are accepted. `reason` stays
-        # "" only when a fresh, recognized verdict for THIS run is in hand.
-        reason = ""
-        if rc not in (0, 1, 2):
-            reason = "exit code is not a verdict result (expected 0, 1, or 2)"
-        elif not fresh:
-            reason = "aggregate wrote no fresh verdict.json"
-        else:
-            try:
-                structured = json.loads(vf.read_text(encoding="utf-8"))
-            except (OSError, ValueError, RecursionError):
-                # A fresh file that is unreadable, MALFORMED, or pathologically deep (json.loads raises
-                # RecursionError on deep nesting — NOT a ValueError) is not a usable verdict. Guarding
-                # read/parse here (as check_digest does) yields a clean rejected result rather than
-                # crashing h_aggregate past the return below. (CodeRabbit, 7da1420; Codex, 60cb2c3.)
-                structured = None
-            # A fresh OBJECT is not enough: accept only a RECOGNIZED verdict value FOR THE PINNED RUN.
-            # run_args always carries --run here (h_aggregate refuses an empty run_args at entry), so
-            # the fresh verdict aggregate wrote must carry that same run_id — a stray/foreign object
-            # (an empty {}, an unknown verdict, or another run's verdict) is rejected below. Attestation
-            # PRESENCE is deliberately not gated here — that is check_digest's concern. (CodeRabbit, bdccc64.)
-            pinned = run_args[run_args.index("--run") + 1] if "--run" in run_args else None
-            if not isinstance(structured, dict):
-                reason = "the fresh verdict.json was unreadable, malformed, or not a JSON object"
-            elif structured.get("verdict") not in ("PASS", "FAIL", "BLOCKED"):
-                reason = f"unrecognized verdict value {structured.get('verdict')!r}"
-            elif not (pinned is None or structured.get("run_id") == pinned):
-                reason = (f"verdict run_id {structured.get('run_id')!r} does not match the resolved "
-                          f"run {pinned!r}")
+                vf.replace(cand)
+                stash = cand
+            except OSError:
+                # Could not move the prior aside under its .prev name. Keep an mtime for the freshness
+                # check AND snapshot the prior's bytes (an unchanged mtime is NOT proof the file is
+                # intact — a coarse-granularity filesystem can leave st_mtime_ns unchanged on a
+                # same-quantum overwrite — so the restore rewrites these bytes rather than trusting
+                # mtime). Persist that snapshot to a DURABLE sidecar (verdict.json.bak) BEFORE
+                # aggregating: an in-memory copy alone is lost if the process is killed between
+                # aggregate's overwrite and the restore, or if the write-back itself fails. No .bak
+                # pre-exists here — the guard above refused if one did — so this never overwrites a good
+                # backup. If the prior can be neither read NOR durably backed up, abort before aggregation
+                # so it is never lost. (.bak, like .prev, is not *.json, so it never enters the
+                # attestation.) (Codex, 52c686f & 274b460; CodeRabbit, 60cb2c3.)
+                try:
+                    before_mtime = vf.stat().st_mtime_ns
+                    stash_bytes = vf.read_bytes()
+                    cand_bak.write_bytes(stash_bytes)
+                    stash_backup = cand_bak
+                except OSError as e:
+                    # Surface the filesystem cause: the tools/call handler sends only str(ToolError)
+                    # to the client, so include {e}; `from e` also satisfies Ruff B904. (CodeRabbit,
+                    # 274b460.)
+                    raise ToolError("cannot snapshot the prior verdict.json to guarantee a restore "
+                                    "(it could be neither moved aside nor durably backed up) — refusing "
+                                    f"to aggregate so a prior verdict is never lost: {e}") from e
+        elif vf is not None:
+            # verdict.json is absent — a prior aggregate was interrupted BETWEEN its move-aside and the
+            # settle that would have reconciled it, stranding the last accepted verdict at .prev. vf being
+            # ABSENT makes this unambiguous: a failed post-success cleanup always leaves vf present, so an
+            # absent vf can only mean the aggregate never completed its write. Adopt the stranded .prev as
+            # this run's stash — restored on a rejected aggregate, discarded once a fresh verdict
+            # supersedes it. (Fable, fc4a701; Codex, 9b93b4c.)
+            cand = vf.parent / (vf.name + ".prev")
+            if cand.is_file():
+                stash = cand
+        # The moved-aside verdict is reconciled in the single finally below, which runs on EVERY exit
+        # path — the accepted return, the rejected return, and a raised invocation (e.g. _run_cli's
+        # subprocess timeout). Earlier revisions restored the prior in several separate branches and
+        # each added branch was a fresh chance to strand or leak one; routing every path through one
+        # settle point (the same try/finally shape h_panel_ingest and the http server already use)
+        # makes that class of bug unrepresentable. `accepted` flips true only once a fresh, well-formed
+        # verdict is actually in hand.
+        accepted = False
+        try:
+            rc, out, err = _run_cli("aggregate", run_args)
+            body = (out or "").strip()
+            if err and err.strip():
+                body = (body + "\n" + err.strip()).strip()
+            if vf is None:  # the run dir may not have resolved before the call — resolve it now
+                try:
+                    vf = _run_dir(run_args) / "verdict.json"
+                except ToolError:
+                    vf = None
+            # aggregate exits 0 PASS / 1 FAIL / 2 BLOCKED for a real verdict and writes verdict.json as
+            # its final step. If it exited some other way (e.g. crashed on a malformed artifact) or did
+            # NOT write a fresh verdict, never surface a pre-existing verdict as success.
+            fresh = bool(vf and vf.is_file()
+                         and (before_mtime is None or vf.stat().st_mtime_ns != before_mtime))
+            # Reject with a SPECIFIC reason (stale / crashed / malformed / unrecognized / wrong-run) so an
+            # operator can tell them apart — WITHOUT changing which verdicts are accepted. `reason` stays
+            # "" only when a fresh, recognized verdict for THIS run is in hand.
+            reason = ""
+            if rc not in (0, 1, 2):
+                reason = "exit code is not a verdict result (expected 0, 1, or 2)"
+            elif not fresh:
+                reason = "aggregate wrote no fresh verdict.json"
             else:
-                accepted = True  # only now: a fresh, recognized verdict for THIS run is in hand
-                return _result(body or structured.get("verdict", ""), structured=structured)
-        return _result(f"aggregate exited {rc} without an accepted verdict ({reason}):\n{body}",
-                       is_error=True)
-    finally:
-        # Single settle point for the moved-aside verdict. On acceptance the stash is a superseded
-        # copy — discard it. On ANY non-acceptance (rejected exit, or a raised/timed-out invocation)
-        # remove whatever rejected verdict was written and restore the prior — from the .prev stash if
-        # the aside-move succeeded, else by rewriting the durable .bak snapshot — so ar_get_verdict
-        # always sees either the freshly accepted verdict or the last accepted one, never a
-        # rejected/partial verdict, never a stranded sidecar.
-        # A restore that FAILS here (a transient OSError — a Windows file lock, a vanished parent)
-        # must NOT be swallowed: doing so silently strands the accepted prior at its sidecar while
-        # ar_get_verdict sees no verdict, or a rejected one, with no signal. Capture such a failure and
-        # surface it, naming the sidecar the prior survives at. On a NORMAL return, raise a ToolError.
-        # When ANOTHER exception is already unwinding (e.g. _run_cli's subprocess timeout) do not
-        # silently drop it: fold the restore failure INTO that error when it is a ToolError, else log
-        # it — so a client is never told only "aggregate timed out" while its accepted verdict sits
-        # stranded and ar_get_verdict can no longer return it. (Codex, 13d473f & 60cb2c3.)
-        reconcile_err = None
-        reconcile_at = None  # sidecar the un-restored prior survives at, for the recovery message
-        if accepted:
-            for s in (stash, stash_backup):  # at most one is set — drop the superseded copy
-                if s is not None and s.is_file():
+                try:
+                    structured = json.loads(vf.read_text(encoding="utf-8"))
+                except (OSError, ValueError, RecursionError):
+                    # A fresh file that is unreadable, MALFORMED, or pathologically deep (json.loads raises
+                    # RecursionError on deep nesting — NOT a ValueError) is not a usable verdict. Guarding
+                    # read/parse here (as check_digest does) yields a clean rejected result rather than
+                    # crashing h_aggregate past the return below. (CodeRabbit, 7da1420; Codex, 60cb2c3.)
+                    structured = None
+                # A fresh OBJECT is not enough: accept only a RECOGNIZED verdict value FOR THE PINNED RUN.
+                # run_args always carries --run here (h_aggregate refuses an empty run_args at entry), so
+                # the fresh verdict aggregate wrote must carry that same run_id — a stray/foreign object
+                # (an empty {}, an unknown verdict, or another run's verdict) is rejected below. Attestation
+                # PRESENCE is deliberately not gated here — that is check_digest's concern. (CodeRabbit, bdccc64.)
+                pinned = run_args[run_args.index("--run") + 1] if "--run" in run_args else None
+                if not isinstance(structured, dict):
+                    reason = "the fresh verdict.json was unreadable, malformed, or not a JSON object"
+                elif structured.get("verdict") not in ("PASS", "FAIL", "BLOCKED"):
+                    reason = f"unrecognized verdict value {structured.get('verdict')!r}"
+                elif not (pinned is None or structured.get("run_id") == pinned):
+                    reason = (f"verdict run_id {structured.get('run_id')!r} does not match the resolved "
+                              f"run {pinned!r}")
+                else:
+                    accepted = True  # only now: a fresh, recognized verdict for THIS run is in hand
+                    return _result(body or structured.get("verdict", ""), structured=structured)
+            return _result(f"aggregate exited {rc} without an accepted verdict ({reason}):\n{body}",
+                           is_error=True)
+        finally:
+            # Single settle point for the moved-aside verdict. On acceptance the stash is a superseded
+            # copy — discard it. On ANY non-acceptance (rejected exit, or a raised/timed-out invocation)
+            # remove whatever rejected verdict was written and restore the prior — from the .prev stash if
+            # the aside-move succeeded, else by rewriting the durable .bak snapshot — so ar_get_verdict
+            # always sees either the freshly accepted verdict or the last accepted one, never a
+            # rejected/partial verdict, never a stranded sidecar.
+            # A restore that FAILS here (a transient OSError — a Windows file lock, a vanished parent)
+            # must NOT be swallowed: doing so silently strands the accepted prior at its sidecar while
+            # ar_get_verdict sees no verdict, or a rejected one, with no signal. Capture such a failure and
+            # surface it, naming the sidecar the prior survives at. On a NORMAL return, raise a ToolError.
+            # When ANOTHER exception is already unwinding (e.g. _run_cli's subprocess timeout) do not
+            # silently drop it: fold the restore failure INTO that error when it is a ToolError, else log
+            # it — so a client is never told only "aggregate timed out" while its accepted verdict sits
+            # stranded and ar_get_verdict can no longer return it. (Codex, 13d473f & 60cb2c3.)
+            reconcile_err = None
+            reconcile_at = None  # sidecar the un-restored prior survives at, for the recovery message
+            if accepted:
+                for s in (stash, stash_backup):  # at most one is set — drop the superseded copy
+                    if s is not None and s.is_file():
+                        try:
+                            s.unlink()
+                        except OSError:
+                            pass
+            elif stash is not None:
+                # Prior was moved aside to .prev — drop any rejected verdict aggregate wrote, then restore
+                # the prior from the stash. BOTH steps run under one guard so a failure of EITHER (the
+                # unlink or the .prev -> verdict.json move) is recorded, not swallowed.
+                try:
+                    if vf is not None and vf.is_file():
+                        vf.unlink()
+                    if stash.is_file():
+                        stash.replace(vf)
+                except OSError as e:
+                    reconcile_err, reconcile_at = e, stash
+            elif stash_bytes is not None:
+                # The aside-move failed, so the prior was byte-snapshotted (and durably backed up to .bak).
+                # Rewrite the bytes verbatim — a write can succeed on the very filesystem whose rename
+                # failed, and it overwrites any rejected verdict written in the same mtime quantum (this
+                # restore never trusts mtime). On success drop the now-redundant .bak; on failure the prior
+                # is NOT lost — it survives at .bak, which the error names.
+                if vf is not None:
                     try:
-                        s.unlink()
+                        vf.write_bytes(stash_bytes)
+                    except OSError as e:
+                        reconcile_err, reconcile_at = e, stash_backup
+                if reconcile_err is None and stash_backup is not None and stash_backup.is_file():
+                    try:
+                        stash_backup.unlink()
                     except OSError:
                         pass
-        elif stash is not None:
-            # Prior was moved aside to .prev — drop any rejected verdict aggregate wrote, then restore
-            # the prior from the stash. BOTH steps run under one guard so a failure of EITHER (the
-            # unlink or the .prev -> verdict.json move) is recorded, not swallowed.
-            try:
+            else:
+                # No prior verdict existed — just remove any rejected verdict aggregate wrote. A failure
+                # here loses nothing (there is no prior to strand), so it stays best-effort.
                 if vf is not None and vf.is_file():
-                    vf.unlink()
-                if stash.is_file():
-                    stash.replace(vf)
-            except OSError as e:
-                reconcile_err, reconcile_at = e, stash
-        elif stash_bytes is not None:
-            # The aside-move failed, so the prior was byte-snapshotted (and durably backed up to .bak).
-            # Rewrite the bytes verbatim — a write can succeed on the very filesystem whose rename
-            # failed, and it overwrites any rejected verdict written in the same mtime quantum (this
-            # restore never trusts mtime). On success drop the now-redundant .bak; on failure the prior
-            # is NOT lost — it survives at .bak, which the error names.
-            if vf is not None:
+                    try:
+                        vf.unlink()
+                    except OSError:
+                        pass
+            if reconcile_err is not None:
+                where = reconcile_at.name if reconcile_at is not None else "verdict.json.prev"
+                detail = ("aggregate was rejected but the prior verdict could not be restored "
+                          f"({reconcile_err}); the last accepted verdict is preserved at {where} — "
+                          "restore it manually before trusting ar_get_verdict")
+                exc = sys.exc_info()[1]
+                if exc is None:
+                    raise ToolError(detail)
+                if isinstance(exc, ToolError):
+                    # Fold the restore failure INTO the in-flight tool error so the client is told BOTH,
+                    # never only the original (e.g. "aggregate timed out") with the prior silently
+                    # stranded and unrecoverable via ar_get_verdict. (Codex, 60cb2c3.)
+                    raise ToolError(f"{exc}; additionally, {detail}")
+                # An unexpected non-ToolError is louder and must not be masked — but still record the
+                # stranded prior so a failed restore during that unwind is never fully silent.
+                log(f"prior verdict restore failed ({reconcile_err}); preserved at {where} — "
+                    "restore it before trusting ar_get_verdict")
+    finally:
+        # Release the per-run lock on every exit path. Close BEFORE unlink so the removal succeeds on
+        # Windows too (an open handle blocks delete there). A failure to unlink leaves a stale lock
+        # the operator can clear — never crash the settle over it, and never unlink a lock this
+        # process did not create (lock_fd is None then). (Codex, <FIX19>.)
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            if lock_path is not None:
                 try:
-                    vf.write_bytes(stash_bytes)
-                except OSError as e:
-                    reconcile_err, reconcile_at = e, stash_backup
-            if reconcile_err is None and stash_backup is not None and stash_backup.is_file():
-                try:
-                    stash_backup.unlink()
+                    os.unlink(str(lock_path))
                 except OSError:
                     pass
-        else:
-            # No prior verdict existed — just remove any rejected verdict aggregate wrote. A failure
-            # here loses nothing (there is no prior to strand), so it stays best-effort.
-            if vf is not None and vf.is_file():
-                try:
-                    vf.unlink()
-                except OSError:
-                    pass
-        if reconcile_err is not None:
-            where = reconcile_at.name if reconcile_at is not None else "verdict.json.prev"
-            detail = ("aggregate was rejected but the prior verdict could not be restored "
-                      f"({reconcile_err}); the last accepted verdict is preserved at {where} — "
-                      "restore it manually before trusting ar_get_verdict")
-            exc = sys.exc_info()[1]
-            if exc is None:
-                raise ToolError(detail)
-            if isinstance(exc, ToolError):
-                # Fold the restore failure INTO the in-flight tool error so the client is told BOTH,
-                # never only the original (e.g. "aggregate timed out") with the prior silently
-                # stranded and unrecoverable via ar_get_verdict. (Codex, 60cb2c3.)
-                raise ToolError(f"{exc}; additionally, {detail}")
-            # An unexpected non-ToolError is louder and must not be masked — but still record the
-            # stranded prior so a failed restore during that unwind is never fully silent.
-            log(f"prior verdict restore failed ({reconcile_err}); preserved at {where} — "
-                "restore it before trusting ar_get_verdict")
 
 
 def h_check_digest(args):

@@ -696,6 +696,126 @@ def t_json_nesting_depth_is_byte_deterministic():
     assert aggregate._json_nesting_depth(b'["a \\" [ still in string"]') == 1     # escaped quote
 
 
+def t_check_digest_legacy_deep_artifact_is_cannot_verify_not_drift():
+    # Codex r3924189603 / CodeRabbit r3924074998: a verdict written BEFORE the version-independent depth
+    # cap (commit 5833535) canonicalized a deep-but-parseable artifact and stored a PLAIN canonical
+    # hash; this version hashes the SAME unchanged bytes as "raw:", so --check-digest recomputes a
+    # different manifest for UNCHANGED bytes. Because the algorithm id stayed sha256-canonical-json-v1,
+    # the id alone cannot date the verdict, so this must be reported as cannot-verify (exit 2) with
+    # re-aggregation guidance, NEVER a false DRIFT (exit 1) that the MCP wrapper maps to detected
+    # tampering. The compat path is proven byte-for-byte (canonicalize the CURRENT bytes and compare to
+    # the stored hash), so it can never MASK a real change — the second half asserts exactly that.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {                       # triage the high finding -> PASS
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    depth = 300  # above the cap, but well under the default recursion limit -> parses fine
+    deep_bytes = ("[" * depth + "]" * depth).encode("utf-8")
+    (run / "deep.json").write_bytes(deep_bytes)
+    sh(["aggregate.py"], repo, expect=0)                            # this version: deep.json -> "raw:"
+    v = read(run / "verdict.json")
+    att = v["attestation"]
+    assert att["files"]["deep.json"].startswith("raw:"), att["files"]["deep.json"]
+    # Rewrite the stored attestation as a LEGACY (pre-cap) tool would have: the deep artifact recorded
+    # as a plain CANONICAL hash, with the manifest digest recomputed so the record stays self-consistent
+    # (exactly what the old code wrote). Nothing else is touched, so the ONLY recompute difference is
+    # deep.json's representation.
+    canon = json.dumps(json.loads(deep_bytes.decode("utf-8")), sort_keys=True,
+                       separators=(",", ":"), ensure_ascii=False)
+    legacy_files = dict(att["files"])
+    legacy_files["deep.json"] = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+    manifest = "\n".join(f"{sha}  {rel}" for rel, sha in sorted(legacy_files.items()))
+    att["files"] = legacy_files
+    att["digest"] = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+    v["attestation"] = att
+    (run / "verdict.json").write_text(json.dumps(v))
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=2)      # cannot-verify, NOT drift (1)
+    blob = r.stdout + r.stderr
+    assert "CANNOT BE VERIFIED" in blob, (r.stdout, r.stderr)
+    assert "deep.json" in blob, blob
+    assert "MISMATCH" not in r.stdout, "legacy transition must not be reported as definitive drift"
+    # Security preserved: a deep artifact SWAPPED for DIFFERENT deep content (bytes changed) must stay
+    # DRIFT, never be masked by the legacy path. The stored legacy canonical hash is of the ORIGINAL
+    # bytes; the new bytes re-canonicalize to a different hash, so the byte-equality proof fails.
+    (run / "deep.json").write_bytes(("[" * (depth + 1) + "]" * (depth + 1)).encode("utf-8"))
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=1)      # real change -> DRIFT, not masked
+    assert "DRIFT" in r.stdout and "deep.json" in r.stdout, r.stdout
+
+
+def t_mcp_aggregate_refuses_when_run_lock_is_held():
+    # Codex r3924189590: two independently launched ar-mcp processes aggregating the SAME run are not
+    # serialized by the process-wide HTTP dispatch lock, so both move the prior verdict to the one
+    # shared .prev and race the settle, losing the verdict. A per-run O_EXCL lockfile makes the second
+    # caller REFUSE instead of adopting the first's sidecar. Pre-creating verdict.json.lock simulates a
+    # concurrent holder; h_aggregate must raise before ever invoking aggregate. (_run_cli is stubbed so
+    # that on the PRE-FIX source, where no lock is honored, this proceeds and DOES NOT raise -> the test
+    # fails, which is the revert-proof.)
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-lock-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    (rundir / "verdict.json").write_text(
+        json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+    (rundir / "verdict.json.lock").write_text("")   # a concurrent aggregate holds the run lock
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fresh(module, argv, timeout=120):           # only reached if the lock is NOT honored (pre-fix)
+        (rundir / "verdict.json").write_text(
+            json.dumps({"verdict": "FAIL", "run_id": "run-20260101-010101"}))
+        return (1, "FAIL", "")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fresh
+    raised = None
+    try:
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except mcpsrv.ToolError as e:
+            raised = e
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    assert raised is not None, "h_aggregate must refuse while the run lock is held (was not honored)"
+    msg = str(raised)
+    assert "lock" in msg and "in progress" in msg, msg
+    assert (rundir / "verdict.json.lock").is_file(), "a lock this process did not create must remain"
+
+
+def t_mcp_aggregate_lock_held_during_run_and_released_after():
+    # Companion to the refusal test: the per-run lock must be HELD across the aggregate invocation (so a
+    # concurrent caller sees it) and REMOVED afterward (so a completed aggregate never strands a stale
+    # lock that blocks the next one). On the pre-fix source no lock is created, so `held_during` is
+    # False -> the assertion fails, which is this regression's revert-proof.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-lockrel-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    (rundir / "verdict.json").write_text(
+        json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+    lock = rundir / "verdict.json.lock"
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    seen = {}
+
+    def fresh(module, argv, timeout=120):
+        seen["held_during"] = lock.exists()   # the lock must be held while aggregate runs
+        (rundir / "verdict.json").write_text(
+            json.dumps({"verdict": "FAIL", "run_id": "run-20260101-010101"}))
+        return (1, "FAIL", "")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fresh
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert not r["isError"] and r["structuredContent"]["verdict"] == "FAIL", r
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    assert seen.get("held_during") is True, "lock must be held while aggregate runs"
+    assert not lock.exists(), "lock must be released after a completed aggregate (no stale lock)"
+
+
 def t_check_digest_unreadable_verdict_is_cannot_verify_not_drift():
     # A malformed verdict.json makes --check-digest unable to READ the stored attestation, so nothing
     # is compared. That must exit 2 (cannot verify), never 1 (a definitive mismatch): the MCP wrapper

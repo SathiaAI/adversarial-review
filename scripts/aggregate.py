@@ -256,9 +256,46 @@ def compute_attestation(run):
             "digest": digest, "files": files}
 
 
+def _is_legacy_canon_to_raw(run, rel, stored_hash, recomputed_hash):
+    """True iff one attestation entry differs ONLY because of the pre-5833535 canonical->raw
+    representation change for a deep artifact, with the on-disk bytes PROVABLY unchanged. check_digest
+    uses it to tell a benign version transition (report cannot-verify, re-aggregate) apart from real
+    tampering (DRIFT).
+
+    Qualifies only when ALL hold: the stored hash is canonical (not "raw:"); the recomputed hash is
+    "raw:" (this version routed the artifact to the raw path); the CURRENT bytes are nested beyond the
+    cap (so that routing is the depth policy, not a parse failure — a parse failure below the cap is
+    real drift or corruption, not this transition); and canonicalizing the CURRENT bytes reproduces
+    EXACTLY the stored canonical hash. That final equality is the security-preserving check: it is
+    positive proof the content is byte-identical to what was attested, so a deep artifact swapped for
+    DIFFERENT deep content re-canonicalizes to a different hash and stays DRIFT (forging a match would
+    require a SHA-256 preimage). Any read/parse error -> not a provable transition -> False, and the
+    caller keeps the DRIFT signal. Canonicalization mirrors compute_attestation exactly so the hashes
+    are comparable."""
+    if not isinstance(stored_hash, str) or stored_hash.startswith("raw:"):
+        return False
+    if not isinstance(recomputed_hash, str) or not recomputed_hash.startswith("raw:"):
+        return False
+    try:
+        raw = (run / rel).read_bytes()
+    except OSError:
+        return False
+    if _json_nesting_depth(raw) <= _MAX_CANON_DEPTH:
+        return False
+    try:
+        canon = json.dumps(json.loads(raw.decode("utf-8")), sort_keys=True,
+                           separators=(",", ":"), ensure_ascii=False)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return False
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest() == stored_hash
+
+
 def check_digest(run):
     """Recompute the attestation and compare to the one stored in verdict.json.
-    Exit 0 on match; on mismatch, name every drifted artifact and exit 1."""
+    Exit 0 on match; exit 1 (DRIFT) when artifacts changed after the verdict was computed; exit 2
+    (cannot-verify) when the stored attestation cannot be read or compared, OR when every differing
+    artifact is only the pre-5833535 canonical->raw deep-artifact representation change with its bytes
+    provably unchanged — re-aggregate to refresh the recorded digest, then re-check."""
     vpath = run / "verdict.json"
     if not vpath.exists():
         print("no verdict.json in run — aggregate first")
@@ -316,11 +353,29 @@ def check_digest(run):
         print(f"attestation OK: sha256 {att['digest']} over {att['inputs']} artifacts")
         sys.exit(0)
     old = stored.get("files", {})
-    for rel in sorted(set(old) | set(att["files"])):
-        a, b = old.get(rel), att["files"].get(rel)
-        if a != b:
-            tag = "added" if a is None else ("removed" if b is None else "modified")
-            print(f"  DRIFT {tag:9s}{rel}")
+    drifted = [(rel, old.get(rel), att["files"].get(rel))
+               for rel in sorted(set(old) | set(att["files"]))
+               if old.get(rel) != att["files"].get(rel)]
+    # Legacy-compat: a verdict written BEFORE the version-independent depth cap (commit 5833535)
+    # canonicalized a deep-but-parseable artifact and stored a plain canonical hash; this version hashes
+    # the SAME unchanged bytes as "raw:<sha>", so the manifest differs though nothing was tampered. The
+    # algorithm id stayed "sha256-canonical-json-v1", so the id alone cannot date a verdict — detect the
+    # transition PER FILE from the artifacts themselves (_is_legacy_canon_to_raw proves byte-equality).
+    # Only when EVERY differing file is such a benign transition is this cannot-verify (exit 2) with
+    # re-aggregation guidance, never a false MISMATCH (exit 1). If even one file is real drift, the whole
+    # run stays DRIFT — the tamper signal is never softened by a co-occurring legacy artifact. (Codex
+    # r3924189603 / CodeRabbit r3924074998, <FIX19>.)
+    if drifted and all(_is_legacy_canon_to_raw(run, rel, a, b) for rel, a, b in drifted):
+        for rel, _a, _b in drifted:
+            print(f"  LEGACY   {rel} (deep artifact attested before the depth cap; bytes unchanged)")
+        print("attestation CANNOT BE VERIFIED: every differing artifact is a deep document an earlier "
+              "version canonicalized and this version hashes raw — the recorded digest predates that "
+              "representation change, so a match is impossible though the bytes are unchanged. "
+              "Re-aggregate to refresh the attestation, then re-check.", file=sys.stderr)
+        sys.exit(2)
+    for rel, a, b in drifted:
+        tag = "added" if a is None else ("removed" if b is None else "modified")
+        print(f"  DRIFT {tag:9s}{rel}")
     print(f"attestation MISMATCH: stored {stored.get('digest')}, "
           f"recomputed {att['digest']} — this run's artifacts changed after the "
           "verdict was computed")

@@ -180,9 +180,12 @@ human-readable `verdict.md` is written alongside `verdict.json`.
 The `attestation` block makes the audit record tamper-evident. Every `*.json` file in
 the run directory except `verdict.json` (the output) is canonicalized — sorted keys,
 compact separators, so cosmetic re-serialization is not tampering — and hashed; a
-`.json` file that fails UTF-8 decoding or JSON parsing is hashed over its raw bytes
-(`raw:` prefix) rather than crashing the aggregator — both failure modes are treated
-identically and deliberately. The per-file hashes are folded into one manifest digest.
+`.json` file that fails UTF-8 decoding or JSON parsing, **or that is nested beyond a fixed,
+version-independent depth cap**, is hashed over its raw bytes (`raw:` prefix) rather than
+crashing the aggregator — these cases are treated identically and deliberately. Deciding
+raw-vs-canonical from the depth cap (measured from the bytes, *before* parsing) rather than
+from whether `json.loads` happens to raise keeps the digest **byte-identical across Python
+versions**. The per-file hashes are folded into one manifest digest.
 Re-aggregating an untouched run reproduces the digest bit-for-bit.
 `aggregate.py --check-digest` recomputes it against the stored value: exit 0 intact;
 exit 1 with each drifted artifact named `DRIFT modified|added|removed`; exit 2 when the
@@ -190,10 +193,18 @@ digest cannot be checked at all — no verdict, an unreadable/malformed or non-o
 verdict.json, or an attestation that is not a usable object: not a dict, or a dict that
 lacks a string `digest` or a dict `files` (e.g. a legacy record computed before #5 — its
 absent/non-string digest would otherwise fall through to the exit-1 mismatch path, and a
-non-dict `files` would crash the drift report and leak as exit 1). Exit 1 is reserved for
-a real recomputed mismatch, never a read/parse/shape failure, so a host that treats exit 1
-as "tampered" is never misled by an uncheckable run. Third parties can verify a shipped run
-directory the same way.
+non-dict `files` would crash the drift report and leak as exit 1). Exit 2 also covers a
+**legacy deep-artifact transition**: a verdict recorded *before* the depth cap canonicalized
+a deep-but-parseable artifact and stored a plain canonical hash, which this version now
+hashes `raw:`; the algorithm id is unchanged (`sha256-canonical-json-v1`), so when *every*
+differing file is that representation change **and** the current bytes provably
+re-canonicalize to the stored hash — positive proof the content is unchanged, not tampered —
+`--check-digest` reports cannot-verify with re-aggregation guidance (`LEGACY <file>`) rather
+than a false `DRIFT`. Because that is a byte-equality proof, a deep artifact swapped for
+*different* content re-canonicalizes to a different hash and still reports `DRIFT`. Exit 1 is
+reserved for a real recomputed mismatch, never a read/parse/shape or legacy-representation
+failure, so a host that treats exit 1 as "tampered" is never misled by an uncheckable run.
+Third parties can verify a shipped run directory the same way.
 
 Optionally, `aggregate.py --sign` produces a **detached cryptographic signature over the
 run's `verdict.json`** (binding the verdict decision, not only this digest), written as the
