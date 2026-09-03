@@ -377,13 +377,14 @@ def h_init(args):
         if RUN_ID_RE.fullmatch(base):
             run_id = base
     if run_id is None:
-        # init SUCCEEDED (rc == 0) but its stdout could not be parsed for the run id — never report a
-        # null run_id on a successful init. Fall back to the newest run (which init just created);
-        # _run_dir orders the -N disambiguator numerically. (Fable, fc4a701.)
-        try:
-            run_id = _run_dir([]).name
-        except ToolError:
-            pass
+        # init SUCCEEDED (rc == 0) but its stdout could not be parsed for the run id. Do NOT fall back
+        # to a directory scan (_run_dir([])) to guess it: a concurrent init would make that return a
+        # DIFFERENT caller's newer run, handing back a valid-looking WRONG id the client would then
+        # write gates / context / reviewer artifacts into — the very concurrent-scan race the stdout
+        # parse exists to avoid. Surface a tool error instead; the run just created is on disk under
+        # the run root. (Codex, 9b93b4c.)
+        return _result("init succeeded but its run id could not be parsed from panel.py output — "
+                       "the new run is under .adversarial-review/; locate it there", is_error=True)
     return _result((out or "").strip() or f"initialized {run_id}",
                    structured={"run_id": run_id})
 
@@ -544,6 +545,13 @@ def h_aggregate(args):
     can leave unchanged on a same-quantum rewrite — so a stale PASS is never surfaced as this run's
     result. A failed aggregate restores the prior verdict and surfaces the error."""
     run_args = _safe_run(args)
+    # _safe_run returns [] ONLY when no run exists (run omitted and none minted yet). Refuse rather
+    # than invoke aggregate.py unpinned: an unpinned aggregate resolves the newest run ITSELF, so a
+    # run that a concurrent external caller inits in the meantime would be aggregated — and its
+    # verdict.json mutated — by THIS call, altering a run the caller never selected. Nothing can be
+    # legitimately aggregated without a run, so require ar_init first. (CodeRabbit merge-risk, 9b93b4c.)
+    if not run_args:
+        raise ToolError("no run to aggregate — call ar_init first")
     try:
         run_dir = _run_dir(run_args)
     except ToolError:
@@ -557,38 +565,49 @@ def h_aggregate(args):
     stash_backup = None  # durable on-disk copy of the prior when the aside-move fell back to bytes
     if vf is not None and vf.is_file():
         cand = vf.parent / (vf.name + ".prev")
-        try:
-            vf.replace(cand)
+        if cand.is_file():
+            # A .prev sidecar ALREADY exists — a prior aggregate was killed mid-settle, leaving the last
+            # known-good verdict stranded there and THIS verdict.json the crashed run's unreliable
+            # output. Do NOT move verdict.json over .prev: that overwrites the good prior, and a later
+            # failed aggregate would then restore the bad file, permanently losing the last accepted
+            # verdict. Preserve .prev as the stash and track verdict.json by mtime so a fresh aggregate
+            # is still detected; a rejected re-aggregate then restores the good .prev. (Codex, 9b93b4c.)
             stash = cand
-        except OSError:
-            # Could not move the prior aside under its .prev name. Keep an mtime for the freshness
-            # check AND snapshot the prior's bytes (an unchanged mtime is NOT proof the file is intact
-            # — a coarse-granularity filesystem can leave st_mtime_ns unchanged on a same-quantum
-            # overwrite — so the restore rewrites these bytes rather than trusting mtime). Persist that
-            # snapshot to a DURABLE sidecar (verdict.json.bak) BEFORE aggregating: an in-memory copy
-            # alone is lost if the process is killed between aggregate's overwrite and the restore, or
-            # if the write-back itself fails — the prior would then be gone from disk with nothing to
-            # recover. A distinct .bak name (not .prev, which the failed move may have left occupied)
-            # lets this durable write still succeed. If the prior can be neither read NOR durably
-            # backed up, there is nothing to restore from and letting aggregate run would overwrite the
-            # only copy — abort before aggregation so the prior is never lost. (.bak, like .prev, is
-            # not *.json, so it never enters the attestation.) (Codex, 52c686f; CodeRabbit, 60cb2c3.)
             try:
                 before_mtime = vf.stat().st_mtime_ns
-                stash_bytes = vf.read_bytes()
-                cand_bak = vf.parent / (vf.name + ".bak")
-                cand_bak.write_bytes(stash_bytes)
-                stash_backup = cand_bak
             except OSError:
-                raise ToolError("cannot snapshot the prior verdict.json to guarantee a restore "
-                                "(it could be neither moved aside nor durably backed up) — refusing "
-                                "to aggregate so a prior verdict is never lost")
+                before_mtime = None
+        else:
+            try:
+                vf.replace(cand)
+                stash = cand
+            except OSError:
+                # Could not move the prior aside under its .prev name. Keep an mtime for the freshness
+                # check AND snapshot the prior's bytes (an unchanged mtime is NOT proof the file is
+                # intact — a coarse-granularity filesystem can leave st_mtime_ns unchanged on a
+                # same-quantum overwrite — so the restore rewrites these bytes rather than trusting
+                # mtime). Persist that snapshot to a DURABLE sidecar (verdict.json.bak) BEFORE
+                # aggregating: an in-memory copy alone is lost if the process is killed between
+                # aggregate's overwrite and the restore, or if the write-back itself fails. A distinct
+                # .bak name (not .prev) lets this durable write still succeed. If the prior can be
+                # neither read NOR durably backed up, abort before aggregation so it is never lost.
+                # (.bak, like .prev, is not *.json, so it never enters the attestation.)
+                # (Codex, 52c686f; CodeRabbit, 60cb2c3.)
+                try:
+                    before_mtime = vf.stat().st_mtime_ns
+                    stash_bytes = vf.read_bytes()
+                    cand_bak = vf.parent / (vf.name + ".bak")
+                    cand_bak.write_bytes(stash_bytes)
+                    stash_backup = cand_bak
+                except OSError:
+                    raise ToolError("cannot snapshot the prior verdict.json to guarantee a restore "
+                                    "(it could be neither moved aside nor durably backed up) — refusing "
+                                    "to aggregate so a prior verdict is never lost")
     elif vf is not None:
         # verdict.json is absent. If a .prev sidecar remains from a crash BETWEEN a prior run's
-        # move-aside and its settle, adopt it as this run's stash so the settle reconciles the
-        # stranded prior — restored on a rejected aggregate, discarded once a fresh verdict supersedes
-        # it. Without this, nothing would ever restore it and ar_get_verdict would keep seeing no
-        # verdict. (Fable, fc4a701.)
+        # move-aside and its settle, adopt it as this run's stash so the settle reconciles the stranded
+        # prior — restored on a rejected aggregate, discarded once a fresh verdict supersedes it.
+        # (Fable, fc4a701; Codex, 9b93b4c.)
         cand = vf.parent / (vf.name + ".prev")
         if cand.is_file():
             stash = cand
@@ -633,13 +652,11 @@ def h_aggregate(args):
                 # crashing h_aggregate past the return below. (CodeRabbit, 7da1420; Codex, 60cb2c3.)
                 structured = None
             # A fresh OBJECT is not enough: accept only a RECOGNIZED verdict value FOR THE PINNED RUN.
-            # When run_args pins --run, verify that id. When it does NOT (aggregate was invoked with no
-            # run and none existed at entry, so aggregate resolved the newest itself), pin against the
-            # run dir actually resolved for vf — so a verdict for a DIFFERENT run (e.g. one a concurrent
-            # external init created) is never surfaced as THIS call's result. Attestation PRESENCE is
-            # deliberately not gated here — that is check_digest's concern. (CodeRabbit, bdccc64; Fable, fc4a701.)
-            pinned = (run_args[run_args.index("--run") + 1] if "--run" in run_args
-                      else (vf.parent.name if vf is not None else None))
+            # run_args always carries --run here (h_aggregate refuses an empty run_args at entry), so
+            # the fresh verdict aggregate wrote must carry that same run_id — a stray/foreign object
+            # (an empty {}, an unknown verdict, or another run's verdict) is rejected below. Attestation
+            # PRESENCE is deliberately not gated here — that is check_digest's concern. (CodeRabbit, bdccc64.)
+            pinned = run_args[run_args.index("--run") + 1] if "--run" in run_args else None
             if not isinstance(structured, dict):
                 reason = "the fresh verdict.json was unreadable, malformed, or not a JSON object"
             elif structured.get("verdict") not in ("PASS", "FAIL", "BLOCKED"):

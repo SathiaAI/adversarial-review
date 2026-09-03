@@ -6745,11 +6745,12 @@ def t_mcp_opt_authorizer_strips_whitespace():
     assert mcpsrv._opt_authorizer({}) is None
 
 
-def t_mcp_init_falls_back_to_newest_run_on_unparseable_stdout():
-    # Fable(fc4a701): a SUCCESSFUL ar_init whose stdout can't be parsed for the run id must not report
-    # run_id: null — it falls back to the newest run (which init just created).
-    repo = Path(tempfile.mkdtemp(prefix="ar-init-nullid-"))
-    (repo / ".adversarial-review" / "run-20260101-010101").mkdir(parents=True)
+def t_mcp_init_errors_when_run_id_unparseable_rather_than_guessing():
+    # Codex(9b93b4c): a SUCCESSFUL ar_init whose stdout can't be parsed for the run id must NOT guess it
+    # from a directory scan — a concurrent init would make _run_dir([]) return a DIFFERENT caller's run,
+    # a valid-looking WRONG id. It surfaces a tool error instead, even with a decoy newest run present.
+    repo = Path(tempfile.mkdtemp(prefix="ar-init-unparseable-"))
+    (repo / ".adversarial-review" / "run-29990101-010101").mkdir(parents=True)  # decoy "newest" run
     cwd0 = os.getcwd()
     os.chdir(repo)
 
@@ -6760,38 +6761,43 @@ def t_mcp_init_falls_back_to_newest_run_on_unparseable_stdout():
     mcpsrv._run_cli = fake
     try:
         r = mcpsrv.h_init({"risk": "NORMAL", "dev_providers": ["anthropic"]})
-        assert not r["isError"], r
-        assert r["structuredContent"]["run_id"] == "run-20260101-010101", r["structuredContent"]
+        assert r["isError"], r                                        # not a success with a guessed id
+        assert "could not be parsed" in r["content"][0]["text"], r
+        assert r.get("structuredContent", {}).get("run_id") != "run-29990101-010101", r
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
 
 
-def t_mcp_aggregate_rejects_verdict_for_unresolved_run_when_unpinned():
-    # Fable(fc4a701): when ar_aggregate is invoked with no run and none exists at entry (run_args==[]),
-    # aggregate resolves the newest run itself. If a concurrent external init produced a run, a fresh
-    # verdict carrying a DIFFERENT run_id must NOT be accepted as this call's result — the accept-check
-    # pins against the resolved run dir instead of `pinned is None` accepting anything.
-    repo = Path(tempfile.mkdtemp(prefix="ar-agg-unpinned-"))
-    arroot = repo / ".adversarial-review"
-    arroot.mkdir(parents=True)  # exists but holds NO runs yet -> _safe_run({}) returns []
+def t_mcp_aggregate_refuses_when_no_run_exists():
+    # CodeRabbit merge-risk (9b93b4c): ar_aggregate invoked with no run and none at entry must NOT
+    # invoke aggregate.py unpinned — an unpinned aggregate resolves the newest run ITSELF, so a run a
+    # concurrent external init creates in the meantime would be aggregated and its verdict.json mutated
+    # by this call. h_aggregate refuses (call ar_init first) and never shells out.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-norun-"))
+    (repo / ".adversarial-review").mkdir(parents=True)  # exists but holds NO runs -> _safe_run({}) == []
     cwd0 = os.getcwd()
     os.chdir(repo)
+    called = []
 
     def fake(module, argv, timeout=120):
-        rd = arroot / "run-20260101-010101"                       # a run "appears" (concurrent init)
-        rd.mkdir(parents=True)
-        (rd / "verdict.json").write_text(json.dumps({"verdict": "PASS", "run_id": "run-somewhere-else"}))
-        return (0, "PASS", "")
+        called.append((module, list(argv)))
+        return (0, "", "")
 
     orig = mcpsrv._run_cli
     mcpsrv._run_cli = fake
+    raised = False
     try:
-        r = mcpsrv.h_aggregate({})  # run omitted; none at entry -> run_args == []
-        assert r["isError"] and "does not match the resolved run" in r["content"][0]["text"], r
+        try:
+            mcpsrv.h_aggregate({})  # run omitted; none at entry -> run_args == []
+        except mcpsrv.ToolError as e:
+            raised = True
+            assert "call ar_init first" in str(e), str(e)
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
+    assert raised, "h_aggregate must refuse (ToolError) when no run exists"
+    assert called == [], "aggregate.py must NOT be invoked when there is no run to aggregate"
 
 
 def t_mcp_aggregate_recovers_crash_stranded_prev():
@@ -6843,6 +6849,35 @@ def t_mcp_aggregate_rejection_states_reason():
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
+
+
+def t_mcp_aggregate_preserves_existing_prev_from_a_crash():
+    # Codex(9b93b4c): if a run was killed mid-settle it restarts with BOTH a good .prev and an
+    # unreliable verdict.json. The move-aside must NOT overwrite .prev with the crashed verdict.json —
+    # else a subsequent failed aggregate restores the bad file and the last accepted verdict is lost.
+    # The existing .prev is preserved and restored.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-prevcrash-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    good = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    (rundir / "verdict.json.prev").write_text(json.dumps(good))     # known-good prior (crash-stranded)
+    (rundir / "verdict.json").write_text("{ truncated/malformed")   # crashed run's unreliable output
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fake(module, argv, timeout=120):
+        return (3, "", "boom")  # aggregate fails without writing a fresh verdict
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert r["isError"], r
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    # the good prior must survive (restored to verdict.json), never overwritten by the malformed file
+    assert json.loads((rundir / "verdict.json").read_text()) == good, "good prior must be preserved"
 
 
 def main():
