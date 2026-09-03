@@ -5857,8 +5857,12 @@ def t_mcp_aggregate_preserves_prior_when_snapshot_fails():
     try:
         try:
             mcpsrv.h_aggregate({"run": "run-20260101-010101"})
-        except mcpsrv.ToolError:
+        except mcpsrv.ToolError as e:
             raised = True
+            # CodeRabbit(274b460): the snapshot-failure ToolError must SURFACE the OSError cause — the
+            # tools/call handler sends only str(ToolError) to clients. Fails on 274b460 (message omits
+            # the cause).
+            assert "unreadable prior verdict" in str(e), str(e)
     finally:
         RB.read_bytes = orig_rb
         mcpsrv._run_cli = orig_cli
@@ -6769,6 +6773,38 @@ def t_mcp_init_errors_when_run_id_unparseable_rather_than_guessing():
         os.chdir(cwd0)
 
 
+def t_mcp_init_error_names_actual_run_root():
+    # CodeRabbit(274b460): when init succeeds but its stdout can't be parsed for the run id, the
+    # recovery hint must name the ACTUAL run root — AR_RUN_DIR when set — not the hardcoded
+    # .adversarial-review default, which would send the operator to an empty directory. Fails on
+    # 274b460 (message hardcodes .adversarial-review/).
+    repo = Path(tempfile.mkdtemp(prefix="ar-init-root-"))
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    custom = "custom-run-root"
+    orig_cli = mcpsrv._run_cli
+    orig_env = os.environ.get("AR_RUN_DIR")
+
+    def fake(module, argv, timeout=120):
+        return (0, "some init output with no parseable initialized line", "")   # rc 0, unparseable
+
+    mcpsrv._run_cli = fake
+    os.environ["AR_RUN_DIR"] = custom
+    try:
+        r = mcpsrv.h_init({"risk": "NORMAL", "dev_providers": ["anthropic"]})
+        assert r["isError"], r
+        text = r["content"][0]["text"]
+        assert custom in text, text                     # names the ACTUAL (AR_RUN_DIR) root
+        assert ".adversarial-review" not in text, text  # not the hardcoded default
+    finally:
+        mcpsrv._run_cli = orig_cli
+        if orig_env is None:
+            os.environ.pop("AR_RUN_DIR", None)
+        else:
+            os.environ["AR_RUN_DIR"] = orig_env
+        os.chdir(cwd0)
+
+
 def t_mcp_aggregate_refuses_when_no_run_exists():
     # CodeRabbit merge-risk (9b93b4c): ar_aggregate invoked with no run and none at entry must NOT
     # invoke aggregate.py unpinned — an unpinned aggregate resolves the newest run ITSELF, so a run a
@@ -6851,33 +6887,91 @@ def t_mcp_aggregate_rejection_states_reason():
         os.chdir(cwd0)
 
 
-def t_mcp_aggregate_preserves_existing_prev_from_a_crash():
-    # Codex(9b93b4c): if a run was killed mid-settle it restarts with BOTH a good .prev and an
-    # unreliable verdict.json. The move-aside must NOT overwrite .prev with the crashed verdict.json —
-    # else a subsequent failed aggregate restores the bad file and the last accepted verdict is lost.
-    # The existing .prev is preserved and restored.
-    repo = Path(tempfile.mkdtemp(prefix="ar-agg-prevcrash-"))
+def t_mcp_aggregate_refuses_ambiguous_prev_sidecar():
+    # Codex(274b460): a verdict.json.prev FILE present alongside verdict.json is AMBIGUOUS — it is
+    # EITHER a crash-mid-settle (the .prev is the last accepted verdict and verdict.json the crashed
+    # output) OR a SUCCESSFUL aggregate whose best-effort .prev cleanup failed (verdict.json is the
+    # NEWER accepted verdict and .prev is obsolete). fix-16 assumed the former and restored .prev on a
+    # rejected re-aggregate — which, in the latter case, ROLLS a newer accepted verdict BACK to an
+    # older one (a newer FAIL reverted to an older PASS). Refuse instead: never guess, never roll
+    # back, never touch the run. This supersedes fix-16's preserve-and-track of an existing .prev, and
+    # still keeps a crash-stranded good .prev intact (it is never overwritten). Fails on 274b460 (which
+    # restores the older .prev over the newer verdict and does not refuse).
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-ambigprev-"))
     rundir = repo / ".adversarial-review" / "run-20260101-010101"
     rundir.mkdir(parents=True)
-    good = {"verdict": "PASS", "run_id": "run-20260101-010101"}
-    (rundir / "verdict.json.prev").write_text(json.dumps(good))     # known-good prior (crash-stranded)
-    (rundir / "verdict.json").write_text("{ truncated/malformed")   # crashed run's unreliable output
+    newer = {"verdict": "FAIL", "run_id": "run-20260101-010101"}    # current accepted verdict
+    older = {"verdict": "PASS", "run_id": "run-20260101-010101"}    # obsolete .prev from a failed cleanup
+    (rundir / "verdict.json").write_text(json.dumps(newer))
+    (rundir / "verdict.json.prev").write_text(json.dumps(older))
     cwd0 = os.getcwd()
     os.chdir(repo)
 
+    called = []
+
     def fake(module, argv, timeout=120):
-        return (3, "", "boom")  # aggregate fails without writing a fresh verdict
+        called.append(list(argv))
+        return (3, "", "boom")
 
     orig = mcpsrv._run_cli
     mcpsrv._run_cli = fake
+    raised = False
     try:
-        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
-        assert r["isError"], r
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except mcpsrv.ToolError as e:
+            raised = True
+            assert "recovery sidecar" in str(e) and "ambiguous" in str(e), str(e)
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
-    # the good prior must survive (restored to verdict.json), never overwritten by the malformed file
-    assert json.loads((rundir / "verdict.json").read_text()) == good, "good prior must be preserved"
+    assert raised, "must refuse (ToolError) when a .prev sidecar is present alongside verdict.json"
+    assert called == [], "must refuse BEFORE invoking aggregate — never touch the run"
+    # neither file is rolled back or lost: the newer accepted verdict stays, the obsolete .prev is left
+    # for the operator (fix-16 would have restored the older .prev over the newer verdict).
+    assert json.loads((rundir / "verdict.json").read_text()) == newer, "newer verdict must not be rolled back"
+    assert json.loads((rundir / "verdict.json.prev").read_text()) == older, ".prev must be left intact"
+
+
+def t_mcp_aggregate_refuses_and_preserves_existing_bak():
+    # Codex(274b460): the rename-fallback used to blindly overwrite verdict.json.bak. If a PRIOR
+    # fallback had already written a good .bak and then crashed (leaving verdict.json as the crashed
+    # output), a second fallback overwrote that good .bak with the crashed bytes, and a rejected
+    # aggregate then restored them — destroying the last accepted verdict. The refuse-guard now stops
+    # at entry when a .bak FILE is present, so the good backup is never touched. Fails on 274b460
+    # (which overwrites .bak with the crashed bytes and then unlinks it on restore).
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-existingbak-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    good = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    (rundir / "verdict.json").write_text("{ crashed/partial output")   # crashed run's output
+    (rundir / "verdict.json.bak").write_text(json.dumps(good))         # last accepted, from a prior fallback
+    (rundir / "verdict.json.prev").mkdir()                             # a prior fallback's blocking .prev dir
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    called = []
+
+    def fake(module, argv, timeout=120):
+        called.append(list(argv))
+        return (3, "", "boom")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    raised = False
+    try:
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except mcpsrv.ToolError:
+            raised = True
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    assert raised, "must refuse (ToolError) when a .bak sidecar is present"
+    assert called == [], "must refuse BEFORE invoking aggregate"
+    # the good backup is never overwritten or unlinked — the last accepted verdict survives at .bak
+    bak = rundir / "verdict.json.bak"
+    assert bak.is_file() and json.loads(bak.read_text()) == good, "existing good .bak must be preserved"
 
 
 def main():

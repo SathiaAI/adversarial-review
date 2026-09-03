@@ -383,8 +383,12 @@ def h_init(args):
         # write gates / context / reviewer artifacts into — the very concurrent-scan race the stdout
         # parse exists to avoid. Surface a tool error instead; the run just created is on disk under
         # the run root. (Codex, 9b93b4c.)
+        # Name the ACTUAL run root (AR_RUN_DIR, else the .adversarial-review default) — the hint
+        # must point where _run_dir looks, or an AR_RUN_DIR override sends the operator to an empty
+        # .adversarial-review/. (CodeRabbit, 274b460.)
+        root = os.environ.get("AR_RUN_DIR", ".adversarial-review")
         return _result("init succeeded but its run id could not be parsed from panel.py output — "
-                       "the new run is under .adversarial-review/; locate it there", is_error=True)
+                       f"the new run is under {root}/; locate it there", is_error=True)
     return _result((out or "").strip() or f"initialized {run_id}",
                    structured={"run_id": run_id})
 
@@ -565,49 +569,62 @@ def h_aggregate(args):
     stash_backup = None  # durable on-disk copy of the prior when the aside-move fell back to bytes
     if vf is not None and vf.is_file():
         cand = vf.parent / (vf.name + ".prev")
-        if cand.is_file():
-            # A .prev sidecar ALREADY exists — a prior aggregate was killed mid-settle, leaving the last
-            # known-good verdict stranded there and THIS verdict.json the crashed run's unreliable
-            # output. Do NOT move verdict.json over .prev: that overwrites the good prior, and a later
-            # failed aggregate would then restore the bad file, permanently losing the last accepted
-            # verdict. Preserve .prev as the stash and track verdict.json by mtime so a fresh aggregate
-            # is still detected; a rejected re-aggregate then restores the good .prev. (Codex, 9b93b4c.)
+        cand_bak = vf.parent / (vf.name + ".bak")
+        if cand.is_file() or cand_bak.is_file():
+            # A recovery sidecar FILE (.prev/.bak) is ALREADY present next to verdict.json — a prior
+            # aggregate left it unreconciled. (A non-file at that path — e.g. a leftover .prev
+            # directory — is not a verdict sidecar; it is left to the move-aside fallback below, which
+            # already handles a rename that cannot land.) That state is AMBIGUOUS and unsafe to guess
+            # at: it is
+            # EITHER a run killed mid-settle (the sidecar is the last accepted verdict and THIS
+            # verdict.json is the crashed run's unreliable output) OR a run that SUCCEEDED whose
+            # best-effort sidecar cleanup then failed (verdict.json is the NEWER accepted verdict and
+            # the sidecar is obsolete). Disk state cannot tell the two apart, and guessing wrong loses
+            # data either way: restoring the sidecar on a later rejection would roll a newer accepted
+            # verdict BACK to an older one, while overwriting it would destroy the last accepted
+            # verdict. So refuse and surface it — the operator reconciles the sidecar and nothing is
+            # silently rolled back or lost. This fail-closed guard supersedes fix-16's preserve-and-
+            # track of an existing .prev (which rolled back a newer verdict) and removes the .bak
+            # overwrite (which clobbered a good backup). (Codex, 274b460.)
+            raise ToolError(
+                f"a recovery sidecar ({cand.name} or {cand_bak.name}) from a prior aggregate is "
+                "present next to verdict.json — the prior run did not reconcile it, so which file "
+                "holds the last accepted verdict is ambiguous. Inspect both and keep the accepted "
+                "verdict (remove the stale sidecar), then re-run ar_aggregate")
+        try:
+            vf.replace(cand)
             stash = cand
+        except OSError:
+            # Could not move the prior aside under its .prev name. Keep an mtime for the freshness
+            # check AND snapshot the prior's bytes (an unchanged mtime is NOT proof the file is
+            # intact — a coarse-granularity filesystem can leave st_mtime_ns unchanged on a
+            # same-quantum overwrite — so the restore rewrites these bytes rather than trusting
+            # mtime). Persist that snapshot to a DURABLE sidecar (verdict.json.bak) BEFORE
+            # aggregating: an in-memory copy alone is lost if the process is killed between
+            # aggregate's overwrite and the restore, or if the write-back itself fails. No .bak
+            # pre-exists here — the guard above refused if one did — so this never overwrites a good
+            # backup. If the prior can be neither read NOR durably backed up, abort before aggregation
+            # so it is never lost. (.bak, like .prev, is not *.json, so it never enters the
+            # attestation.) (Codex, 52c686f & 274b460; CodeRabbit, 60cb2c3.)
             try:
                 before_mtime = vf.stat().st_mtime_ns
-            except OSError:
-                before_mtime = None
-        else:
-            try:
-                vf.replace(cand)
-                stash = cand
-            except OSError:
-                # Could not move the prior aside under its .prev name. Keep an mtime for the freshness
-                # check AND snapshot the prior's bytes (an unchanged mtime is NOT proof the file is
-                # intact — a coarse-granularity filesystem can leave st_mtime_ns unchanged on a
-                # same-quantum overwrite — so the restore rewrites these bytes rather than trusting
-                # mtime). Persist that snapshot to a DURABLE sidecar (verdict.json.bak) BEFORE
-                # aggregating: an in-memory copy alone is lost if the process is killed between
-                # aggregate's overwrite and the restore, or if the write-back itself fails. A distinct
-                # .bak name (not .prev) lets this durable write still succeed. If the prior can be
-                # neither read NOR durably backed up, abort before aggregation so it is never lost.
-                # (.bak, like .prev, is not *.json, so it never enters the attestation.)
-                # (Codex, 52c686f; CodeRabbit, 60cb2c3.)
-                try:
-                    before_mtime = vf.stat().st_mtime_ns
-                    stash_bytes = vf.read_bytes()
-                    cand_bak = vf.parent / (vf.name + ".bak")
-                    cand_bak.write_bytes(stash_bytes)
-                    stash_backup = cand_bak
-                except OSError:
-                    raise ToolError("cannot snapshot the prior verdict.json to guarantee a restore "
-                                    "(it could be neither moved aside nor durably backed up) — refusing "
-                                    "to aggregate so a prior verdict is never lost")
+                stash_bytes = vf.read_bytes()
+                cand_bak.write_bytes(stash_bytes)
+                stash_backup = cand_bak
+            except OSError as e:
+                # Surface the filesystem cause: the tools/call handler sends only str(ToolError)
+                # to the client, so include {e}; `from e` also satisfies Ruff B904. (CodeRabbit,
+                # 274b460.)
+                raise ToolError("cannot snapshot the prior verdict.json to guarantee a restore "
+                                "(it could be neither moved aside nor durably backed up) — refusing "
+                                f"to aggregate so a prior verdict is never lost: {e}") from e
     elif vf is not None:
-        # verdict.json is absent. If a .prev sidecar remains from a crash BETWEEN a prior run's
-        # move-aside and its settle, adopt it as this run's stash so the settle reconciles the stranded
-        # prior — restored on a rejected aggregate, discarded once a fresh verdict supersedes it.
-        # (Fable, fc4a701; Codex, 9b93b4c.)
+        # verdict.json is absent — a prior aggregate was interrupted BETWEEN its move-aside and the
+        # settle that would have reconciled it, stranding the last accepted verdict at .prev. vf being
+        # ABSENT makes this unambiguous: a failed post-success cleanup always leaves vf present, so an
+        # absent vf can only mean the aggregate never completed its write. Adopt the stranded .prev as
+        # this run's stash — restored on a rejected aggregate, discarded once a fresh verdict
+        # supersedes it. (Fable, fc4a701; Codex, 9b93b4c.)
         cand = vf.parent / (vf.name + ".prev")
         if cand.is_file():
             stash = cand
