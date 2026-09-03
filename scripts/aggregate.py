@@ -174,34 +174,81 @@ def check_rebuttal(run, meta, plan, reports, blocked, notes):
     return rcov
 
 
+# Canonicalizing an artifact requires json.loads, whose RecursionError threshold on a deeply nested
+# document is VERSION-DEPENDENT: the same artifact can parse (and be canonical-hashed) on one Python
+# but raise RecursionError (and be raw-hashed) on another, so a portable verdict would report false
+# DRIFT across versions. Decide raw-vs-canonical from a FIXED, version-independent nesting cap measured
+# from the bytes instead of from whether json.loads happens to raise. The cap sits far below the default
+# recursion limit (so any artifact at or under it parses on every supported Python) and far above any
+# legitimate artifact's depth (the tool's own records are a handful of levels deep), so real artifacts
+# are always canonicalized and only pathologically deep ones take the raw path — identically on every
+# version. (Codex, 8c999b9.)
+_MAX_CANON_DEPTH = 200
+
+
+def _json_nesting_depth(raw):
+    """Maximum [/{ nesting depth of JSON bytes, ignoring brackets inside strings. Computed purely from
+    the bytes, so it is identical on every Python version. Structural characters are ASCII, so a byte
+    scan is correct regardless of multi-byte UTF-8 sequences inside strings (their bytes are all >=
+    0x80 and never match a structural character)."""
+    depth = maxd = 0
+    in_str = escaped = False
+    for b in raw:
+        c = chr(b)
+        if in_str:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c in "[{":
+            depth += 1
+            if depth > maxd:
+                maxd = depth
+        elif c in "]}":
+            if depth > 0:
+                depth -= 1
+    return maxd
+
+
 def compute_attestation(run):
     """Reproducible SHA-256 over every recorded JSON artifact that can feed the
     verdict — everything except verdict.json, which is the output (#5).
 
     Each artifact is canonicalized (sorted keys, compact separators) so cosmetic
     re-serialization does not read as tampering; a .json file that fails UTF-8
-    decoding or JSON parsing — both treated identically, by design — is hashed over
-    its raw bytes instead of crashing the enforcement point. The
+    decoding or JSON parsing — both treated identically, by design — or that is
+    nested beyond a fixed, version-independent depth cap is hashed over its raw
+    bytes instead of crashing the enforcement point. The
     per-file hashes are folded into one manifest digest, and returned alongside it
     so --check-digest can name exactly which artifact drifted.
-    Same untouched run in, same digest out — bit for bit."""
+    Same untouched run in, same digest out — bit for bit, on every Python version."""
     files = {}
     for p in sorted(run.rglob("*.json")):
         rel = p.relative_to(run).as_posix()
         if rel == "verdict.json":
             continue
         raw = p.read_bytes()
+        if _json_nesting_depth(raw) > _MAX_CANON_DEPTH:
+            # Nested beyond the fixed cap: canonicalizing would hinge on the runtime's version-specific
+            # RecursionError threshold (canonical on a Python that parses it, raw on one that does not),
+            # so a portable verdict would report false DRIFT across versions. Hash the raw bytes —
+            # deterministic on every version — instead. (Codex, 8c999b9.)
+            files[rel] = "raw:" + hashlib.sha256(raw).hexdigest()
+            continue
         try:
             canon = json.dumps(json.loads(raw.decode("utf-8")), sort_keys=True,
                                separators=(",", ":"), ensure_ascii=False)
             files[rel] = hashlib.sha256(canon.encode("utf-8")).hexdigest()
         except (ValueError, UnicodeDecodeError, RecursionError):
-            # A .json artifact that fails UTF-8 decoding or JSON parsing — including one nested so
-            # deeply json.loads raises RecursionError — is hashed over its RAW bytes rather than
-            # crashing the enforcement point. Folding RecursionError in here (not treating it as
-            # cannot-verify) keeps a legitimately deep-but-unchanged artifact verifiable and still
-            # surfaces real drift, and stops such an artifact from crashing aggregation itself.
-            # (Codex, 60cb2c3.)
+            # A .json artifact that fails UTF-8 decoding or JSON parsing is hashed over its RAW bytes
+            # rather than crashing the enforcement point. RecursionError stays caught defensively (a
+            # pathologically low ambient recursion limit), but the depth cap above already routes a
+            # deep artifact to the raw path BEFORE this parse — so which branch is taken no longer
+            # depends on the Python version. (Codex, 60cb2c3 & 8c999b9.)
             files[rel] = "raw:" + hashlib.sha256(raw).hexdigest()
     manifest = "\n".join(f"{sha}  {rel}" for rel, sha in sorted(files.items()))
     digest = hashlib.sha256(manifest.encode("utf-8")).hexdigest()

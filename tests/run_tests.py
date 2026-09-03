@@ -662,6 +662,40 @@ def t_attestation_unparseable_fallback():
     assert "DRIFT modified" in r.stdout and "blob.json" in r.stdout
 
 
+def t_attestation_deep_artifact_raw_hashed_deterministically():
+    # Codex(8c999b9): whether a deeply-nested .json artifact was canonicalized (json.loads succeeds) or
+    # raw-hashed (json.loads raises RecursionError) used to depend on the runtime's recursion limit, so
+    # the SAME artifact produced different attestation digests on different Python versions — a verdict
+    # made under one version reports false "DRIFT modified" when checked under another (Codex reproduced
+    # a 20,000-level artifact: raw under 3.13, canonical under 3.14). compute_attestation now routes any
+    # artifact nested beyond a FIXED, version-independent depth cap to the raw-byte hash BEFORE parsing.
+    # A 300-deep artifact parses fine at the default recursion limit, so on 8c999b9 it is canonicalized
+    # (its hash has no "raw:" prefix) — this fails there and passes once the cap routes it to raw.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {                       # triage the high finding -> PASS
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    depth = 300  # above the fixed canon cap, but well under the default recursion limit -> parses fine
+    (run / "deep.json").write_text("[" * depth + "]" * depth, encoding="utf-8")
+    sh(["aggregate.py"], repo, expect=0)
+    att = read(run / "verdict.json")["attestation"]
+    assert att["files"]["deep.json"].startswith("raw:"), att["files"]["deep.json"]
+    # the recomputed digest matches, so a beyond-cap artifact never reads as false drift
+    sh(["aggregate.py", "--check-digest"], repo, expect=0)
+
+
+def t_json_nesting_depth_is_byte_deterministic():
+    # The depth cap must be measured from the bytes (identical on every Python version), not from
+    # whether json.loads raises. Brackets inside strings do not count; escapes are honored.
+    import aggregate
+    assert aggregate._json_nesting_depth(b"[]") == 1
+    assert aggregate._json_nesting_depth(b'{"a": [1, [2, [3]]]}') == 4      # { [ [ [
+    assert aggregate._json_nesting_depth(b'{"a": "[[[[[not nesting]]]]]"}') == 1  # brackets in a string
+    assert aggregate._json_nesting_depth(b'["a \\" [ still in string"]') == 1     # escaped quote
+
+
 def t_check_digest_unreadable_verdict_is_cannot_verify_not_drift():
     # A malformed verdict.json makes --check-digest unable to READ the stored attestation, so nothing
     # is compared. That must exit 2 (cannot verify), never 1 (a definitive mismatch): the MCP wrapper
