@@ -195,21 +195,27 @@ digest cannot be checked at all — no verdict, an unreadable/malformed or non-o
 verdict.json, or an attestation that is not a usable object: not a dict, or a dict that
 lacks a string `digest` or a dict `files` (e.g. a legacy record computed before #5 — its
 absent/non-string digest would otherwise fall through to the exit-1 mismatch path, and a
-non-dict `files` would crash the drift report and leak as exit 1). Exit 2 also covers a
-**legacy representation transition**: a verdict recorded *before* the byte-based raw policy
-canonicalized a deep or wide-integer artifact and stored a plain canonical hash, which this
-version now hashes `raw:`. Such a verdict carries an **older `algorithm` id**, so `--check-digest`
-gates purely on that id being older than the current `sha256-canonical-json-v2` **and** every
-differing file being a canonical->`raw:` transition — never by re-parsing the artifact, which
-would reintroduce the very runtime dependence the byte policy removes (canonicalizing a deep
-artifact raises `RecursionError` on a lower-limit runtime; a wide integer trips the integer
-limit). When both hold it reports cannot-verify with re-aggregation guidance (`LEGACY <file>`)
-rather than a false `DRIFT`. A **current**-algorithm verdict is never excused this way — a
-canonical->`raw:` mismatch on it is real `DRIFT` — so the transitional leniency cannot mask
-tampering on a freshly aggregated run, and a legacy artifact whose *content* actually changed
-stays canonical (not `raw:`) and so stays `DRIFT` too. Exit 1 is reserved for a real recomputed
-mismatch, never a read/parse/shape or legacy-representation failure, so a host that treats exit 1
-as "tampered" is never misled by an uncheckable run. Third parties can verify a shipped run
+non-dict `files` would crash the drift report and leak as exit 1); and when the stored `algorithm`
+id is one this version does **not** recognize — a newer, unknown, or malformed id — because its
+representation cannot be interpreted here. Exit 2 also covers a **legacy representation
+transition**: a verdict recorded by a recognized predecessor (`sha256-canonical-json-v1`, before
+the byte-based raw policy) canonicalized a deep or wide-integer artifact and stored a plain
+canonical hash, which this version now hashes `raw:`. `--check-digest` gates purely on the id being
+that recognized predecessor **and** every differing file being a canonical->`raw:` transition —
+never by re-parsing the artifact, which would reintroduce the very runtime dependence the byte
+policy removes (canonicalizing a deep artifact raises `RecursionError` on a lower-limit runtime; a
+wide integer trips the integer limit). Such a transition is **unverifiable, not proven-unchanged**:
+from the recorded hashes alone the tool cannot tell a benign representation change from a real
+modification that kept the artifact beyond the cap (a deep artifact changed to *different* deep
+content is still canonical->`raw:`). It reports cannot-verify with re-aggregation guidance
+(`LEGACY <file>`) — exit 2 is a tool error, **never an intact pass**, so nothing tampered is let
+through, and re-aggregation yields a fresh, fully-verifiable current-algorithm verdict. (Reporting
+`DRIFT` instead would false-alarm on an *unchanged* legacy artifact — the case this path exists to
+avoid — and no runtime-independent re-canonicalization of a deep artifact exists.) A
+**current**-algorithm verdict is never routed here — a canonical->`raw:` mismatch on it is real
+`DRIFT`. Exit 1 is reserved for a real recomputed mismatch, never a read/parse/shape,
+unrecognized-id, or legacy-transition case, so a host that treats exit 1 as "tampered" is never
+misled by an uncheckable run. Third parties can verify a shipped run
 directory the same way.
 
 Optionally, `aggregate.py --sign` produces a **detached cryptographic signature over the

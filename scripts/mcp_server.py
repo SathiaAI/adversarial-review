@@ -596,11 +596,18 @@ def h_aggregate(args):
         if vf is not None and vf.is_file():
             cand = vf.parent / (vf.name + ".prev")
             cand_bak = vf.parent / (vf.name + ".bak")
-            if cand.is_file() or cand_bak.is_file():
-                # A recovery sidecar FILE (.prev/.bak) is ALREADY present next to verdict.json — a prior
+            if (cand.is_file() or cand_bak.is_file()
+                    or cand.is_symlink() or cand_bak.is_symlink()):
+                # A recovery sidecar (.prev/.bak) is ALREADY present next to verdict.json — a prior
                 # aggregate left it unreconciled. (A non-file at that path — e.g. a leftover .prev
                 # directory — is not a verdict sidecar; it is left to the move-aside fallback below, which
-                # already handles a rename that cannot land.) That state is AMBIGUOUS and unsafe to guess
+                # already handles a rename that cannot land.) `is_symlink()` (lstat, does not follow) is
+                # checked TOO: a sidecar that is a SYMLINK — including a DANGLING one, which `is_file()`
+                # reports as absent — must never be adopted or written through, or the snapshot write
+                # below would follow it and create/overwrite an attacker-chosen out-of-run file, and the
+                # settle would move an attacker's symlink into verdict.json for ar_get_verdict to read
+                # back (a symlinked sidecar in an untrusted run root is an arbitrary read/write vector).
+                # (Codex P1 r3930666146.) That state is AMBIGUOUS and unsafe to guess
                 # at: it is
                 # EITHER a run killed mid-settle (the sidecar is the last accepted verdict and THIS
                 # verdict.json is the crashed run's unreliable output) OR a run that SUCCEEDED whose
@@ -614,9 +621,10 @@ def h_aggregate(args):
                 # overwrite (which clobbered a good backup). (Codex, 274b460.)
                 raise ToolError(
                     f"a recovery sidecar ({cand.name} or {cand_bak.name}) from a prior aggregate is "
-                    "present next to verdict.json — the prior run did not reconcile it, so which file "
-                    "holds the last accepted verdict is ambiguous. Inspect both and keep the accepted "
-                    "verdict (remove the stale sidecar), then re-run ar_aggregate")
+                    "present (as a regular file or a symlink) next to verdict.json — the prior run did "
+                    "not reconcile it, so which file holds the last accepted verdict is ambiguous (and a "
+                    "symlinked sidecar is never a valid recovery file). Inspect both and keep the "
+                    "accepted verdict (remove the stale/symlinked sidecar), then re-run ar_aggregate")
             try:
                 vf.replace(cand)
                 stash = cand
@@ -652,7 +660,13 @@ def h_aggregate(args):
             # this run's stash — restored on a rejected aggregate, discarded once a fresh verdict
             # supersedes it. (Fable, fc4a701; Codex, 9b93b4c.)
             cand = vf.parent / (vf.name + ".prev")
-            if cand.is_file():
+            # Adopt the stranded .prev ONLY when it is a regular, NON-symlink file. `is_file()` follows
+            # symlinks, so a symlinked .prev in an untrusted run root would be adopted here and then moved
+            # to verdict.json by the settle below — after which ar_get_verdict follows it and returns an
+            # arbitrary external file's contents. `is_symlink()` (lstat) rejects that; a symlinked .prev is
+            # not a legitimate stranded verdict, so it is left untouched and a fresh verdict is computed.
+            # (Codex P1 r3930666147.)
+            if cand.is_file() and not cand.is_symlink():
                 stash = cand
         # The moved-aside verdict is reconciled in the single finally below, which runs on EVERY exit
         # path — the accepted return, the rejected return, and a raised invocation (e.g. _run_cli's

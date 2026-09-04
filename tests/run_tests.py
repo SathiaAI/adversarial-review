@@ -7167,6 +7167,177 @@ def t_mcp_aggregate_refuses_and_preserves_existing_bak():
     assert bak.is_file() and json.loads(bak.read_text()) == good, "existing good .bak must be preserved"
 
 
+def t_mcp_aggregate_rejects_symlinked_prev_recovery():
+    # Codex P1 r3930666147: the crash-recovery path adopts a stranded verdict.json.prev when verdict.json
+    # is ABSENT. It used `cand.is_file()`, which FOLLOWS symlinks, so a .prev that is a SYMLINK into an
+    # untrusted run dir would be adopted as the stash and then moved to verdict.json by the settle -- after
+    # which ar_get_verdict follows it and returns an arbitrary external file's contents. The fix adopts the
+    # stranded .prev ONLY when it is a regular, NON-symlink file (`is_file() and not is_symlink()`), so a
+    # symlinked .prev is left untouched and a fresh verdict is computed. Fails on the pre-fix source, which
+    # adopts the symlink and (on a rejected aggregate) moves it into verdict.json, exposing the secret.
+    secret_dir = Path(tempfile.mkdtemp(prefix="ar-secret-"))
+    secret = secret_dir / "secret.txt"
+    secret.write_text("TOP-SECRET out-of-run contents")
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-symprev-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    cand = rundir / "verdict.json.prev"
+    try:
+        cand.symlink_to(secret)                  # stranded .prev is a SYMLINK -> out-of-run secret
+    except (OSError, NotImplementedError):
+        return  # platform/user without symlink privilege -> nothing to assert here
+    # verdict.json is ABSENT -> the crash-recovery adopt path is taken
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def fake(module, argv, timeout=120):
+        return (3, "", "boom")   # reject WITHOUT writing a fresh verdict.json
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert r["isError"], r
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    vj = rundir / "verdict.json"
+    # the symlinked .prev must NEVER be adopted and moved into verdict.json (arbitrary-read vector)
+    assert not (vj.exists() and vj.read_text() == secret.read_text()), \
+        "symlinked .prev was adopted and exposed an out-of-run file via verdict.json"
+    assert cand.is_symlink(), "the symlinked .prev must be left untouched, not adopted as the stash"
+
+
+def t_mcp_aggregate_refuses_dangling_bak_symlink():
+    # Codex P1 r3930666146: the entry guard refuses when a recovery sidecar is present next to an existing
+    # verdict.json, but used only `is_file()` -- which is False for a DANGLING symlink (target absent). A
+    # verdict.json.bak that is a dangling symlink therefore slipped past the guard, and the durable-snapshot
+    # write below would follow it and CREATE the attacker-chosen target out-of-run. The guard now also trips
+    # on `is_symlink()` (an lstat, which catches a dangling link too) and refuses BEFORE invoking aggregate.
+    # Fails on the pre-fix source, which does not refuse (is_file() is False for the dangling link).
+    target_dir = Path(tempfile.mkdtemp(prefix="ar-bak-target-"))
+    target = target_dir / "attacker-chosen.json"     # does NOT exist -> the .bak symlink is dangling
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-danglingbak-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    (rundir / "verdict.json").write_text(
+        json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+    cand_bak = rundir / "verdict.json.bak"
+    try:
+        cand_bak.symlink_to(target)              # DANGLING: target does not exist
+    except (OSError, NotImplementedError):
+        return  # platform/user without symlink privilege -> nothing to assert here
+    assert cand_bak.is_symlink() and not cand_bak.is_file(), "precondition: .bak is a dangling symlink"
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    called = []
+
+    def fake(module, argv, timeout=120):
+        called.append(list(argv))
+        return (0, "PASS", "")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    raised = False
+    try:
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except mcpsrv.ToolError as e:
+            raised = True
+            assert "recovery sidecar" in str(e) and "symlink" in str(e), str(e)
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    assert raised, "must refuse (ToolError) when a dangling .bak symlink is present"
+    assert called == [], "must refuse BEFORE invoking aggregate -- never follow/create through the symlink"
+    assert not target.exists(), "the dangling symlink's target must never be created (write-through vector)"
+
+
+def t_check_digest_unrecognized_algorithm_id_is_cannot_verify():
+    # CodeRabbit r3930631485: --check-digest must validate the stored `algorithm` id BEFORE any legacy
+    # handling. Only the current sha256-canonical-json-v2 and recognized predecessors (...-v1) are
+    # interpretable; a NEWER, unknown, or malformed (non-string) id means this version cannot interpret the
+    # representation, so a digest mismatch is cannot-verify (exit 2) -- never the legacy canonical->raw path
+    # and never DRIFT (exit 1). Fails on the pre-fix source, which had no id whitelist: an unknown id whose
+    # drift is not a canonical->raw transition fell through to DRIFT (exit 1).
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {                       # triage the high finding -> PASS
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)
+    v = read(run / "verdict.json")
+    att = v["attestation"]
+    assert att["algorithm"] == "sha256-canonical-json-v2", att["algorithm"]
+    some = sorted(att["files"])[0]                                  # any recorded artifact
+    assert not att["files"][some].startswith("raw:"), \
+        "the tampered file's recompute must be a PLAIN hash so the drift is not a canonical->raw transition"
+
+    def forge(algo):
+        files = dict(att["files"])
+        files[some] = "b" * 64                                     # a PLAIN (non-"raw:") modification -> drift
+        forged = dict(att); forged["files"] = files; forged["algorithm"] = algo
+        manifest = "\n".join(f"{sha}  {rel}" for rel, sha in sorted(files.items()))
+        forged["digest"] = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+        doc = dict(v); doc["attestation"] = forged
+        (run / "verdict.json").write_text(json.dumps(doc))
+
+    # (a) a NEWER/unknown string id this version does not know
+    forge("sha256-canonical-json-v3")
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=2)
+    blob = r.stdout + r.stderr
+    assert "CANNOT BE VERIFIED" in blob, blob
+    assert "sha256-canonical-json-v3" in blob, "message must name the unrecognized id"
+    assert "recognize" in blob, blob
+    assert "MISMATCH" not in r.stdout and "DRIFT" not in r.stdout, \
+        "an unrecognized id is cannot-verify, never DRIFT"
+    assert "LEGACY" not in r.stdout, "an unrecognized id must not be routed through the legacy path"
+    # (b) a MALFORMED, non-string id
+    forge(2)
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=2)
+    blob = r.stdout + r.stderr
+    assert "CANNOT BE VERIFIED" in blob, blob
+    assert "MISMATCH" not in r.stdout and "DRIFT" not in r.stdout, blob
+
+
+def t_check_digest_legacy_message_says_unverifiable_not_unchanged():
+    # Codex r3930666148 / CodeRabbit r3930631493: fix-20's LEGACY cannot-verify message overstated the
+    # guarantee -- it said a digest match is impossible "even though the run is unchanged," asserting the
+    # content IS unchanged. From a stored canonical hash and a recomputed "raw:" hash alone the tool cannot
+    # tell a benign representation change from a real modification that stayed beyond the cap, so the message
+    # now says the transition is UNVERIFIABLE (re-aggregate), not proven-unchanged. The classification is
+    # unchanged: recognized-predecessor id + all-canonical->raw -> exit 2 (a tool error, never DRIFT). This
+    # pins BOTH: still exit 2 (not drift -- the alternative Codex raised) AND no false "unchanged" claim.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    (run / "wide.json").write_bytes(b'{"n": ' + b'9' * 300 + b'}')  # 300-digit int > _MAX_INT_DIGITS -> "raw:"
+    sh(["aggregate.py"], repo, expect=0)
+    att = read(run / "verdict.json")["attestation"]
+    assert att["files"]["wide.json"].startswith("raw:"), att["files"]["wide.json"]
+    # forge a v1 (recognized predecessor) verdict that stored a PLAIN canonical hash for wide.json
+    v = read(run / "verdict.json")
+    files = dict(att["files"]); files["wide.json"] = "a" * 64       # plain canonical -> canonical->raw transition
+    legacy = dict(att); legacy["files"] = files; legacy["algorithm"] = "sha256-canonical-json-v1"
+    manifest = "\n".join(f"{sha}  {rel}" for rel, sha in sorted(files.items()))
+    legacy["digest"] = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+    v["attestation"] = legacy
+    (run / "verdict.json").write_text(json.dumps(v))
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=2)      # recognized-predecessor legacy transition
+    blob = r.stdout + r.stderr
+    assert "CANNOT BE VERIFIED" in blob, blob
+    assert "MISMATCH" not in r.stdout and "DRIFT" not in r.stdout, \
+        "a legacy transition stays cannot-verify, never DRIFT (the alternative Codex raised)"
+    assert "even though the run is unchanged" not in blob, \
+        "must not falsely assert the run is unchanged (fix-20 overstatement)"
+    assert ("cannot establish whether" in blob or "cannot tell them apart" in blob), \
+        "message must convey the transition is unverifiable, not proven-unchanged"
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

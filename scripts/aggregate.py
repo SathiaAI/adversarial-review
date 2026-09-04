@@ -192,6 +192,14 @@ _MAX_CANON_DEPTH = 200
 # change any digest — an unchanged shallow run verifies identically under either id. (Codex r3930239157.)
 _ATTESTATION_ALGO = "sha256-canonical-json-v2"
 
+# Attestation algorithm ids this version can interpret in --check-digest: the current one plus recognized
+# PREDECESSORS. "sha256-canonical-json-v1" is the pre-byte-cap representation (a deep/wide artifact it
+# canonicalized, this version hashes "raw:"). An id OUTSIDE this set — a newer tool's format, or a
+# malformed/non-string value — is not interpretable, so on a digest mismatch it is cannot-verify, never
+# classified as a legacy transition or as drift. (CodeRabbit r3930631485.)
+_LEGACY_ALGOS = ("sha256-canonical-json-v1",)
+_RECOGNIZED_ALGOS = _LEGACY_ALGOS + (_ATTESTATION_ALGO,)
+
 # A JSON integer literal wider than this many digits is routed to the raw path, for the same
 # version-independence reason as the depth cap: whether json.loads ACCEPTS a very long integer depends on
 # the runtime's integer-string-conversion limit (sys.get_int_max_str_digits / PYTHONINTMAXSTRDIGITS) — a
@@ -325,9 +333,10 @@ def _canon_to_raw_transition(stored_hash, recomputed_hash):
 def check_digest(run):
     """Recompute the attestation and compare to the one stored in verdict.json.
     Exit 0 on match; exit 1 (DRIFT) when artifacts changed after the verdict was computed; exit 2
-    (cannot-verify) when the stored attestation cannot be read or compared, OR when it predates this
-    version's algorithm id AND every differing artifact is a canonical->raw representation transition
-    (re-aggregate to refresh the recorded digest under the current algorithm, then re-check)."""
+    (cannot-verify) when the stored attestation cannot be read or compared, when its algorithm id is not
+    one this version recognizes (a newer/unknown/malformed id), OR when the id is a recognized predecessor
+    AND every differing artifact is a canonical->raw representation transition (unverifiable from the
+    recorded hashes) — re-aggregate under the current algorithm, then re-check."""
     vpath = run / "verdict.json"
     if not vpath.exists():
         print("no verdict.json in run — aggregate first")
@@ -388,29 +397,44 @@ def check_digest(run):
     drifted = [(rel, old.get(rel), att["files"].get(rel))
                for rel in sorted(set(old) | set(att["files"]))
                if old.get(rel) != att["files"].get(rel)]
-    # Legacy-compat (version-gated, runtime-INDEPENDENT): a verdict written before the byte-based raw
-    # policy stored a plain canonical hash for a deep or wide-integer artifact that this version now hashes
-    # "raw:", so the manifest differs though nothing was tampered. Such a verdict predates the current
-    # algorithm id, so gate on that id plus the canonical->raw hash-prefix shape — NEVER by re-parsing the
+    stored_algo = stored.get("algorithm")
+    # Validate the stored algorithm id BEFORE any legacy handling. Only _ATTESTATION_ALGO (current) and the
+    # recognized predecessors in _LEGACY_ALGOS are interpretable. An unknown, FUTURE, or malformed id (a
+    # newer tool's format, or a non-string) means this version does not know that representation, so a
+    # mismatch cannot be classified as either a known transition or as drift — report cannot-verify (exit
+    # 2), never the LEGACY path and never DRIFT. (CodeRabbit r3930631485.)
+    if stored_algo not in _RECOGNIZED_ALGOS:
+        print(f"attestation CANNOT BE VERIFIED: the stored attestation's algorithm id ({stored_algo!r}) "
+              f"is not one this version recognizes ({', '.join(_RECOGNIZED_ALGOS)}) — it was produced by "
+              "a different (newer or unknown) tool version, so this tool cannot interpret its "
+              "representation. Re-aggregate under the current algorithm, then re-check.", file=sys.stderr)
+        sys.exit(2)
+    # Legacy-compat (version-gated, runtime-INDEPENDENT): a verdict written by a RECOGNIZED PREDECESSOR
+    # (_LEGACY_ALGOS — before the byte-based raw policy) stored a plain canonical hash for a deep or
+    # wide-integer artifact that this version now hashes "raw:", so the manifest differs. Gate on the id
+    # being a recognized predecessor PLUS the canonical->raw hash-prefix shape — NEVER by re-parsing the
     # artifact to prove byte-equality, which would reintroduce the exact runtime dependence this avoids
     # (canonicalizing a deep artifact RecursionErrors on a lower-limit runtime; a wide integer trips the
-    # integer-string limit — either makes an unchanged legacy run report false DRIFT on some runtimes).
-    # Only when the stored attestation predates _ATTESTATION_ALGO AND every differing file is a
-    # canonical->raw transition is this cannot-verify (exit 2) with re-aggregation guidance. A CURRENT
-    # -algorithm verdict is NEVER excused: a canonical->raw mismatch on it is real DRIFT (exit 1), so this
-    # transitional leniency cannot mask tampering on a freshly aggregated run — and a legacy artifact whose
-    # CONTENT actually changed stays canonical (not "raw:"), so it fails the transition shape and stays
-    # DRIFT too. (Codex r3930239157 / CodeRabbit r3930172612, <FIX20>. Supersedes fix-19's re-parse proof.)
-    if (drifted and stored.get("algorithm") != att["algorithm"]
+    # integer-string limit). A canonical->raw transition is UNVERIFIABLE, not proven-unchanged: from the
+    # recorded hashes alone this tool cannot tell a benign representation change from a real modification
+    # that kept the artifact beyond the cap (deep -> different-deep is still canonical->"raw:"). So report
+    # cannot-verify (exit 2) — which is a tool error, NEVER an "intact" pass, so tampering is never let
+    # through; re-aggregation then yields a fresh, fully-verifiable current-algorithm verdict. Reporting
+    # DRIFT here instead would false-alarm on an UNCHANGED legacy artifact (the case fix-19 was created to
+    # fix), and a runtime-independent re-canonicalization of a deep artifact does not exist. A CURRENT
+    # -algorithm verdict is NEVER routed here: a canonical->raw mismatch on it is real DRIFT (exit 1).
+    # (Codex r3930666148 / CodeRabbit r3930631493, <FIX21>; corrects fix-20's "unchanged" overstatement.)
+    if (drifted and stored_algo in _LEGACY_ALGOS
             and all(_canon_to_raw_transition(a, b) for _rel, a, b in drifted)):
         for rel, _a, _b in drifted:
-            print(f"  LEGACY   {rel} (canonicalized before the byte-based raw policy; "
-                  f"predates {att['algorithm']})")
-        print("attestation CANNOT BE VERIFIED: the stored attestation predates this version's "
-              "representation policy (its algorithm id is older) and every differing artifact is a "
-              "canonical->raw transition, so a digest match is impossible even though the run is "
-              "unchanged. Re-aggregate to refresh the attestation under the current algorithm, then "
-              "re-check.", file=sys.stderr)
+            print(f"  LEGACY   {rel} (canonical->raw transition from a pre-{_ATTESTATION_ALGO} "
+                  "attestation; unverifiable from the recorded hashes)")
+        print("attestation CANNOT BE VERIFIED: the stored attestation was produced by an earlier "
+              "algorithm and every differing artifact is a canonical->raw representation transition. The "
+              "recorded hashes cannot establish whether the content is unchanged (a benign version "
+              "transition) or was modified while staying beyond the cap — this tool cannot tell them apart "
+              "without a runtime-dependent re-parse. Re-aggregate under the current algorithm to obtain a "
+              "verifiable verdict, then re-check.", file=sys.stderr)
         sys.exit(2)
     for rel, a, b in drifted:
         tag = "added" if a is None else ("removed" if b is None else "modified")

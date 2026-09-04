@@ -477,8 +477,9 @@ directory can verify it:
 python scripts/aggregate.py --check-digest
 # exit 0 — intact.  Output: "attestation OK: sha256 1f58da91… over 27 artifacts"
 # exit 1 — drifted. One line per drifted artifact, e.g. "  DRIFT modified gates/deps.json"
-# exit 2 — cannot verify (no verdict.json, one computed before attestations existed, or a legacy
-#          verdict whose representation predates the current algorithm id — re-aggregate, then re-check)
+# exit 2 — cannot verify (no verdict.json, one computed before attestations existed, a legacy verdict
+#          whose representation predates the current algorithm id, or a verdict written under an
+#          algorithm id this version does not recognize — re-aggregate, then re-check)
 ```
 
 `--check-digest` proves the bytes are intact; it says nothing about *who* stands behind them.
