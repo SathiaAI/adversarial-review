@@ -185,6 +185,57 @@ def check_rebuttal(run, meta, plan, reports, blocked, notes):
 # version. (Codex, 8c999b9.)
 _MAX_CANON_DEPTH = 200
 
+# Algorithm id stamped into every attestation. It is bumped whenever the canonical-vs-raw REPRESENTATION
+# changes, so --check-digest can date a stored attestation from the id alone (never by re-parsing an
+# artifact, which is runtime-dependent). "v2" marks the byte-based raw policy (depth AND integer-width
+# caps); "v1" verdicts predate it. The id is metadata, NOT folded into the digest, so bumping it does not
+# change any digest — an unchanged shallow run verifies identically under either id. (Codex r3930239157.)
+_ATTESTATION_ALGO = "sha256-canonical-json-v2"
+
+# A JSON integer literal wider than this many digits is routed to the raw path, for the same
+# version-independence reason as the depth cap: whether json.loads ACCEPTS a very long integer depends on
+# the runtime's integer-string-conversion limit (sys.get_int_max_str_digits / PYTHONINTMAXSTRDIGITS) — a
+# per-interpreter CONFIG, not a property of the bytes — so the same artifact canonicalizes under one
+# configuration and raises ValueError (-> raw) under another, and a portable verdict would report false
+# DRIFT across configurations. The cap sits far below the smallest limit the runtime permits
+# (sys.int_info.str_digits_check_threshold, 640) so any artifact at or under it parses on EVERY
+# configuration, and far above any legitimate artifact's integers (the tool's own records hold small
+# counts and timestamps), so real artifacts are always canonicalized and only pathologically wide ones
+# take the raw path — identically everywhere. (Codex r3930239161.)
+_MAX_INT_DIGITS = 256
+
+
+def _max_int_digit_run(raw):
+    """Longest run of consecutive ASCII decimal digits OUTSIDE JSON strings, computed purely from the
+    bytes so it is identical on every runtime. A JSON integer literal is a digit run, so this bounds the
+    widest integer the artifact can ask json.loads to build; digits inside strings never become integers
+    and are skipped. Over-counting a long fraction or exponent run only routes an already-pathological
+    artifact to the (deterministic) raw path, which is harmless. Mirrors _json_nesting_depth's string
+    handling; structural/quote bytes are ASCII, so a byte scan is correct despite multi-byte UTF-8 in
+    strings."""
+    run = maxrun = 0
+    in_str = escaped = False
+    for b in raw:
+        c = chr(b)
+        if in_str:
+            run = 0
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            run = 0
+            in_str = True
+        elif "0" <= c <= "9":
+            run += 1
+            if run > maxrun:
+                maxrun = run
+        else:
+            run = 0
+    return maxrun
+
 
 def _json_nesting_depth(raw):
     """Maximum [/{ nesting depth of JSON bytes, ignoring brackets inside strings. Computed purely from
@@ -220,23 +271,26 @@ def compute_attestation(run):
 
     Each artifact is canonicalized (sorted keys, compact separators) so cosmetic
     re-serialization does not read as tampering; a .json file that fails UTF-8
-    decoding or JSON parsing — both treated identically, by design — or that is
-    nested beyond a fixed, version-independent depth cap is hashed over its raw
-    bytes instead of crashing the enforcement point. The
+    decoding or JSON parsing — both treated identically, by design — or whose bytes
+    exceed a fixed cap on nesting depth OR integer-literal width is hashed over its
+    raw bytes instead of crashing the enforcement point. The
     per-file hashes are folded into one manifest digest, and returned alongside it
     so --check-digest can name exactly which artifact drifted.
-    Same untouched run in, same digest out — bit for bit, on every Python version."""
+    Same untouched run in, same digest out — bit for bit, from the BYTES, so the raw-vs-canonical choice
+    never depends on a per-runtime parser limit (recursion depth or integer-string width)."""
     files = {}
     for p in sorted(run.rglob("*.json")):
         rel = p.relative_to(run).as_posix()
         if rel == "verdict.json":
             continue
         raw = p.read_bytes()
-        if _json_nesting_depth(raw) > _MAX_CANON_DEPTH:
-            # Nested beyond the fixed cap: canonicalizing would hinge on the runtime's version-specific
-            # RecursionError threshold (canonical on a Python that parses it, raw on one that does not),
-            # so a portable verdict would report false DRIFT across versions. Hash the raw bytes —
-            # deterministic on every version — instead. (Codex, 8c999b9.)
+        if _json_nesting_depth(raw) > _MAX_CANON_DEPTH or _max_int_digit_run(raw) > _MAX_INT_DIGITS:
+            # Nested beyond the depth cap, OR carrying an integer literal wider than the digit cap:
+            # whether json.loads accepts either hinges on a PER-RUNTIME limit (the RecursionError
+            # threshold, or the integer-string-conversion limit), so canonicalizing would make the same
+            # artifact hash canonically on one runtime/config and raw on another — a portable verdict
+            # would then report false DRIFT. Decide raw-vs-canonical from the BYTES, before parsing, so
+            # the choice is identical everywhere. (Codex, 8c999b9 & r3930239161.)
             files[rel] = "raw:" + hashlib.sha256(raw).hexdigest()
             continue
         try:
@@ -245,57 +299,35 @@ def compute_attestation(run):
             files[rel] = hashlib.sha256(canon.encode("utf-8")).hexdigest()
         except (ValueError, UnicodeDecodeError, RecursionError):
             # A .json artifact that fails UTF-8 decoding or JSON parsing is hashed over its RAW bytes
-            # rather than crashing the enforcement point. RecursionError stays caught defensively (a
-            # pathologically low ambient recursion limit), but the depth cap above already routes a
-            # deep artifact to the raw path BEFORE this parse — so which branch is taken no longer
-            # depends on the Python version. (Codex, 60cb2c3 & 8c999b9.)
+            # rather than crashing the enforcement point. The byte caps above already route a deep or
+            # wide-integer artifact to the raw path BEFORE this parse, so for those known runtime-limited
+            # cases which branch is taken no longer depends on the Python version or config; this stays
+            # as a defensive net for any other parse failure. (Codex, 60cb2c3 & 8c999b9 & r3930239161.)
             files[rel] = "raw:" + hashlib.sha256(raw).hexdigest()
     manifest = "\n".join(f"{sha}  {rel}" for rel, sha in sorted(files.items()))
     digest = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
-    return {"algorithm": "sha256-canonical-json-v1", "inputs": len(files),
+    return {"algorithm": _ATTESTATION_ALGO, "inputs": len(files),
             "digest": digest, "files": files}
 
 
-def _is_legacy_canon_to_raw(run, rel, stored_hash, recomputed_hash):
-    """True iff one attestation entry differs ONLY because of the pre-5833535 canonical->raw
-    representation change for a deep artifact, with the on-disk bytes PROVABLY unchanged. check_digest
-    uses it to tell a benign version transition (report cannot-verify, re-aggregate) apart from real
-    tampering (DRIFT).
-
-    Qualifies only when ALL hold: the stored hash is canonical (not "raw:"); the recomputed hash is
-    "raw:" (this version routed the artifact to the raw path); the CURRENT bytes are nested beyond the
-    cap (so that routing is the depth policy, not a parse failure — a parse failure below the cap is
-    real drift or corruption, not this transition); and canonicalizing the CURRENT bytes reproduces
-    EXACTLY the stored canonical hash. That final equality is the security-preserving check: it is
-    positive proof the content is byte-identical to what was attested, so a deep artifact swapped for
-    DIFFERENT deep content re-canonicalizes to a different hash and stays DRIFT (forging a match would
-    require a SHA-256 preimage). Any read/parse error -> not a provable transition -> False, and the
-    caller keeps the DRIFT signal. Canonicalization mirrors compute_attestation exactly so the hashes
-    are comparable."""
-    if not isinstance(stored_hash, str) or stored_hash.startswith("raw:"):
-        return False
-    if not isinstance(recomputed_hash, str) or not recomputed_hash.startswith("raw:"):
-        return False
-    try:
-        raw = (run / rel).read_bytes()
-    except OSError:
-        return False
-    if _json_nesting_depth(raw) <= _MAX_CANON_DEPTH:
-        return False
-    try:
-        canon = json.dumps(json.loads(raw.decode("utf-8")), sort_keys=True,
-                           separators=(",", ":"), ensure_ascii=False)
-    except (ValueError, UnicodeDecodeError, RecursionError):
-        return False
-    return hashlib.sha256(canon.encode("utf-8")).hexdigest() == stored_hash
+def _canon_to_raw_transition(stored_hash, recomputed_hash):
+    """True iff one attestation entry differs in exactly the shape of the canonical->raw REPRESENTATION
+    change: the stored hash is a plain canonical hash (a str not prefixed "raw:") and the recomputed hash
+    is a "raw:" hash. Purely a comparison of the two recorded strings — it never re-reads or re-parses the
+    artifact, so it is identical on every runtime (that runtime-independence is the whole point; the
+    earlier positive-proof re-canonicalization was itself runtime-dependent). Real tampering that changes
+    an artifact's CONTENT while it stays canonical (canonical->different-canonical) is not this shape, so
+    it is never mistaken for the benign transition. (Codex r3930239157 / CodeRabbit r3930172612.)"""
+    return (isinstance(stored_hash, str) and not stored_hash.startswith("raw:")
+            and isinstance(recomputed_hash, str) and recomputed_hash.startswith("raw:"))
 
 
 def check_digest(run):
     """Recompute the attestation and compare to the one stored in verdict.json.
     Exit 0 on match; exit 1 (DRIFT) when artifacts changed after the verdict was computed; exit 2
-    (cannot-verify) when the stored attestation cannot be read or compared, OR when every differing
-    artifact is only the pre-5833535 canonical->raw deep-artifact representation change with its bytes
-    provably unchanged — re-aggregate to refresh the recorded digest, then re-check."""
+    (cannot-verify) when the stored attestation cannot be read or compared, OR when it predates this
+    version's algorithm id AND every differing artifact is a canonical->raw representation transition
+    (re-aggregate to refresh the recorded digest under the current algorithm, then re-check)."""
     vpath = run / "verdict.json"
     if not vpath.exists():
         print("no verdict.json in run — aggregate first")
@@ -356,22 +388,29 @@ def check_digest(run):
     drifted = [(rel, old.get(rel), att["files"].get(rel))
                for rel in sorted(set(old) | set(att["files"]))
                if old.get(rel) != att["files"].get(rel)]
-    # Legacy-compat: a verdict written BEFORE the version-independent depth cap (commit 5833535)
-    # canonicalized a deep-but-parseable artifact and stored a plain canonical hash; this version hashes
-    # the SAME unchanged bytes as "raw:<sha>", so the manifest differs though nothing was tampered. The
-    # algorithm id stayed "sha256-canonical-json-v1", so the id alone cannot date a verdict — detect the
-    # transition PER FILE from the artifacts themselves (_is_legacy_canon_to_raw proves byte-equality).
-    # Only when EVERY differing file is such a benign transition is this cannot-verify (exit 2) with
-    # re-aggregation guidance, never a false MISMATCH (exit 1). If even one file is real drift, the whole
-    # run stays DRIFT — the tamper signal is never softened by a co-occurring legacy artifact. (Codex
-    # r3924189603 / CodeRabbit r3924074998, <FIX19>.)
-    if drifted and all(_is_legacy_canon_to_raw(run, rel, a, b) for rel, a, b in drifted):
+    # Legacy-compat (version-gated, runtime-INDEPENDENT): a verdict written before the byte-based raw
+    # policy stored a plain canonical hash for a deep or wide-integer artifact that this version now hashes
+    # "raw:", so the manifest differs though nothing was tampered. Such a verdict predates the current
+    # algorithm id, so gate on that id plus the canonical->raw hash-prefix shape — NEVER by re-parsing the
+    # artifact to prove byte-equality, which would reintroduce the exact runtime dependence this avoids
+    # (canonicalizing a deep artifact RecursionErrors on a lower-limit runtime; a wide integer trips the
+    # integer-string limit — either makes an unchanged legacy run report false DRIFT on some runtimes).
+    # Only when the stored attestation predates _ATTESTATION_ALGO AND every differing file is a
+    # canonical->raw transition is this cannot-verify (exit 2) with re-aggregation guidance. A CURRENT
+    # -algorithm verdict is NEVER excused: a canonical->raw mismatch on it is real DRIFT (exit 1), so this
+    # transitional leniency cannot mask tampering on a freshly aggregated run — and a legacy artifact whose
+    # CONTENT actually changed stays canonical (not "raw:"), so it fails the transition shape and stays
+    # DRIFT too. (Codex r3930239157 / CodeRabbit r3930172612, <FIX20>. Supersedes fix-19's re-parse proof.)
+    if (drifted and stored.get("algorithm") != att["algorithm"]
+            and all(_canon_to_raw_transition(a, b) for _rel, a, b in drifted)):
         for rel, _a, _b in drifted:
-            print(f"  LEGACY   {rel} (deep artifact attested before the depth cap; bytes unchanged)")
-        print("attestation CANNOT BE VERIFIED: every differing artifact is a deep document an earlier "
-              "version canonicalized and this version hashes raw — the recorded digest predates that "
-              "representation change, so a match is impossible though the bytes are unchanged. "
-              "Re-aggregate to refresh the attestation, then re-check.", file=sys.stderr)
+            print(f"  LEGACY   {rel} (canonicalized before the byte-based raw policy; "
+                  f"predates {att['algorithm']})")
+        print("attestation CANNOT BE VERIFIED: the stored attestation predates this version's "
+              "representation policy (its algorithm id is older) and every differing artifact is a "
+              "canonical->raw transition, so a digest match is impossible even though the run is "
+              "unchanged. Re-aggregate to refresh the attestation under the current algorithm, then "
+              "re-check.", file=sys.stderr)
         sys.exit(2)
     for rel, a, b in drifted:
         tag = "added" if a is None else ("removed" if b is None else "modified")

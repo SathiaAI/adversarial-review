@@ -589,7 +589,7 @@ def t_attestation_reproducible():
     sh(["aggregate.py"], repo, expect=0)
     v1 = read(run / "verdict.json")
     att1 = v1["attestation"]
-    assert att1["algorithm"] == "sha256-canonical-json-v1"
+    assert att1["algorithm"] == "sha256-canonical-json-v2"
     assert att1["inputs"] == len(att1["files"]) > 0
     assert "verdict.json" not in att1["files"]
     assert "run.json" in att1["files"] and "gates/unit.json" in att1["files"]
@@ -696,52 +696,91 @@ def t_json_nesting_depth_is_byte_deterministic():
     assert aggregate._json_nesting_depth(b'["a \\" [ still in string"]') == 1     # escaped quote
 
 
-def t_check_digest_legacy_deep_artifact_is_cannot_verify_not_drift():
-    # Codex r3924189603 / CodeRabbit r3924074998: a verdict written BEFORE the version-independent depth
-    # cap (commit 5833535) canonicalized a deep-but-parseable artifact and stored a PLAIN canonical
-    # hash; this version hashes the SAME unchanged bytes as "raw:", so --check-digest recomputes a
-    # different manifest for UNCHANGED bytes. Because the algorithm id stayed sha256-canonical-json-v1,
-    # the id alone cannot date the verdict, so this must be reported as cannot-verify (exit 2) with
-    # re-aggregation guidance, NEVER a false DRIFT (exit 1) that the MCP wrapper maps to detected
-    # tampering. The compat path is proven byte-for-byte (canonicalize the CURRENT bytes and compare to
-    # the stored hash), so it can never MASK a real change — the second half asserts exactly that.
+def t_max_int_digit_run_is_byte_deterministic():
+    # The integer-width cap (Codex r3930239161) must be measured from the bytes (identical on every
+    # runtime), not from whether json.loads raises on the ambient integer-string limit. Digits inside
+    # strings do not count; escapes are honored.
+    import aggregate
+    assert aggregate._max_int_digit_run(b"[]") == 0
+    assert aggregate._max_int_digit_run(b"[1, 22, 333]") == 3
+    assert aggregate._max_int_digit_run(b'{"id": 1234567}') == 7            # the integer value
+    assert aggregate._max_int_digit_run(b'{"k": "' + b"9" * 40 + b'"}') == 0  # 40 digits inside a string
+    assert aggregate._max_int_digit_run(b'"12\\"34"') == 0                  # escaped quote, still in string
+    assert aggregate._max_int_digit_run(b"1" * 500) == 500
+
+
+def t_attestation_wide_integer_raw_hashed_deterministically():
+    # Codex r3930239161: whether json.loads accepts a very wide integer literal depends on the runtime's
+    # integer-string-conversion limit (sys.get_int_max_str_digits / PYTHONINTMAXSTRDIGITS), a per-config
+    # value, so canonicalizing it made the digest config-dependent and an unchanged run reported false
+    # DRIFT across configs. compute_attestation now routes any artifact whose integer-digit run exceeds
+    # the byte cap to the raw hash BEFORE parsing. A 1000-digit integer is UNDER the default limit (4300)
+    # so a pre-fix build canonicalizes it (no "raw:" prefix) -- this fails there and passes once the byte
+    # cap routes it to raw deterministically.
     repo = _complete_sensitive_repo()
     run = latest_run(repo)
     write(run / "validation" / "idor.json", {                       # triage the high finding -> PASS
         "finding_ids": ["security-1"], "classification": "confirmed",
         "severity": "high", "evidence": "reproduced", "reproduced": True,
         "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
-    depth = 300  # above the cap, but well under the default recursion limit -> parses fine
-    deep_bytes = ("[" * depth + "]" * depth).encode("utf-8")
-    (run / "deep.json").write_bytes(deep_bytes)
-    sh(["aggregate.py"], repo, expect=0)                            # this version: deep.json -> "raw:"
+    (run / "wide.json").write_bytes(b"[" + b"9" * 1000 + b"]")      # 1000-digit int: parses on default
+    sh(["aggregate.py"], repo, expect=0)
+    att = read(run / "verdict.json")["attestation"]
+    assert att["files"]["wide.json"].startswith("raw:"), att["files"]["wide.json"]
+    assert att["algorithm"] == "sha256-canonical-json-v2", att["algorithm"]
+    sh(["aggregate.py", "--check-digest"], repo, expect=0)          # recomputed digest matches -> intact
+
+
+def t_check_digest_legacy_deep_artifact_is_cannot_verify_not_drift():
+    # Codex r3930239157 / CodeRabbit r3930172612 (fix-20, version-gated compat -- supersedes fix-19's
+    # runtime-dependent re-parse proof): a verdict written before the byte-based raw policy stored a plain
+    # CANONICAL hash for a deep/wide artifact that this version hashes "raw:", so --check-digest recomputes
+    # a different manifest for UNCHANGED bytes. The cannot-verify (exit 2) is gated PURELY on the stored
+    # algorithm id being older than the current one PLUS every differing file being a canonical->raw
+    # transition -- NEVER by re-parsing the artifact, which RecursionErrors on a lower-limit runtime and
+    # made fix-19 falsely report DRIFT. This test uses a 100k-deep artifact whose re-parse RecursionErrors
+    # on the checking runtime: fix-19 -> false DRIFT (exit 1); fix-20 -> cannot-verify (exit 2).
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {                       # triage the high finding -> PASS
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    (run / "deep.json").write_bytes(("[" * 100000 + "]" * 100000).encode("utf-8"))  # re-parse RecursionErrors
+    sh(["aggregate.py"], repo, expect=0)                            # v2 verdict: deep.json -> "raw:"
     v = read(run / "verdict.json")
     att = v["attestation"]
+    assert att["algorithm"] == "sha256-canonical-json-v2", att["algorithm"]
     assert att["files"]["deep.json"].startswith("raw:"), att["files"]["deep.json"]
-    # Rewrite the stored attestation as a LEGACY (pre-cap) tool would have: the deep artifact recorded
-    # as a plain CANONICAL hash, with the manifest digest recomputed so the record stays self-consistent
-    # (exactly what the old code wrote). Nothing else is touched, so the ONLY recompute difference is
-    # deep.json's representation.
-    canon = json.dumps(json.loads(deep_bytes.decode("utf-8")), sort_keys=True,
-                       separators=(",", ":"), ensure_ascii=False)
+    # (1) Forge a LEGACY verdict: stamp the PREVIOUS algorithm id and store a plain (non-"raw:") canonical
+    # hash for the deep artifact, as the old tool on a high-recursion-limit runtime did. (Its true canonical
+    # hash cannot be recomputed here -- json.loads of 100k-deep RecursionErrors on this runtime -- which is
+    # exactly why fix-20 must not re-parse.) deep.json is then the only canonical->raw transition.
+    legacy = dict(att)
     legacy_files = dict(att["files"])
-    legacy_files["deep.json"] = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+    legacy_files["deep.json"] = "a" * 64                            # a plain canonical-looking hash
+    legacy["files"] = legacy_files
+    legacy["algorithm"] = "sha256-canonical-json-v1"                # predates the byte-based raw policy
     manifest = "\n".join(f"{sha}  {rel}" for rel, sha in sorted(legacy_files.items()))
-    att["files"] = legacy_files
-    att["digest"] = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
-    v["attestation"] = att
+    legacy["digest"] = hashlib.sha256(manifest.encode("utf-8")).hexdigest()  # keep the record consistent
+    v["attestation"] = legacy
     (run / "verdict.json").write_text(json.dumps(v))
-    r = sh(["aggregate.py", "--check-digest"], repo, expect=2)      # cannot-verify, NOT drift (1)
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=2)      # version-gated cannot-verify, NOT drift
     blob = r.stdout + r.stderr
     assert "CANNOT BE VERIFIED" in blob, (r.stdout, r.stderr)
     assert "deep.json" in blob, blob
     assert "MISMATCH" not in r.stdout, "legacy transition must not be reported as definitive drift"
-    # Security preserved: a deep artifact SWAPPED for DIFFERENT deep content (bytes changed) must stay
-    # DRIFT, never be masked by the legacy path. The stored legacy canonical hash is of the ORIGINAL
-    # bytes; the new bytes re-canonicalize to a different hash, so the byte-equality proof fails.
-    (run / "deep.json").write_bytes(("[" * (depth + 1) + "]" * (depth + 1)).encode("utf-8"))
-    r = sh(["aggregate.py", "--check-digest"], repo, expect=1)      # real change -> DRIFT, not masked
-    assert "DRIFT" in r.stdout and "deep.json" in r.stdout, r.stdout
+    # (2) Security preserved: the version gate NEVER excuses a CURRENT (v2) verdict. Add a shallow artifact,
+    # aggregate a fresh v2 verdict (extra.json is stored as a plain canonical hash), then TAMPER by
+    # replacing it with DEEP content so it recomputes "raw:". stored is v2 == current, so this same
+    # canonical->raw shape is real DRIFT (exit 1), never the transitional cannot-verify.
+    (run / "extra.json").write_text('{"x": 1}')                    # shallow -> canonical under v2
+    sh(["aggregate.py"], repo, expect=0)
+    att2 = read(run / "verdict.json")["attestation"]
+    assert not att2["files"]["extra.json"].startswith("raw:"), att2["files"]["extra.json"]
+    (run / "extra.json").write_bytes(("[" * 300 + "]" * 300).encode("utf-8"))  # now deep -> recomputes raw:
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=1)      # current verdict: DRIFT, not excused
+    assert "DRIFT" in r.stdout and "extra.json" in r.stdout, r.stdout
 
 
 def t_mcp_aggregate_refuses_when_run_lock_is_held():
@@ -3727,7 +3766,7 @@ def _write_run(path, verdict="PASS", risk="NORMAL", run_id="run-x", reports=None
         (d / "panel" / (role + ".json")).write_text(json.dumps({"role": role, "findings": findings}))
     for i, rec in enumerate(validations or []):
         (d / "validation" / ("v%d.json" % i)).write_text(json.dumps(rec))
-    att = compute_attestation(d)  # sha256-canonical-json-v1 over every .json except verdict.json
+    att = compute_attestation(d)  # sha256-canonical-json-v2 over every .json except verdict.json
     (d / "verdict.json").write_text(json.dumps({
         "verdict": verdict, "risk": risk, "run_id": run_id, "computed_at": "2026-08-20T00:00:00Z",
         "counts": {"findings_high_critical": 0, "findings_medium_low": 0, "confirmed": 0, "unresolved": 0},

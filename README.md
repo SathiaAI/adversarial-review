@@ -450,7 +450,7 @@ record self-describing and self-verifying:
   "areas_not_reviewed": ["union of the reviewers' own attestations"]
 },
 "attestation": {                    // tamper-evident digest over the recorded run
-  "algorithm": "sha256-canonical-json-v1",
+  "algorithm": "sha256-canonical-json-v2",
   "inputs": 27,
   "digest": "1f58da91…",
   "files": {"run.json": "…", "gates/unit.json": "…"}
@@ -465,16 +465,20 @@ unknowns behind a BLOCKED verdict.
 
 **Attestation** is a reproducible SHA-256 over every recorded `*.json` artifact except
 `verdict.json` itself. Artifacts are canonicalized (sorted keys, compact separators),
-so cosmetic re-serialization is not tampering, while a file that fails UTF-8 decoding
-or JSON parsing hashes over its raw bytes instead of crashing the aggregator.
-Re-aggregating an untouched run reproduces the digest bit-for-bit, and anyone holding
-the run directory can verify it:
+so cosmetic re-serialization is not tampering, while a file that fails UTF-8 decoding or
+JSON parsing — or whose bytes exceed a fixed cap on nesting depth or integer-literal width —
+hashes over its raw bytes instead of crashing the aggregator. Deciding that **from the bytes,
+before parsing** keeps the digest identical across Python versions and interpreter
+configurations (both the recursion-depth and integer-string limits are per-runtime), so
+re-aggregating an untouched run reproduces the digest bit-for-bit and anyone holding the run
+directory can verify it:
 
 ```bash
 python scripts/aggregate.py --check-digest
 # exit 0 — intact.  Output: "attestation OK: sha256 1f58da91… over 27 artifacts"
 # exit 1 — drifted. One line per drifted artifact, e.g. "  DRIFT modified gates/deps.json"
-# exit 2 — nothing to verify yet (no verdict.json, or one computed before attestations existed)
+# exit 2 — cannot verify (no verdict.json, one computed before attestations existed, or a legacy
+#          verdict whose representation predates the current algorithm id — re-aggregate, then re-check)
 ```
 
 `--check-digest` proves the bytes are intact; it says nothing about *who* stands behind them.
