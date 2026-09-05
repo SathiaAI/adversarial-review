@@ -390,6 +390,21 @@ def check_digest(run):
         print(f"cannot recompute attestation ({e}) — a recorded artifact could not be read; "
               "re-aggregate before checking the digest", file=sys.stderr)
         sys.exit(2)
+    # Validate the stored algorithm id BEFORE comparing digests. Only _ATTESTATION_ALGO (current) and the
+    # recognized predecessors in _LEGACY_ALGOS are interpretable; an unknown, FUTURE, or malformed id (a
+    # newer tool's format, or a non-string) means this version cannot interpret the stored representation.
+    # Checking it AHEAD of the digest-equality exit-0 below is required: a record whose algorithm id was
+    # changed to an unrecognized value while its digest still equals the recompute would otherwise report
+    # "attestation OK" (exit 0) for a representation this version does not understand. An unrecognized id is
+    # ALWAYS cannot-verify (exit 2) — whether or not the digest matches — and is never classified as a known
+    # legacy transition or as drift. (CodeRabbit r3930631485; matching-digest case, Codex r3941637877.)
+    stored_algo = stored.get("algorithm")
+    if stored_algo not in _RECOGNIZED_ALGOS:
+        print(f"attestation CANNOT BE VERIFIED: the stored attestation's algorithm id ({stored_algo!r}) "
+              f"is not one this version recognizes ({', '.join(_RECOGNIZED_ALGOS)}) — it was produced by "
+              "a different (newer or unknown) tool version, so this tool cannot interpret its "
+              "representation. Re-aggregate under the current algorithm, then re-check.", file=sys.stderr)
+        sys.exit(2)
     if att["digest"] == stored.get("digest"):
         print(f"attestation OK: sha256 {att['digest']} over {att['inputs']} artifacts")
         sys.exit(0)
@@ -397,18 +412,6 @@ def check_digest(run):
     drifted = [(rel, old.get(rel), att["files"].get(rel))
                for rel in sorted(set(old) | set(att["files"]))
                if old.get(rel) != att["files"].get(rel)]
-    stored_algo = stored.get("algorithm")
-    # Validate the stored algorithm id BEFORE any legacy handling. Only _ATTESTATION_ALGO (current) and the
-    # recognized predecessors in _LEGACY_ALGOS are interpretable. An unknown, FUTURE, or malformed id (a
-    # newer tool's format, or a non-string) means this version does not know that representation, so a
-    # mismatch cannot be classified as either a known transition or as drift — report cannot-verify (exit
-    # 2), never the LEGACY path and never DRIFT. (CodeRabbit r3930631485.)
-    if stored_algo not in _RECOGNIZED_ALGOS:
-        print(f"attestation CANNOT BE VERIFIED: the stored attestation's algorithm id ({stored_algo!r}) "
-              f"is not one this version recognizes ({', '.join(_RECOGNIZED_ALGOS)}) — it was produced by "
-              "a different (newer or unknown) tool version, so this tool cannot interpret its "
-              "representation. Re-aggregate under the current algorithm, then re-check.", file=sys.stderr)
-        sys.exit(2)
     # Legacy-compat (version-gated, runtime-INDEPENDENT): a verdict written by a RECOGNIZED PREDECESSOR
     # (_LEGACY_ALGOS — before the byte-based raw policy) stored a plain canonical hash for a deep or
     # wide-integer artifact that this version now hashes "raw:", so the manifest differs. Gate on the id

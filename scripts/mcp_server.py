@@ -653,21 +653,42 @@ def h_aggregate(args):
                                     "(it could be neither moved aside nor durably backed up) — refusing "
                                     f"to aggregate so a prior verdict is never lost: {e}") from e
         elif vf is not None:
-            # verdict.json is absent — a prior aggregate was interrupted BETWEEN its move-aside and the
-            # settle that would have reconciled it, stranding the last accepted verdict at .prev. vf being
-            # ABSENT makes this unambiguous: a failed post-success cleanup always leaves vf present, so an
-            # absent vf can only mean the aggregate never completed its write. Adopt the stranded .prev as
-            # this run's stash — restored on a rejected aggregate, discarded once a fresh verdict
-            # supersedes it. (Fable, fc4a701; Codex, 9b93b4c.)
+            # verdict.json is absent — a prior aggregate was interrupted BEFORE the settle that would have
+            # reconciled it, stranding the last accepted verdict at a sidecar. It may sit at .prev (the
+            # move-aside path: verdict.json was renamed to .prev, then the run died before settling) OR at
+            # .bak (the rename-FALLBACK path: the move-aside failed, so the prior was durably snapshotted to
+            # .bak, then the run died — or its restore failed — leaving verdict.json unwritten). The durable
+            # .bak MUST stay recoverable here too: ignoring it would aggregate with no stash and, worse, a
+            # successful retry would leave the stale .bak behind, so the NEXT call refuses at the entry guard
+            # above over an unrecoverable sidecar. Adopt exactly one regular, non-symlink sidecar as this
+            # run's stash — restored on a rejected aggregate, discarded once a fresh verdict supersedes it (a
+            # .bak restores by the same rename a .prev uses, so no separate bytes path is needed here).
+            # (CodeRabbit r3941598640.)
             cand = vf.parent / (vf.name + ".prev")
-            # Adopt the stranded .prev ONLY when it is a regular, NON-symlink file. `is_file()` follows
-            # symlinks, so a symlinked .prev in an untrusted run root would be adopted here and then moved
-            # to verdict.json by the settle below — after which ar_get_verdict follows it and returns an
-            # arbitrary external file's contents. `is_symlink()` (lstat) rejects that; a symlinked .prev is
-            # not a legitimate stranded verdict, so it is left untouched and a fresh verdict is computed.
-            # (Codex P1 r3930666147.)
-            if cand.is_file() and not cand.is_symlink():
+            cand_bak = vf.parent / (vf.name + ".bak")
+            if cand.is_symlink() or cand_bak.is_symlink():
+                # A symlinked sidecar in an untrusted run root is an arbitrary read/write vector: adopted, it
+                # would be moved into verdict.json for ar_get_verdict to follow (Codex P1 r3930666147). It is
+                # never a valid recovery file — refuse rather than adopt or silently ignore it, so this path
+                # treats a symlinked sidecar exactly as the entry guard above does.
+                raise ToolError(
+                    f"a recovery sidecar ({cand.name} or {cand_bak.name}) next to an absent verdict.json is "
+                    "a symlink — a symlinked sidecar is never a valid recovery file. Remove it, then re-run "
+                    "ar_aggregate")
+            prev_ok = cand.is_file()
+            bak_ok = cand_bak.is_file()
+            if prev_ok and bak_ok:
+                # A .prev AND a .bak both hold a candidate last-accepted verdict — which is authoritative is
+                # ambiguous, and adopting one could restore a stale verdict over a newer one. Refuse and
+                # surface it (as the entry guard does) rather than guess. (CodeRabbit r3941598640.)
+                raise ToolError(
+                    f"both recovery sidecars ({cand.name} and {cand_bak.name}) are present while "
+                    "verdict.json is absent — which holds the last accepted verdict is ambiguous. Inspect "
+                    "both and keep the accepted verdict (remove the other), then re-run ar_aggregate")
+            if prev_ok:
                 stash = cand
+            elif bak_ok:
+                stash = cand_bak
         # The moved-aside verdict is reconciled in the single finally below, which runs on EVERY exit
         # path — the accepted return, the rejected return, and a raised invocation (e.g. _run_cli's
         # subprocess timeout). Earlier revisions restored the prior in several separate branches and
@@ -714,6 +735,13 @@ def h_aggregate(args):
                 # (an empty {}, an unknown verdict, or another run's verdict) is rejected below. Attestation
                 # PRESENCE is deliberately not gated here — that is check_digest's concern. (CodeRabbit, bdccc64.)
                 pinned = run_args[run_args.index("--run") + 1] if "--run" in run_args else None
+                # aggregate.py maps its verdict to its exit code (PASS=0, FAIL=1, BLOCKED=2) and writes
+                # verdict.json BEFORE the human-readable verdict.md; if it crashes AFTER that write (e.g. an
+                # untrusted run has verdict.md as a directory, so the markdown write raises), it exits
+                # nonzero while a fresh, well-formed verdict.json is already on disk. Requiring the exit code
+                # to MATCH the written verdict (below) makes such a post-write crash a rejection, not an
+                # accepted verdict that carries a traceback. (Codex r3941637886.)
+                verdict_exit = {"PASS": 0, "FAIL": 1, "BLOCKED": 2}
                 if not isinstance(structured, dict):
                     reason = "the fresh verdict.json was unreadable, malformed, or not a JSON object"
                 elif structured.get("verdict") not in ("PASS", "FAIL", "BLOCKED"):
@@ -721,6 +749,11 @@ def h_aggregate(args):
                 elif not (pinned is None or structured.get("run_id") == pinned):
                     reason = (f"verdict run_id {structured.get('run_id')!r} does not match the resolved "
                               f"run {pinned!r}")
+                elif rc != verdict_exit[structured["verdict"]]:
+                    reason = (f"aggregate exit code {rc} does not match the written verdict "
+                              f"{structured['verdict']!r} (expected {verdict_exit[structured['verdict']]}) "
+                              "— aggregate likely crashed after writing verdict.json, so it is not a "
+                              "completed aggregation")
                 else:
                     accepted = True  # only now: a fresh, recognized verdict for THIS run is in hand
                     return _result(body or structured.get("verdict", ""), structured=structured)

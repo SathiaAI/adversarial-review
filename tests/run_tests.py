@@ -7168,13 +7168,14 @@ def t_mcp_aggregate_refuses_and_preserves_existing_bak():
 
 
 def t_mcp_aggregate_rejects_symlinked_prev_recovery():
-    # Codex P1 r3930666147: the crash-recovery path adopts a stranded verdict.json.prev when verdict.json
-    # is ABSENT. It used `cand.is_file()`, which FOLLOWS symlinks, so a .prev that is a SYMLINK into an
-    # untrusted run dir would be adopted as the stash and then moved to verdict.json by the settle -- after
-    # which ar_get_verdict follows it and returns an arbitrary external file's contents. The fix adopts the
-    # stranded .prev ONLY when it is a regular, NON-symlink file (`is_file() and not is_symlink()`), so a
-    # symlinked .prev is left untouched and a fresh verdict is computed. Fails on the pre-fix source, which
-    # adopts the symlink and (on a rejected aggregate) moves it into verdict.json, exposing the secret.
+    # Codex P1 r3930666147 (fix-21) + CodeRabbit r3941598640 (fix-22): the crash-recovery path handles a
+    # stranded verdict.json.prev when verdict.json is ABSENT. `is_file()` FOLLOWS symlinks, so a .prev that
+    # is a SYMLINK into an untrusted run dir would be adopted as the stash and then moved to verdict.json by
+    # the settle -- after which ar_get_verdict follows it and returns an arbitrary external file. fix-21
+    # stopped ADOPTING a symlinked .prev; fix-22 makes this branch REFUSE a symlinked sidecar outright (as
+    # the entry guard already does), so the vector is surfaced rather than silently ignored, aggregate is
+    # never invoked, and the symlink is never followed/moved. Fails on the pre-fix (fix-21) source, which
+    # does NOT refuse (it proceeds to aggregate with no stash) -- so `raised`/`called==[]` fail there.
     secret_dir = Path(tempfile.mkdtemp(prefix="ar-secret-"))
     secret = secret_dir / "secret.txt"
     secret.write_text("TOP-SECRET out-of-run contents")
@@ -7186,26 +7187,179 @@ def t_mcp_aggregate_rejects_symlinked_prev_recovery():
         cand.symlink_to(secret)                  # stranded .prev is a SYMLINK -> out-of-run secret
     except (OSError, NotImplementedError):
         return  # platform/user without symlink privilege -> nothing to assert here
-    # verdict.json is ABSENT -> the crash-recovery adopt path is taken
+    # verdict.json is ABSENT -> the crash-recovery branch is taken
     cwd0 = os.getcwd()
     os.chdir(repo)
+    called = []
 
     def fake(module, argv, timeout=120):
-        return (3, "", "boom")   # reject WITHOUT writing a fresh verdict.json
+        called.append(list(argv))
+        return (3, "", "boom")
 
     orig = mcpsrv._run_cli
     mcpsrv._run_cli = fake
+    raised = False
+    try:
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except mcpsrv.ToolError as e:
+            raised = True
+            assert "symlink" in str(e), str(e)
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    assert raised, "a symlinked .prev with absent verdict.json must be REFUSED (ToolError)"
+    assert called == [], "must refuse BEFORE invoking aggregate"
+    vj = rundir / "verdict.json"
+    # the symlinked .prev must NEVER be adopted/exposed via verdict.json (arbitrary-read vector)
+    assert not (vj.exists() and vj.read_text() == secret.read_text()), \
+        "symlinked .prev was adopted and exposed an out-of-run file via verdict.json"
+    assert cand.is_symlink(), "the symlinked .prev must be left untouched, not adopted as the stash"
+
+
+def t_mcp_aggregate_recovers_stranded_bak():
+    # CodeRabbit r3941598640: when verdict.json is ABSENT and the last accepted verdict was durably
+    # snapshotted to verdict.json.bak (the rename-fallback path) before a crash, the absent-verdict branch
+    # must ADOPT that .bak as the recovery stash -- restored on a rejected aggregate, and cleaned up on a
+    # successful one (so a retry never strands the .bak for the entry guard to trip over next call). Fails
+    # on the pre-fix source (fix-21), which recovers only .prev and ignores .bak.
+    prior = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    # (1) rejected retry -> the stranded .bak is restored to verdict.json
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-bak1-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    (rundir / "verdict.json.bak").write_text(json.dumps(prior))    # stranded .bak; verdict.json ABSENT
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def reject(module, argv, timeout=120):
+        return (3, "", "boom")   # rejected WITHOUT writing a fresh verdict.json
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = reject
     try:
         r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
         assert r["isError"], r
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
-    vj = rundir / "verdict.json"
-    # the symlinked .prev must NEVER be adopted and moved into verdict.json (arbitrary-read vector)
-    assert not (vj.exists() and vj.read_text() == secret.read_text()), \
-        "symlinked .prev was adopted and exposed an out-of-run file via verdict.json"
-    assert cand.is_symlink(), "the symlinked .prev must be left untouched, not adopted as the stash"
+    assert (rundir / "verdict.json").is_file(), "stranded .bak must be restored to verdict.json on reject"
+    assert json.loads((rundir / "verdict.json").read_text()) == prior, "restored verdict must be the prior"
+
+    # (2) successful retry -> the stranded .bak is cleaned up (not left for the entry guard to refuse on)
+    repo2 = Path(tempfile.mkdtemp(prefix="ar-agg-bak2-"))
+    rundir2 = repo2 / ".adversarial-review" / "run-20260101-010101"
+    rundir2.mkdir(parents=True)
+    (rundir2 / "verdict.json.bak").write_text(json.dumps(prior))   # stranded .bak; verdict.json ABSENT
+    os.chdir(repo2)
+
+    def fresh(module, argv, timeout=120):
+        (rundir2 / "verdict.json").write_text(
+            json.dumps({"verdict": "FAIL", "run_id": "run-20260101-010101"}))
+        return (1, "FAIL", "")
+
+    mcpsrv._run_cli = fresh
+    try:
+        r2 = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert not r2["isError"] and r2["structuredContent"]["verdict"] == "FAIL", r2
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    assert not (rundir2 / "verdict.json.bak").exists(), "successful retry must clean up the stranded .bak"
+
+
+def t_mcp_aggregate_refuses_ambiguous_prev_and_bak_when_absent():
+    # CodeRabbit r3941598640: when verdict.json is ABSENT and BOTH a regular verdict.json.prev and a
+    # regular verdict.json.bak are present, which holds the last accepted verdict is ambiguous -- adopting
+    # one could restore a stale verdict over a newer one -- so h_aggregate must REFUSE (as the entry guard
+    # does), never invoke aggregate, and leave both sidecars intact. Fails on the pre-fix source (fix-21),
+    # which adopts .prev, ignores .bak, and proceeds to aggregate (no refusal).
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-ambigbak-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    aprev = {"verdict": "PASS", "run_id": "run-20260101-010101"}
+    abak = {"verdict": "FAIL", "run_id": "run-20260101-010101"}
+    (rundir / "verdict.json.prev").write_text(json.dumps(aprev))
+    (rundir / "verdict.json.bak").write_text(json.dumps(abak))     # both present; verdict.json ABSENT
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    called = []
+
+    def fake(module, argv, timeout=120):
+        called.append(list(argv))
+        return (3, "", "boom")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    raised = False
+    try:
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except mcpsrv.ToolError as e:
+            raised = True
+            assert "ambiguous" in str(e), str(e)
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    assert raised, "both .prev and .bak present with absent verdict.json must be refused (ToolError)"
+    assert called == [], "must refuse BEFORE invoking aggregate"
+    assert json.loads((rundir / "verdict.json.prev").read_text()) == aprev, ".prev must be left intact"
+    assert json.loads((rundir / "verdict.json.bak").read_text()) == abak, ".bak must be left intact"
+
+
+def t_check_digest_unrecognized_algorithm_id_matching_digest_is_cannot_verify():
+    # Codex r3941637877: the algorithm-id whitelist must run BEFORE the digest-equality check. A verdict
+    # whose attestation.algorithm was changed to an unrecognized value but whose digest still equals the
+    # recompute (only the id changed) must be cannot-verify (exit 2) -- this version cannot interpret that
+    # representation -- NOT "attestation OK" (exit 0). Fails on the pre-fix source (fix-21), where the
+    # digest-match exit-0 runs first and reports OK before the id is validated.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)
+    base = read(run / "verdict.json")
+    assert base["attestation"]["algorithm"] == "sha256-canonical-json-v2", base["attestation"]["algorithm"]
+    # Change ONLY the algorithm id (unknown string, then malformed non-string); leave files + digest exactly
+    # as written so the recompute still equals the stored digest -- the digest-match path would exit 0.
+    for algo in ("sha256-canonical-json-v3", 2):
+        base["attestation"]["algorithm"] = algo
+        (run / "verdict.json").write_text(json.dumps(base))
+        r = sh(["aggregate.py", "--check-digest"], repo, expect=2)
+        blob = r.stdout + r.stderr
+        assert "CANNOT BE VERIFIED" in blob, blob
+        assert "attestation OK" not in r.stdout, \
+            "an unrecognized algorithm id must be cannot-verify even when the digest matches"
+
+
+def t_mcp_aggregate_rejects_exit_code_verdict_mismatch():
+    # Codex r3941637886: aggregate.py maps verdict->exit code (PASS=0/FAIL=1/BLOCKED=2) and writes
+    # verdict.json BEFORE the human-readable verdict.md; a crash AFTER that write (e.g. verdict.md is a
+    # directory) exits nonzero with a fresh, well-formed PASS verdict.json on disk. h_aggregate must REJECT
+    # when the exit code does not match the written verdict -- not return isError:false with a PASS carrying
+    # a traceback. Fails on the pre-fix source (fix-21), which accepts any rc in {0,1,2}.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-rcmismatch-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    def crash_after_pass(module, argv, timeout=120):
+        (rundir / "verdict.json").write_text(                       # fresh, well-formed PASS verdict.json
+            json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+        return (1, "PASS", "Traceback (most recent call last): IsADirectoryError")  # but exit 1 (post-write crash)
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = crash_after_pass
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    assert r["isError"], "a PASS verdict.json with exit 1 (crash after write) must be rejected, not accepted"
+    assert "does not match" in r["content"][0]["text"], r["content"][0]["text"]
 
 
 def t_mcp_aggregate_refuses_dangling_bak_symlink():
