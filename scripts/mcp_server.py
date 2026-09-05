@@ -712,6 +712,8 @@ HTTP_DEFAULT_HOST = "127.0.0.1"
 HTTP_DEFAULT_PORT = 8730
 HTTP_DEFAULT_MAX_BYTES = 1_048_576  # 1 MiB: a JSON-RPC control message is tiny; caps an oversized-body DoS
 HTTP_DEFAULT_MAX_SESSIONS = 128     # bounded session store: a flood of `initialize`s cannot exhaust memory
+HTTP_DEFAULT_MAX_STREAMS = 64       # bounded concurrent GET/SSE streams: each pins a thread+fd, so cap their
+                                    # count independently of the session store (one valid id != unlimited streams)
 SESSION_HEADER = "Mcp-Session-Id"   # MCP 2026-07-28 Streamable-HTTP session id header (issued at initialize)
 SSE_KEEPALIVE_SECONDS = 15          # GET/SSE idle keepalive-comment cadence; also the shutdown re-check tick
 
@@ -734,11 +736,25 @@ def _http_int_env(name, default, minimum=None, maximum=None):
     return n
 
 
+_HTTP_BOOL_TRUE = ("1", "true", "yes", "on")     # explicit affirmatives
+_HTTP_BOOL_FALSE = ("0", "false", "no", "off")   # explicit negatives
+
+
 def _http_bool_env(name):
-    """A boolean env flag: true only for an explicit affirmative ('1'/'true'/'yes'/'on'); anything
-    else — unset, blank, '0', 'false', or a typo — is off. AR_MCP_HTTP_REQUIRE_SESSION must fail
-    *safe* on a typo rather than silently flipping a security posture."""
-    return (os.environ.get(name, "") or "").strip().lower() in ("1", "true", "yes", "on")
+    """A boolean env flag: true for an explicit affirmative ('1'/'true'/'yes'/'on'), false for an
+    explicit negative ('0'/'false'/'no'/'off') or when unset/blank. A NON-BLANK value that is neither
+    is a loud error, never a silent fallback — mirroring _http_int_env. Failing *safe* on a typo'd
+    AR_MCP_HTTP_REQUIRE_SESSION means refusing to start, NOT silently flipping the security posture to
+    off: a value like 'tru' must not quietly disable the session requirement."""
+    v = (os.environ.get(name, "") or "").strip().lower()
+    if not v:
+        return False
+    if v in _HTTP_BOOL_TRUE:
+        return True
+    if v in _HTTP_BOOL_FALSE:
+        return False
+    raise ValueError("%s must be one of %s (on) or %s (off), got %r"
+                     % (name, "/".join(_HTTP_BOOL_TRUE), "/".join(_HTTP_BOOL_FALSE), v))
 
 
 def http_config():
@@ -876,17 +892,27 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         self._json(403, {"error": "origin not allowed"})
         return False
 
-    def do_POST(self):
-        # (1) DNS-rebinding defense first: reject a disallowed browser Origin before touching the body.
-        if not self._origin_ok():
-            return
-        # (2) HTTP-level protocol-version negotiation. Absent is fine (the modern per-request _meta path
-        #     negotiates in-band); a present-but-unsupported version is rejected with what we speak.
+    def _protocol_ok(self):
+        # HTTP-level protocol-version negotiation, shared by EVERY verb (POST, GET, DELETE). Absent is
+        # fine (the modern per-request _meta path negotiates in-band); a present-but-unsupported version
+        # is rejected (closed 400) with what we speak. GET/DELETE run this too, not just POST — a bogus
+        # pinned version must not slip through the session verbs.
         pv = self.headers.get("MCP-Protocol-Version")
         if pv is not None and pv not in ALL_PROTOCOLS:
             self._json(400, {"error": "unsupported MCP-Protocol-Version",
                              "supportedVersions": list(ALL_PROTOCOLS)})
+            return False
+        return True
+
+    def do_POST(self):
+        # (1) DNS-rebinding defense first: reject a disallowed browser Origin before touching the body.
+        if not self._origin_ok():
             return
+        # (2) HTTP-level protocol-version negotiation (shared with GET/DELETE); reject an unsupported
+        #     pinned version before touching the body.
+        if not self._protocol_ok():
+            return
+        pv = self.headers.get("MCP-Protocol-Version")
         # (3) Frame strictly by Content-Length: reject any Transfer-Encoding (chunked et al.), even when
         #     combined with Content-Length. We do not decode a chunked body, so it would sit unread on a
         #     keep-alive connection and desync into the next request (smuggling) — refuse with a closed 400.
@@ -959,7 +985,14 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         # GET opens the server->client SSE channel for a session (MCP 2026-07-28, E3-S2b). Origin
         # defense applies (a browser EventSource sends Origin). A missing session id -> 400; a
         # forged/terminated one -> 404: the stream is never opened for an id the server did not mint.
+        # The SSE channel belongs to the OPTIONAL session lifecycle (initialize -> Mcp-Session-Id ->
+        # GET/DELETE). A purely stateless 2026-07-28 client that never runs `initialize` has no session,
+        # so it uses POST only and does not open this channel yet — there are no server-initiated
+        # messages to receive (the tool surface is request/response). Sessionless modern SSE is deferred
+        # to E3-S2c (auth) when there is something to push; see docs/using-on-your-platform.md.
         if not self._origin_ok():
+            return
+        if not self._protocol_ok():
             return
         sid = self.headers.get(SESSION_HEADER)
         if sid is None:
@@ -968,39 +1001,58 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         if not self.server.sessions.valid(sid):
             self._json(404, {"error": "unknown or terminated session"})
             return
-        # This server emits no server-initiated messages yet (the tool surface is request/response),
-        # so the stream is a valid, idle channel: an initial comment confirms it is live, then it is
-        # held open (periodic keepalive comments) until the session is terminated, the client
-        # disconnects, or the server shuts down (sse_stop). text/event-stream, uncached, closed at end.
-        self.close_connection = True
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        # Bound the stream's lifetime against a wedged client (reliability review, run-20260824-013958):
-        # a peer that stops reading fills the TCP send buffer, and without a socket timeout `wfile.write`
-        # would block forever, pinning this thread + fd. A write timeout turns that into a bounded OSError
-        # that ends the handler. (Localhost-only for now, so the realistic trigger is a local client that
-        # opens a stream and stalls; still worth bounding before S2c exposes this remotely.)
-        self.connection.settimeout(SSE_KEEPALIVE_SECONDS)
-        stop = self.server.sse_stop
+        # Cap concurrent SSE streams (reliability review, PR #54): a valid session does not entitle a
+        # client to unbounded parallel streams — each held-open stream pins a server thread + fd, and the
+        # session-store bound limits session COUNT, not stream count (N GETs on one valid id = N threads).
+        # A global BoundedSemaphore caps live streams; past the cap the GET is refused with a retryable
+        # 503, and the slot is released when the stream ends (below).
+        if not self.server.sse_streams.acquire(blocking=False):
+            self._json(503, {"error": "too many concurrent event streams"}, {"Retry-After": "1"})
+            return
         try:
-            self.wfile.write(b": connected\n\n")
-            self.wfile.flush()
-            while not stop.is_set() and self.server.sessions.valid(sid):
-                if stop.wait(SSE_KEEPALIVE_SECONDS):
-                    break
-                self.wfile.write(b": keepalive\n\n")  # a stuck write now raises socket.timeout -> break
+            # This server emits no server-initiated messages yet (the tool surface is request/response),
+            # so the stream is a valid, idle channel: an initial comment confirms it is live, then it is
+            # held open (periodic keepalive comments) until the session is terminated, the client
+            # disconnects, or the server shuts down (sse_stop). text/event-stream, uncached, closed at end.
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            # Bound the stream's lifetime against a wedged client (reliability review, run-20260824-013958):
+            # a peer that stops reading fills the TCP send buffer, and without a socket timeout `wfile.write`
+            # would block forever, pinning this thread + fd. A write timeout turns that into a bounded OSError
+            # that ends the handler. (Localhost-only for now, so the realistic trigger is a local client that
+            # opens a stream and stalls; still worth bounding before S2c exposes this remotely.)
+            self.connection.settimeout(SSE_KEEPALIVE_SECONDS)
+            stop = self.server.sse_stop
+            try:
+                self.wfile.write(b": connected\n\n")
                 self.wfile.flush()
-        except OSError:
-            pass  # client disconnected / stalled mid-stream — end the handler quietly
+                while not stop.is_set() and self.server.sessions.valid(sid):
+                    if stop.wait(SSE_KEEPALIVE_SECONDS):
+                        break
+                    # Re-check validity AFTER the wait and BEFORE writing (reliability review, PR #54):
+                    # a DELETE that terminated this session mid-wait must not yield one more keepalive.
+                    # The top-of-loop check alone is insufficient — the wait can return (timeout) after a
+                    # termination, so gate the write on a fresh validity read.
+                    if not self.server.sessions.valid(sid):
+                        break
+                    self.wfile.write(b": keepalive\n\n")  # a stuck write now raises socket.timeout -> break
+                    self.wfile.flush()
+            except OSError:
+                pass  # client disconnected / stalled mid-stream — end the handler quietly
+        finally:
+            self.server.sse_streams.release()
 
     def do_DELETE(self):
         # DELETE terminates a session (MCP 2026-07-28, E3-S2b). Missing id -> 400; unknown/already-
         # terminated -> 404; success -> 204 No Content. Once terminated the id is dead: a later request
         # bearing it is refused 404 by the validation in do_POST/do_GET.
         if not self._origin_ok():
+            return
+        if not self._protocol_ok():
             return
         sid = self.headers.get(SESSION_HEADER)
         if sid is None:
@@ -1024,7 +1076,7 @@ class HttpTransport:
     remotely until auth lands. Binding is split from serving so the framing is testable offline."""
 
     def __init__(self, host=None, port=None, origins=None, max_bytes=None,
-                 max_sessions=None, require_session=None):
+                 max_sessions=None, require_session=None, max_streams=None):
         h, p, o, m = http_config()
         self.host = h if host is None else host
         self.port = p if port is None else port
@@ -1032,6 +1084,8 @@ class HttpTransport:
         self.max_bytes = m if max_bytes is None else max_bytes
         self.max_sessions = (_http_int_env("AR_MCP_HTTP_MAX_SESSIONS", HTTP_DEFAULT_MAX_SESSIONS, minimum=1)
                              if max_sessions is None else max_sessions)
+        self.max_streams = (_http_int_env("AR_MCP_HTTP_MAX_STREAMS", HTTP_DEFAULT_MAX_STREAMS, minimum=1)
+                            if max_streams is None else max_streams)
         self.require_session = (_http_bool_env("AR_MCP_HTTP_REQUIRE_SESSION")
                                 if require_session is None else require_session)
         self.sessions = _SessionStore(self.max_sessions)
@@ -1058,6 +1112,7 @@ class HttpTransport:
         httpd.max_bytes = self.max_bytes
         httpd.sessions = self.sessions
         httpd.require_session = self.require_session
+        httpd.sse_streams = threading.BoundedSemaphore(self.max_streams)  # cap concurrent GET/SSE streams
         httpd.sse_stop = threading.Event()  # set on shutdown so open SSE streams end promptly
         try:
             httpd.server_bind()

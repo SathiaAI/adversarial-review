@@ -227,7 +227,8 @@ keyless `panel.py prepare` + `ingest` (MCP) transport does **not** take corrobor
 | `AR_MCP_HTTP_ORIGINS` | — | Comma list of allowed `Origin` values (DNS-rebinding defense). An absent Origin (non-browser client) is allowed; any *present* Origin must be listed, else `403`. |
 | `AR_MCP_HTTP_MAX_BYTES` | `1048576` | Max POST body bytes for the `http` transport; a larger declared length is refused with `413`. |
 | `AR_MCP_HTTP_MAX_SESSIONS` | `128` | Max concurrent Streamable-HTTP sessions (E3-S2b). The store evicts the least-recently-used id past this bound, so an `initialize` flood cannot exhaust memory. |
-| `AR_MCP_HTTP_REQUIRE_SESSION` | off | When on (`1`/`true`/`yes`/`on`), every `http` request except the `initialize` handshake and the `server/discover` probe must carry a valid `Mcp-Session-Id`, else `400` (E3-S2b). Off by default (the stateless path keeps working); intended to default on with the bearer token in E3-S2c. |
+| `AR_MCP_HTTP_MAX_STREAMS` | `64` | Max concurrent GET/SSE streams (E3-S2b). Each open stream holds a server thread + fd, so this bounds stream count independently of the session store — past the cap a GET is refused with `503` (`Retry-After: 1`). |
+| `AR_MCP_HTTP_REQUIRE_SESSION` | off | When on (`1`/`true`/`yes`/`on`), every `http` request except the `initialize` handshake and the `server/discover` probe must carry a valid `Mcp-Session-Id`, else `400` (E3-S2b). Off (`0`/`false`/`no`/`off` or unset) keeps the stateless path working. A non-blank value that is neither is **rejected loudly** (the transport refuses to start) rather than silently treated as off — a security toggle must not fail open on a typo. Intended to default on with the bearer token in E3-S2c. |
 | `AR_PRIVACY` | by tier | `default`, `deny`, or `zdr` |
 | `AR_TEMPERATURE` | `0.1` | Reviewer sampling temperature |
 | `AR_MAX_TOKENS` | `8000` | Reviewer response cap (floored per model by `max_tokens_floor`) |

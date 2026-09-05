@@ -5189,13 +5189,15 @@ def t_ingest_notes_corroboration_not_applied_on_mcp():
         mock_router.reset()
 
 
-def _http_transport(origins=(), max_bytes=4096, require_session=None, max_sessions=None):
+def _http_transport(origins=(), max_bytes=4096, require_session=None, max_sessions=None, max_streams=None):
     """Start an HttpTransport on an ephemeral localhost port in a daemon thread; return (transport, port).
-    Offline — binds 127.0.0.1 only, no external network. require_session/max_sessions (E3-S2b) default to
-    None so the transport reads the env (require off, 128 sessions); tests inject explicit values."""
+    Offline — binds 127.0.0.1 only, no external network. require_session/max_sessions/max_streams (E3-S2b)
+    default to None so the transport reads the env (require off, 128 sessions, 64 streams); tests inject
+    explicit values."""
     import threading
     t = mcpsrv.HttpTransport(host="127.0.0.1", port=0, origins=origins, max_bytes=max_bytes,
-                             require_session=require_session, max_sessions=max_sessions)
+                             require_session=require_session, max_sessions=max_sessions,
+                             max_streams=max_streams)
     _host, port = t.bind()
     threading.Thread(target=t.serve_forever, daemon=True).start()
     return t, port
@@ -5650,6 +5652,177 @@ def t_mcp_http_session_rotates():
                            {"Mcp-Session-Id": sid})
             assert s[0] == 200, (sid, s[0])
     finally:
+        t.shutdown()
+
+
+def t_mcp_http_require_session_rejects_invalid_value():
+    # Codex (PR #54): AR_MCP_HTTP_REQUIRE_SESSION is a security toggle. A NON-BLANK value that is neither a
+    # documented affirmative nor negative (e.g. the typo "tru") must FAIL LOUDLY, never silently fall back
+    # to "off" and quietly accept sessionless requests. Unset/blank stays off; explicit negatives stay off.
+    NAME = "AR_MCP_HTTP_REQUIRE_SESSION"
+
+    def val(v):
+        old = os.environ.get(NAME)
+        try:
+            os.environ.pop(NAME, None) if v is None else os.environ.__setitem__(NAME, v)
+            return mcpsrv._http_bool_env(NAME)
+        finally:
+            os.environ.pop(NAME, None) if old is None else os.environ.__setitem__(NAME, old)
+
+    assert val(None) is False and val("") is False and val("   ") is False   # unset/blank -> off
+    for aff in ("1", "true", "TRUE", " yes ", "on"):
+        assert val(aff) is True, aff                                          # explicit affirmative -> on
+    for neg in ("0", "false", "No", "off"):
+        assert val(neg) is False, neg                                        # explicit negative -> off
+    for bad in ("tru", "flase", "2", "enable", "y", "onn"):
+        try:
+            val(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("_http_bool_env silently accepted invalid %r (must fail loud)" % bad)
+    # End to end: a typo must stop the transport from constructing, not silently disable strict mode.
+    old = os.environ.get(NAME)
+    try:
+        os.environ[NAME] = "tru"
+        try:
+            mcpsrv.HttpTransport(host="127.0.0.1", port=0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("HttpTransport accepted AR_MCP_HTTP_REQUIRE_SESSION=tru (must refuse)")
+    finally:
+        os.environ.pop(NAME, None) if old is None else os.environ.__setitem__(NAME, old)
+
+
+def t_mcp_http_protocol_version_validated_on_every_verb():
+    # Codex (PR #54): the MCP-Protocol-Version check ran only on POST; GET and DELETE skipped it, so a bogus
+    # pinned version (1999-01-01) slipped through -> GET 200 / DELETE 204. The check is shared across every
+    # verb now: an unsupported version is a closed 400 on POST, GET AND DELETE, before any session work.
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        # GET with a valid session but a bogus version -> 400 (was a 200 SSE stream before the fix).
+        sg, rg = _http_raw(port, b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+                                 b"MCP-Protocol-Version: 1999-01-01\r\n"
+                                 b"Mcp-Session-Id: " + sid.encode("ascii") + b"\r\n\r\n")
+        assert sg == 400 and b"unsupported MCP-Protocol-Version" in rg, (sg, rg[:200])
+        # DELETE with a valid session but a bogus version -> 400 (was 204), and the session is NOT
+        # terminated (the version check runs before terminate) — a clean DELETE afterwards still 204s.
+        assert _http_method(port, "DELETE", {"MCP-Protocol-Version": "1999-01-01",
+                                             "Mcp-Session-Id": sid}) == 400
+        assert _http_method(port, "DELETE", {"Mcp-Session-Id": sid}) == 204
+        # A supported pinned version is still accepted on GET.
+        sok, sid2, _r2 = _http_initialize(port)
+        assert sid2
+        sg2, rg2 = _http_get(port, session_id=sid2)  # no version header -> allowed (absent is fine)
+        assert sg2 == 200 and b": connected" in rg2, (sg2, rg2[:200])
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_sse_streams_are_capped():
+    # Codex (PR #54): a valid session does not entitle a client to unbounded parallel SSE streams — each
+    # held-open stream pins a server thread + fd, so N concurrent GETs on one valid id = N threads
+    # regardless of the session cap. A global BoundedSemaphore caps concurrent streams; the (cap+1)th
+    # concurrent GET is refused with a retryable 503, and a slot freed when a stream ends re-admits.
+    import time
+    old_ka = mcpsrv.SSE_KEEPALIVE_SECONDS
+    mcpsrv.SSE_KEEPALIVE_SECONDS = 0.4    # so a closed stream's slot is reclaimed promptly (readmit check)
+    t, port = _http_transport(max_streams=1)
+    open_socks = []
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+
+        def open_stream():
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+                      b"Mcp-Session-Id: " + sid.encode("ascii") + b"\r\n\r\n")
+            s.settimeout(5)
+            buf = b""
+            while b": connected" not in buf and b" 503 " not in buf:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            return s, buf
+
+        # The first stream occupies the single slot and stays open; reading ": connected" proves the
+        # handler has acquired the slot (happens-before), so the next GET reliably sees the cap hit.
+        s1, b1 = open_stream()
+        open_socks.append(s1)
+        assert b": connected" in b1, b1[:200]
+        # The second concurrent GET is over the cap -> a 503 refusal (retryable), before any second stream
+        # opens. Assert on the STATUS: it is the unambiguous cap signal (no other path returns 503), it is
+        # read deterministically from the status line, and _http_get stops at the first body byte so it
+        # never drains a live stream — so if the cap ever regresses this fails FAST (uncapped -> 200) rather
+        # than hanging on an unbounded stream.
+        s503, _r503 = _http_get(port, session_id=sid)
+        assert s503 == 503, (s503, _r503[:200])
+        # Free the slot: close stream 1; within one (shortened) keepalive tick the handler notices the
+        # dead socket and releases. A GET then re-admits (bounded retry so the release is observed, not raced).
+        s1.close()
+        open_socks.remove(s1)
+        deadline = time.time() + 4.0
+        readmitted = 0
+        while time.time() < deadline:
+            s2, r2 = _http_get(port, session_id=sid)
+            if s2 == 200 and b": connected" in r2:
+                readmitted = 200
+                break
+            time.sleep(0.2)
+        assert readmitted == 200, "slot not re-admitted after the stream ended"
+    finally:
+        for s in open_socks:
+            try:
+                s.close()
+            except OSError:
+                pass
+        mcpsrv.SSE_KEEPALIVE_SECONDS = old_ka
+        t.shutdown()
+
+
+def t_mcp_http_sse_stops_output_after_delete():
+    # Codex (PR #54): terminating a session while its SSE handler is blocked in stop.wait must not yield one
+    # more keepalive. The loop rechecks session validity AFTER the wait and BEFORE writing, so a DELETE that
+    # lands mid-wait ends the stream with NO further output. Before the fix a keepalive was written after
+    # termination (data after DELETE 204). Keepalive cadence is shortened so the test does not wait 15s; the
+    # cadence (2.0s) is large relative to the DELETE round-trip, so the DELETE reliably lands mid-wait.
+    old_ka = mcpsrv.SSE_KEEPALIVE_SECONDS
+    mcpsrv.SSE_KEEPALIVE_SECONDS = 2.0
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+                      b"Mcp-Session-Id: " + sid.encode("ascii") + b"\r\n\r\n")
+            s.settimeout(5)
+            head = b""
+            while b": connected" not in head:                 # read headers + the initial live comment
+                chunk = s.recv(4096)
+                assert chunk, ("stream closed before ': connected'", head[:200])
+                head += chunk
+            # Terminate mid-wait (well before the first 2.0s keepalive tick).
+            assert _http_method(port, "DELETE", {"Mcp-Session-Id": sid}) == 204
+            after = b""
+            s.settimeout(5)
+            while True:                                       # drain until the server closes the stream
+                try:
+                    chunk = s.recv(4096)
+                except socket.timeout:
+                    break                                     # idle without closing -> still no keepalive
+                if not chunk:
+                    break                                     # server closed the stream (fixed behaviour)
+                after += chunk
+            assert b"keepalive" not in after, ("keepalive written after DELETE", after[:200])
+        finally:
+            s.close()
+    finally:
+        mcpsrv.SSE_KEEPALIVE_SECONDS = old_ka
         t.shutdown()
 
 
