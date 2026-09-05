@@ -172,22 +172,59 @@ human-readable `verdict.md` is written alongside `verdict.json`.
    "findings": {"raised": 0, "triaged": 0, "untriaged_release_blocking": 0},
    "cost_usd": 0.0, "cost_aborted": false, "cost_cap_usd": 20.0, "cost_cap_source": "default",
    "areas_not_reviewed": ["union of reviewer attestations"]},
- "attestation": {"algorithm": "sha256-canonical-json-v1", "inputs": 0,
+ "attestation": {"algorithm": "sha256-canonical-json-v2", "inputs": 0,
    "digest": "hex", "files": {"run.json": "hex", "gates/unit.json": "hex"}},
  "computed_at": "ISO-8601"}
 ```
 
+The main aggregation **exits 0 for PASS, 1 for FAIL, 2 for BLOCKED**, writing `verdict.json`
+first and then the human-readable `verdict.md`. Any **unexpected error exits 3** — a code
+deliberately outside the verdict set `{0,1,2}` — so a crash *after* `verdict.json` is already
+written (e.g. an untrusted run has `verdict.md` as a directory, so the markdown write raises)
+can never be mistaken for a completed `FAIL` by a consumer that matches the exit code to the
+written verdict (`mcp_server`'s `ar_aggregate`). Intentional exits pass through unchanged, so a
+subcommand's own codes (e.g. `--sign`'s exit 3 for "no signer configured") are unaffected.
+
 The `attestation` block makes the audit record tamper-evident. Every `*.json` file in
 the run directory except `verdict.json` (the output) is canonicalized — sorted keys,
 compact separators, so cosmetic re-serialization is not tampering — and hashed; a
-`.json` file that fails UTF-8 decoding or JSON parsing is hashed over its raw bytes
-(`raw:` prefix) rather than crashing the aggregator — both failure modes are treated
-identically and deliberately. The per-file hashes are folded into one manifest digest.
-Re-aggregating an untouched run reproduces the digest bit-for-bit.
+`.json` file that fails UTF-8 decoding or JSON parsing, **or whose bytes exceed a fixed,
+version-independent cap on nesting depth OR integer-literal width**, is hashed over its raw
+bytes (`raw:` prefix) rather than crashing the aggregator — these cases are treated
+identically and deliberately. Deciding raw-vs-canonical **from the bytes, *before* parsing**
+(rather than from whether `json.loads` happens to raise) is what keeps the digest identical
+across Python versions *and* interpreter configurations: both the recursion-depth limit and the
+integer-string-conversion limit (`PYTHONINTMAXSTRDIGITS`) are per-runtime, so a byte-measured
+policy is the only portable one. The per-file hashes are folded into one manifest digest.
+Re-aggregating an untouched run reproduces the digest bit-for-bit, on any supported runtime.
 `aggregate.py --check-digest` recomputes it against the stored value: exit 0 intact;
-exit 1 with each drifted artifact named `DRIFT modified|added|removed`; exit 2 when no
-verdict or no attestation exists. Third parties can verify a shipped run directory the
-same way.
+exit 1 with each drifted artifact named `DRIFT modified|added|removed`; exit 2 when the
+digest cannot be checked at all — no verdict, an unreadable/malformed or non-object
+verdict.json, or an attestation that is not a usable object: not a dict, or a dict that
+lacks a string `digest` or a dict `files` (e.g. a legacy record computed before #5 — its
+absent/non-string digest would otherwise fall through to the exit-1 mismatch path, and a
+non-dict `files` would crash the drift report and leak as exit 1); and when the stored `algorithm`
+id is one this version does **not** recognize — a newer, unknown, or malformed id — because its
+representation cannot be interpreted here. Exit 2 also covers a **legacy representation
+transition**: a verdict recorded by a recognized predecessor (`sha256-canonical-json-v1`, before
+the byte-based raw policy) canonicalized a deep or wide-integer artifact and stored a plain
+canonical hash, which this version now hashes `raw:`. `--check-digest` gates purely on the id being
+that recognized predecessor **and** every differing file being a canonical->`raw:` transition —
+never by re-parsing the artifact, which would reintroduce the very runtime dependence the byte
+policy removes (canonicalizing a deep artifact raises `RecursionError` on a lower-limit runtime; a
+wide integer trips the integer limit). Such a transition is **unverifiable, not proven-unchanged**:
+from the recorded hashes alone the tool cannot tell a benign representation change from a real
+modification that kept the artifact beyond the cap (a deep artifact changed to *different* deep
+content is still canonical->`raw:`). It reports cannot-verify with re-aggregation guidance
+(`LEGACY <file>`) — exit 2 is a tool error, **never an intact pass**, so nothing tampered is let
+through, and re-aggregation yields a fresh, fully-verifiable current-algorithm verdict. (Reporting
+`DRIFT` instead would false-alarm on an *unchanged* legacy artifact — the case this path exists to
+avoid — and no runtime-independent re-canonicalization of a deep artifact exists.) A
+**current**-algorithm verdict is never routed here — a canonical->`raw:` mismatch on it is real
+`DRIFT`. Exit 1 is reserved for a real recomputed mismatch, never a read/parse/shape,
+unrecognized-id, or legacy-transition case, so a host that treats exit 1 as "tampered" is never
+misled by an uncheckable run. Third parties can verify a shipped run
+directory the same way.
 
 Optionally, `aggregate.py --sign` produces a **detached cryptographic signature over the
 run's `verdict.json`** (binding the verdict decision, not only this digest), written as the
