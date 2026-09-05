@@ -45,7 +45,6 @@ import json
 import os
 import re
 import socket
-import stat
 import subprocess
 import sys
 import tempfile
@@ -542,6 +541,37 @@ def h_panel_rebuttal(args):
     return _cli_result("panel", argv, timeout=_panel_timeout())
 
 
+def _valid_recovery_sidecar(candidate, run_dir):
+    """A stranded .prev/.bak (adopted when verdict.json is absent) is only a genuine last-accepted verdict
+    for THIS run if it parses as a verdict object whose run_id matches the run AND whose stored attestation
+    digest still verifies against the run's recorded artifacts. Otherwise an attacker who can drop a file in
+    the untrusted run dir could plant a forged PASS that the settle path would promote to verdict.json and
+    ar_get_verdict would return (Codex r3942035547). Fail-closed: any parse/read error, missing run_id or
+    attestation, or a digest that does not re-verify makes the sidecar unadoptable."""
+    try:
+        data = json.loads(candidate.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return False
+    if not isinstance(data, dict) or data.get("verdict") not in ("PASS", "FAIL", "BLOCKED"):
+        return False
+    try:
+        meta = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return False
+    run_id = meta.get("run_id") if isinstance(meta, dict) else None
+    if not run_id or data.get("run_id") != run_id:
+        return False
+    att = data.get("attestation")
+    if not isinstance(att, dict) or not isinstance(att.get("digest"), str):
+        return False
+    try:
+        from aggregate import compute_attestation
+        recomputed = compute_attestation(run_dir)
+    except Exception:
+        return False  # cannot recompute -> cannot verify -> not adoptable
+    return isinstance(recomputed, dict) and att.get("digest") == recomputed.get("digest")
+
+
 def h_aggregate(args):
     """Aggregate the run into a fresh verdict. _safe_run pins the target run so aggregate.py binds
     to the same run whose freshness is checked here (no lexicographic-vs-numeric or concurrent-init
@@ -644,32 +674,35 @@ def h_aggregate(args):
                 try:
                     before_mtime = vf.stat().st_mtime_ns
                     stash_bytes = vf.read_bytes()
-                    # Refuse a non-regular .bak BEFORE opening it (Codex r3941758239): if the backup path
-                    # is a FIFO/socket/device, write_bytes() would BLOCK (a FIFO waits for a reader) before
-                    # any _run_cli timeout applies; a directory would error late. lstat() classifies it
-                    # without following a symlink or opening it. A regular/symlink .bak was already refused
-                    # by the entry guard, so any non-regular .bak still present here is never a safe backup
-                    # target. (Reproduced: .prev is a directory so the rename fails, .bak is a FIFO, and
-                    # h_aggregate hangs on write_bytes until an outer timeout.)
-                    try:
-                        bak_mode = cand_bak.lstat().st_mode
-                    except OSError:
-                        bak_mode = None
-                    if bak_mode is not None and not stat.S_ISREG(bak_mode):
-                        raise ToolError(
-                            f"the backup sidecar path {cand_bak.name} exists but is not a regular file "
-                            "(e.g. a FIFO, socket, device, or directory) — refusing to snapshot the prior "
-                            "verdict through it so ar_aggregate cannot block or clobber; remove it, then "
-                            "re-run ar_aggregate")
-                    cand_bak.write_bytes(stash_bytes)
-                    stash_backup = cand_bak
                 except OSError as e:
                     # Surface the filesystem cause: the tools/call handler sends only str(ToolError)
-                    # to the client, so include {e}; `from e` also satisfies Ruff B904. (CodeRabbit,
-                    # 274b460.)
-                    raise ToolError("cannot snapshot the prior verdict.json to guarantee a restore "
-                                    "(it could be neither moved aside nor durably backed up) — refusing "
+                    # to the client, so include {e}; `from e` also satisfies Ruff B904. (CodeRabbit, 274b460.)
+                    raise ToolError("cannot read the prior verdict.json to guarantee a restore — refusing "
                                     f"to aggregate so a prior verdict is never lost: {e}") from e
+                # Create the backup sidecar ATOMICALLY (CodeRabbit r3941991607). lstat-then-write_bytes was
+                # TOCTOU: a symlink swapped in at .bak after the lstat would be FOLLOWED by write_bytes and
+                # overwrite its target. os.open with O_CREAT|O_EXCL|O_WRONLY fails if ANYTHING already exists
+                # at the path — a regular file, symlink, FIFO, socket, or directory — so a pre-existing or
+                # raced sidecar can be neither followed nor blocked on; the snapshot is written through the
+                # returned fd. (A regular/symlink .bak was already refused by the entry guard; O_EXCL closes
+                # the residual race and also rejects a non-regular .bak without opening/blocking on it.)
+                try:
+                    bak_fd = os.open(str(cand_bak), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                except FileExistsError as e:
+                    raise ToolError(
+                        f"the backup sidecar path {cand_bak.name} already exists — refusing to snapshot the "
+                        "prior verdict through it so ar_aggregate cannot follow a symlink or clobber a file; "
+                        "remove it, then re-run ar_aggregate") from e
+                except OSError as e:
+                    raise ToolError("cannot create the backup sidecar to guarantee a restore — refusing to "
+                                    f"aggregate so a prior verdict is never lost: {e}") from e
+                try:
+                    with os.fdopen(bak_fd, "wb") as bf:
+                        bf.write(stash_bytes)
+                except OSError as e:
+                    raise ToolError("cannot write the backup sidecar to guarantee a restore — refusing to "
+                                    f"aggregate so a prior verdict is never lost: {e}") from e
+                stash_backup = cand_bak
         elif vf is not None:
             # verdict.json is absent — a prior aggregate was interrupted BEFORE the settle that would have
             # reconciled it, stranding the last accepted verdict at a sidecar. It may sit at .prev (the
@@ -703,10 +736,21 @@ def h_aggregate(args):
                     f"both recovery sidecars ({cand.name} and {cand_bak.name}) are present while "
                     "verdict.json is absent — which holds the last accepted verdict is ambiguous. Inspect "
                     "both and keep the accepted verdict (remove the other), then re-run ar_aggregate")
-            if prev_ok:
-                stash = cand
-            elif bak_ok:
-                stash = cand_bak
+            candidate = cand if prev_ok else (cand_bak if bak_ok else None)
+            if candidate is not None:
+                # Validate the stranded sidecar is a genuine last-accepted verdict for THIS run BEFORE
+                # adopting it: on a rejected retry the settle promotes the stash to verdict.json, so an
+                # unvalidated adopt lets an attacker who dropped a crafted .prev/.bak in the untrusted run
+                # dir have a forged verdict returned by ar_get_verdict (Codex r3942035547 reproduced a
+                # crafted PASS .prev being promoted). Refuse and surface an unadoptable sidecar rather than
+                # silently promoting or ignoring it.
+                if not _valid_recovery_sidecar(candidate, vf.parent):
+                    raise ToolError(
+                        f"the recovery sidecar {candidate.name} next to an absent verdict.json is not a "
+                        "valid aggregator verdict for this run (it does not parse as a verdict, its run_id "
+                        "does not match, or its attestation does not verify against the run's artifacts) — "
+                        "it may be stale or planted. Inspect and remove it, then re-run ar_aggregate")
+                stash = candidate
         # The moved-aside verdict is reconciled in the single finally below, which runs on EVERY exit
         # path — the accepted return, the rejected return, and a raised invocation (e.g. _run_cli's
         # subprocess timeout). Earlier revisions restored the prior in several separate branches and
@@ -1009,11 +1053,13 @@ TOOLS = [
 
     _t("ar_panel_rebuttal",
        "Run the adversarial rebuttal round: each reviewer now sees the others' high/critical "
-       "findings and must refute, corroborate, or extend each with evidence. Required (per the "
-       "run's rebuttal policy) before a SENSITIVE/CRITICAL run with high/critical findings can "
-       "reach a verdict. Set prepare=true to write per-reviewer rebuttal request bodies for your "
-       "host to execute, then ingest each with ar_panel_ingest phase='rebuttal' (the keyless "
-       "path); omit prepare to have the server call the reviewers directly over HTTP.",
+       "findings and must refute, corroborate, or extend each with evidence. Required before a run "
+       "with high/critical findings can reach a verdict whenever the run's rebuttal policy demands "
+       "it: 'critical' (CRITICAL runs), 'contention' (SENSITIVE and CRITICAL; the default), or "
+       "'any' (every tier, including NORMAL). Set prepare=true to write per-reviewer rebuttal "
+       "request bodies for your host to execute, then ingest each with ar_panel_ingest "
+       "phase='rebuttal' (the keyless path); omit prepare to have the server call the reviewers "
+       "directly over HTTP.",
        {"run": _RUN_PROP,
         "prepare": {"type": "boolean", "description": "Write rebuttal request bodies for host "
                     "execution (keyless) instead of calling the reviewers directly over HTTP."}},

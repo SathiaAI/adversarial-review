@@ -1088,6 +1088,24 @@ def next_steps(verdict, fail, blocked, gcov, fcov, counts):
 
 
 def main():
+    # Wrap the whole aggregation so an UNEXPECTED error maps to exit 3 for BOTH entry points: `python
+    # aggregate.py` (the __main__ block below) AND the installed `ar-aggregate` console script, which
+    # pyproject points straight at THIS callable (`adversarial_review.aggregate:main`) and so never runs
+    # __main__. A crash after verdict.json is written (e.g. an untrusted run has verdict.md as a directory,
+    # so the markdown write raises) must exit 3 — a code OUTSIDE the verdict set {0,1,2} — for the installed
+    # CLI too, else ar_aggregate cannot tell a crashed FAIL from a completed one (both would exit 1).
+    # Intentional sys.exit(...) raises SystemExit (not Exception) and passes through unchanged, so a
+    # subcommand's own codes (e.g. --sign's exit 3 for "no signer") are unaffected. (Codex r3942035551;
+    # extends CodeRabbit r3941710394, which added the exit-3 mapping only on the __main__/file path.)
+    try:
+        _aggregate_cli()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(3)
+
+
+def _aggregate_cli():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run")
     ap.add_argument("--check-digest", action="store_true",
@@ -1214,19 +1232,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        # An UNEXPECTED error (not an intentional sys.exit) must not exit with a code that could be
-        # mistaken for a verdict. main() writes verdict.json BEFORE verdict.md and finally exits the
-        # verdict code (PASS=0/FAIL=1/BLOCKED=2); a crash AFTER the verdict.json write (e.g. an
-        # untrusted run has verdict.md as a directory, so the markdown write raises) would otherwise
-        # exit 1 — Python's default for an uncaught exception — which is identical to FAIL, so a
-        # consumer that matches the exit code to the written verdict (mcp_server's ar_aggregate) would
-        # accept a crashed FAIL as completed. Exit 3 instead: a code OUTSIDE the verdict set {0,1,2},
-        # so a post-write crash is always a rejection, never a verdict. Intentional sys.exit(...) raises
-        # SystemExit (not Exception) and passes through unchanged, so the subcommands' own codes (e.g.
-        # --sign's exit 3 for "no signer configured") are unaffected. (CodeRabbit r3941710394.)
-        import traceback
-        traceback.print_exc()
-        sys.exit(3)
+    main()
