@@ -177,6 +177,14 @@ human-readable `verdict.md` is written alongside `verdict.json`.
  "computed_at": "ISO-8601"}
 ```
 
+The main aggregation **exits 0 for PASS, 1 for FAIL, 2 for BLOCKED**, writing `verdict.json`
+first and then the human-readable `verdict.md`. Any **unexpected error exits 3** — a code
+deliberately outside the verdict set `{0,1,2}` — so a crash *after* `verdict.json` is already
+written (e.g. an untrusted run has `verdict.md` as a directory, so the markdown write raises)
+can never be mistaken for a completed `FAIL` by a consumer that matches the exit code to the
+written verdict (`mcp_server`'s `ar_aggregate`). Intentional exits pass through unchanged, so a
+subcommand's own codes (e.g. `--sign`'s exit 3 for "no signer configured") are unaffected.
+
 The `attestation` block makes the audit record tamper-evident. Every `*.json` file in
 the run directory except `verdict.json` (the output) is canonicalized — sorted keys,
 compact separators, so cosmetic re-serialization is not tampering — and hashed; a

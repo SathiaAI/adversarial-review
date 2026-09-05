@@ -7407,6 +7407,90 @@ def t_mcp_aggregate_refuses_dangling_bak_symlink():
     assert not target.exists(), "the dangling symlink's target must never be created (write-through vector)"
 
 
+def t_aggregate_post_write_crash_exits_3():
+    # CodeRabbit (PR #55) r3941710394: aggregate.py writes verdict.json BEFORE verdict.md, so an uncaught
+    # exception AFTER that write must exit 3 -- a code OUTSIDE the verdict set {0,1,2} -- rather than Python's
+    # default 1, which is identical to FAIL. Force the post-write crash by making verdict.md a directory (the
+    # markdown write raises IsADirectoryError); verdict.json (FAIL) is still written first. Fails on the base
+    # commit, where the uncaught-exception exit is 1.
+    repo = _complete_sensitive_repo()
+    sh(["gate.py", "record", "--name", "unit", "--exit-code", "1", "--summary", "boom"], repo)
+    run = latest_run(repo)
+    (run / "verdict.md").mkdir()                     # the post-verdict.json markdown write will raise
+    sh(["aggregate.py"], repo, expect=3)             # uncaught error -> exit 3 (base: 1, == FAIL)
+    v = read(run / "verdict.json")                   # verdict.json was written BEFORE the crash ...
+    assert v["verdict"] == "FAIL", v                 # ... and it is the FAIL the base would exit 1 for
+
+
+def t_mcp_aggregate_rejects_post_write_fail_crash():
+    # CodeRabbit (PR #55) r3941710394: the fix-22 exit-code/verdict match is necessary but not sufficient --
+    # a crash after writing a FAIL verdict.json exits 1, which EQUALS verdict_exit["FAIL"], so h_aggregate
+    # accepted a crashed FAIL as a completed verdict. With aggregate.py now exiting 3 on an uncaught error,
+    # h_aggregate (running the REAL aggregate via _run_cli, not a mock) REJECTS it. Fails on the base commit,
+    # where the real aggregate exits 1 and the crashed FAIL is accepted.
+    repo = _complete_sensitive_repo()
+    sh(["gate.py", "record", "--name", "unit", "--exit-code", "1", "--summary", "boom"], repo)
+    run = latest_run(repo)
+    (run / "verdict.md").mkdir()                     # post-verdict.json markdown write raises -> aggregate crash
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        r = mcpsrv.h_aggregate({"run": run.name})    # real aggregate via _run_cli (NOT mocked)
+    finally:
+        os.chdir(cwd0)
+    assert r.get("isError"), ("a crash after writing a FAIL verdict.json must be rejected, not accepted", r)
+    assert "exited 3" in r["content"][0]["text"], r["content"][0]["text"]
+
+
+def t_mcp_aggregate_refuses_fifo_bak_sidecar():
+    # Codex (PR #55) r3941758239: with verdict.json present, .prev a DIRECTORY (so the move-aside rename
+    # fails), and .bak a FIFO, the rename-fallback's write_bytes() opened the FIFO and BLOCKED forever
+    # waiting for a reader -- before any _run_cli timeout applied. h_aggregate now lstat()s the backup path
+    # and REFUSES a non-regular .bak, returning promptly. Run in a daemon thread with a join timeout so a
+    # regression (the blocking write) fails FAST here instead of hanging the suite.
+    if not hasattr(os, "mkfifo"):
+        return  # POSIX-only (CI is Linux); no FIFO on this platform
+    import threading
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-fifobak-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    (rundir / "verdict.json").write_text(json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+    (rundir / "verdict.json.prev").mkdir()           # .prev is a directory -> vf.replace(.prev) fails
+    os.mkfifo(str(rundir / "verdict.json.bak"))      # .bak is a FIFO -> write_bytes would block forever
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    called = []
+
+    def fake(module, argv, timeout=120):
+        called.append(list(argv))
+        return (3, "", "boom")
+
+    out = {}
+
+    def call():
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+            out["ret"] = True
+        except mcpsrv.ToolError as e:
+            out["err"] = str(e)
+        except BaseException as e:  # pragma: no cover
+            out["other"] = repr(e)
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    th = threading.Thread(target=call, daemon=True)
+    th.start()
+    th.join(10)   # the fixed handler raises in ms; only a regression (the blocking write) reaches the timeout
+    try:
+        assert not th.is_alive(), \
+            "h_aggregate blocked on a FIFO .bak (regression: no lstat guard before write_bytes)"
+        assert "err" in out and "not a regular file" in out["err"], out
+        assert called == [], "must refuse BEFORE invoking aggregate"
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
 def t_check_digest_unrecognized_algorithm_id_is_cannot_verify():
     # CodeRabbit r3930631485: --check-digest must validate the stored `algorithm` id BEFORE any legacy
     # handling. Only the current sha256-canonical-json-v2 and recognized predecessors (...-v1) are

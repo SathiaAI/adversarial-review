@@ -1214,4 +1214,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # An UNEXPECTED error (not an intentional sys.exit) must not exit with a code that could be
+        # mistaken for a verdict. main() writes verdict.json BEFORE verdict.md and finally exits the
+        # verdict code (PASS=0/FAIL=1/BLOCKED=2); a crash AFTER the verdict.json write (e.g. an
+        # untrusted run has verdict.md as a directory, so the markdown write raises) would otherwise
+        # exit 1 — Python's default for an uncaught exception — which is identical to FAIL, so a
+        # consumer that matches the exit code to the written verdict (mcp_server's ar_aggregate) would
+        # accept a crashed FAIL as completed. Exit 3 instead: a code OUTSIDE the verdict set {0,1,2},
+        # so a post-write crash is always a rejection, never a verdict. Intentional sys.exit(...) raises
+        # SystemExit (not Exception) and passes through unchanged, so the subcommands' own codes (e.g.
+        # --sign's exit 3 for "no signer configured") are unaffected. (CodeRabbit r3941710394.)
+        import traceback
+        traceback.print_exc()
+        sys.exit(3)

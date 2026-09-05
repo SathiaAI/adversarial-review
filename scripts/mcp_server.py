@@ -45,6 +45,7 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -643,6 +644,23 @@ def h_aggregate(args):
                 try:
                     before_mtime = vf.stat().st_mtime_ns
                     stash_bytes = vf.read_bytes()
+                    # Refuse a non-regular .bak BEFORE opening it (Codex r3941758239): if the backup path
+                    # is a FIFO/socket/device, write_bytes() would BLOCK (a FIFO waits for a reader) before
+                    # any _run_cli timeout applies; a directory would error late. lstat() classifies it
+                    # without following a symlink or opening it. A regular/symlink .bak was already refused
+                    # by the entry guard, so any non-regular .bak still present here is never a safe backup
+                    # target. (Reproduced: .prev is a directory so the rename fails, .bak is a FIFO, and
+                    # h_aggregate hangs on write_bytes until an outer timeout.)
+                    try:
+                        bak_mode = cand_bak.lstat().st_mode
+                    except OSError:
+                        bak_mode = None
+                    if bak_mode is not None and not stat.S_ISREG(bak_mode):
+                        raise ToolError(
+                            f"the backup sidecar path {cand_bak.name} exists but is not a regular file "
+                            "(e.g. a FIFO, socket, device, or directory) — refusing to snapshot the prior "
+                            "verdict through it so ar_aggregate cannot block or clobber; remove it, then "
+                            "re-run ar_aggregate")
                     cand_bak.write_bytes(stash_bytes)
                     stash_backup = cand_bak
                 except OSError as e:
