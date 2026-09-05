@@ -5189,14 +5189,53 @@ def t_ingest_notes_corroboration_not_applied_on_mcp():
         mock_router.reset()
 
 
-def _http_transport(origins=(), max_bytes=4096):
+def _http_transport(origins=(), max_bytes=4096, require_session=None, max_sessions=None, max_streams=None):
     """Start an HttpTransport on an ephemeral localhost port in a daemon thread; return (transport, port).
-    Offline — binds 127.0.0.1 only, no external network."""
+    Offline — binds 127.0.0.1 only, no external network. require_session/max_sessions/max_streams (E3-S2b)
+    default to None so the transport reads the env (require off, 128 sessions, 64 streams); tests inject
+    explicit values."""
     import threading
-    t = mcpsrv.HttpTransport(host="127.0.0.1", port=0, origins=origins, max_bytes=max_bytes)
+    t = mcpsrv.HttpTransport(host="127.0.0.1", port=0, origins=origins, max_bytes=max_bytes,
+                             require_session=require_session, max_sessions=max_sessions,
+                             max_streams=max_streams)
     _host, port = t.bind()
     threading.Thread(target=t.serve_forever, daemon=True).start()
     return t, port
+
+
+def _http_get(port, session_id=None, origin=None):
+    """Open a GET (SSE) and read the FIRST response chunk (status line + headers + any initial SSE
+    comment) in a single recv, then close — so a live text/event-stream never blocks the test. Raw
+    socket because urllib.urlopen would drain the open stream. Returns (status, raw_response_bytes)."""
+    import socket
+    req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+    if origin is not None:
+        req += b"Origin: " + origin.encode("ascii") + b"\r\n"
+    if session_id is not None:
+        req += b"Mcp-Session-Id: " + session_id.encode("ascii") + b"\r\n"
+    req += b"\r\n"
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        s.sendall(req)
+        s.settimeout(5)
+        data = b""
+        for _ in range(10):  # headers and the initial SSE comment can arrive in separate TCP reads
+            try:
+                chunk = s.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            data += chunk
+            head, sep, body = data.partition(b"\r\n\r\n")
+            if sep:
+                status = int(head.split(b" ", 2)[1])
+                if status != 200 or body:  # error bodies are self-contained; a 200 SSE needs its first byte
+                    break
+    finally:
+        s.close()
+    status = int(data.split(b" ", 2)[1]) if data.startswith(b"HTTP/") else 0
+    return status, data
 
 
 def _http_post(port, body, headers=None):
@@ -5212,10 +5251,10 @@ def _http_post(port, body, headers=None):
         return e.code, e.read(), {k.lower(): v for k, v in e.headers.items()}
 
 
-def _http_method(port, method):
+def _http_method(port, method, headers=None):
     import urllib.request
     import urllib.error
-    req = urllib.request.Request("http://127.0.0.1:%d/" % port, method=method)
+    req = urllib.request.Request("http://127.0.0.1:%d/" % port, method=method, headers=headers or {})
     try:
         r = urllib.request.urlopen(req, timeout=5)
         return r.status
@@ -5285,11 +5324,14 @@ def t_mcp_http_malformed_body_is_parse_error():
         t.shutdown()
 
 
-def t_mcp_http_non_post_is_405():
-    # No server->client SSE stream yet (E3-S2b); non-POST methods are 405.
+def t_mcp_http_unsupported_verbs_are_405():
+    # E3-S2b: GET (SSE stream) and DELETE (terminate a session) are real verbs now — without a session
+    # they are 400 (Mcp-Session-Id required), not 405. Every OTHER verb stays 405 (Allow: POST,GET,DELETE).
     t, port = _http_transport()
     try:
-        for method in ("GET", "DELETE", "PUT"):
+        assert _http_get(port)[0] == 400              # GET, no session -> 400 (not 405)
+        assert _http_method(port, "DELETE") == 400    # DELETE, no session -> 400 (not 405)
+        for method in ("PUT", "PATCH", "OPTIONS"):
             assert _http_method(port, method) == 405, method
     finally:
         t.shutdown()
@@ -5485,10 +5527,302 @@ def t_mcp_http_error_paths_close_connection():
         big = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "x", "params": {"p": "A" * 200}})
         s413, _b2, h413 = _http_post(port, big)
         assert s413 == 413 and h413.get("connection", "").lower() == "close", (s413, h413)
-        s405, r405 = _http_raw(port, b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
-        head405 = r405.lower().split(b"\r\n\r\n", 1)[0]
-        assert s405 == 405 and b"connection: close" in head405, r405[:200]
+        # GET with no session id -> 400 (Mcp-Session-Id required, E3-S2b), still a closed connection.
+        s400, r400 = _http_raw(port, b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+        head400 = r400.lower().split(b"\r\n\r\n", 1)[0]
+        assert s400 == 400 and b"connection: close" in head400, r400[:200]
     finally:
+        t.shutdown()
+
+
+def _http_initialize(port, headers=None):
+    """POST a legacy `initialize` handshake; return (status, minted_session_id_or_None, parsed_response)."""
+    req = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+           "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                      "clientInfo": {"name": "t", "version": "0"}}}
+    status, body, hdrs = _http_post(port, json.dumps(req), headers)
+    return status, hdrs.get("mcp-session-id"), (json.loads(body) if body else None)
+
+
+def t_mcp_http_session_issued_at_initialize():
+    # E3-S2b: a successful `initialize` mints a server session and returns it in the Mcp-Session-Id
+    # response header. The id is cryptographically random (long, url-safe) — never a client value — and
+    # a subsequent request bearing it is accepted.
+    t, port = _http_transport()
+    try:
+        status, sid, result = _http_initialize(port)
+        assert status == 200 and "result" in result, (status, result)
+        assert sid and len(sid) >= 40 and re.match(r"^[A-Za-z0-9_-]+$", sid), sid
+        s2, _b2, _h2 = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+                                  {"Mcp-Session-Id": sid})
+        assert s2 == 200, s2
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_forged_session_is_404():
+    # A client-supplied session id the server never minted is refused with 404 — never silently honored —
+    # across POST, GET and DELETE, even for the version-agnostic server/discover probe.
+    t, port = _http_transport()
+    try:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
+        assert _http_post(port, body, {"Mcp-Session-Id": "forged-not-a-real-session"})[0] == 404
+        assert _http_get(port, session_id="forged")[0] == 404
+        assert _http_method(port, "DELETE", {"Mcp-Session-Id": "forged"}) == 404
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_session_delete_terminates():
+    # DELETE terminates a session (204). The id is then dead: a later request bearing it -> 404, and a
+    # repeat DELETE -> 404; a DELETE with no id -> 400.
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        assert _http_method(port, "DELETE", {"Mcp-Session-Id": sid}) == 204
+        reuse = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+                           {"Mcp-Session-Id": sid})
+        assert reuse[0] == 404, reuse[0]
+        assert _http_method(port, "DELETE", {"Mcp-Session-Id": sid}) == 404  # repeat
+        assert _http_method(port, "DELETE") == 400                            # missing id
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_get_opens_sse_for_valid_session():
+    # GET opens the server->client SSE channel for a valid session: 200 text/event-stream + an initial
+    # comment. Missing session -> 400; forged -> 404. The initial chunk is read once and the socket is
+    # closed, so the live stream never blocks the test.
+    t, port = _http_transport()
+    try:
+        assert _http_get(port)[0] == 400                    # no session
+        assert _http_get(port, session_id="nope")[0] == 404  # forged
+        _s, sid, _r = _http_initialize(port)
+        status, raw = _http_get(port, session_id=sid)
+        assert status == 200, (status, raw[:200])
+        head = raw.lower().split(b"\r\n\r\n", 1)[0]
+        assert b"content-type: text/event-stream" in head, raw[:200]
+        assert b": connected" in raw, raw[:200]
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_session_store_bounded_evicts():
+    # The session store is bounded with LRU eviction: minting past capacity drops the least-recently-used
+    # id (so an `initialize` flood cannot exhaust memory), and the evicted id no longer validates.
+    store = mcpsrv._SessionStore(3)
+    a, b, c = store.create(), store.create(), store.create()
+    assert len(store) == 3 and store.valid(a) and store.valid(b) and store.valid(c)
+    store.valid(a)      # touch `a` -> `b` becomes least-recently-used
+    d = store.create()  # over capacity -> evict LRU (`b`)
+    assert len(store) == 3, len(store)
+    assert not store.valid(b), "LRU victim should be evicted"
+    assert store.valid(a) and store.valid(c) and store.valid(d)
+    assert store.terminate(d) and not store.valid(d)
+
+
+def t_mcp_http_require_session_flag():
+    # AR_MCP_HTTP_REQUIRE_SESSION (strict mode; off by default, on with auth in E3-S2c): a request other
+    # than the initialize handshake or the server/discover probe must carry a valid session, else 400.
+    t, port = _http_transport(require_session=True)
+    try:
+        bare = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        assert bare[0] == 400, bare[0]                                            # no session -> 400
+        disc = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 2, "method": "server/discover"}))
+        assert disc[0] == 200, disc[0]                                            # probe is exempt
+        s_init, sid, _r = _http_initialize(port)
+        assert s_init == 200 and sid                                             # handshake is exempt
+        ok = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+                        {"Mcp-Session-Id": sid})
+        assert ok[0] == 200, ok[0]                                                # with session -> 200
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_session_rotates():
+    # Rotatable: each initialize mints a FRESH id; both remain independently valid until terminated.
+    t, port = _http_transport()
+    try:
+        _s1, sid1, _r1 = _http_initialize(port)
+        _s2, sid2, _r2 = _http_initialize(port)
+        assert sid1 and sid2 and sid1 != sid2, (sid1, sid2)
+        for sid in (sid1, sid2):
+            s = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/list"}),
+                           {"Mcp-Session-Id": sid})
+            assert s[0] == 200, (sid, s[0])
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_require_session_rejects_invalid_value():
+    # Codex (PR #54): AR_MCP_HTTP_REQUIRE_SESSION is a security toggle. A NON-BLANK value that is neither a
+    # documented affirmative nor negative (e.g. the typo "tru") must FAIL LOUDLY, never silently fall back
+    # to "off" and quietly accept sessionless requests. Unset/blank stays off; explicit negatives stay off.
+    NAME = "AR_MCP_HTTP_REQUIRE_SESSION"
+
+    def val(v):
+        old = os.environ.get(NAME)
+        try:
+            os.environ.pop(NAME, None) if v is None else os.environ.__setitem__(NAME, v)
+            return mcpsrv._http_bool_env(NAME)
+        finally:
+            os.environ.pop(NAME, None) if old is None else os.environ.__setitem__(NAME, old)
+
+    assert val(None) is False and val("") is False and val("   ") is False   # unset/blank -> off
+    for aff in ("1", "true", "TRUE", " yes ", "on"):
+        assert val(aff) is True, aff                                          # explicit affirmative -> on
+    for neg in ("0", "false", "No", "off"):
+        assert val(neg) is False, neg                                        # explicit negative -> off
+    for bad in ("tru", "flase", "2", "enable", "y", "onn"):
+        try:
+            val(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("_http_bool_env silently accepted invalid %r (must fail loud)" % bad)
+    # End to end: a typo must stop the transport from constructing, not silently disable strict mode.
+    old = os.environ.get(NAME)
+    try:
+        os.environ[NAME] = "tru"
+        try:
+            mcpsrv.HttpTransport(host="127.0.0.1", port=0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("HttpTransport accepted AR_MCP_HTTP_REQUIRE_SESSION=tru (must refuse)")
+    finally:
+        os.environ.pop(NAME, None) if old is None else os.environ.__setitem__(NAME, old)
+
+
+def t_mcp_http_protocol_version_validated_on_every_verb():
+    # Codex (PR #54): the MCP-Protocol-Version check ran only on POST; GET and DELETE skipped it, so a bogus
+    # pinned version (1999-01-01) slipped through -> GET 200 / DELETE 204. The check is shared across every
+    # verb now: an unsupported version is a closed 400 on POST, GET AND DELETE, before any session work.
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        # GET with a valid session but a bogus version -> 400 (was a 200 SSE stream before the fix).
+        sg, rg = _http_raw(port, b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+                                 b"MCP-Protocol-Version: 1999-01-01\r\n"
+                                 b"Mcp-Session-Id: " + sid.encode("ascii") + b"\r\n\r\n")
+        assert sg == 400 and b"unsupported MCP-Protocol-Version" in rg, (sg, rg[:200])
+        # DELETE with a valid session but a bogus version -> 400 (was 204), and the session is NOT
+        # terminated (the version check runs before terminate) — a clean DELETE afterwards still 204s.
+        assert _http_method(port, "DELETE", {"MCP-Protocol-Version": "1999-01-01",
+                                             "Mcp-Session-Id": sid}) == 400
+        assert _http_method(port, "DELETE", {"Mcp-Session-Id": sid}) == 204
+        # A supported pinned version is still accepted on GET.
+        sok, sid2, _r2 = _http_initialize(port)
+        assert sid2
+        sg2, rg2 = _http_get(port, session_id=sid2)  # no version header -> allowed (absent is fine)
+        assert sg2 == 200 and b": connected" in rg2, (sg2, rg2[:200])
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_sse_streams_are_capped():
+    # Codex (PR #54): a valid session does not entitle a client to unbounded parallel SSE streams — each
+    # held-open stream pins a server thread + fd, so N concurrent GETs on one valid id = N threads
+    # regardless of the session cap. A global BoundedSemaphore caps concurrent streams; the (cap+1)th
+    # concurrent GET is refused with a retryable 503, and a slot freed when a stream ends re-admits.
+    import time
+    old_ka = mcpsrv.SSE_KEEPALIVE_SECONDS
+    mcpsrv.SSE_KEEPALIVE_SECONDS = 0.4    # so a closed stream's slot is reclaimed promptly (readmit check)
+    t, port = _http_transport(max_streams=1)
+    open_socks = []
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+
+        def open_stream():
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+                      b"Mcp-Session-Id: " + sid.encode("ascii") + b"\r\n\r\n")
+            s.settimeout(5)
+            buf = b""
+            while b": connected" not in buf and b" 503 " not in buf:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            return s, buf
+
+        # The first stream occupies the single slot and stays open; reading ": connected" proves the
+        # handler has acquired the slot (happens-before), so the next GET reliably sees the cap hit.
+        s1, b1 = open_stream()
+        open_socks.append(s1)
+        assert b": connected" in b1, b1[:200]
+        # The second concurrent GET is over the cap -> a 503 refusal (retryable), before any second stream
+        # opens. Assert on the STATUS: it is the unambiguous cap signal (no other path returns 503), it is
+        # read deterministically from the status line, and _http_get stops at the first body byte so it
+        # never drains a live stream — so if the cap ever regresses this fails FAST (uncapped -> 200) rather
+        # than hanging on an unbounded stream.
+        s503, _r503 = _http_get(port, session_id=sid)
+        assert s503 == 503, (s503, _r503[:200])
+        # Free the slot: close stream 1; within one (shortened) keepalive tick the handler notices the
+        # dead socket and releases. A GET then re-admits (bounded retry so the release is observed, not raced).
+        s1.close()
+        open_socks.remove(s1)
+        deadline = time.time() + 4.0
+        readmitted = 0
+        while time.time() < deadline:
+            s2, r2 = _http_get(port, session_id=sid)
+            if s2 == 200 and b": connected" in r2:
+                readmitted = 200
+                break
+            time.sleep(0.2)
+        assert readmitted == 200, "slot not re-admitted after the stream ended"
+    finally:
+        for s in open_socks:
+            try:
+                s.close()
+            except OSError:
+                pass
+        mcpsrv.SSE_KEEPALIVE_SECONDS = old_ka
+        t.shutdown()
+
+
+def t_mcp_http_sse_stops_output_after_delete():
+    # Codex (PR #54): terminating a session while its SSE handler is blocked in stop.wait must not yield one
+    # more keepalive. The loop rechecks session validity AFTER the wait and BEFORE writing, so a DELETE that
+    # lands mid-wait ends the stream with NO further output. Before the fix a keepalive was written after
+    # termination (data after DELETE 204). Keepalive cadence is shortened so the test does not wait 15s; the
+    # cadence (2.0s) is large relative to the DELETE round-trip, so the DELETE reliably lands mid-wait.
+    old_ka = mcpsrv.SSE_KEEPALIVE_SECONDS
+    mcpsrv.SSE_KEEPALIVE_SECONDS = 2.0
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+                      b"Mcp-Session-Id: " + sid.encode("ascii") + b"\r\n\r\n")
+            s.settimeout(5)
+            head = b""
+            while b": connected" not in head:                 # read headers + the initial live comment
+                chunk = s.recv(4096)
+                assert chunk, ("stream closed before ': connected'", head[:200])
+                head += chunk
+            # Terminate mid-wait (well before the first 2.0s keepalive tick).
+            assert _http_method(port, "DELETE", {"Mcp-Session-Id": sid}) == 204
+            after = b""
+            s.settimeout(5)
+            while True:                                       # drain until the server closes the stream
+                try:
+                    chunk = s.recv(4096)
+                except socket.timeout:
+                    break                                     # idle without closing -> still no keepalive
+                if not chunk:
+                    break                                     # server closed the stream (fixed behaviour)
+                after += chunk
+            assert b"keepalive" not in after, ("keepalive written after DELETE", after[:200])
+        finally:
+            s.close()
+    finally:
+        mcpsrv.SSE_KEEPALIVE_SECONDS = old_ka
         t.shutdown()
 
 
