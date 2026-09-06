@@ -608,6 +608,21 @@ def sign_attestation(run):
     AR_SIGNER_CMD override > cosign keyless > minisign (AR_MINISIGN_KEY). Exit 0 signed, 1 drift,
     2 nothing to sign, 3 no signer / signer failure — opt-in signing is never silently skipped."""
     verdict, digest = _load_verdict(run)
+    # Only a CURRENT-algorithm attestation can be validly signed. compute_attestation ALWAYS recomputes
+    # under _ATTESTATION_ALGO, so the drift comparison below is a meaningful freshness check ONLY when the
+    # recorded attestation was itself produced under that algorithm. A record whose algorithm id is a
+    # legacy predecessor, or an unrecognized/forged value whose digest happens to equal the current
+    # recompute, would otherwise be signed as if current — vouching for a representation this version never
+    # actually re-attested. Gate on it BEFORE the digest compare, mirroring check_digest's algorithm gate
+    # ahead of its digest-equality. Exit 1 (the "re-aggregate before signing" refusal family, alongside
+    # drift) — NOT exit 3, which is reserved for a missing/failed signer, an unrelated tooling error.
+    # (Codex r3945556742.)
+    stored_algo = (verdict.get("attestation") or {}).get("algorithm")
+    if stored_algo != _ATTESTATION_ALGO:
+        print(f"refusing to sign: recorded attestation algorithm {stored_algo!r} is not the current "
+              f"{_ATTESTATION_ALGO!r} — re-aggregate under the current algorithm before signing",
+              file=sys.stderr)
+        sys.exit(1)
     att = compute_attestation(run)
     if att["digest"] != digest:
         print(f"refusing to sign: run artifacts drifted — recomputed attestation {att['digest']} "
@@ -653,6 +668,19 @@ def verify_signature(run):
     canonical verdict.json — so a relabeled verdict decision no longer verifies. Verifier resolution
     mirrors the signer: AR_VERIFIER_CMD override > cosign verify-blob > minisign -V."""
     verdict, digest = _load_verdict(run)
+    # A signature can be checked only against a CURRENT-algorithm attestation. verify recomputes the
+    # attestation under _ATTESTATION_ALGO (below), so a recorded algorithm id that is legacy or
+    # unrecognized/forged cannot be meaningfully re-checked — and a forged id whose digest coincides with
+    # the current recompute must NOT be allowed to reach the "signature OK" exit 0. This is cannot-verify
+    # (exit 2, the missing-prerequisite family), NEVER "not verified" (exit 1), which the CLI contract and
+    # downstream consumers read as a detected tamper — matching check_digest's exit-2 treatment of an
+    # unrecognized algorithm. (Codex r3945556742.)
+    stored_algo = (verdict.get("attestation") or {}).get("algorithm")
+    if stored_algo != _ATTESTATION_ALGO:
+        print(f"signature CANNOT BE VERIFIED: recorded attestation algorithm {stored_algo!r} is not the "
+              f"current {_ATTESTATION_ALGO!r} — this version cannot re-check that representation; "
+              "re-aggregate under the current algorithm, then re-verify", file=sys.stderr)
+        sys.exit(2)
     sigpath = run / SIG_FILENAME
     if not sigpath.exists():
         print(f"no signature sidecar ({SIG_FILENAME}) — run `aggregate.py --sign` first")

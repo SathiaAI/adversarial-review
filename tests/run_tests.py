@@ -1185,6 +1185,38 @@ def t_sign_refuses_drift():
     assert not (run / "attestation.sig").exists(), "no sidecar when signing is refused"
 
 
+def t_sign_verify_require_current_attestation_algorithm():
+    # Codex r3945556742: --sign and --verify-signature must REQUIRE the recorded attestation's algorithm
+    # to be the current _ATTESTATION_ALGO before trusting the digest comparison. compute_attestation only
+    # produces the current algorithm, so a digest match against a record LABELED with a legacy or
+    # unrecognized/forged algorithm is not a valid check — signing/verifying it would vouch for a
+    # representation this version never re-attested (the same hole check_digest closes ahead of its
+    # digest-equality). Sign+verify cleanly under the current algorithm, then relabel the algorithm id to
+    # an unrecognized value WITHOUT touching the (matching) digest:
+    #   --sign             -> refuse (exit 1, "re-aggregate under the current algorithm"), sidecar UNCHANGED
+    #   --verify-signature -> cannot-verify (exit 2), never "not verified" (exit 1 = tamper) or a false OK
+    # On e51160c (no algorithm gate) the digest still matches, so --sign SIGNS the mislabeled verdict
+    # (exit 0) and --verify-signature reports OK (exit 0) — so this test fails there.
+    import aggregate
+    repo, run = _pass_run_for_signing()
+    env = _stub_signer_env()
+    sh(["aggregate.py"], repo, expect=0, env=env)
+    sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
+    sh(["aggregate.py", "--verify-signature"], repo, expect=0, env=env)          # clean baseline
+    good_sig = (run / "attestation.sig").read_bytes()
+    v = read(run / "verdict.json")
+    assert v["attestation"]["algorithm"] == aggregate._ATTESTATION_ALGO, v["attestation"].get("algorithm")
+    v["attestation"]["algorithm"] = "sha256-canonical-json-v3"                    # unrecognized future id
+    write(run / "verdict.json", v)
+    # sign refuses at the algorithm gate (exit 1), before any signer work, leaving the sidecar untouched
+    rs = sh(["aggregate.py", "--sign"], repo, expect=1, env=env)
+    assert "algorithm" in rs.stderr and "re-aggregate" in rs.stderr, (rs.returncode, rs.stderr)
+    assert (run / "attestation.sig").read_bytes() == good_sig, "sidecar must be untouched on refusal"
+    # verify is cannot-verify (exit 2), never 1 — the gate fires before the signature check
+    rv = sh(["aggregate.py", "--verify-signature"], repo, expect=2, env=env)
+    assert "CANNOT BE VERIFIED" in rv.stderr and "algorithm" in rv.stderr, (rv.returncode, rv.stderr)
+
+
 def t_sign_malformed_command_template_exits_3():
     # E6-S1 (CodeRabbit): an AR_SIGNER_CMD / AR_VERIFIER_CMD with unbalanced quotes is a configuration
     # error (shlex.split raises), not a silent fallthrough — it must exit 3. Deterministic, offline.
