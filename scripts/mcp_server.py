@@ -1097,14 +1097,18 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
                              "initialize handshake", "header": pv})
             return
         # A legacy `initialize` must not carry an MCP-Protocol-Version header that disagrees with the version
-        # its body requests (Codex r3945470135): the handshake negotiates from the BODY's protocolVersion,
-        # but the response echoes the HEADER and the session is bound to the negotiated (body) version — so a
-        # legacy-vs-legacy mismatch (e.g. header 2024-11-05 over a 2025-06-18 body) leaves the client with an
-        # echoed version its own session id then 404s on. Require the header and the body version to agree.
-        if is_initialize and pv is not None and isinstance(body_pv, str) and body_pv != pv:
-            self._json(400, {"error": "MCP-Protocol-Version header does not match the initialize body's "
-                             "protocolVersion", "header": pv, "body": body_pv})
-            return
+        # the handshake will actually NEGOTIATE (Codex r3945470135 + CodeRabbit r3945516733): the response
+        # echoes the HEADER and the session is bound to the NEGOTIATED version — which handle() derives as
+        # the body's protocolVersion when supported, else SUPPORTED_PROTOCOLS[0]. So comparing against the
+        # raw body version missed a body that OMITS protocolVersion (or sends an unsupported/non-string one):
+        # it negotiates SUPPORTED_PROTOCOLS[0] while echoing a different header, leaving the client with an
+        # echoed version its own session id then 404s on. Compare the header to the negotiated version.
+        if is_initialize and pv is not None:
+            negotiated = body_pv if body_pv in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0]
+            if pv != negotiated:
+                self._json(400, {"error": "MCP-Protocol-Version header does not match the version the "
+                                 "initialize handshake will negotiate", "header": pv, "negotiated": negotiated})
+                return
         # A present Mcp-Session-Id must be one the server minted AND must match the version this request
         # speaks (Codex r3941957895) — the pinned header version, else the modern _meta version. So a
         # stateless modern request that rides a legacy session is refused here: its 2026-07-28 version
@@ -1212,25 +1216,32 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             # AFTER registration fires the now-registered wake, which is_set() also catches here. This
             # replaces the earlier separate revalidation (Codex r3941957879) with a race-free one.
             wake = self.server.sessions.register_wake(sid, pv)
-            if wake.is_set():
-                self._json(404, {"error": "unknown or terminated session"})
-                return
-            # This server emits no server-initiated messages yet (the tool surface is request/response),
-            # so the stream is a valid, idle channel: an initial comment confirms it is live, then it is
-            # held open (periodic keepalive comments) until the session is terminated, the client
-            # disconnects, or the server shuts down (sse_stop). text/event-stream, uncached, closed at end.
-            self.close_connection = True
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            # Bound the stream's lifetime against a wedged client (reliability review, run-20260824-013958):
-            # a peer that stops reading fills the TCP send buffer, and without a socket timeout `wfile.write`
-            # would block forever, pinning this thread + fd. A write timeout turns that into a bounded OSError
-            # that ends the handler. (Localhost-only for now, so the realistic trigger is a local client that
-            # opens a stream and stalls; still worth bounding before S2c exposes this remotely.)
+            # Bound every socket write with a timeout FIRST (reliability review, run-20260824-013958): a peer
+            # that stops reading fills the TCP send buffer, and without this `wfile.write` would block
+            # forever, pinning this thread + fd (and, below, the dispatch lock). A write timeout turns that
+            # into a bounded OSError that ends the handler. Set before the 200 so even the header write is
+            # bounded while the dispatch lock is held.
             self.connection.settimeout(SSE_KEEPALIVE_SECONDS)
+            # Commit the stream ATOMICALLY with session termination (Codex r3945547151): DELETE takes
+            # _HTTP_DISPATCH_LOCK to terminate, so committing the 200 under the SAME lock closes the window
+            # between the final validity read (wake.is_set) and send_response in which a DELETE could
+            # otherwise complete while this handler still emits 200 + ": connected" for a dead session. The
+            # lock is held only for the tiny header write (bounded above) and released BEFORE the long-lived
+            # keepalive loop, which then relies on the wake for prompt termination.
+            with _HTTP_DISPATCH_LOCK:
+                if wake.is_set():
+                    self._json(404, {"error": "unknown or terminated session"})
+                    return
+                # This server emits no server-initiated messages yet (the tool surface is request/response),
+                # so the stream is a valid, idle channel: an initial comment confirms it is live, then it is
+                # held open (periodic keepalives) until the session is terminated, the client disconnects, or
+                # the server shuts down (sse_stop). text/event-stream, uncached, closed at end.
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                self.end_headers()
             stop = self.server.sse_stop
             # Free the slot promptly on a CLIENT disconnect too (Codex r3943958155): a peer that closes
             # right after ": connected" fires no wake, so without polling the slot would linger until the
@@ -1295,7 +1306,14 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         # Terminate BOUND to the pinned version (Codex r3941957895): a DELETE pinned to a version other
         # than the one the session negotiated does not terminate it (returns 404), so it cannot be used
         # to tear down a session it does not actually speak for.
-        if not self.server.sessions.terminate(sid, pv):
+        # Serialize the termination with request dispatch under _HTTP_DISPATCH_LOCK (Codex r3945547146 /
+        # r3945547151): do_POST re-checks the session, and do_GET commits its stream, WHILE holding this
+        # lock — so taking it here makes termination atomic with those commitments. A DELETE can no longer
+        # land AFTER a POST's in-lock re-check but before serve_message, nor after a GET's commit re-check
+        # but before its 200. terminate() is O(1) (drop the id, fire wakes), so the lock is held only briefly.
+        with _HTTP_DISPATCH_LOCK:
+            terminated = self.server.sessions.terminate(sid, pv)
+        if not terminated:
             self._json(404, {"error": "unknown or terminated session"})
             return
         self.close_connection = True

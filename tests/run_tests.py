@@ -6240,6 +6240,58 @@ def t_mcp_http_accept_ignores_extensions_after_q():
         t.shutdown()
 
 
+def t_mcp_http_initialize_header_matches_negotiated_when_body_omits_version():
+    # CodeRabbit r3945516733: a legacy initialize that OMITS params.protocolVersion negotiates
+    # SUPPORTED_PROTOCOLS[0] while echoing the header, so a header naming a different supported version is
+    # contradictory (the client pins the echoed version and its session id then 404s). The header is now
+    # compared to the NEGOTIATED version, so this is 400. Fails on 5f810d4 (the raw-body check skipped a
+    # None body -> 200 + a session).
+    t, port = _http_transport()
+    try:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}})
+        supported0 = mcpsrv.SUPPORTED_PROTOCOLS[0]
+        other = next(v for v in mcpsrv.SUPPORTED_PROTOCOLS if v != supported0)
+        s, b, h = _http_post(port, body, {"MCP-Protocol-Version": other})
+        assert s == 400, (s, b[:200])
+        assert "mcp-session-id" not in h, h
+        s_ok, _b, h_ok = _http_post(port, body, {"MCP-Protocol-Version": supported0})   # matches negotiated
+        assert s_ok == 200 and h_ok.get("mcp-session-id"), (s_ok, h_ok)
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_delete_serializes_with_dispatch_lock():
+    # Codex r3945547146 / r3945547151: DELETE now serializes with request dispatch via _HTTP_DISPATCH_LOCK,
+    # so a session cannot be terminated while a POST re-check + serve_message (or a GET stream commit) holds
+    # the lock -- closing the check-to-dispatch / check-to-200 window. Hold the lock and show a concurrent
+    # DELETE BLOCKS until release. Fails on 5f810d4 (DELETE terminates immediately, not under the lock).
+    import threading
+    import time
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        result = {}
+
+        def do_delete():
+            result["code"] = _http_method(port, "DELETE", {"Mcp-Session-Id": sid})
+
+        mcpsrv._HTTP_DISPATCH_LOCK.acquire()
+        try:
+            th = threading.Thread(target=do_delete)
+            th.start()
+            time.sleep(0.6)                     # long enough for an un-serialized DELETE to complete
+            blocked = "code" not in result       # on the fix the DELETE is still waiting on the lock
+        finally:
+            mcpsrv._HTTP_DISPATCH_LOCK.release()
+        th.join(5)
+        assert blocked, "DELETE completed while the dispatch lock was held -> not serialized with dispatch"
+        assert result.get("code") == 204, result  # after release it terminates normally
+    finally:
+        t.shutdown()
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
