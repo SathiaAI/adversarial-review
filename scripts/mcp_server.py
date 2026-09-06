@@ -912,9 +912,11 @@ def h_aggregate(args):
                     # stranded and unrecoverable via ar_get_verdict. (Codex, 60cb2c3.)
                     raise ToolError(f"{exc}; additionally, {detail}")
                 # An unexpected non-ToolError is louder and must not be masked — but still record the
-                # stranded prior so a failed restore during that unwind is never fully silent.
-                log(f"prior verdict restore failed ({reconcile_err}); preserved at {where} — "
-                    "restore it before trusting ar_get_verdict")
+                # reconcile failure so it is never fully silent during that unwind. Log `detail` (always
+                # assigned for BOTH the prior-restore and rejected-output branches); the earlier code read
+                # `where`, which the rejected_unremoved branch never sets — an UnboundLocalError that would
+                # itself mask the original exception (CodeRabbit r3945458785).
+                log(detail)
     finally:
         # Release the per-run lock on every exit path. Close BEFORE unlink so the removal succeeds on
         # Windows too (an open handle blocks delete there). A failure to unlink leaves a stale lock

@@ -7807,6 +7807,57 @@ def t_mcp_aggregate_unremovable_rejected_verdict_is_not_readable():
         os.chdir(cwd0)
 
 
+def t_mcp_aggregate_reconcile_failure_does_not_mask_original_error():
+    # CodeRabbit r3945458785: when a rejected verdict can be neither removed NOR moved aside AND a
+    # non-ToolError is already unwinding, the cleanup log referenced `where`, which the rejected_unremoved
+    # branch never assigns -> UnboundLocalError, masking the original exception. It now logs `detail`
+    # (assigned in both branches). Fails on 778b087 (raises UnboundLocalError instead of the original error).
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-reclog-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    RB = type(rundir)
+    orig_unlink = RB.unlink
+    orig_replace = RB.replace
+
+    def blocked_unlink(self, *a, **k):
+        if self.name == "verdict.json":
+            raise OSError("simulated: verdict.json is locked")
+        return orig_unlink(self, *a, **k)
+
+    def blocked_replace(self, target, *a, **k):
+        if str(target).endswith("verdict.json.rejected"):
+            raise OSError("simulated: cannot move the rejected verdict aside")
+        return orig_replace(self, target, *a, **k)
+
+    class Boom(RuntimeError):
+        pass
+
+    def fake(module, argv, timeout=120):
+        (rundir / "verdict.json").write_text(json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+        raise Boom("subprocess exploded")            # a NON-ToolError unwinds while cleanup fails
+
+    orig_cli = mcpsrv._run_cli
+    RB.unlink = blocked_unlink
+    RB.replace = blocked_replace
+    mcpsrv._run_cli = fake
+    got = None
+    try:
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except BaseException as e:
+            got = e
+    finally:
+        RB.unlink = orig_unlink
+        RB.replace = orig_replace
+        mcpsrv._run_cli = orig_cli
+        os.chdir(cwd0)
+    # The original error must propagate, not be masked by an UnboundLocalError from the cleanup log.
+    assert isinstance(got, Boom), ("expected the original error to propagate, got", type(got).__name__, repr(got)[:150])
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
