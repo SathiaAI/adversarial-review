@@ -45,6 +45,7 @@ import json
 import os
 import re
 import secrets
+import select
 import socket
 import subprocess
 import sys
@@ -817,14 +818,24 @@ def _accepts_event_stream(accept):
         if r is None:
             continue      # a non-matching range (e.g. application/json) never admits SSE
         q = 1.0           # q defaults to 1; q<=0 means this range is not acceptable
+        has_media_param = False  # a non-q parameter (e.g. level=1)
         for p in pieces[1:]:
             k, _sep, v = p.strip().partition("=")
-            if k.strip().lower() == "q":
+            key = k.strip().lower()
+            if key == "q":
                 try:
                     q = float(v.strip())
                 except ValueError:
                     q = 0.0
-                break
+            elif key:
+                has_media_param = True
+        # A range carrying a media parameter (e.g. text/event-stream;level=1) only matches a
+        # representation that has that parameter; this server emits a parameterless text/event-stream, so
+        # such a range does NOT match and must not override a later, plainer alternative. Skipping it means
+        # e.g. `text/event-stream;level=1;q=0, text/event-stream;q=1` correctly admits the stream via the
+        # second range instead of being rejected 406 by the first (Codex r3943958164 / CodeRabbit r3943913914).
+        if has_media_param:
+            continue
         if r > best_rank:  # a more specific matching range overrides a less specific one (RFC precedence)
             best_rank = r
             best_ok = q > 0
@@ -897,13 +908,16 @@ class _SessionStore:
             ev.set()
         return True
 
-    def register_wake(self, sid):
-        """Register and return an Event fired when `sid` is terminated, evicted, or wake_all() runs — so
-        an open SSE stream stops waiting the instant its session ends. If the id is already gone the
-        Event is returned pre-set, so a stream never blocks against a session that died first."""
+    def register_wake(self, sid, version=None):
+        """Atomically validate `sid` (bound to `version` when pinned) AND register a wake Event for it,
+        under one lock. Returns the Event, fired when `sid` is later terminated, evicted, or wake_all()
+        runs — so an open SSE stream stops the instant its session ends. The Event is returned PRE-SET
+        when the session is not currently valid, so the GET handler validates-and-registers in a single
+        step: a DELETE that lands in the window between a separate check and registration cannot slip a
+        200 + ": connected" past for an already-dead session (Codex r3943958149)."""
         ev = threading.Event()
         with self._lock:
-            if sid in self._ids:
+            if self._matches(sid, version):
                 self._wakes.setdefault(sid, []).append(ev)
             else:
                 ev.set()
@@ -1056,6 +1070,18 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._json(400, {"error": "MCP-Protocol-Version header does not match params._meta."
                              + META_PROTOCOL_VERSION, "header": pv, "_meta": meta_pv})
             return
+        # Route `initialize` by era too (CodeRabbit r3943894656 / Codex r3943958158): the stateless
+        # 2026-07-28 revision REMOVED the initialize handshake and Mcp-Session-Id, so a POST that pins a
+        # modern MCP-Protocol-Version but carries a legacy `initialize` body (which has no _meta, so the
+        # header/_meta check above never fires) is contradictory. Serving it would negotiate a legacy
+        # version yet echo the modern one and mint a legacy Mcp-Session-Id the client can never use (its
+        # modern-pinned GET/DELETE/POST are 405/405/404), while still consuming an LRU slot — so repeated
+        # modern-pinned handshakes evict live legacy sessions. Refuse it rather than route it ambiguously.
+        if is_initialize and pv in MODERN_PROTOCOLS:
+            self._json(400, {"error": "the " + ", ".join(MODERN_PROTOCOLS) + " revision is stateless and "
+                             "has no initialize handshake; do not pin a modern MCP-Protocol-Version on an "
+                             "initialize request", "header": pv})
+            return
         # A present Mcp-Session-Id must be one the server minted AND must match the version this request
         # speaks (Codex r3941957895) — the pinned header version, else the modern _meta version. So a
         # stateless modern request that rides a legacy session is refused here: its 2026-07-28 version
@@ -1147,18 +1173,16 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             return
         wake = None
         try:
-            # Revalidate AFTER acquiring the slot and BEFORE committing the 200 (Codex r3941957879):
-            # the gap between the check above and this response is a window in which a concurrent DELETE
-            # can terminate the session; without this re-check the stream would emit 200 + ": connected"
-            # for an already-dead session (the DELETE having returned 204). Pairs with the in-loop
-            # re-check that ends an already-open stream.
-            if not self.server.sessions.valid(sid, pv):
+            # Atomically re-validate the session AND register its wake under one store lock (Codex
+            # r3943958149): register_wake returns a PRE-SET event when the session is already gone (or its
+            # version no longer matches), so a DELETE that lands in the window between a separate check and
+            # registration cannot slip a 200 + ": connected" past for a dead session. A DELETE that lands
+            # AFTER registration fires the now-registered wake, which is_set() also catches here. This
+            # replaces the earlier separate revalidation (Codex r3941957879) with a race-free one.
+            wake = self.server.sessions.register_wake(sid, pv)
+            if wake.is_set():
                 self._json(404, {"error": "unknown or terminated session"})
                 return
-            # Register a wake BEFORE streaming so a DELETE (or eviction, or shutdown) ends this stream —
-            # and releases its slot — the instant the session dies, instead of lingering to the next
-            # keepalive tick and making the 503's Retry-After above a lie (Codex r3941957873).
-            wake = self.server.sessions.register_wake(sid)
             # This server emits no server-initiated messages yet (the tool surface is request/response),
             # so the stream is a valid, idle channel: an initial comment confirms it is live, then it is
             # held open (periodic keepalive comments) until the session is terminated, the client
@@ -1176,18 +1200,33 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             # opens a stream and stalls; still worth bounding before S2c exposes this remotely.)
             self.connection.settimeout(SSE_KEEPALIVE_SECONDS)
             stop = self.server.sse_stop
+            # Free the slot promptly on a CLIENT disconnect too (Codex r3943958155): a peer that closes
+            # right after ": connected" fires no wake, so without polling the slot would linger until the
+            # next keepalive WRITE detects the dead socket (up to SSE_KEEPALIVE_SECONDS) — making the 503's
+            # Retry-After a lie for a disconnect just as it was for a DELETE. Wait on a bounded interval:
+            # `wake` fires on server-side termination, and select() reports the socket readable when the
+            # peer closes (MSG_PEEK then reads EOF) or sends; keepalives still go out every
+            # SSE_KEEPALIVE_SECONDS. select on a socket works on Windows too (sockets only).
+            poll = 1.0 if SSE_KEEPALIVE_SECONDS > 1.0 else SSE_KEEPALIVE_SECONDS
+            since_keepalive = 0.0
             try:
                 self.wfile.write(b": connected\n\n")
                 self.wfile.flush()
                 while not stop.is_set() and self.server.sessions.valid(sid, pv):
-                    # Wait for the keepalive interval, but wake the instant the session ends: terminate,
-                    # eviction, and shutdown all fire `wake` (Codex r3941957873), so a DELETE frees this
-                    # slot at once rather than after up to SSE_KEEPALIVE_SECONDS.
-                    if wake.wait(SSE_KEEPALIVE_SECONDS):
-                        break
-                    # Timed out -> keepalive. Re-check stop/validity AFTER the wait and BEFORE writing
-                    # (reliability review, PR #54): a DELETE that terminated this session mid-wait must
-                    # not yield one more keepalive.
+                    if wake.wait(poll):
+                        break  # server-side termination / eviction / shutdown -> stop at once
+                    try:
+                        readable, _, _ = select.select([self.connection], [], [], 0)
+                        if readable and self.connection.recv(1, socket.MSG_PEEK) == b"":
+                            break  # client closed the connection (EOF) -> release the slot now
+                    except OSError:
+                        break  # socket already torn down
+                    since_keepalive += poll
+                    if since_keepalive < SSE_KEEPALIVE_SECONDS:
+                        continue
+                    since_keepalive = 0.0
+                    # Re-check stop/validity AFTER the wait and BEFORE writing: a DELETE that terminated
+                    # this session mid-wait must not yield one more keepalive.
                     if stop.is_set() or not self.server.sessions.valid(sid, pv):
                         break
                     self.wfile.write(b": keepalive\n\n")  # a stuck write now raises socket.timeout -> break

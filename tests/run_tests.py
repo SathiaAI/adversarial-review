@@ -6010,6 +6010,111 @@ def t_mcp_http_delete_wakes_stream_slot_promptly():
         t.shutdown()
 
 
+def t_mcp_http_modern_pinned_initialize_is_400():
+    # CodeRabbit r3943894656 / Codex r3943958158: the 2026-07-28 revision removed the initialize handshake
+    # and Mcp-Session-Id, so a POST pinning MCP-Protocol-Version: 2026-07-28 with a legacy initialize body
+    # (no _meta, so the header/_meta consistency check does not fire) is contradictory and must be 400 --
+    # not dispatched to mint a legacy session while echoing the modern version. Fails on e930dff (200 + id).
+    t, port = _http_transport()
+    try:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                      "clientInfo": {"name": "t", "version": "0"}}})
+        s, b, h = _http_post(port, body, {"MCP-Protocol-Version": "2026-07-28"})
+        assert s == 400, (s, b[:200])
+        assert "mcp-session-id" not in h, h            # no session minted for a modern-pinned initialize
+        s_ok, _b, h_ok = _http_post(port, body, {"MCP-Protocol-Version": "2025-06-18"})
+        assert s_ok == 200 and h_ok.get("mcp-session-id"), (s_ok, h_ok)   # legacy-pinned initialize still works
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_get_registers_wake_atomically():
+    # Codex r3943958149: a DELETE landing at register_wake() (after the prior validity check) must not let
+    # the handler still commit 200 + ": connected" for a dead session. register_wake now validates AND
+    # registers atomically, returning a pre-set event when the session is gone, which the handler checks
+    # before sending. Reproduce by terminating the session as a side effect of registration. Fails on
+    # e930dff (streams 200 for the terminated session); passes here (404).
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        real_reg = t.sessions.register_wake
+        real_term = t.sessions.terminate
+
+        def racing_register(s, *a, **k):
+            real_term(s)             # a concurrent DELETE lands exactly at registration
+            return real_reg(s)       # now returns a pre-set event (session gone)
+
+        t.sessions.register_wake = racing_register
+        try:
+            st, raw = _http_get(port, session_id=sid)
+            assert st == 404, (st, raw[:200])
+            assert b": connected" not in raw, raw[:200]
+        finally:
+            t.sessions.register_wake = real_reg
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_client_disconnect_releases_stream_slot():
+    # Codex r3943958155: a client that closes right after ": connected" must free its stream slot promptly
+    # (within the advertised Retry-After), not hold it until the next keepalive write up to
+    # SSE_KEEPALIVE_SECONDS later. With max_streams=1 and a long keepalive, closing the sole stream must let
+    # a new session's GET re-admit quickly. Fails on e930dff (slot pinned until the keepalive tick).
+    import time
+    old_ka = mcpsrv.SSE_KEEPALIVE_SECONDS
+    mcpsrv.SSE_KEEPALIVE_SECONDS = 30      # long: only prompt disconnect detection (not a tick) frees it
+    t, port = _http_transport(max_streams=1)
+    try:
+        _s, sid_a, _r = _http_initialize(port)
+        assert sid_a
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+                  b"Mcp-Session-Id: " + sid_a.encode("ascii") + b"\r\n\r\n")
+        s.settimeout(5)
+        head = b""
+        while b": connected" not in head:
+            chunk = s.recv(4096)
+            assert chunk, ("stream closed before ': connected'", head[:200])
+            head += chunk
+        _s2, sid_b, _r2 = _http_initialize(port)
+        assert sid_b
+        assert _http_get(port, session_id=sid_b)[0] == 503, "slot should be full while A streams"
+        s.close()                                    # client A disconnects
+        deadline = time.time() + 5.0
+        readmitted = 0
+        while time.time() < deadline:
+            st, raw = _http_get(port, session_id=sid_b)
+            if st == 200 and b": connected" in raw:
+                readmitted = 200
+                break
+            time.sleep(0.1)
+        assert readmitted == 200, "client disconnect did not free the stream slot promptly"
+    finally:
+        mcpsrv.SSE_KEEPALIVE_SECONDS = old_ka
+        t.shutdown()
+
+
+def t_mcp_http_get_accept_honors_media_params():
+    # Codex r3943958164 / CodeRabbit r3943913914: a parameterized exact range (e.g. text/event-stream;level=1)
+    # only matches a representation carrying that parameter; this server emits a parameterless
+    # text/event-stream, so such a range must not override a plainer acceptable alternative. So
+    # `text/event-stream;level=1;q=0, text/event-stream;q=1` must ADMIT the stream (200), not 406. Fails on
+    # e930dff, which lets the first parameterized q=0 range reject it.
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        st, raw = _http_get(port, session_id=sid,
+                            extra={"Accept": "text/event-stream;level=1;q=0, text/event-stream;q=1"})
+        assert st == 200 and b": connected" in raw, (st, raw[:200])
+        st0, _r0 = _http_get(port, session_id=sid, extra={"Accept": "text/event-stream;q=0"})
+        assert st0 == 406, st0                       # a bare q=0 is still an explicit rejection
+    finally:
+        t.shutdown()
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
