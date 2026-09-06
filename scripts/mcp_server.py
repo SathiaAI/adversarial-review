@@ -332,6 +332,15 @@ def _read_json(run_args):
     run_dir = _run_dir(run_args)
     vf = run_dir / "verdict.json"
     if not vf.is_file():
+        # RECOVERY_PENDING vs NO_VERDICT: a stranded .prev/.bak means a prior aggregate was interrupted
+        # before it settled. Recovery is fail-closed — the sidecar is NEVER promoted to a verdict here
+        # (an attacker-writable run dir could plant a forged PASS), so ar_get_verdict does not return it.
+        # Re-run ar_aggregate to recompute a fresh verdict. (CodeRabbit r3942141283 / Codex r3942166700.)
+        if (run_dir / "verdict.json.prev").is_file() or (run_dir / "verdict.json.bak").is_file():
+            raise ToolError(
+                f"no accepted verdict for {run_dir.name}: a prior aggregate was interrupted, leaving a "
+                "recovery sidecar (verdict.json.prev/.bak) that is NOT promoted automatically. Re-run "
+                "ar_aggregate to recompute a fresh verdict; inspect and remove the sidecar if it is stale.")
         raise ToolError(f"no verdict yet for {run_dir.name} — call ar_aggregate first")
     return json.loads(vf.read_text(encoding="utf-8"))
 
@@ -541,37 +550,6 @@ def h_panel_rebuttal(args):
     return _cli_result("panel", argv, timeout=_panel_timeout())
 
 
-def _valid_recovery_sidecar(candidate, run_dir):
-    """A stranded .prev/.bak (adopted when verdict.json is absent) is only a genuine last-accepted verdict
-    for THIS run if it parses as a verdict object whose run_id matches the run AND whose stored attestation
-    digest still verifies against the run's recorded artifacts. Otherwise an attacker who can drop a file in
-    the untrusted run dir could plant a forged PASS that the settle path would promote to verdict.json and
-    ar_get_verdict would return (Codex r3942035547). Fail-closed: any parse/read error, missing run_id or
-    attestation, or a digest that does not re-verify makes the sidecar unadoptable."""
-    try:
-        data = json.loads(candidate.read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):
-        return False
-    if not isinstance(data, dict) or data.get("verdict") not in ("PASS", "FAIL", "BLOCKED"):
-        return False
-    try:
-        meta = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):
-        return False
-    run_id = meta.get("run_id") if isinstance(meta, dict) else None
-    if not run_id or data.get("run_id") != run_id:
-        return False
-    att = data.get("attestation")
-    if not isinstance(att, dict) or not isinstance(att.get("digest"), str):
-        return False
-    try:
-        from aggregate import compute_attestation
-        recomputed = compute_attestation(run_dir)
-    except Exception:
-        return False  # cannot recompute -> cannot verify -> not adoptable
-    return isinstance(recomputed, dict) and att.get("digest") == recomputed.get("digest")
-
-
 def h_aggregate(args):
     """Aggregate the run into a fresh verdict. _safe_run pins the target run so aggregate.py binds
     to the same run whose freshness is checked here (no lexicographic-vs-numeric or concurrent-init
@@ -624,6 +602,8 @@ def h_aggregate(args):
         before_mtime = None
         stash_bytes = None
         stash_backup = None  # durable on-disk copy of the prior when the aside-move fell back to bytes
+        stranded = None      # a RECOVERY_PENDING sidecar (verdict.json absent): never promoted here,
+                             # only superseded for audit once a fresh verdict is accepted (settle below)
         if vf is not None and vf.is_file():
             cand = vf.parent / (vf.name + ".prev")
             cand_bak = vf.parent / (vf.name + ".bak")
@@ -703,6 +683,18 @@ def h_aggregate(args):
                     raise ToolError("cannot write the backup sidecar to guarantee a restore — refusing to "
                                     f"aggregate so a prior verdict is never lost: {e}") from e
                 stash_backup = cand_bak
+                # Prove freshness by EXISTENCE, not mtime (Codex r3942166702). The aside-move failed, so
+                # verdict.json is still in place; if aggregate rewrites it within the same coarse mtime
+                # quantum, `st_mtime_ns` is unchanged and the freshness check below would mislabel a
+                # genuinely fresh verdict as stale and roll it back to .bak. The prior is now durably at
+                # .bak, so removing the original loses nothing and forces aggregate to CREATE a new file
+                # (existence == fresh), exactly as the move-aside path already does. If the unlink itself
+                # fails, before_mtime stays set and the mtime check remains as the (weaker) fallback.
+                try:
+                    vf.unlink()
+                    before_mtime = None
+                except OSError:
+                    pass
         elif vf is not None:
             # verdict.json is absent — a prior aggregate was interrupted BEFORE the settle that would have
             # reconciled it, stranding the last accepted verdict at a sidecar. It may sit at .prev (the
@@ -736,21 +728,18 @@ def h_aggregate(args):
                     f"both recovery sidecars ({cand.name} and {cand_bak.name}) are present while "
                     "verdict.json is absent — which holds the last accepted verdict is ambiguous. Inspect "
                     "both and keep the accepted verdict (remove the other), then re-run ar_aggregate")
-            candidate = cand if prev_ok else (cand_bak if bak_ok else None)
-            if candidate is not None:
-                # Validate the stranded sidecar is a genuine last-accepted verdict for THIS run BEFORE
-                # adopting it: on a rejected retry the settle promotes the stash to verdict.json, so an
-                # unvalidated adopt lets an attacker who dropped a crafted .prev/.bak in the untrusted run
-                # dir have a forged verdict returned by ar_get_verdict (Codex r3942035547 reproduced a
-                # crafted PASS .prev being promoted). Refuse and surface an unadoptable sidecar rather than
-                # silently promoting or ignoring it.
-                if not _valid_recovery_sidecar(candidate, vf.parent):
-                    raise ToolError(
-                        f"the recovery sidecar {candidate.name} next to an absent verdict.json is not a "
-                        "valid aggregator verdict for this run (it does not parse as a verdict, its run_id "
-                        "does not match, or its attestation does not verify against the run's artifacts) — "
-                        "it may be stale or planted. Inspect and remove it, then re-run ar_aggregate")
-                stash = candidate
+            # verdict.json is absent with a stranded sidecar: RECOVERY_PENDING. Do NOT adopt it as a
+            # promotable stash. Fix-24 validated the sidecar by re-verifying its attestation digest, but
+            # compute_attestation() hashes the run's PUBLIC *.json artifacts — all attacker-writable — and
+            # never binds the verdict VALUE, so a planted PASS whose (freely recomputable) digest matches
+            # passed that check and, on a rejected retry, the settle promoted it to verdict.json for
+            # ar_get_verdict to return (CodeRabbit r3942141283 / Codex r3942166700). Recovery is now
+            # fail-closed: ar_aggregate only recomputes a FRESH verdict here and NEVER promotes a sidecar.
+            # A rejected/crashed retry leaves verdict.json absent (RECOVERY_PENDING persists); a successful
+            # one supersedes the stranded sidecar for audit (settle below). Promotion of a stranded sidecar
+            # is the sole job of ar_recover, behind a signature-over-the-complete-verdict gate or an
+            # explicit operator confirmation bound to the sidecar bytes.
+            stranded = cand if prev_ok else (cand_bak if bak_ok else None)
         # The moved-aside verdict is reconciled in the single finally below, which runs on EVERY exit
         # path — the accepted return, the rejected return, and a raised invocation (e.g. _run_cli's
         # subprocess timeout). Earlier revisions restored the prior in several separate branches and
@@ -839,7 +828,11 @@ def h_aggregate(args):
             reconcile_err = None
             reconcile_at = None  # sidecar the un-restored prior survives at, for the recovery message
             if accepted:
-                for s in (stash, stash_backup):  # at most one is set — drop the superseded copy
+                # Drop the superseded copies: the moved-aside prior (stash / stash_backup), and — on the
+                # RECOVERY_PENDING path — the stranded sidecar, now superseded by the fresh authoritative
+                # verdict. Leaving the stranded sidecar in place would trip the entry guard on the NEXT
+                # aggregate (a sidecar beside verdict.json is refused as unreconciled).
+                for s in (stash, stash_backup, stranded):  # at most one of stash/stash_backup is set
                     if s is not None and s.is_file():
                         try:
                             s.unlink()

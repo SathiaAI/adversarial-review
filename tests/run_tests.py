@@ -6794,11 +6794,14 @@ def t_mcp_aggregate_fallback_snapshot_is_durable_before_aggregation():
         return orig_replace(self, target)
 
     def fake(module, argv, timeout=120):
-        # aggregate replaces verdict.json with a DIRECTORY (the aside-move failed, so the prior file is
-        # still in place — remove it first). Result: not a fresh FILE (rejected) AND the write-back
-        # restore (vf.write_bytes) then fails, forcing the reconcile-failure path.
-        (rundir / "verdict.json").unlink()
-        (rundir / "verdict.json").mkdir()
+        # aggregate leaves verdict.json as a DIRECTORY: not a fresh FILE (rejected) AND the write-back
+        # restore (vf.write_bytes) then fails, forcing the reconcile-failure path. The fallback now removes
+        # the original after snapshotting to .bak (freshness by existence, Codex r3942166702), so
+        # verdict.json may already be gone here — create the directory either way.
+        p = rundir / "verdict.json"
+        if p.is_file():
+            p.unlink()
+        p.mkdir()
         return (0, "", "")
 
     orig_cli = mcpsrv._run_cli
@@ -7029,12 +7032,13 @@ def t_mcp_aggregate_refuses_when_no_run_exists():
     assert called == [], "aggregate.py must NOT be invoked when there is no run to aggregate"
 
 
-def t_mcp_aggregate_recovers_crash_stranded_prev():
-    # Fable(fc4a701): if the server was killed BETWEEN a prior run's move-aside and its settle, verdict.json
-    # is absent and the last accepted verdict is stranded at verdict.json.prev. The next ar_aggregate adopts
-    # that .prev as its stash, so a rejected aggregate restores it (never lost).
-    # PR #55 r3942035547: a stranded sidecar is adopted only if it is a GENUINE verdict for this run (run_id
-    # + attestation verify), so this strands a real minted verdict rather than a bare {verdict, run_id}.
+def t_mcp_aggregate_stranded_prev_not_auto_promoted():
+    # PR #55 fix-25 (CodeRabbit r3942141283 / Codex r3942166700): recovery is FAIL-CLOSED. When verdict.json
+    # is absent and a verdict is stranded at verdict.json.prev, ar_aggregate must NOT adopt/promote it -- a
+    # rejected retry leaves verdict.json absent (RECOVERY_PENDING), and the .prev is left intact for an
+    # explicit, gated recovery. fix-24 adopted the .prev and promoted it on a rejected retry; because the run
+    # dir is attacker-writable and its input-digest is freely recomputable, that surfaced un-vetted bytes as
+    # a verdict. Fails on e67c330 (fix-24), which restores the .prev to verdict.json.
     repo = _complete_sensitive_repo()
     run = latest_run(repo)
     write(run / "validation" / "idor.json", {
@@ -7042,7 +7046,6 @@ def t_mcp_aggregate_recovers_crash_stranded_prev():
         "evidence": "reproduced", "reproduced": True, "regression_test": "t",
         "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
     sh(["aggregate.py"], repo, expect=0)                        # mint a genuine verdict.json (with attestation)
-    prior = read(run / "verdict.json")
     (run / "verdict.json").rename(run / "verdict.json.prev")    # crash-stranded: aside-move done, settle never ran
     cwd0 = os.getcwd()
     os.chdir(repo)
@@ -7058,7 +7061,19 @@ def t_mcp_aggregate_recovers_crash_stranded_prev():
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
-    assert read(run / "verdict.json") == prior, "stranded genuine prior must be recovered"
+    # Fail-closed: the stranded sidecar is NOT promoted; verdict.json stays absent and .prev is left intact.
+    assert not (run / "verdict.json").exists(), "stranded .prev must NOT be auto-promoted on a rejected retry"
+    assert (run / "verdict.json.prev").is_file(), "the stranded .prev must be left intact for gated recovery"
+    # ar_get_verdict reports RECOVERY_PENDING rather than returning the un-vetted sidecar as a verdict
+    # (run resolution is relative to cwd, so this check runs from inside the repo).
+    os.chdir(repo)
+    try:
+        mcpsrv.h_get_verdict({"run": run.name})
+        assert False, "ar_get_verdict must not return a stranded sidecar as a verdict"
+    except mcpsrv.ToolError as e:
+        assert "recovery sidecar" in str(e), str(e)
+    finally:
+        os.chdir(cwd0)
 
 
 def t_mcp_aggregate_rejection_states_reason():
@@ -7223,13 +7238,12 @@ def t_mcp_aggregate_rejects_symlinked_prev_recovery():
     assert cand.is_symlink(), "the symlinked .prev must be left untouched, not adopted as the stash"
 
 
-def t_mcp_aggregate_recovers_stranded_bak():
-    # CodeRabbit r3941598640: when verdict.json is ABSENT and the last accepted verdict was durably
-    # snapshotted to verdict.json.bak (the rename-fallback path) before a crash, the absent-verdict branch
-    # must ADOPT that .bak as the recovery stash -- restored on a rejected aggregate, and cleaned up on a
-    # successful one (so a retry never strands the .bak for the entry guard to trip over next call).
-    # PR #55 r3942035547: the .bak is adopted only if it is a GENUINE verdict for this run (run_id +
-    # attestation verify), so each case strands a real minted verdict rather than a bare {verdict, run_id}.
+def t_mcp_aggregate_stranded_bak_not_promoted_but_superseded_on_success():
+    # PR #55 fix-25 (CodeRabbit r3942141283 / Codex r3942166700): recovery is FAIL-CLOSED for a .bak too.
+    # When verdict.json is absent and a verdict is stranded at verdict.json.bak (the rename-fallback path),
+    # ar_aggregate must NOT promote it on a rejected retry (fix-24 restored it -> un-vetted bytes surfaced as
+    # a verdict), and it must SUPERSEDE it on a successful retry (so a stranded .bak is not left for the entry
+    # guard to trip over next call). Part (1) fails on e67c330 (fix-24), which restores the .bak to verdict.json.
     def _mint_and_strand_bak():
         repo = _complete_sensitive_repo()
         run = latest_run(repo)
@@ -7238,15 +7252,14 @@ def t_mcp_aggregate_recovers_stranded_bak():
             "evidence": "reproduced", "reproduced": True, "regression_test": "t",
             "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
         sh(["aggregate.py"], repo, expect=0)                    # genuine verdict.json (with attestation)
-        prior = read(run / "verdict.json")
         (run / "verdict.json").rename(run / "verdict.json.bak")  # durable .bak stranded; verdict.json ABSENT
-        return repo, run, prior
+        return repo, run
 
     orig = mcpsrv._run_cli
     cwd0 = os.getcwd()
 
-    # (1) rejected retry -> the stranded genuine .bak is restored to verdict.json
-    repo, run, prior = _mint_and_strand_bak()
+    # (1) rejected retry -> the stranded .bak is NOT promoted; verdict.json stays absent (RECOVERY_PENDING)
+    repo, run = _mint_and_strand_bak()
     os.chdir(repo)
 
     def reject(module, argv, timeout=120):
@@ -7259,11 +7272,11 @@ def t_mcp_aggregate_recovers_stranded_bak():
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
-    assert (run / "verdict.json").is_file(), "stranded .bak must be restored to verdict.json on reject"
-    assert read(run / "verdict.json") == prior, "restored verdict must be the genuine prior"
+    assert not (run / "verdict.json").exists(), "stranded .bak must NOT be auto-promoted on a rejected retry"
+    assert (run / "verdict.json.bak").is_file(), "the stranded .bak must be left intact for gated recovery"
 
-    # (2) successful retry -> the stranded genuine .bak is cleaned up (not left for the entry guard next call)
-    repo2, run2, _p2 = _mint_and_strand_bak()
+    # (2) successful retry -> a fresh verdict is written and the stranded .bak is superseded (cleaned up)
+    repo2, run2 = _mint_and_strand_bak()
     os.chdir(repo2)
 
     def fresh(module, argv, timeout=120):
@@ -7277,7 +7290,7 @@ def t_mcp_aggregate_recovers_stranded_bak():
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
-    assert not (run2 / "verdict.json.bak").exists(), "successful retry must clean up the stranded .bak"
+    assert not (run2 / "verdict.json.bak").exists(), "successful retry must supersede the stranded .bak"
 
 
 def t_mcp_aggregate_refuses_ambiguous_prev_and_bak_when_absent():
@@ -7504,44 +7517,97 @@ def t_mcp_aggregate_refuses_fifo_bak_sidecar():
         os.chdir(cwd0)
 
 
-def t_mcp_aggregate_refuses_forged_recovery_sidecar():
-    # Codex (PR #55) r3942035547: when verdict.json is absent, a stranded .prev/.bak is adopted as the
-    # recovery stash and, on a rejected retry, PROMOTED to verdict.json. An untrusted regular sidecar was
-    # adopted WITHOUT checking it is a genuine verdict for this run, so a crafted PASS could be returned by
-    # ar_get_verdict. h_aggregate now validates run_id + attestation against the run's artifacts and REFUSES
-    # an unverifiable sidecar. Fails on base 2d8cfe3 (adopts + promotes the forged PASS on the rejected retry).
+def t_mcp_aggregate_forged_stranded_sidecar_never_promoted():
+    # PR #55 fix-25 (CodeRabbit r3942141283 / Codex r3942166700): the ACTUAL forgery fix-24 missed. fix-24
+    # adopted a stranded sidecar when its attestation DIGEST re-verified -- but compute_attestation() hashes
+    # the run's PUBLIC *.json artifacts (all attacker-writable) and never binds the verdict VALUE, so an
+    # attacker recomputes the correct digest and flips the verdict. Here the forged .prev reuses the genuine
+    # (recomputable) attestation and flips the decision to PASS -- exactly the sidecar fix-24's digest check
+    # accepts. Recovery is now fail-closed: a stranded sidecar is NEVER promoted by ar_aggregate. Fails on
+    # e67c330 (fix-24), which adopts the forged PASS and promotes it to verdict.json on the rejected retry.
     repo = _complete_sensitive_repo()
     run = latest_run(repo)
-    meta = read(run / "run.json")
-    # a crafted "last accepted verdict": correct shape + run_id, but an attestation that does NOT verify
-    # against the run's recorded artifacts (a real forged verdict cannot recompute to this digest).
-    forged = {"verdict": "PASS", "run_id": meta["run_id"],
-              "attestation": {"algorithm": "sha256-canonical-json-v2", "digest": "0" * 64, "files": {}}}
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+        "evidence": "reproduced", "reproduced": True, "regression_test": "t",
+        "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)                        # mint a genuine verdict WITH a real attestation
+    genuine = read(run / "verdict.json")
+    # Reuse the genuine attestation (its digest recomputes from the unchanged *.json artifacts -- removing
+    # verdict.json and adding a non-*.json .prev does not change it), but FLIP the decision to PASS.
+    forged = {**genuine, "verdict": "PASS", "forged_marker": True}
+    (run / "verdict.json").unlink()
     (run / "verdict.json.prev").write_text(json.dumps(forged))   # planted; verdict.json ABSENT
     cwd0 = os.getcwd()
     os.chdir(repo)
-    called = []
 
     def fake(module, argv, timeout=120):
-        called.append(list(argv))
-        return (3, "", "boom")   # rejected retry -> base would PROMOTE the forged .prev to verdict.json
+        return (3, "", "boom")   # rejected retry -> fix-24 PROMOTES the forged .prev; fix-25 does not
 
     orig = mcpsrv._run_cli
     mcpsrv._run_cli = fake
-    raised = False
     try:
-        try:
-            mcpsrv.h_aggregate({"run": run.name})
-        except mcpsrv.ToolError as e:
-            raised = True
-            assert "not a valid aggregator verdict" in str(e), str(e)
+        r = mcpsrv.h_aggregate({"run": run.name})
+        assert r["isError"], r
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
-    assert raised, "a forged recovery sidecar (attestation does not verify) must be REFUSED, not adopted"
-    assert called == [], "must refuse BEFORE invoking aggregate"
     vj = run / "verdict.json"
-    assert not (vj.exists() and read(vj) == forged), "forged sidecar must never be promoted to verdict.json"
+    assert not vj.exists(), "a stranded forged sidecar must NEVER be promoted to verdict.json (fail-closed)"
+    # and ar_get_verdict never surfaces it as a verdict (run resolution is relative to cwd)
+    os.chdir(repo)
+    try:
+        mcpsrv.h_get_verdict({"run": run.name})
+        assert False, "ar_get_verdict must not return the forged sidecar"
+    except mcpsrv.ToolError as e:
+        assert "recovery sidecar" in str(e), str(e)
+    finally:
+        os.chdir(cwd0)
+
+
+def t_mcp_aggregate_fallback_freshness_is_mtime_independent():
+    # PR #55 fix-25 (Codex r3942166702): in the rename-FALLBACK path (the .prev move failed, so the prior is
+    # snapshotted to .bak), fix-24 proved a fresh verdict by comparing st_mtime_ns. A coarse-granularity
+    # filesystem can leave the mtime UNCHANGED on a same-quantum rewrite, so a genuinely fresh verdict is
+    # mislabeled stale and rolled back to .bak. fix-25 removes the original after snapshotting, so freshness
+    # is by EXISTENCE (mtime-independent). This forces the coarse-FS case by writing the fresh verdict with
+    # the prior's exact mtime; fails on e67c330 (rejects the fresh verdict, rolls back to the prior).
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-mtime-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    vf = rundir / "verdict.json"
+    vf.write_text(json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+    prior_mtime = vf.stat().st_mtime_ns
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    RB = type(vf)
+    orig_replace = RB.replace
+
+    def blocked_move(self, target):            # force the rename-fallback: the .prev move fails, .bak succeeds
+        if str(target).endswith(".prev"):
+            raise OSError("simulated: cannot rename verdict.json -> .prev")
+        return orig_replace(self, target)
+
+    def fake(module, argv, timeout=120):
+        # a genuine FRESH verdict, but written within the SAME coarse mtime quantum as the prior
+        p = rundir / "verdict.json"
+        p.write_text(json.dumps({"verdict": "FAIL", "run_id": "run-20260101-010101"}))
+        os.utime(p, ns=(prior_mtime, prior_mtime))
+        return (1, "FAIL", "")
+
+    orig_cli = mcpsrv._run_cli
+    RB.replace = blocked_move
+    mcpsrv._run_cli = fake
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+    finally:
+        RB.replace = orig_replace
+        mcpsrv._run_cli = orig_cli
+        os.chdir(cwd0)
+    assert not r.get("isError"), ("a fresh verdict in the same mtime quantum must be ACCEPTED, not rolled back", r)
+    assert r["structuredContent"]["verdict"] == "FAIL", r
+    assert json.loads(vf.read_text())["verdict"] == "FAIL", "the fresh verdict must be on disk, not the prior"
 
 
 def t_aggregate_console_entry_crash_exits_3():
