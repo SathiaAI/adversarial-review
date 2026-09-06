@@ -6115,6 +6115,131 @@ def t_mcp_http_get_accept_honors_media_params():
         t.shutdown()
 
 
+def t_mcp_http_post_revalidates_session_after_dispatch_lock():
+    # Codex r3945470134: the session validity check runs BEFORE _HTTP_DISPATCH_LOCK, so a session-bearing
+    # POST that queues behind a long handler could have its session terminated meanwhile and then dispatch a
+    # (state-mutating) tool anyway. The session is now re-validated after acquiring the lock. Reproduce by
+    # terminating the session as a side effect of the pre-lock check; fails on 592212d (tools/list runs, 200).
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        real_valid = t.sessions.valid
+        real_term = t.sessions.terminate
+        state = {"n": 0}
+
+        def racing(s, *a, **k):
+            state["n"] += 1
+            ok = real_valid(s, *a, **k)
+            if state["n"] == 1:               # a concurrent DELETE lands after the pre-lock check
+                real_term(s)
+            return ok
+
+        t.sessions.valid = racing
+        try:
+            s2, b2, _h = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+                                    {"Mcp-Session-Id": sid})
+            assert s2 == 404, (s2, b2[:200])
+        finally:
+            t.sessions.valid = real_valid
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_legacy_initialize_header_must_match_body_version():
+    # Codex r3945470135: a legacy initialize whose MCP-Protocol-Version header names a different supported
+    # version than its body's protocolVersion is contradictory (the response echoes the header, the session
+    # binds the body version) -> 400. Fails on 592212d (200 + a session bound to the body version).
+    t, port = _http_transport()
+    try:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                      "clientInfo": {"name": "t", "version": "0"}}})
+        s, b, h = _http_post(port, body, {"MCP-Protocol-Version": "2024-11-05"})
+        assert s == 400, (s, b[:200])
+        assert "mcp-session-id" not in h, h
+        s_ok, _b, h_ok = _http_post(port, body, {"MCP-Protocol-Version": "2025-06-18"})   # matching -> ok
+        assert s_ok == 200 and h_ok.get("mcp-session-id"), (s_ok, h_ok)
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_modern_header_requires_modern_body():
+    # Codex r3945470142: a modern MCP-Protocol-Version header on a legacy (no-_meta) body -- e.g. tools/list
+    # -- is 400; it would otherwise be served under legacy semantics while echoing the modern version and
+    # skipping resultType. server/discover (the version probe) stays exempt. Fails on 592212d (200).
+    t, port = _http_transport()
+    try:
+        s, b, _h = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                              {"MCP-Protocol-Version": "2026-07-28"})
+        assert s == 400, (s, b[:200])
+        s_ok, _b, _h2 = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 2, "method": "server/discover"}),
+                                   {"MCP-Protocol-Version": "2026-07-28"})   # version-agnostic probe -> allowed
+        assert s_ok == 200, s_ok
+        modern = json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list",
+                             "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                                  "io.modelcontextprotocol/clientCapabilities": {}}}})
+        s_m, _b3, _h3 = _http_post(port, modern, {"MCP-Protocol-Version": "2026-07-28"})   # modern body -> ok
+        assert s_m == 200, s_m
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_client_disconnect_releases_slot_even_with_unread_byte():
+    # Codex r3945470136: a client that sends a stray byte then closes must still free its slot promptly --
+    # peeking for EOF alone let the unread byte mask the close until the next keepalive. Any readable input
+    # on the server->client SSE stream now ends it. Fails on 592212d (slot pinned by the unread byte).
+    import time
+    old_ka = mcpsrv.SSE_KEEPALIVE_SECONDS
+    mcpsrv.SSE_KEEPALIVE_SECONDS = 30
+    t, port = _http_transport(max_streams=1)
+    try:
+        _s, sid_a, _r = _http_initialize(port)
+        assert sid_a
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+                  b"Mcp-Session-Id: " + sid_a.encode("ascii") + b"\r\n\r\n")
+        s.settimeout(5)
+        head = b""
+        while b": connected" not in head:
+            chunk = s.recv(4096)
+            assert chunk, ("stream closed before ': connected'", head[:200])
+            head += chunk
+        _s2, sid_b, _r2 = _http_initialize(port)
+        assert sid_b
+        assert _http_get(port, session_id=sid_b)[0] == 503, "slot should be full while A streams"
+        s.sendall(b"x")                                  # a stray byte BEFORE closing (masks EOF from MSG_PEEK)
+        s.close()
+        deadline = time.time() + 5.0
+        readmitted = 0
+        while time.time() < deadline:
+            st, raw = _http_get(port, session_id=sid_b)
+            if st == 200 and b": connected" in raw:
+                readmitted = 200
+                break
+            time.sleep(0.1)
+        assert readmitted == 200, "an unread client byte masked EOF -> slot not freed promptly"
+    finally:
+        mcpsrv.SSE_KEEPALIVE_SECONDS = old_ka
+        t.shutdown()
+
+
+def t_mcp_http_accept_ignores_extensions_after_q():
+    # Codex r3945470144: an accept-extension after the weight (e.g. text/event-stream;q=1;foo=bar) is NOT a
+    # media parameter and must not cause a 406. Fails on 592212d (treats foo as a media param -> skip -> 406).
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        st, raw = _http_get(port, session_id=sid, extra={"Accept": "text/event-stream;q=1;foo=bar"})
+        assert st == 200 and b": connected" in raw, (st, raw[:200])
+        # a media parameter BEFORE q still constrains our parameterless representation -> 406 (unchanged)
+        st2, _r2 = _http_get(port, session_id=sid, extra={"Accept": "text/event-stream;level=1"})
+        assert st2 == 406, st2
+    finally:
+        t.shutdown()
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

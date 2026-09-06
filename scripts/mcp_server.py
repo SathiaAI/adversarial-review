@@ -818,7 +818,8 @@ def _accepts_event_stream(accept):
         if r is None:
             continue      # a non-matching range (e.g. application/json) never admits SSE
         q = 1.0           # q defaults to 1; q<=0 means this range is not acceptable
-        has_media_param = False  # a non-q parameter (e.g. level=1)
+        has_media_param = False  # a non-q parameter BEFORE q constrains the representation (e.g. level=1)
+        seen_q = False           # parameters AFTER q are accept-extensions, not media params (RFC 9110)
         for p in pieces[1:]:
             k, _sep, v = p.strip().partition("=")
             key = k.strip().lower()
@@ -827,8 +828,10 @@ def _accepts_event_stream(accept):
                     q = float(v.strip())
                 except ValueError:
                     q = 0.0
-            elif key:
-                has_media_param = True
+                seen_q = True
+            elif key and not seen_q:
+                has_media_param = True   # a media parameter before q; extensions after q are ignored
+                                         # (so text/event-stream;q=1;foo=bar still matches — Codex r3945470144)
         # A range carrying a media parameter (e.g. text/event-stream;level=1) only matches a
         # representation that has that parameter; this server emits a parameterless text/event-stream, so
         # such a range does NOT match and must not override a later, plainer alternative. Skipping it means
@@ -1050,14 +1053,17 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         #     one the server minted — a forged/terminated id is refused with 404, never silently honored.
         sid = self.headers.get(SESSION_HEADER)
         meta_pv = None
+        body_pv = None
         try:
             peeked = json.loads(raw) if raw else None
             method = peeked.get("method") if isinstance(peeked, dict) else None
             if isinstance(peeked, dict):
                 _params = peeked.get("params")
-                _meta = _params.get("_meta") if isinstance(_params, dict) else None
-                if isinstance(_meta, dict):
-                    meta_pv = _meta.get(META_PROTOCOL_VERSION)  # a modern request's declared version
+                if isinstance(_params, dict):
+                    _meta = _params.get("_meta")
+                    if isinstance(_meta, dict):
+                        meta_pv = _meta.get(META_PROTOCOL_VERSION)  # a modern request's declared version
+                    body_pv = _params.get("protocolVersion")        # a legacy initialize's requested version
         except (ValueError, RecursionError):
             method = None  # unparseable -> let serve_message() frame the -32700 (non-strict mode)
         is_initialize = (method == "initialize")
@@ -1070,17 +1076,34 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._json(400, {"error": "MCP-Protocol-Version header does not match params._meta."
                              + META_PROTOCOL_VERSION, "header": pv, "_meta": meta_pv})
             return
-        # Route `initialize` by era too (CodeRabbit r3943894656 / Codex r3943958158): the stateless
-        # 2026-07-28 revision REMOVED the initialize handshake and Mcp-Session-Id, so a POST that pins a
-        # modern MCP-Protocol-Version but carries a legacy `initialize` body (which has no _meta, so the
-        # header/_meta check above never fires) is contradictory. Serving it would negotiate a legacy
-        # version yet echo the modern one and mint a legacy Mcp-Session-Id the client can never use (its
-        # modern-pinned GET/DELETE/POST are 405/405/404), while still consuming an LRU slot — so repeated
-        # modern-pinned handshakes evict live legacy sessions. Refuse it rather than route it ambiguously.
-        if is_initialize and pv in MODERN_PROTOCOLS:
-            self._json(400, {"error": "the " + ", ".join(MODERN_PROTOCOLS) + " revision is stateless and "
-                             "has no initialize handshake; do not pin a modern MCP-Protocol-Version on an "
-                             "initialize request", "header": pv})
+        # A modern MCP-Protocol-Version header requires a modern request BODY (Codex r3943958158 +
+        # r3945470142, generalizing the earlier initialize-only guard): the stateless 2026-07-28 revision
+        # removed the initialize handshake and carries its version + capabilities in params._meta, and its
+        # results must include resultType. A POST that pins a modern header but omits a modern _meta version
+        # — a legacy `initialize`, or an ordinary legacy `tools/list`/`tools/call` — would otherwise be
+        # dispatched under legacy semantics while echoing the modern version (and, for initialize, minting a
+        # legacy Mcp-Session-Id the client can never use), an incoherent protocol state that also bypasses
+        # modern capability/resultType handling. Reject a modern header not backed by a modern _meta version.
+        # (The header/_meta mismatch above already covers a modern header paired with a DIFFERENT declared
+        # version; this covers a modern header with NO modern version declared at all.)
+        # `server/discover` is the version-agnostic probe a client sends BEFORE it commits to a version, so
+        # a modern header on it is a legitimate hint and is exempt; every other method must back a modern
+        # header with a modern body.
+        if (pv in MODERN_PROTOCOLS and method != "server/discover"
+                and not (isinstance(meta_pv, str) and meta_pv in MODERN_PROTOCOLS)):
+            self._json(400, {"error": "a modern MCP-Protocol-Version (" + ", ".join(MODERN_PROTOCOLS)
+                             + ") requires a modern request body declaring params._meta."
+                             + META_PROTOCOL_VERSION + "; the modern revision is stateless with no "
+                             "initialize handshake", "header": pv})
+            return
+        # A legacy `initialize` must not carry an MCP-Protocol-Version header that disagrees with the version
+        # its body requests (Codex r3945470135): the handshake negotiates from the BODY's protocolVersion,
+        # but the response echoes the HEADER and the session is bound to the negotiated (body) version — so a
+        # legacy-vs-legacy mismatch (e.g. header 2024-11-05 over a 2025-06-18 body) leaves the client with an
+        # echoed version its own session id then 404s on. Require the header and the body version to agree.
+        if is_initialize and pv is not None and isinstance(body_pv, str) and body_pv != pv:
+            self._json(400, {"error": "MCP-Protocol-Version header does not match the initialize body's "
+                             "protocolVersion", "header": pv, "body": body_pv})
             return
         # A present Mcp-Session-Id must be one the server minted AND must match the version this request
         # speaks (Codex r3941957895) — the pinned header version, else the modern _meta version. So a
@@ -1102,6 +1125,15 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         #     stateful tool handlers keep stdio's one-at-a-time invariant. serve_message() accepts bytes
         #     and never raises: a malformed body frames as -32700, a handler crash as -32603.
         with _HTTP_DISPATCH_LOCK:
+            # Re-validate a session-bearing request AFTER acquiring the dispatch lock (Codex r3945470134):
+            # the validity check above runs BEFORE this lock, so a request that queues here behind a
+            # long-running handler could have had its session terminated (DELETE) or LRU-evicted in the
+            # meantime, then resume and execute a (possibly state-mutating) tool for a dead session.
+            # Re-check while committing to dispatch. An `initialize` mints its session and carries none, and
+            # a sessionless stateless request has nothing to re-check — both have sid is None and skip this.
+            if sid is not None and not self.server.sessions.valid(sid, effective_pv):
+                self._json(404, {"error": "unknown or terminated session"})
+                return
             out = serve_message(raw)
         if out is None:
             # A notification (or any message handle() declines to answer) -> 202 Accepted, no body.
@@ -1216,9 +1248,12 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
                     if wake.wait(poll):
                         break  # server-side termination / eviction / shutdown -> stop at once
                     try:
-                        readable, _, _ = select.select([self.connection], [], [], 0)
-                        if readable and self.connection.recv(1, socket.MSG_PEEK) == b"":
-                            break  # client closed the connection (EOF) -> release the slot now
+                        if select.select([self.connection], [], [], 0)[0]:
+                            # An SSE GET is server->client only, so any readability means the client closed
+                            # (EOF) OR sent an unexpected byte — either way, end the stream and free the slot
+                            # now. (Peeking for EOF alone let a lingering unread client byte mask the close
+                            # until the next keepalive write, pinning the slot — Codex r3945470136.)
+                            break
                     except OSError:
                         break  # socket already torn down
                     since_keepalive += poll
