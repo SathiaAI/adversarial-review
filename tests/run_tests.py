@@ -5203,16 +5203,20 @@ def _http_transport(origins=(), max_bytes=4096, require_session=None, max_sessio
     return t, port
 
 
-def _http_get(port, session_id=None, origin=None):
+def _http_get(port, session_id=None, origin=None, extra=None):
     """Open a GET (SSE) and read the FIRST response chunk (status line + headers + any initial SSE
     comment) in a single recv, then close — so a live text/event-stream never blocks the test. Raw
-    socket because urllib.urlopen would drain the open stream. Returns (status, raw_response_bytes)."""
+    socket because urllib.urlopen would drain the open stream. `extra` adds request headers (e.g. an
+    MCP-Protocol-Version or Accept), so era/version/Accept rejections can be exercised without hanging
+    on a live 200 stream. Returns (status, raw_response_bytes)."""
     import socket
     req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
     if origin is not None:
         req += b"Origin: " + origin.encode("ascii") + b"\r\n"
     if session_id is not None:
         req += b"Mcp-Session-Id: " + session_id.encode("ascii") + b"\r\n"
+    for k, v in (extra or {}).items():
+        req += k.encode("ascii") + b": " + v.encode("ascii") + b"\r\n"
     req += b"\r\n"
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
     try:
@@ -5822,6 +5826,182 @@ def t_mcp_http_sse_stops_output_after_delete():
         finally:
             s.close()
     finally:
+        mcpsrv.SSE_KEEPALIVE_SECONDS = old_ka
+        t.shutdown()
+
+
+def t_mcp_http_modern_era_get_is_405():
+    # CodeRabbit r3941912010 (era routing): the stateless MCP 2026-07-28 revision removed the HTTP GET
+    # stream and Mcp-Session-Id, so a GET pinned to a modern version has no session channel to open and
+    # is 405 (Allow: POST) — NOT a 200 SSE stream. Before the fix a modern-pinned GET on a valid session
+    # opened a stream (era not enforced). A legacy/absent-version GET is unaffected (still 200).
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)                       # legacy session (2025-06-18)
+        assert sid
+        st, raw = _http_get(port, session_id=sid, extra={"MCP-Protocol-Version": "2026-07-28"})
+        assert st == 405, (st, raw[:200])                          # was 200 (SSE) before era routing
+        assert b"text/event-stream" not in raw.split(b"\r\n\r\n", 1)[0].lower(), raw[:200]
+        # The legacy path still opens a stream (no version pinned) — the change is era-scoped, not a ban.
+        st_ok, raw_ok = _http_get(port, session_id=sid)
+        assert st_ok == 200 and b": connected" in raw_ok, (st_ok, raw_ok[:200])
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_modern_era_delete_is_405():
+    # CodeRabbit r3941912010 (era routing): 2026-07-28 is stateless with no Mcp-Session-Id to terminate,
+    # so a DELETE pinned to a modern version is 405 and does NOT terminate the session. Before the fix a
+    # modern-pinned DELETE terminated a legacy session (era not enforced). A legacy DELETE still 204s.
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        assert _http_method(port, "DELETE", {"MCP-Protocol-Version": "2026-07-28",
+                                             "Mcp-Session-Id": sid}) == 405     # was 204 before the fix
+        # Proof it was not torn down by the modern DELETE: a legacy DELETE still terminates it.
+        assert _http_method(port, "DELETE", {"Mcp-Session-Id": sid}) == 204
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_post_header_meta_version_mismatch_is_400():
+    # CodeRabbit r3941912010 (POST header/_meta consistency): a modern request declares its version in
+    # params._meta; when the POST ALSO pins an MCP-Protocol-Version header the two must agree, or the
+    # request is contradictory and refused (400). Before the fix the header and _meta could disagree and
+    # the request was still served. A matching pair, and a modern header over a version-less body, are OK.
+    t, port = _http_transport()
+    try:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                           "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                                "io.modelcontextprotocol/clientCapabilities": {}}}})
+        s_bad, b_bad, _ = _http_post(port, body, {"MCP-Protocol-Version": "2025-06-18"})
+        assert s_bad == 400 and b"does not match" in b_bad, (s_bad, b_bad[:200])   # was 200 before the fix
+        # A CONSISTENT pair still dispatches (header == _meta).
+        s_ok, _b_ok, _h = _http_post(port, body, {"MCP-Protocol-Version": "2026-07-28"})
+        assert s_ok == 200, s_ok
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_session_bound_to_negotiated_version():
+    # Codex r3941957895 (session bound to its negotiated version): a session negotiated at 2025-06-18 must
+    # not be honored for a GET/DELETE pinned to a DIFFERENT version. 2025-03-26 is legacy (not era-405'd),
+    # so this isolates the binding from era routing. Before the fix valid()/terminate() ignored the stored
+    # version, so a mismatched-version GET opened a stream (200) and DELETE terminated it (204).
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)                       # negotiated 2025-06-18
+        assert sid
+        st, raw = _http_get(port, session_id=sid, extra={"MCP-Protocol-Version": "2025-03-26"})
+        assert st == 404, (st, raw[:200])                          # was 200 (SSE) before binding
+        assert _http_method(port, "DELETE", {"MCP-Protocol-Version": "2025-03-26",
+                                             "Mcp-Session-Id": sid}) == 404   # was 204 before binding
+        # The session is intact (the mismatched DELETE did not terminate it): the matching version works.
+        st_ok, raw_ok = _http_get(port, session_id=sid, extra={"MCP-Protocol-Version": "2025-06-18"})
+        assert st_ok == 200 and b": connected" in raw_ok, (st_ok, raw_ok[:200])
+        assert _http_method(port, "DELETE", {"MCP-Protocol-Version": "2025-06-18",
+                                             "Mcp-Session-Id": sid}) == 204
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_get_requires_sse_accept():
+    # Codex r3941957888: a GET that does not accept text/event-stream must be refused (406) BEFORE a
+    # stream slot is acquired — a client asking only for application/json must not be handed, nor charged
+    # a slot for, an SSE body it will not read. Before the fix Accept was ignored and a 200 SSE opened.
+    # An absent Accept (accept-anything) still opens the stream.
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        st, raw = _http_get(port, session_id=sid, extra={"Accept": "application/json"})
+        assert st == 406, (st, raw[:200])                          # was 200 (SSE) before the fix
+        # text/event-stream and absent Accept both still open the stream.
+        st_ok, raw_ok = _http_get(port, session_id=sid, extra={"Accept": "text/event-stream"})
+        assert st_ok == 200 and b": connected" in raw_ok, (st_ok, raw_ok[:200])
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_get_revalidates_session_before_streaming():
+    # Codex r3941957879 (TOCTOU): the window between the session check and committing the 200 lets a
+    # concurrent DELETE terminate the session, after which the stream must NOT emit 200 + ": connected".
+    # Deterministic reproduction: wrap valid() so the session is terminated as a side effect of the first
+    # check (a DELETE landing exactly in the window). Before the fix do_GET checks validity ONCE, so it
+    # streams 200 for the now-dead session; the fix revalidates after acquiring the slot -> 404.
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        real_valid = t.sessions.valid
+        real_terminate = t.sessions.terminate
+        state = {"n": 0}
+
+        def racing_valid(s, *a, **k):         # accept both the fix's (sid, version) and the base's (sid)
+            state["n"] += 1
+            ok = real_valid(s)                # liveness only — this test pins no version, so the base
+            if state["n"] == 1:               # streams 200 (the bug) rather than erroring on the arity
+                real_terminate(s)             # a concurrent DELETE lands right after the first check
+            return ok
+
+        t.sessions.valid = racing_valid
+        try:
+            st, raw = _http_get(port, session_id=sid)
+            assert st == 404, (st, raw[:200])   # was 200 + ": connected" for a dead session before the fix
+            assert b": connected" not in raw, raw[:200]
+        finally:
+            t.sessions.valid = real_valid
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_delete_wakes_stream_slot_promptly():
+    # Codex r3941957873: terminating a session must WAKE its open SSE stream so the bounded stream slot is
+    # released at once — not held until the next keepalive tick, which would make the 503's Retry-After a
+    # lie. With one slot and a long keepalive, an open stream holds the slot; after DELETE, a fresh
+    # session's GET must re-admit quickly. Before the fix the stream slept in the keepalive wait and the
+    # slot stayed pinned for the full (here, long) interval, so re-admit did NOT happen in the window.
+    import time
+    old_ka = mcpsrv.SSE_KEEPALIVE_SECONDS
+    mcpsrv.SSE_KEEPALIVE_SECONDS = 30       # long: on the base, only a keepalive tick frees the slot
+    t, port = _http_transport(max_streams=1)
+    open_socks = []
+    try:
+        _s, sid_a, _r = _http_initialize(port)
+        assert sid_a
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        open_socks.append(s)
+        s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+                  b"Mcp-Session-Id: " + sid_a.encode("ascii") + b"\r\n\r\n")
+        s.settimeout(5)
+        head = b""
+        while b": connected" not in head:                 # the stream holds the single slot (happens-before)
+            chunk = s.recv(4096)
+            assert chunk, ("stream closed before ': connected'", head[:200])
+            head += chunk
+        # A second session's GET is over the cap while A holds the slot.
+        _s2, sid_b, _r2 = _http_initialize(port)
+        assert sid_b
+        assert _http_get(port, session_id=sid_b)[0] == 503, "slot should be full while A streams"
+        # Terminate A. The fix wakes A's stream immediately -> its slot frees -> B re-admits fast. On the
+        # base A sleeps in the 30s keepalive wait, so the slot stays pinned and B keeps getting 503.
+        assert _http_method(port, "DELETE", {"Mcp-Session-Id": sid_a}) == 204
+        deadline = time.time() + 5.0        # << 30s keepalive: only the wake (not a tick) can free it in time
+        readmitted = 0
+        while time.time() < deadline:
+            st, raw = _http_get(port, session_id=sid_b)
+            if st == 200 and b": connected" in raw:
+                readmitted = 200
+                break
+            time.sleep(0.1)
+        assert readmitted == 200, "terminating a session did not free its stream slot promptly"
+    finally:
+        for s in open_socks:
+            try:
+                s.close()
+            except OSError:
+                pass
         mcpsrv.SSE_KEEPALIVE_SECONDS = old_ka
         t.shutdown()
 
