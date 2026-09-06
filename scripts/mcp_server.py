@@ -540,8 +540,16 @@ def h_panel_rebuttal(args):
     request bodies for a keyless host to execute and ingest; otherwise call the reviewers over
     HTTP using the router key in the environment (with the scaled panel timeout)."""
     run_args = _safe_run(args)
+    # Validate that `prepare` is an ACTUAL boolean before it selects the transport (Codex r3894216938):
+    # this server does not auto-validate tool arguments against the advertised schema, so a truthy
+    # non-boolean (e.g. the string "false", or a number/list) would otherwise be treated as enabled and
+    # take the keyless prepare path instead of running the direct rebuttal — rejecting it is safer than
+    # guessing intent.
+    prepare = args.get("prepare", False)
+    if not isinstance(prepare, bool):
+        raise ToolError("prepare must be a boolean")
     argv = ["rebuttal", *run_args]
-    if args.get("prepare"):
+    if prepare:
         # Keyless path: write per-reviewer rebuttal request bodies for the host to execute,
         # then ingest each with ar_panel_ingest phase='rebuttal'. No network -> default timeout.
         argv.append("--prepare")
@@ -827,6 +835,7 @@ def h_aggregate(args):
             # stranded and ar_get_verdict can no longer return it. (Codex, 13d473f & 60cb2c3.)
             reconcile_err = None
             reconcile_at = None  # sidecar the un-restored prior survives at, for the recovery message
+            rejected_unremoved = False  # a rejected verdict.json that could not be removed NOR moved aside
             if accepted:
                 # Drop the superseded copies: the moved-aside prior (stash / stash_backup), and — on the
                 # RECOVERY_PENDING path — the stranded sidecar, now superseded by the fresh authoritative
@@ -866,18 +875,34 @@ def h_aggregate(args):
                     except OSError:
                         pass
             else:
-                # No prior verdict existed — just remove any rejected verdict aggregate wrote. A failure
-                # here loses nothing (there is no prior to strand), so it stays best-effort.
+                # No prior verdict was moved aside — remove any rejected verdict aggregate wrote. A leftover
+                # here strands no PRIOR, but the rejected verdict.json itself is NOT an accepted verdict, and
+                # a later ar_get_verdict would return it as one (Codex r3944027644 reproduced an exit-3/PASS
+                # whose cleanup hit a PermissionError, after which ar_get_verdict returned PASS). So do NOT
+                # swallow the failure: if the unlink fails (transient OSError / Windows lock), move the file
+                # aside to a non-verdict, non-sidecar name (.rejected — not *.json, so never attested; not
+                # .prev/.bak, so never a recovery candidate) so it can never be read back as a verdict; only
+                # if THAT also fails do we surface the failure so the rejected file is never silently readable.
                 if vf is not None and vf.is_file():
                     try:
                         vf.unlink()
                     except OSError:
-                        pass
+                        try:
+                            vf.replace(vf.parent / (vf.name + ".rejected"))
+                        except OSError as e:
+                            reconcile_err, reconcile_at, rejected_unremoved = e, vf, True
             if reconcile_err is not None:
-                where = reconcile_at.name if reconcile_at is not None else "verdict.json.prev"
-                detail = ("aggregate was rejected but the prior verdict could not be restored "
-                          f"({reconcile_err}); the last accepted verdict is preserved at {where} — "
-                          "restore it manually before trusting ar_get_verdict")
+                if rejected_unremoved:
+                    # A rejected verdict that could be neither removed nor moved aside: warn that the
+                    # leftover verdict.json is NOT an accepted verdict and must be removed before it is read.
+                    detail = ("aggregate was rejected but the rejected verdict.json could be neither removed "
+                              f"nor moved aside ({reconcile_err}); it is NOT an accepted verdict — remove it "
+                              "before calling ar_get_verdict, which would otherwise return it as a verdict")
+                else:
+                    where = reconcile_at.name if reconcile_at is not None else "verdict.json.prev"
+                    detail = ("aggregate was rejected but the prior verdict could not be restored "
+                              f"({reconcile_err}); the last accepted verdict is preserved at {where} — "
+                              "restore it manually before trusting ar_get_verdict")
                 exc = sys.exc_info()[1]
                 if exc is None:
                     raise ToolError(detail)

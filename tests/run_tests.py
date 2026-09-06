@@ -7725,6 +7725,88 @@ def t_check_digest_legacy_message_says_unverifiable_not_unchanged():
         "message must convey the transition is unverifiable, not proven-unchanged"
 
 
+def t_mcp_rebuttal_prepare_must_be_boolean():
+    # Codex r3894216938: the server does not auto-validate tool arguments against the schema, so a truthy
+    # non-boolean `prepare` (e.g. the string "false") must be REJECTED, not treated as enabled and routed
+    # to the keyless prepare path. Fails on 561122f (which forwards `panel rebuttal --prepare`).
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    called = []
+
+    def fake(module, argv, timeout=120):
+        called.append(list(argv))
+        return (0, "ok", "")
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    outcome = "returned"
+    msg = ""
+    try:
+        try:
+            mcpsrv.h_panel_rebuttal({"run": run.name, "prepare": "false"})
+        except mcpsrv.ToolError as e:
+            outcome, msg = "toolerror", str(e)
+        # a real boolean still dispatches (via the fake), proving only the non-boolean is rejected
+        called.clear()
+        mcpsrv.h_panel_rebuttal({"run": run.name, "prepare": True})
+        forwarded = called and "--prepare" in called[0]
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    assert outcome == "toolerror" and "prepare must be a boolean" in msg, (outcome, msg)
+    assert forwarded, "prepare=True must still forward --prepare"
+
+
+def t_mcp_aggregate_unremovable_rejected_verdict_is_not_readable():
+    # Codex r3944027644: when no prior verdict exists and aggregation writes verdict.json but is rejected
+    # (an exit-3 post-write crash), a cleanup unlink that fails (transient OSError / Windows lock) must NOT
+    # be swallowed -- the rejected verdict.json would then be returned by a later ar_get_verdict as an
+    # accepted verdict. It is now moved aside to a non-verdict name (.rejected), unreadable as a verdict;
+    # only if that also fails is the failure surfaced. Fails on 561122f (ar_get_verdict returns the rejected PASS).
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-rejclean-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    RB = type(rundir)
+    orig_unlink = RB.unlink
+
+    def blocked_unlink(self, *a, **k):
+        if self.name == "verdict.json":                 # simulate a locked verdict.json (unlink fails)
+            raise OSError("simulated: verdict.json is locked")
+        return orig_unlink(self, *a, **k)
+
+    def fake(module, argv, timeout=120):
+        # aggregate writes a fresh PASS verdict.json, then "crashes" post-write -> exit 3 (rejected)
+        (rundir / "verdict.json").write_text(json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+        return (3, "", "boom")
+
+    orig_cli = mcpsrv._run_cli
+    RB.unlink = blocked_unlink
+    mcpsrv._run_cli = fake
+    try:
+        r = mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        assert r["isError"], r                          # exit 3 -> rejected
+    finally:
+        RB.unlink = orig_unlink
+        mcpsrv._run_cli = orig_cli
+        os.chdir(cwd0)
+    # The rejected verdict must not be readable as an accepted verdict: moved aside, not left in place.
+    assert not (rundir / "verdict.json").is_file(), "the rejected verdict.json must be moved aside, not left readable"
+    assert (rundir / "verdict.json.rejected").is_file(), "the rejected verdict must be preserved under .rejected"
+    os.chdir(repo)
+    try:
+        v = mcpsrv.h_get_verdict({"run": "run-20260101-010101"})
+        assert False, ("ar_get_verdict must not return the rejected verdict", v)
+    except mcpsrv.ToolError:
+        pass
+    finally:
+        os.chdir(cwd0)
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
