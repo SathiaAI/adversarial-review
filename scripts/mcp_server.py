@@ -798,18 +798,37 @@ def is_loopback_host(host):
 
 def _accepts_event_stream(accept):
     """True iff an HTTP Accept header admits the SSE media type (text/event-stream). An ABSENT Accept
-    means "accept anything" (RFC 9110 §12.5.1) and is admitted; otherwise the header must list
-    text/event-stream, the text/* range, or */*. A GET that asks only for application/json must not be
-    handed — nor charged a stream slot for — a text/event-stream it will not read (Codex r3941957888).
-    Media-type parameters (q-values etc.) are tolerated by matching the bare type token; a deliberate
-    `;q=0` rejection is not parsed (a pathological case the finding does not concern)."""
+    means "accept anything" (RFC 9110 §12.5.1) and is admitted. Otherwise the MOST SPECIFIC matching
+    media range decides — text/event-stream > text/* > */* — and an explicit `q=0` on the winning range
+    is honored as "not acceptable". So a GET that excludes SSE with `application/json` OR
+    `text/event-stream;q=0` is refused, and is neither handed the stream nor charged a stream slot for a
+    representation it declared it cannot consume (Codex r3941957888)."""
     if accept is None:
         return True
+    rank = {"text/event-stream": 2, "text/*": 1, "*/*": 0}
+    best_rank = -1        # -1 = no range matched SSE
+    best_ok = False
     for part in accept.split(","):
-        token = part.split(";", 1)[0].strip().lower()
-        if token in ("text/event-stream", "text/*", "*/*"):
-            return True
-    return False
+        seg = part.strip()
+        if not seg:
+            continue
+        pieces = seg.split(";")
+        r = rank.get(pieces[0].strip().lower())
+        if r is None:
+            continue      # a non-matching range (e.g. application/json) never admits SSE
+        q = 1.0           # q defaults to 1; q<=0 means this range is not acceptable
+        for p in pieces[1:]:
+            k, _sep, v = p.strip().partition("=")
+            if k.strip().lower() == "q":
+                try:
+                    q = float(v.strip())
+                except ValueError:
+                    q = 0.0
+                break
+        if r > best_rank:  # a more specific matching range overrides a less specific one (RFC precedence)
+            best_rank = r
+            best_ok = q > 0
+    return best_ok
 
 
 class _SessionStore:

@@ -5917,9 +5917,13 @@ def t_mcp_http_get_requires_sse_accept():
         assert sid
         st, raw = _http_get(port, session_id=sid, extra={"Accept": "application/json"})
         assert st == 406, (st, raw[:200])                          # was 200 (SSE) before the fix
-        # text/event-stream and absent Accept both still open the stream.
-        st_ok, raw_ok = _http_get(port, session_id=sid, extra={"Accept": "text/event-stream"})
-        assert st_ok == 200 and b": connected" in raw_ok, (st_ok, raw_ok[:200])
+        # An explicit q=0 rejection of the SSE type is honored too (the finding names this case).
+        st_q0, raw_q0 = _http_get(port, session_id=sid, extra={"Accept": "text/event-stream;q=0"})
+        assert st_q0 == 406, (st_q0, raw_q0[:200])
+        # text/event-stream, a matching wildcard, and absent Accept all still open the stream.
+        for acc in ("text/event-stream", "text/*", "*/*", "application/json, text/event-stream"):
+            st_ok, raw_ok = _http_get(port, session_id=sid, extra={"Accept": acc})
+            assert st_ok == 200 and b": connected" in raw_ok, (acc, st_ok, raw_ok[:200])
     finally:
         t.shutdown()
 
