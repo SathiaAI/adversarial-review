@@ -45,12 +45,15 @@ import ipaddress
 import json
 import os
 import re
+import secrets
+import select
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
+from collections import OrderedDict
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -1412,7 +1415,19 @@ def handle(msg):
     requested_version = meta.get(META_PROTOCOL_VERSION)
     is_modern = META_PROTOCOL_VERSION in meta
 
-    # Legacy initialize handshake — selects legacy semantics regardless of _meta.
+    # A body that DECLARES the modern era (params._meta carries io.modelcontextprotocol/protocolVersion)
+    # has NO `initialize` handshake: the 2026-07-28 revision is stateless and removed it. Serving such a
+    # request as the legacy handshake below would negotiate a legacy version and (over HTTP) mint a legacy
+    # Mcp-Session-Id for a client that declared modern — a contradictory state its own modern GET/DELETE
+    # then 404/405 on (Codex r3949809506). Reject it here in the shared core, so the era is validated from
+    # the BODY regardless of transport or whether an HTTP MCP-Protocol-Version header was present.
+    if method == "initialize" and is_modern:
+        return _error(id_, -32601,
+                      "method not found: 'initialize' is the legacy (pre-2026-07-28) handshake; the "
+                      "stateless 2026-07-28 revision has no initialize (omit params._meta to use the "
+                      "legacy handshake)", {"declared": requested_version})
+
+    # Legacy initialize handshake — selects legacy semantics (the body did not declare the modern era).
     if method == "initialize":
         requested = params.get("protocolVersion")
         version = requested if requested in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0]
@@ -1524,14 +1539,27 @@ class StdioTransport:
                 self.stdout.flush()
 
 
-# --- Streamable-HTTP transport (MCP 2026-07-28) — E3-S2a: endpoint + framing only ---------------
+# --- Dual-era Streamable-HTTP transport — E3-S2a endpoint/framing + E3-S2b sessions ---------------
 # Reuses serve_message()/handle() (the E3-S1 seam), so HTTP inherits stdio's exact dispatch and error
-# semantics and stays a framing surface, never a command-execution one. There is NO authentication and
-# NO session yet (those are E3-S2c / E3-S2b): the listener binds 127.0.0.1 by default and MUST NOT be
-# exposed to a network until auth lands. See the committed threat model in docs/.
+# semantics and stays a framing surface, never a command-execution one. The transport routes by
+# protocol ERA (CodeRabbit r3941912010): the stateless MCP 2026-07-28 revision is POST-only — it
+# removed protocol-level sessions, the Mcp-Session-Id header, and the HTTP GET stream (server->client
+# notifications moved to a POST subscriptions/listen stream), so a GET or DELETE pinned to a modern
+# version is 405. The session lifecycle (Mcp-Session-Id minted at initialize, validated, DELETE-
+# terminable, GET opens the SSE channel, bounded+evicting store) is LEGACY — MCP revisions through
+# 2025-11-25 — and each id is bound to the version its initialize negotiated (Codex r3941957895).
+# Sessions are OPTIONAL on the legacy path, so a version-less client still works;
+# AR_MCP_HTTP_REQUIRE_SESSION makes them mandatory. There is still NO authentication (that is E3-S2c):
+# the listener binds 127.0.0.1 by default and MUST NOT be exposed to a network until auth lands. See
+# the committed threat model in docs/.
 HTTP_DEFAULT_HOST = "127.0.0.1"
 HTTP_DEFAULT_PORT = 8730
 HTTP_DEFAULT_MAX_BYTES = 1_048_576  # 1 MiB: a JSON-RPC control message is tiny; caps an oversized-body DoS
+HTTP_DEFAULT_MAX_SESSIONS = 128     # bounded session store: a flood of `initialize`s cannot exhaust memory
+HTTP_DEFAULT_MAX_STREAMS = 64       # bounded concurrent GET/SSE streams: each pins a thread+fd, so cap their
+                                    # count independently of the session store (one valid id != unlimited streams)
+SESSION_HEADER = "Mcp-Session-Id"   # LEGACY session id header (revisions through 2025-11-25; issued at initialize)
+SSE_KEEPALIVE_SECONDS = 15          # GET/SSE idle keepalive-comment cadence; also the shutdown re-check tick
 
 
 def _http_int_env(name, default, minimum=None, maximum=None):
@@ -1550,6 +1578,27 @@ def _http_int_env(name, default, minimum=None, maximum=None):
     if maximum is not None and n > maximum:
         raise ValueError("%s must be <= %d, got %d" % (name, maximum, n))
     return n
+
+
+_HTTP_BOOL_TRUE = ("1", "true", "yes", "on")     # explicit affirmatives
+_HTTP_BOOL_FALSE = ("0", "false", "no", "off")   # explicit negatives
+
+
+def _http_bool_env(name):
+    """A boolean env flag: true for an explicit affirmative ('1'/'true'/'yes'/'on'), false for an
+    explicit negative ('0'/'false'/'no'/'off') or when unset/blank. A NON-BLANK value that is neither
+    is a loud error, never a silent fallback — mirroring _http_int_env. Failing *safe* on a typo'd
+    AR_MCP_HTTP_REQUIRE_SESSION means refusing to start, NOT silently flipping the security posture to
+    off: a value like 'tru' must not quietly disable the session requirement."""
+    v = (os.environ.get(name, "") or "").strip().lower()
+    if not v:
+        return False
+    if v in _HTTP_BOOL_TRUE:
+        return True
+    if v in _HTTP_BOOL_FALSE:
+        return False
+    raise ValueError("%s must be one of %s (on) or %s (off), got %r"
+                     % (name, "/".join(_HTTP_BOOL_TRUE), "/".join(_HTTP_BOOL_FALSE), v))
 
 
 def http_config():
@@ -1584,6 +1633,175 @@ def is_loopback_host(host):
         return ipaddress.ip_address(h).is_loopback
     except ValueError:
         return False
+
+
+def _accepts_event_stream(accept):
+    """True iff an HTTP Accept header admits the SSE media type (text/event-stream). An ABSENT Accept
+    means "accept anything" (RFC 9110 §12.5.1) and is admitted. Otherwise the MOST SPECIFIC matching
+    media range decides — text/event-stream > text/* > */* — and an explicit `q=0` on the winning range
+    is honored as "not acceptable". So a GET that excludes SSE with `application/json` OR
+    `text/event-stream;q=0` is refused, and is neither handed the stream nor charged a stream slot for a
+    representation it declared it cannot consume (Codex r3941957888)."""
+    if accept is None:
+        return True
+    rank = {"text/event-stream": 2, "text/*": 1, "*/*": 0}
+    best_rank = -1        # -1 = no range matched SSE
+    best_ok = False
+    for part in accept.split(","):
+        seg = part.strip()
+        if not seg:
+            continue
+        pieces = seg.split(";")
+        r = rank.get(pieces[0].strip().lower())
+        if r is None:
+            continue      # a non-matching range (e.g. application/json) never admits SSE
+        q = 1.0           # q defaults to 1; q<=0 means this range is not acceptable
+        has_media_param = False  # a non-q parameter BEFORE q constrains the representation (e.g. level=1)
+        seen_q = False           # parameters AFTER q are accept-extensions, not media params (RFC 9110)
+        for p in pieces[1:]:
+            k, _sep, v = p.strip().partition("=")
+            key = k.strip().lower()
+            if key == "q":
+                try:
+                    q = float(v.strip())
+                except ValueError:
+                    q = 0.0
+                seen_q = True
+            elif key and not seen_q:
+                has_media_param = True   # a media parameter before q; extensions after q are ignored
+                                         # (so text/event-stream;q=1;foo=bar still matches — Codex r3945470144)
+        # A range carrying a media parameter (e.g. text/event-stream;level=1) only matches a
+        # representation that has that parameter; this server emits a parameterless text/event-stream, so
+        # such a range does NOT match and must not override a later, plainer alternative. Skipping it means
+        # e.g. `text/event-stream;level=1;q=0, text/event-stream;q=1` correctly admits the stream via the
+        # second range instead of being rejected 406 by the first (Codex r3943958164 / CodeRabbit r3943913914).
+        if has_media_param:
+            continue
+        if r > best_rank:  # a more specific matching range overrides a less specific one (RFC precedence)
+            best_rank = r
+            best_ok = q > 0
+        elif r == best_rank:
+            # Equal-specificity alternatives: an ACCEPTABLE one wins regardless of field order, so
+            # `text/event-stream;q=0, text/event-stream;q=1` (or the same split across combined Accept field
+            # lines) admits the stream instead of the first occurrence permanently deciding it 406 (Codex
+            # r3951751953). Only a TIE is OR-merged; a MORE specific range still overrides via the branch
+            # above, so `*/*;q=1, text/event-stream;q=0` still correctly refuses (the specific q=0 wins).
+            best_ok = best_ok or (q > 0)
+    return best_ok
+
+
+class _SessionStore:
+    """Bounded, evicting, thread-safe store of live Streamable-HTTP session ids. Sessions belong to the
+    LEGACY session lifecycle (MCP revisions through 2025-11-25: `initialize` mints an id, GET opens the
+    SSE channel, DELETE terminates); the stateless 2026-07-28 revision has no sessions. Ids are
+    cryptographically random and *server-minted*: a client-supplied id the server never issued is never
+    honored (anti-hijack). Each id is BOUND to the protocol version its `initialize` negotiated — a
+    request pinning a different version is not honored for it (Codex r3941957895). The store is bounded
+    with LRU eviction so a flood of `initialize`s cannot exhaust memory. A terminated or evicted id
+    WAKES any SSE stream registered against it (Codex r3941957873) so the stream — and its bounded slot —
+    ends at once rather than lingering to the next keepalive tick. All access is under one lock:
+    ThreadingHTTPServer dispatches concurrently."""
+
+    def __init__(self, capacity):
+        self._cap = max(1, int(capacity))
+        self._ids = OrderedDict()  # sid -> negotiated protocol version (the id is bound to it)
+        self._wakes = {}           # sid -> list[threading.Event]: SSE streams to wake when it ends
+        self._lock = threading.Lock()
+
+    def create(self, protocol=None):
+        """Mint a fresh id (256 bits from `secrets`), evicting the least-recently-used if at capacity."""
+        sid = secrets.token_urlsafe(32)
+        evicted = []
+        with self._lock:
+            self._ids[sid] = protocol
+            self._ids.move_to_end(sid)
+            while len(self._ids) > self._cap:
+                old, _ = self._ids.popitem(last=False)  # evict least-recently-used
+                evicted.append(old)
+        for old in evicted:
+            self._wake(old)  # an evicted id is dead -> end its stream promptly, don't leak the slot
+        return sid
+
+    def _matches(self, sid, version):
+        # Caller holds the lock. True iff `sid` is live AND (no version is pinned, or it equals the
+        # session's negotiated version). This binding stops a legacy session from being reused under a
+        # different protocol version — e.g. a 2025-06-18 session driving a request pinned to 2026-07-28.
+        if sid not in self._ids:
+            return False
+        return version is None or self._ids[sid] == version
+
+    def valid(self, sid, version=None):
+        """True iff `sid` is a live, server-minted id whose negotiated version matches `version` (when
+        one is pinned); touches it most-recently-used so an active session is not evicted under a client."""
+        if not sid:
+            return False
+        with self._lock:
+            if self._matches(sid, version):
+                self._ids.move_to_end(sid)
+                return True
+            return False
+
+    def terminate(self, sid, version=None):
+        """Remove a session (client DELETE). True iff it existed AND its negotiated version matches
+        `version` (when pinned); a repeat/unknown/version-mismatched terminate is False. Wakes every SSE
+        stream bound to the id so its stream slot is released immediately."""
+        if not sid:
+            return False
+        with self._lock:
+            if not self._matches(sid, version):
+                return False
+            del self._ids[sid]
+            wakes = self._wakes.pop(sid, ())
+        for ev in wakes:
+            ev.set()
+        return True
+
+    def register_wake(self, sid, version=None):
+        """Atomically validate `sid` (bound to `version` when pinned) AND register a wake Event for it,
+        under one lock. Returns the Event, fired when `sid` is later terminated, evicted, or wake_all()
+        runs — so an open SSE stream stops the instant its session ends. The Event is returned PRE-SET
+        when the session is not currently valid, so the GET handler validates-and-registers in a single
+        step: a DELETE that lands in the window between a separate check and registration cannot slip a
+        200 + ": connected" past for an already-dead session (Codex r3943958149)."""
+        ev = threading.Event()
+        with self._lock:
+            if self._matches(sid, version):
+                self._wakes.setdefault(sid, []).append(ev)
+            else:
+                ev.set()
+        return ev
+
+    def unregister_wake(self, sid, ev):
+        """Drop a wake Event when its stream ends (the GET handler's finally), so the registry does not
+        grow across streams."""
+        with self._lock:
+            lst = self._wakes.get(sid)
+            if lst is not None:
+                try:
+                    lst.remove(ev)
+                except ValueError:
+                    pass
+                if not lst:
+                    self._wakes.pop(sid, None)
+
+    def _wake(self, sid):
+        # Caller must NOT hold the lock. Fire and drop every wake for a now-dead id (eviction path).
+        with self._lock:
+            wakes = self._wakes.pop(sid, ())
+        for ev in wakes:
+            ev.set()
+
+    def wake_all(self):
+        """Fire every registered wake (server shutdown) so all open SSE streams stop waiting at once."""
+        with self._lock:
+            all_wakes = [ev for lst in self._wakes.values() for ev in lst]
+            self._wakes.clear()
+        for ev in all_wakes:
+            ev.set()
+
+    def __len__(self):
+        with self._lock:
+            return len(self._ids)
 
 
 # Dispatch is serialized process-wide: the MCP tool handlers are stateful (they write context.md and
@@ -1621,28 +1839,59 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _not_allowed(self):
-        # No GET/SSE server->client stream yet (that is E3-S2b); the endpoint accepts only POST.
-        self._json(405, {"error": "method not allowed; the MCP endpoint accepts POST"}, {"Allow": "POST"})
+        # The MCP endpoint speaks POST (JSON-RPC in), GET (SSE server->client stream, E3-S2b), and
+        # DELETE (terminate a session, E3-S2b). Any other method is 405.
+        self._json(405, {"error": "method not allowed; the MCP endpoint accepts POST, GET, DELETE"},
+                   {"Allow": "POST, GET, DELETE"})
 
-    do_GET = _not_allowed
     do_HEAD = _not_allowed
     do_PUT = _not_allowed
-    do_DELETE = _not_allowed
     do_PATCH = _not_allowed
     do_OPTIONS = _not_allowed
 
-    def do_POST(self):
-        # (1) DNS-rebinding defense first: reject a disallowed browser Origin before touching the body.
-        if not origin_allowed(self.headers.get("Origin"), self.server.allowed_origins):
-            self._json(403, {"error": "origin not allowed"})
-            return
-        # (2) HTTP-level protocol-version negotiation. Absent is fine (the modern per-request _meta path
-        #     negotiates in-band); a present-but-unsupported version is rejected with what we speak.
+    def _origin_ok(self):
+        # DNS-rebinding defense, shared by every verb: a present browser Origin must be allow-listed
+        # (reject -> closed 403); an absent Origin (curl / a programmatic MCP host) is allowed.
+        if origin_allowed(self.headers.get("Origin"), self.server.allowed_origins):
+            return True
+        self._json(403, {"error": "origin not allowed"})
+        return False
+
+    def _protocol_ok(self):
+        # HTTP-level protocol-version negotiation, shared by EVERY verb (POST, GET, DELETE). Absent is
+        # fine (the modern per-request _meta path negotiates in-band); a present-but-unsupported version
+        # is rejected (closed 400) with what we speak. GET/DELETE run this too, not just POST — a bogus
+        # pinned version must not slip through the session verbs.
+        #
+        # MCP-Protocol-Version is a SINGLETON control header, but a client/intermediary may split or repeat
+        # it across field lines (RFC 9110 §5.3). self.headers.get() reads only the FIRST, so a contradictory
+        # LATER value — `2025-06-18` then `1999-01-01`, or a legacy value then the modern revision — would
+        # bypass this check and the downstream session-version binding, which read the first value too (Codex
+        # r3952163012, reproduced as an initialize with a smuggled second version getting 200 + a session).
+        # Reject when the header carries more than one DISTINCT value: an ambiguous pin must not be silently
+        # resolved to whichever line came first. Identical repeats are harmless (get()'s first value equals
+        # the rest) and pass, so a benign duplicating intermediary is tolerated.
+        vals = self.headers.get_all("MCP-Protocol-Version")
+        if vals and len({v.strip() for v in vals}) > 1:
+            self._json(400, {"error": "conflicting MCP-Protocol-Version headers",
+                             "supportedVersions": list(ALL_PROTOCOLS)})
+            return False
         pv = self.headers.get("MCP-Protocol-Version")
         if pv is not None and pv not in ALL_PROTOCOLS:
             self._json(400, {"error": "unsupported MCP-Protocol-Version",
                              "supportedVersions": list(ALL_PROTOCOLS)})
+            return False
+        return True
+
+    def do_POST(self):
+        # (1) DNS-rebinding defense first: reject a disallowed browser Origin before touching the body.
+        if not self._origin_ok():
             return
+        # (2) HTTP-level protocol-version negotiation (shared with GET/DELETE); reject an unsupported
+        #     pinned version before touching the body.
+        if not self._protocol_ok():
+            return
+        pv = self.headers.get("MCP-Protocol-Version")
         # (3) Frame strictly by Content-Length: reject any Transfer-Encoding (chunked et al.), even when
         #     combined with Content-Length. We do not decode a chunked body, so it would sit unread on a
         #     keep-alive connection and desync into the next request (smuggling) — refuse with a closed 400.
@@ -1658,39 +1907,333 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._json(413, {"error": "request body too large"})
             return
         raw = self.rfile.read(length) if length else b""
-        # (5) Dispatch through the transport-agnostic core, serialized (see _HTTP_DISPATCH_LOCK) so the
+        # (5) Session gating (E3-S2b). Peek the JSON-RPC method to tell an `initialize` (which MINTS a
+        #     session) from a subsequent request (which may CARRY one). A present Mcp-Session-Id must be
+        #     one the server minted — a forged/terminated id is refused with 404, never silently honored.
+        sid = self.headers.get(SESSION_HEADER)
+        meta_pv = None
+        body_pv = None
+        try:
+            peeked = json.loads(raw) if raw else None
+            method = peeked.get("method") if isinstance(peeked, dict) else None
+            if isinstance(peeked, dict):
+                _params = peeked.get("params")
+                if isinstance(_params, dict):
+                    _meta = _params.get("_meta")
+                    if isinstance(_meta, dict):
+                        meta_pv = _meta.get(META_PROTOCOL_VERSION)  # a modern request's declared version
+                    body_pv = _params.get("protocolVersion")        # a legacy initialize's requested version
+        except (ValueError, RecursionError):
+            method = None  # unparseable -> let serve_message() frame the -32700 (non-strict mode)
+        is_initialize = (method == "initialize")
+        # Route by protocol era (CodeRabbit r3941912010): a modern request declares its version in
+        # params._meta; when the POST ALSO pins an MCP-Protocol-Version header, the two must agree.
+        # A legacy header wrapping a modern body (or vice-versa) is contradictory — refuse it rather
+        # than serve it under an ambiguous era. (Only fires when BOTH are present; a modern header over
+        # a version-less legacy body, as the HTTP-negotiation path already allows, is untouched.)
+        if pv is not None and isinstance(meta_pv, str) and meta_pv != pv:
+            self._json(400, {"error": "MCP-Protocol-Version header does not match params._meta."
+                             + META_PROTOCOL_VERSION, "header": pv, "_meta": meta_pv})
+            return
+        # A modern MCP-Protocol-Version header requires a modern request BODY (Codex r3943958158 +
+        # r3945470142, generalizing the earlier initialize-only guard): the stateless 2026-07-28 revision
+        # removed the initialize handshake and carries its version + capabilities in params._meta, and its
+        # results must include resultType. A POST that pins a modern header but omits a modern _meta version
+        # — a legacy `initialize`, or an ordinary legacy `tools/list`/`tools/call` — would otherwise be
+        # dispatched under legacy semantics while echoing the modern version (and, for initialize, minting a
+        # legacy Mcp-Session-Id the client can never use), an incoherent protocol state that also bypasses
+        # modern capability/resultType handling. Reject a modern header not backed by a modern _meta version.
+        # (The header/_meta mismatch above already covers a modern header paired with a DIFFERENT declared
+        # version; this covers a modern header with NO modern version declared at all.)
+        # `server/discover` is the version-agnostic probe a client sends BEFORE it commits to a version, so
+        # a modern header on it is a legitimate hint and is exempt; every other method must back a modern
+        # header with a modern body.
+        if (pv in MODERN_PROTOCOLS and method != "server/discover"
+                and not (isinstance(meta_pv, str) and meta_pv in MODERN_PROTOCOLS)):
+            self._json(400, {"error": "a modern MCP-Protocol-Version (" + ", ".join(MODERN_PROTOCOLS)
+                             + ") requires a modern request body declaring params._meta."
+                             + META_PROTOCOL_VERSION + "; the modern revision is stateless with no "
+                             "initialize handshake", "header": pv})
+            return
+        # A legacy `initialize` must not carry an MCP-Protocol-Version header that disagrees with the version
+        # the handshake will actually NEGOTIATE (Codex r3945470135 + CodeRabbit r3945516733): the response
+        # echoes the HEADER and the session is bound to the NEGOTIATED version — which handle() derives as
+        # the body's protocolVersion when supported, else SUPPORTED_PROTOCOLS[0]. So comparing against the
+        # raw body version missed a body that OMITS protocolVersion (or sends an unsupported/non-string one):
+        # it negotiates SUPPORTED_PROTOCOLS[0] while echoing a different header, leaving the client with an
+        # echoed version its own session id then 404s on. Compare the header to the negotiated version.
+        if is_initialize and pv is not None:
+            negotiated = body_pv if body_pv in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0]
+            if pv != negotiated:
+                self._json(400, {"error": "MCP-Protocol-Version header does not match the version the "
+                                 "initialize handshake will negotiate", "header": pv, "negotiated": negotiated})
+                return
+        # A present Mcp-Session-Id must be one the server minted AND must match the version this request
+        # speaks (Codex r3941957895) — the pinned header version, else the modern _meta version. So a
+        # stateless modern request that rides a legacy session is refused here: its 2026-07-28 version
+        # cannot match the legacy version that session negotiated.
+        effective_pv = pv if pv is not None else (meta_pv if isinstance(meta_pv, str) else None)
+        if sid is not None and not self.server.sessions.valid(sid, effective_pv):
+            self._json(404, {"error": "unknown or terminated session"})
+            return
+        # Strict mode (AR_MCP_HTTP_REQUIRE_SESSION, default off; turned on with the bearer token in
+        # E3-S2c): a request other than the `initialize` handshake or the version-agnostic
+        # `server/discover` probe must carry a valid session, else 400. Off by default so the stateless
+        # 2026-07-28 path keeps working unchanged.
+        if (self.server.require_session and sid is None
+                and not is_initialize and method != "server/discover"):
+            self._json(400, {"error": "Mcp-Session-Id required"})
+            return
+        # (6) Dispatch through the transport-agnostic core, serialized (see _HTTP_DISPATCH_LOCK) so the
         #     stateful tool handlers keep stdio's one-at-a-time invariant. serve_message() accepts bytes
         #     and never raises: a malformed body frames as -32700, a handler crash as -32603.
         with _HTTP_DISPATCH_LOCK:
+            # Re-validate a session-bearing request AFTER acquiring the dispatch lock (Codex r3945470134):
+            # the validity check above runs BEFORE this lock, so a request that queues here behind a
+            # long-running handler could have had its session terminated (DELETE) or LRU-evicted in the
+            # meantime, then resume and execute a (possibly state-mutating) tool for a dead session.
+            # Re-check while committing to dispatch. An `initialize` mints its session and carries none, and
+            # a sessionless stateless request has nothing to re-check — both have sid is None and skip this.
+            if sid is not None and not self.server.sessions.valid(sid, effective_pv):
+                self._json(404, {"error": "unknown or terminated session"})
+                return
             out = serve_message(raw)
+        # In strict mode (require_session) the stateless modern revision cannot be served here: it carries no
+        # session, and every non-initialize/non-discover request without one is 400'd above -- and a legacy
+        # session cannot back it (it is version-bound). So server/discover must not ADVERTISE a version this
+        # configuration will reject, or a client selects it and is turned away (Codex r3951751963). Filter the
+        # modern revision out of the discover response on THIS transport posture only; the transport-agnostic
+        # _discover_result stays era-complete for stdio and for non-strict HTTP. A client then negotiates a
+        # legacy, session-bearing version instead. (server/discover is exempt from the session gate above, so
+        # it still answers in strict mode.)
+        if out is not None and self.server.require_session and method == "server/discover":
+            try:
+                _d = json.loads(out)
+                _res = _d.get("result") if isinstance(_d, dict) else None
+                if isinstance(_res, dict) and isinstance(_res.get("supportedVersions"), list):
+                    _res["supportedVersions"] = [v for v in _res["supportedVersions"]
+                                                 if v not in MODERN_PROTOCOLS]
+                    out = json.dumps(_d)
+            except (ValueError, RecursionError):
+                pass  # leave the response unchanged if it is not the shape we expect
         if out is None:
             # A notification (or any message handle() declines to answer) -> 202 Accepted, no body.
             self.send_response(202)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        # (7) On a SUCCESSFUL `initialize`, mint and return a session id (rotatable: a fresh id per
+        #     handshake). Only on success — an errored initialize starts no session.
+        session_id = None
+        if is_initialize:
+            try:
+                resp = json.loads(out)
+                if isinstance(resp, dict) and isinstance(resp.get("result"), dict):
+                    session_id = self.server.sessions.create(resp["result"].get("protocolVersion"))
+            except (ValueError, RecursionError):
+                session_id = None
         body = out.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         if pv is not None:
             self.send_header("MCP-Protocol-Version", pv)  # echo the negotiated version
+        if session_id is not None:
+            self.send_header(SESSION_HEADER, session_id)
         self.end_headers()
         self.wfile.write(body)
 
+    def do_GET(self):
+        # GET opens the LEGACY server->client SSE channel for a session (MCP revisions through
+        # 2025-11-25: initialize -> Mcp-Session-Id -> GET/DELETE). The stateless 2026-07-28 revision
+        # REMOVED the HTTP GET stream (server->client notifications now ride a POST subscriptions/listen
+        # stream) and Mcp-Session-Id, so a GET pinned to a modern version is 405 (era routing,
+        # CodeRabbit r3941912010). Origin defense applies (a browser EventSource sends Origin).
+        if not self._origin_ok():
+            return
+        if not self._protocol_ok():
+            return
+        pv = self.headers.get("MCP-Protocol-Version")
+        if pv in MODERN_PROTOCOLS:
+            self._json(405, {"error": "the event stream is a legacy session channel; MCP "
+                             + ", ".join(MODERN_PROTOCOLS) + " is stateless and POST-only "
+                             "(server->client notifications use a POST subscriptions/listen stream)"},
+                       {"Allow": "POST"})
+            return
+        sid = self.headers.get(SESSION_HEADER)
+        if sid is None:
+            self._json(400, {"error": "Mcp-Session-Id required for the event stream"})
+            return
+        # Reject a GET that does not accept text/event-stream BEFORE acquiring a stream slot (Codex
+        # r3941957888): a client asking only for application/json must neither be handed the SSE body
+        # nor charged one of the bounded stream slots for it. An absent Accept means "accept anything".
+        # Combine ALL repeated Accept field lines (RFC 9110 §5.3: a list-valued header may be split across
+        # lines) so a request whose SSE-admitting value is not on the first line is negotiated on the whole
+        # header, not just get("Accept")'s first value (Codex r3951256116).
+        _accept_lines = self.headers.get_all("Accept")   # None when absent; a list of field lines otherwise
+        if not _accepts_event_stream(", ".join(_accept_lines) if _accept_lines else None):
+            self._json(406, {"error": "this endpoint streams text/event-stream; send an Accept that "
+                             "admits it (text/event-stream, text/*, or */*)"})
+            return
+        # Validate the session, BOUND to the version this GET pins (Codex r3941957895): a valid legacy
+        # session is not a blank cheque for a GET pinned to a different protocol version.
+        if not self.server.sessions.valid(sid, pv):
+            self._json(404, {"error": "unknown or terminated session"})
+            return
+        # Cap concurrent SSE streams (reliability review, PR #54): a valid session does not entitle a
+        # client to unbounded parallel streams — each held-open stream pins a server thread + fd, and the
+        # session-store bound limits session COUNT, not stream count (N GETs on one valid id = N threads).
+        # A global BoundedSemaphore caps live streams; past the cap the GET is refused with a retryable
+        # 503, and the slot is released when the stream ends (below).
+        if not self.server.sse_streams.acquire(blocking=False):
+            self._json(503, {"error": "too many concurrent event streams"}, {"Retry-After": "1"})
+            return
+        wake = None
+        try:
+            # Atomically re-validate the session AND register its wake under one store lock (Codex
+            # r3943958149): register_wake returns a PRE-SET event when the session is already gone (or its
+            # version no longer matches), so a DELETE that lands in the window between a separate check and
+            # registration cannot slip a 200 + ": connected" past for a dead session. A DELETE that lands
+            # AFTER registration fires the now-registered wake, which is_set() also catches here. This
+            # replaces the earlier separate revalidation (Codex r3941957879) with a race-free one.
+            wake = self.server.sessions.register_wake(sid, pv)
+            # Bound every socket write with a timeout FIRST (reliability review, run-20260824-013958): a peer
+            # that stops reading fills the TCP send buffer, and without this `wfile.write` would block
+            # forever, pinning this thread + fd. A write timeout turns that into a bounded OSError that ends
+            # the handler.
+            self.connection.settimeout(SSE_KEEPALIVE_SECONDS)
+            # Commit the stream WITHOUT taking _HTTP_DISPATCH_LOCK (E3-S2b round 6, CodeRabbit r3945707197):
+            # do_POST holds that lock across serve_message(), which can run a tool for up to ~AR_TIMEOUT_S,
+            # so committing the GET under the SAME lock (round 5, Codex r3945547151) let a concurrent GET
+            # block for the whole dispatch. register_wake() above is atomic (validity + registration under the
+            # store lock) and returns a pre-set event when the session is already gone, so a DELETE landing
+            # before this check is caught by wake.is_set(), and a DELETE landing AFTER the 200 wakes the
+            # keepalive loop below, which stops at once. What stays best-effort is only the tiny window
+            # between this check and the ": connected" write, in which a just-terminated session can still
+            # receive that one comment line. Strict "no output after terminate" ordering is a multi-client /
+            # revocation property deferred to E3-S2c (auth + remote bind), designed there against the threat
+            # model rather than retrofitted onto the dispatch lock; on this localhost-only, single-user,
+            # pre-auth transport the only racer is the local user and the worst case is a stray ": connected".
+            if wake.is_set():
+                self._json(404, {"error": "unknown or terminated session"})
+                return
+            # This server emits no server-initiated messages yet (the tool surface is request/response), so
+            # the stream is a valid, idle channel: an initial comment confirms it is live, then it is held
+            # open (periodic keepalives) until the session is terminated, the client disconnects, or the
+            # server shuts down (sse_stop). text/event-stream, uncached, closed at end.
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            stop = self.server.sse_stop
+            # Free the slot promptly on a CLIENT disconnect too (Codex r3943958155): a peer that closes
+            # right after ": connected" fires no wake, so without polling the slot would linger until the
+            # next keepalive WRITE detects the dead socket (up to SSE_KEEPALIVE_SECONDS) — making the 503's
+            # Retry-After a lie for a disconnect just as it was for a DELETE. Wait on a bounded interval:
+            # `wake` fires on server-side termination, and select() reports the socket readable when the
+            # peer closes (MSG_PEEK then reads EOF) or sends; keepalives still go out every
+            # SSE_KEEPALIVE_SECONDS. select on a socket works on Windows too (sockets only).
+            poll = 1.0 if SSE_KEEPALIVE_SECONDS > 1.0 else SSE_KEEPALIVE_SECONDS
+            since_keepalive = 0.0
+            try:
+                self.wfile.write(b": connected\n\n")
+                self.wfile.flush()
+                while not stop.is_set() and self.server.sessions.valid(sid, pv):
+                    if wake.wait(poll):
+                        break  # server-side termination / eviction / shutdown -> stop at once
+                    try:
+                        if select.select([self.connection], [], [], 0)[0]:
+                            # An SSE GET is server->client only, so any readability means the client closed
+                            # (EOF) OR sent an unexpected byte — either way, end the stream and free the slot
+                            # now. (Peeking for EOF alone let a lingering unread client byte mask the close
+                            # until the next keepalive write, pinning the slot — Codex r3945470136.)
+                            break
+                    except OSError:
+                        break  # socket already torn down
+                    since_keepalive += poll
+                    if since_keepalive < SSE_KEEPALIVE_SECONDS:
+                        continue
+                    since_keepalive = 0.0
+                    # Re-check stop/validity AFTER the wait and BEFORE writing: a DELETE that terminated
+                    # this session mid-wait must not yield one more keepalive.
+                    if stop.is_set() or not self.server.sessions.valid(sid, pv):
+                        break
+                    self.wfile.write(b": keepalive\n\n")  # a stuck write now raises socket.timeout -> break
+                    self.wfile.flush()
+            except OSError:
+                pass  # client disconnected / stalled mid-stream — end the handler quietly
+        finally:
+            if wake is not None:
+                self.server.sessions.unregister_wake(sid, wake)
+            self.server.sse_streams.release()
+
+    def do_DELETE(self):
+        # DELETE terminates a LEGACY session (MCP revisions through 2025-11-25). The stateless 2026-07-28
+        # revision has no Mcp-Session-Id to terminate, so a DELETE pinned to a modern version is 405 (era
+        # routing, CodeRabbit r3941912010). Missing id -> 400; unknown/already-terminated/version-
+        # mismatched -> 404; success -> 204 No Content. Once terminated the id is dead: a later request
+        # bearing it is refused 404 by the validation in do_POST/do_GET.
+        if not self._origin_ok():
+            return
+        if not self._protocol_ok():
+            return
+        pv = self.headers.get("MCP-Protocol-Version")
+        if pv in MODERN_PROTOCOLS:
+            self._json(405, {"error": "no session to terminate; MCP " + ", ".join(MODERN_PROTOCOLS)
+                             + " is stateless (no Mcp-Session-Id)"}, {"Allow": "POST"})
+            return
+        sid = self.headers.get(SESSION_HEADER)
+        if sid is None:
+            self._json(400, {"error": "Mcp-Session-Id required to terminate a session"})
+            return
+        # Terminate BOUND to the pinned version (Codex r3941957895): a DELETE pinned to a version other
+        # than the one the session negotiated does not terminate it (returns 404), so it cannot be used
+        # to tear down a session it does not actually speak for.
+        # Terminate WITHOUT taking _HTTP_DISPATCH_LOCK (E3-S2b round 6, CodeRabbit r3945707197): round 5
+        # (Codex r3945547146 / r3945547151) took that lock here to make termination atomic with a POST's
+        # in-lock re-check and a GET's stream commit — but do_POST holds it across serve_message() for up to
+        # ~AR_TIMEOUT_S, so a DELETE could then block for the whole tool call before terminating. terminate()
+        # is internally synchronized on the session store and O(1) (drop the id, fire wakes), so it is
+        # thread-safe on its own and a DELETE now takes effect immediately. What is given up is the strict
+        # ordering (a DELETE landing after a POST's re-check may not preempt an already-admitted tool; a GET
+        # racing this DELETE may still emit one ": connected") — a multi-client / revocation property whose
+        # strict form (including cancelling an in-flight tool) is deferred to E3-S2c, not achievable by mutual
+        # exclusion here. On this localhost-only, single-user, pre-auth transport that ordering is best-effort.
+        if not self.server.sessions.terminate(sid, pv):
+            self._json(404, {"error": "unknown or terminated session"})
+            return
+        self.close_connection = True
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
 
 class HttpTransport:
-    """Streamable-HTTP framing (MCP 2026-07-28) over stdlib http.server, reusing serve_message() — the
-    E3-S2a endpoint. POST only: application/json for a response, 202 for a notification. NO auth and NO
-    session yet (E3-S2c / E3-S2b): binds 127.0.0.1 by default and MUST NOT be exposed remotely until
-    auth lands. Binding is split from serving so the framing is testable offline on an ephemeral port."""
+    """Dual-era Streamable-HTTP transport over stdlib http.server, reusing serve_message() — the
+    E3-S2a endpoint plus the E3-S2b legacy session lifecycle. POST (JSON-RPC: json response / 202
+    notification) serves both eras; GET (per-session SSE channel) and DELETE (terminate a session) are
+    the LEGACY verbs and are 405 when pinned to the stateless 2026-07-28 revision, which has no
+    sessions. `initialize` mints an Mcp-Session-Id from a bounded, evicting store, bound to the version
+    it negotiated. NO auth yet (E3-S2c): binds 127.0.0.1 by default and MUST NOT be exposed remotely
+    until auth lands. Binding is split from serving so the framing is testable offline."""
 
-    def __init__(self, host=None, port=None, origins=None, max_bytes=None):
+    def __init__(self, host=None, port=None, origins=None, max_bytes=None,
+                 max_sessions=None, require_session=None, max_streams=None):
         h, p, o, m = http_config()
         self.host = h if host is None else host
         self.port = p if port is None else port
         self.origins = tuple(o) if origins is None else tuple(origins)
         self.max_bytes = m if max_bytes is None else max_bytes
+        self.max_sessions = (_http_int_env("AR_MCP_HTTP_MAX_SESSIONS", HTTP_DEFAULT_MAX_SESSIONS, minimum=1)
+                             if max_sessions is None else max_sessions)
+        self.max_streams = (_http_int_env("AR_MCP_HTTP_MAX_STREAMS", HTTP_DEFAULT_MAX_STREAMS, minimum=1)
+                            if max_streams is None else max_streams)
+        self.require_session = (_http_bool_env("AR_MCP_HTTP_REQUIRE_SESSION")
+                                if require_session is None else require_session)
+        self.sessions = _SessionStore(self.max_sessions)
         self.httpd = None
 
     def bind(self):
@@ -1712,6 +2255,10 @@ class HttpTransport:
         httpd.daemon_threads = True
         httpd.allowed_origins = self.origins
         httpd.max_bytes = self.max_bytes
+        httpd.sessions = self.sessions
+        httpd.require_session = self.require_session
+        httpd.sse_streams = threading.BoundedSemaphore(self.max_streams)  # cap concurrent GET/SSE streams
+        httpd.sse_stop = threading.Event()  # set on shutdown so open SSE streams end promptly
         try:
             httpd.server_bind()
             httpd.server_activate()
@@ -1726,15 +2273,19 @@ class HttpTransport:
             self.bind()
         addr = self.httpd.server_address
         log(f"http transport ready on {addr[0]}:{addr[1]} "
-            "(localhost-only, NO auth — E3-S2a; do not expose remotely until E3-S2c)")
+            "(localhost-only, sessions but NO auth — E3-S2b; do not expose remotely until E3-S2c)")
         try:
             self.httpd.serve_forever()
         finally:
+            self.httpd.sse_stop.set()          # signal shutdown to open SSE handler threads
+            self.httpd.sessions.wake_all()     # ...and wake them: they wait on the per-session wake now
             self.httpd.server_close()
 
     def shutdown(self):
         if self.httpd is not None:
-            self.httpd.shutdown()
+            self.httpd.sse_stop.set()          # signal shutdown
+            self.httpd.sessions.wake_all()     # wake any open SSE stream so it stops promptly (not at
+            self.httpd.shutdown()              # the next keepalive tick): the loop waits on `wake` now
 
 
 def select_transport(argv=None, env=None):
