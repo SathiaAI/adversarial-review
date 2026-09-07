@@ -62,22 +62,61 @@ def cmd_plan(args):
         print(f"  WAIVED: {w['name']} (authorized by {w['authorized_by']})")
 
 
+def _parse_exit_map(spec):
+    """Opt-in exit-code -> status map for `run`. `spec` is a comma list of CODE=STATUS
+    (CODE an integer, or '*' as the catch-all for any unmapped nonzero exit); STATUS is
+    PASS|FAIL|BLOCKED. Returns (dict, star_status_or_None). This is how a wrapper that
+    emits a tri-state exit (e.g. ai-defects: 0/1/2) records BLOCKED, with no aggregator
+    change and no effect on gates that don't pass the flag."""
+    mapping, star = {}, None
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            die(f"--exit-map entry {part!r} must be CODE=STATUS")
+        code_s, status = (x.strip() for x in part.split("=", 1))
+        if status not in ("PASS", "FAIL", "BLOCKED"):
+            die(f"--exit-map status must be PASS|FAIL|BLOCKED, got {status!r}")
+        if code_s == "*":
+            star = status
+        else:
+            try:
+                mapping[int(code_s)] = status
+            except ValueError:
+                die(f"--exit-map code must be an integer or '*', got {code_s!r}")
+    return mapping, star
+
+
 def cmd_run(args):
     run = resolve_run(args.run)
     cmd = args.command
     if not cmd:
         die("no command given after --")
+    # Validate any --exit-map BEFORE running, so a malformed map fails fast.
+    emap, estar = _parse_exit_map(args.exit_map) if args.exit_map else ({}, None)
     proc = subprocess.run(cmd, capture_output=True, text=True)
     tail = ((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else ""))[-4000:]
-    status = "PASS" if proc.returncode == 0 else "FAIL"
+    rc = proc.returncode
+    if args.exit_map:
+        # Explicit CODE wins; exit 0 is PASS unless explicitly remapped; an unmapped
+        # nonzero uses '*' if given, else FAIL (the built-in, backward-compatible default).
+        if rc in emap:
+            status = emap[rc]
+        elif rc == 0:
+            status = "PASS"
+        else:
+            status = estar if estar is not None else "FAIL"
+    else:
+        status = "PASS" if rc == 0 else "FAIL"
+    default_summary = {"PASS": "pass", "FAIL": "fail", "BLOCKED": "blocked"}[status]
     write_json(run / "gates" / f"{args.name}.json", {
-        "gate": args.name, "command": " ".join(cmd), "exit_code": proc.returncode,
+        "gate": args.name, "command": " ".join(cmd), "exit_code": rc,
         "status": status,
-        "summary": args.summary or ("pass" if proc.returncode == 0 else "fail"),
+        "summary": args.summary or default_summary,
         "output_tail": tail, "recorded_at": now_iso(), "source": "run"})
-    print(f"gate {args.name}: {status}"
-          + (f" (exit {proc.returncode})" if proc.returncode else ""))
-    sys.exit(proc.returncode)
+    print(f"gate {args.name}: {status}" + (f" (exit {rc})" if rc else ""))
+    sys.exit(rc)
 
 
 def cmd_record(args):
@@ -132,6 +171,11 @@ def main():
     p = sub.add_parser("run")
     p.add_argument("--run"); p.add_argument("--name", required=True)
     p.add_argument("--summary", default="")
+    p.add_argument("--exit-map", default="",
+                   help="opt-in exit-code to status map, e.g. '1=FAIL,2=BLOCKED,*=BLOCKED' "
+                        "('*' = catch-all for unmapped nonzero). Absent: exit 0=PASS, "
+                        "nonzero=FAIL (unchanged). Lets a tri-state wrapper (e.g. ai-defects) "
+                        "record BLOCKED without any aggregator change.")
     p.add_argument("command", nargs=argparse.REMAINDER,
                    help="command after -- to execute")
     p.set_defaults(fn=cmd_run)

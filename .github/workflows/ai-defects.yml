@@ -1,0 +1,111 @@
+# ai-defects gate — deeper verifier (port wrapper + pinned CLI) run in CI.
+#
+# The verifier is a PINNED CLI adopted BY COMMAND: its exact version + digest are private
+# CI secrets and the binary is installed on the runner only (never committed, never a
+# release asset, never named on a public surface). This is workflow_dispatch on purpose:
+# the pin is operator-only, so a required always-on gate would fail-closed to BLOCKED on
+# every PR until an operator supplies the secrets. The gate's PASS/FAIL/BLOCKED taxonomy
+# is locked by the required test job (tests/run_tests.py: t_ai_defects_*). Dispatch this
+# with the secrets set to run the real verify; dispatch it WITHOUT them to see the
+# fail-closed BLOCKED path.
+#
+# Required secrets (set in repo/org Actions settings — internal, never in public docs):
+#   AI_DEFECTS_PIN_VERSION   exact pinned version
+#   AI_DEFECTS_PIN_DIGEST    sha256 of the pinned binary (optionally 'sha256:'-prefixed)
+# Optional:
+#   AI_DEFECTS_INSTALL_URL   where CI fetches the pinned binary (internal)
+#   AI_DEFECTS_FETCH_TOKEN   bearer token for that fetch (never echoed)
+name: ai-defects
+
+on:
+  workflow_dispatch:
+    inputs:
+      diff-ref:
+        description: "Git range to scope the verify"
+        default: "HEAD~1...HEAD"
+
+permissions:
+  contents: read
+
+jobs:
+  ai-defects:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned verifier (digest-verified; runner path only)
+        env:
+          AI_DEFECTS_PIN_VERSION: ${{ secrets.AI_DEFECTS_PIN_VERSION }}
+          AI_DEFECTS_PIN_DIGEST: ${{ secrets.AI_DEFECTS_PIN_DIGEST }}
+          AI_DEFECTS_INSTALL_URL: ${{ secrets.AI_DEFECTS_INSTALL_URL }}
+          AI_DEFECTS_FETCH_TOKEN: ${{ secrets.AI_DEFECTS_FETCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AI_DEFECTS_PIN_VERSION:-}" ] || [ -z "${AI_DEFECTS_PIN_DIGEST:-}" ]; then
+            echo "::notice::ai-defects: pin secrets absent — the gate will record BLOCKED (fail-closed)."
+            exit 0
+          fi
+          if [ -z "${AI_DEFECTS_INSTALL_URL:-}" ]; then
+            echo "::notice::ai-defects: AI_DEFECTS_INSTALL_URL not set — cannot install; gate will be BLOCKED."
+            exit 0
+          fi
+          dest="$RUNNER_TEMP/ai-defects-verifier"
+          # Fetch to a runner-only path. The token (if any) is passed via a header and
+          # never printed; -f makes a bad fetch a hard error.
+          if [ -n "${AI_DEFECTS_FETCH_TOKEN:-}" ]; then
+            curl -fsSL -H "Authorization: Bearer ${AI_DEFECTS_FETCH_TOKEN}" -o "$dest" "$AI_DEFECTS_INSTALL_URL"
+          else
+            curl -fsSL -o "$dest" "$AI_DEFECTS_INSTALL_URL"
+          fi
+          got="$(sha256sum "$dest" | awk '{print $1}')"
+          want="$(printf '%s' "$AI_DEFECTS_PIN_DIGEST" | tr 'A-Z' 'a-z' | tr -d '[:space:]' | sed 's/^sha256://')"
+          if [ "$got" != "$want" ]; then
+            echo "::error::ai-defects: pinned binary digest mismatch — refusing to install (values redacted)."
+            rm -f "$dest"
+            exit 0   # leave AI_DEFECTS_BIN unset -> the gate records BLOCKED, never runs an unpinned binary
+          fi
+          chmod 0755 "$dest"
+          echo "AI_DEFECTS_BIN=$dest" >> "$GITHUB_ENV"
+          echo "::notice::ai-defects: pinned verifier installed and digest-verified."
+
+      - name: Run the ai-defects gate (records PASS/FAIL/BLOCKED; fail-closed)
+        env:
+          AI_DEFECTS_PIN_VERSION: ${{ secrets.AI_DEFECTS_PIN_VERSION }}
+          AI_DEFECTS_PIN_DIGEST: ${{ secrets.AI_DEFECTS_PIN_DIGEST }}
+          IN_DIFF_REF: ${{ github.event.inputs.diff-ref }}
+        run: |
+          set -euo pipefail
+          RUN_DIR="$(python scripts/panel.py init --risk NORMAL --dev-providers anthropic \
+                       --diff-ref "$IN_DIFF_REF" | awk '/^initialized /{print $2; exit}')"
+          test -n "$RUN_DIR" && test -d "$RUN_DIR"
+          git diff --name-only "$IN_DIFF_REF" > "$RUN_DIR/changed_paths.txt" || true
+          python scripts/gate.py plan --run "$RUN_DIR" --require ai-defects
+          # The wrapper emits a tri-state exit; --exit-map records BLOCKED on exit 2.
+          python scripts/gate.py run --run "$RUN_DIR" --name ai-defects \
+            --exit-map "1=FAIL,2=BLOCKED,*=BLOCKED" -- \
+            python scripts/ai_defects_verify.py \
+              --run-dir "$RUN_DIR" --diff-file "$RUN_DIR/changed_paths.txt" || true
+          echo "----- ai-defects ledger entry -----"
+          cat "$RUN_DIR/gates/ai-defects.json"
+          echo "AR_LEDGER=$RUN_DIR/gates/ai-defects.json" >> "$GITHUB_ENV"
+          status="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$RUN_DIR/gates/ai-defects.json")"
+          case "$status" in
+            PASS)    echo "::notice::ai-defects gate: PASS" ;;
+            FAIL)    echo "::error::ai-defects gate: FAIL (defects found)"; exit 1 ;;
+            BLOCKED) echo "::error::ai-defects gate: BLOCKED (fail-closed — supply the pin to reach PASS)"; exit 1 ;;
+            *)       echo "::error::ai-defects gate: unexpected status '$status'"; exit 1 ;;
+          esac
+
+      - name: Upload ai-defects ledger entry
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-defects-ledger
+          path: .adversarial-review/*/gates/ai-defects.json
+          if-no-files-found: warn

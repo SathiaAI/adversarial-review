@@ -139,9 +139,9 @@ summary as usual):
 - **JVM** — the build's compile step with `-Werror` plus Error Prone (or a comparable
   compile-time checker)
 
-Deeper options: any AI-code-verification tool that emits an exit code (skylos-class
-verifiers) — adopted by command, never by name in the protocol. Recorded like every
-gate, so the aggregator can see it:
+Deeper options: any AI-code-verification tool that emits an exit code — adopted by
+command, never by name in the protocol. Recorded like every gate, so the aggregator
+can see it:
 
 ```bash
 python <skill>/scripts/gate.py run --name ai-defects -- \
@@ -161,6 +161,30 @@ an on-record waiver (`gate.py plan --waive ai-defects --authorized-by "<user>"`)
 never silence. `MINIMUM_GATES` floors are unchanged (promoting `ai-defects` into the
 floors would be a separate, breaking decision), and no aggregator change is involved —
 gates are already tool-agnostic commands with exit codes.
+
+**Port wrapper (finer, fail-closed taxonomy).** A raw tool via `gate.py run` is binary
+(exit 0 = PASS, nonzero = FAIL). For a deeper verifier that distinguishes "found defects"
+from "could not complete", run it through the port wrapper `scripts/ai_defects_verify.py`
+— a thin closed-arg adapter (fixed argv `--run-dir <dir> --diff-file <file>`; no shell, no
+wildcards, no passthrough) — and record with `gate.py run`'s opt-in `--exit-map`:
+
+```bash
+python <skill>/scripts/gate.py run --name ai-defects \
+  --exit-map "1=FAIL,2=BLOCKED,*=BLOCKED" -- \
+  python <skill>/scripts/ai_defects_verify.py \
+    --run-dir "$RUN_DIR" --diff-file "$RUN_DIR/changed_paths.txt"
+```
+
+The wrapper collapses the whole taxonomy to a tri-state exit — 0 PASS, 1 FAIL (defects),
+2 BLOCKED — so a missing/empty pin, a bad digest, a missing or non-executable binary, an
+`incomplete: true` summary (even on exit 0), a timeout, or any unknown exit all record
+**BLOCKED**, never PASS and never a silent skip. An empty diff records PASS with reason
+`empty-diff`. The deeper verifier is a **pinned CLI adopted by command**: its exact
+version and digest are supplied to CI as secrets (`AI_DEFECTS_PIN_VERSION`,
+`AI_DEFECTS_PIN_DIGEST`) and its binary is installed on the runner only — never committed,
+never released as an artifact, and never named on a public surface. Operators get the pin
+values from the internal Product Scout / board, not from these docs. `check_ai_defects_public_silence.sh`
+guards the public surfaces against brand leakage in CI.
 
 ## The enforcement gate: 404 is not "absent"
 
