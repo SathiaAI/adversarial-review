@@ -6189,6 +6189,25 @@ def t_mcp_panel_timeout_reads_policy_racesafe():
         if linked:
             assert mcpsrv._resolved_high_samples() == "25", "a symlink policy leaf must not be followed in-process"
             assert mcpsrv._panel_timeout() == MAXB, mcpsrv._panel_timeout()
+        # (b2) a DANGLING policy symlink (target missing) is PRESENT-but-unsafe, not absent: lexists() keeps it
+        #      (exists() would silently drop it), and the O_NOFOLLOW open below then fails closed -> budget the
+        #      MAX. On the fix-35 base the presence probe used exists(), which FOLLOWS the link, finds no target,
+        #      and reports the policy "absent" -> _resolved_high_samples() returns the non-conservative "1", not
+        #      "25" -> this case fails there, pinning exactly what fix-36 closes (CodeRabbit r3951475453).
+        repo_dangle = Path(tempfile.mkdtemp(prefix="ar-pol-dangle-"))
+        os.chdir(repo_dangle)
+        dangled = False
+        try:
+            (repo_dangle / ".adversarial-review.yml").symlink_to(repo_dangle / "no-such-policy-target.yml")
+            dangled = True
+        except (OSError, NotImplementedError):
+            pass
+        if dangled:
+            # sanity: this really is a dangling link, and exists()/lexists() diverge on it (the crux of the fix)
+            assert not os.path.exists(repo_dangle / ".adversarial-review.yml"), "target must be missing (dangling)"
+            assert os.path.lexists(repo_dangle / ".adversarial-review.yml"), "the link itself must be present"
+            assert mcpsrv._resolved_high_samples() == "25", "a dangling policy symlink must budget MAX, not read as absent"
+            assert mcpsrv._panel_timeout() == MAXB, mcpsrv._panel_timeout()
         # (c) a FIFO policy is refused WITHOUT blocking the open (O_NONBLOCK + fstat non-regular) -> MAX
         if hasattr(os, "mkfifo"):
             repo3 = Path(tempfile.mkdtemp(prefix="ar-pol-fifo-"))

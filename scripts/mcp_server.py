@@ -301,7 +301,10 @@ def _read_policy_racesafe():
     still die()s on a malformed one. (Same race-safe read the catalog uses.)"""
     from _common import POLICY_BASENAMES, load_policy
     root = Path.cwd()
-    present = [n for n in POLICY_BASENAMES if (root / n).exists()]  # the open below is race-safe regardless
+    # lexists (not exists): a DANGLING policy symlink is present-but-unsafe, not "absent" — exists() would
+    # drop it and mislead _resolved_high_samples into the non-conservative "1" instead of the max budget;
+    # lexists keeps it, and the O_NOFOLLOW open below then fails closed on it (CodeRabbit r3951475453).
+    present = [n for n in POLICY_BASENAMES if os.path.lexists(root / n)]  # the open below is race-safe regardless
     if not present:
         return None
     if len(present) > 1:
