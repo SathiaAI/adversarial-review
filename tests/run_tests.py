@@ -855,6 +855,43 @@ def t_mcp_aggregate_lock_held_during_run_and_released_after():
     assert not lock.exists(), "lock must be released after a completed aggregate (no stale lock)"
 
 
+def t_aggregate_cli_refuses_while_verdict_lock_held():
+    # Codex (PR #55) r3951566976: ar_aggregate (mcp_server.h_aggregate) holds run/verdict.json.lock across
+    # its move-aside -> aggregate -> settle section, but the supported DIRECT ar-aggregate/aggregate.py CLI
+    # never honored it -- so a direct write could land inside the MCP critical section and be rolled back
+    # when the MCP settle restored its moved-aside prior (Codex reproduced a direct BLOCKED reverted to a
+    # stale PASS). aggregate.py now takes the SAME O_EXCL lock around its verdict write and REFUSES (exit 3)
+    # when it is held. Pre-creating verdict.json.lock simulates a concurrent MCP holder: the CLI must refuse
+    # and NOT overwrite verdict.json. On the base commit aggregate.py ignores the lock and writes a fresh
+    # verdict (exit 2), so this fails there -- the revert-proof.
+    repo = _complete_sensitive_repo()
+    sh(["aggregate.py"], repo, expect=2)                 # security-1 open -> BLOCKED verdict written
+    run = latest_run(repo)
+    baseline = (run / "verdict.json").read_text(encoding="utf-8")
+    (run / "verdict.json.lock").write_text("")           # a concurrent aggregate holds the run lock
+    r = sh(["aggregate.py"], repo, expect=3)             # must refuse, exit 3 (not a verdict)
+    assert "lock" in (r.stdout + r.stderr) and "in progress" in (r.stdout + r.stderr), (r.stdout, r.stderr)
+    assert (run / "verdict.json").read_text(encoding="utf-8") == baseline, \
+        "a locked direct aggregate must not overwrite verdict.json"
+    assert (run / "verdict.json.lock").is_file(), "a lock this process did not create must remain"
+
+
+def t_aggregate_cli_lock_already_held_skips_acquisition():
+    # Re-entrancy for the MCP path: h_aggregate already holds run/verdict.json.lock when it spawns
+    # aggregate.py as its child, so the child must NOT re-acquire it -- otherwise the child's own O_EXCL open
+    # would fail against the parent's lock and EVERY MCP aggregate would reject (also guarded end-to-end by
+    # t_mcp_fail_verdict, which runs the real child while the parent holds the lock). aggregate.py
+    # --lock-already-held skips acquisition and writes the verdict even with the lock present, and does NOT
+    # remove the parent's lock. On the base commit the flag does not exist, so aggregate.py never writes the
+    # verdict under a held lock -- this fails there.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    (run / "verdict.json.lock").write_text("")           # the MCP parent holds it
+    r = sh(["aggregate.py", "--lock-already-held"], repo, expect=2)   # BLOCKED verdict still WRITTEN
+    assert (run / "verdict.json").is_file() and "BLOCKED" in r.stdout, (r.stdout, r.stderr)
+    assert (run / "verdict.json.lock").is_file(), "the child must not remove the MCP-held lock"
+
+
 def t_check_digest_unreadable_verdict_is_cannot_verify_not_drift():
     # A malformed verdict.json makes --check-digest unable to READ the stored attestation, so nothing
     # is compared. That must exit 2 (cannot verify), never 1 (a definitive mismatch): the MCP wrapper
@@ -6621,7 +6658,9 @@ def t_mcp_aggregate_pins_run_against_concurrent_init():
     mcpsrv._run_cli = fake
     try:
         r = mcpsrv.h_aggregate({})  # no explicit run -> must pin the newest-at-entry (older)
-        assert cap and cap[0]["argv"] == ["--run", "run-20260101-010101"], cap
+        # --run <id> is pinned as the leading args (the TOCTOU concern here); a trailing
+        # --lock-already-held may follow (fix-37: the wrapper holds the lock, so the child skips it).
+        assert cap and cap[0]["argv"][:2] == ["--run", "run-20260101-010101"], cap
         assert not r["isError"], r
         assert r["structuredContent"]["run_id"] == "run-20260101-010101", r
         assert r["structuredContent"]["verdict"] == "FAIL", r

@@ -926,7 +926,13 @@ def h_aggregate(args):
         # verdict is actually in hand.
         accepted = False
         try:
-            rc, out, err = _run_cli("aggregate", run_args)
+            # This wrapper holds verdict.json.lock across the whole move-aside -> aggregate -> settle
+            # section, so tell the aggregate child NOT to re-acquire it — otherwise the child's own O_EXCL
+            # open would fail against the lock this process already holds and every MCP aggregate would
+            # reject. Pass the flag ONLY when we actually took the lock (lock_fd is not None); if the run
+            # dir did not resolve here we hold no lock, so the child should take its own. (Codex r3951566976.)
+            agg_argv = run_args + ["--lock-already-held"] if lock_fd is not None else run_args
+            rc, out, err = _run_cli("aggregate", agg_argv)
             body = (out or "").strip()
             if err and err.strip():
                 body = (body + "\n" + err.strip()).strip()

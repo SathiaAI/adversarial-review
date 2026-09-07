@@ -1148,6 +1148,11 @@ def _aggregate_cli():
                     help="verify the detached attestation.sig sidecar against verdict.json — "
                          "recomputing the attestation from artifacts and checking the signed verdict "
                          "— and exit (0 valid, 1 not verified, 2 missing prerequisite, 3 no verifier)")
+    # Internal (SUPPRESS): set ONLY by mcp_server.h_aggregate when it spawns this process as its child and
+    # ALREADY holds run/verdict.json.lock across its wider move-aside -> aggregate -> settle section. The
+    # child must then NOT re-acquire that lock, or every MCP aggregate would fail against its own held lock.
+    # A direct `ar-aggregate` invocation never sets it and so takes the lock itself. (Codex r3951566976.)
+    ap.add_argument("--lock-already-held", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
     run = resolve_run(args.run)
     if args.check_digest:
@@ -1218,35 +1223,74 @@ def _aggregate_cli():
            "next_steps": steps,
            "counts": counts, "coverage": coverage, "attestation": attestation,
            "risk": meta["risk"], "run_id": meta["run_id"], "computed_at": now_iso()}
-    write_json(run / "verdict.json", out)
+    # fix-37 (Codex r3951566976): serialize this verdict write against a concurrent MCP ar_aggregate.
+    # mcp_server.h_aggregate holds run/verdict.json.lock across its move-aside -> aggregate -> settle
+    # critical section; a direct ar-aggregate that ignored the lock could write verdict.json INSIDE that
+    # window and then be silently rolled back when the MCP settle restored its moved-aside prior (Codex
+    # reproduced a direct BLOCKED reverted to a stale PASS). Take the SAME per-run O_EXCL lock around the
+    # verdict.json/verdict.md writes so a concurrent MCP aggregate (which holds it) forces this CLI to
+    # refuse instead of racing. verdict.json.lock is not *.json, so it never enters the attestation.
+    # --lock-already-held means the MCP wrapper spawned this process and ALREADY holds the lock, so the
+    # child must NOT re-acquire it (that would fail every MCP aggregate against its own held lock).
+    lock_fd = None
+    lock_path = None
+    if not args.lock_already_held:
+        lock_path = run / "verdict.json.lock"
+        try:
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            print("another aggregate is in progress for this run (lock file "
+                  f"{lock_path.name} is held). If none is running, a prior aggregate was killed before "
+                  "releasing it — remove the stale lock file and re-run.", file=sys.stderr)
+            sys.exit(3)
+        except OSError as e:
+            print(f"cannot acquire the aggregate lock ({lock_path.name}): {e}", file=sys.stderr)
+            sys.exit(3)
+    try:
+        write_json(run / "verdict.json", out)
 
-    md = [f"# Release verdict: {verdict}", "",
-          f"Run `{meta['run_id']}`, risk {meta['risk']}, computed {out['computed_at']}.", ""]
-    md += [f"- FAIL: {r}" for r in fail]
-    md += [f"- BLOCKED: {r}" for r in blocked]
-    md += [f"- note: {n}" for n in notes]
-    # Plain-language guidance up top, where a non-expert will actually read it — before
-    # the technical counts/coverage that follow.
-    md += ["", "## Next steps", ""]
-    md += [f"- {s}" for s in steps]
-    md += ["", "Counts: " + ", ".join(f"{k}={v}" for k, v in counts.items())]
-    reb = ("ran" if rcov["ran"] else
-           ("required but missing" if rcov["required"] else "not required"))
-    md += ["", f"Coverage: gates {len(gcov['passed'])}/{len(gcov['required'])} passed "
-           f"({len(gcov['missing'])} missing, {len(gcov['blocked'])} blocked, "
-           f"{len(gcov['not_applicable'])} n/a, {len(gcov['waived'])} waived); "
-           f"panel {len(pcov['roles_filled'])}/{len(pcov['roles_required'])} roles; "
-           f"rebuttal policy '{rcov['policy']}' {reb}; "
-           f"findings {fcov['triaged']}/{fcov['raised']} triaged; "
-           f"{len(coverage['areas_not_reviewed'])} reviewer-attested unreviewed areas"]
-    # Surface every not-applicable determination and its authorizer distinctly — a
-    # skipped gate must never be silent, even when it does not restrict the verdict.
-    md += [f"- not applicable: gate '{na['name']}' (authorized by "
-           f"{na['authorized_by']}): {na['reason']}" for na in gcov["not_applicable"]]
-    md += ["", f"Attestation: sha256 {attestation['digest']} over "
-           f"{attestation['inputs']} recorded artifacts "
-           "(verify with `aggregate.py --check-digest`)"]
-    (run / "verdict.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+        md = [f"# Release verdict: {verdict}", "",
+              f"Run `{meta['run_id']}`, risk {meta['risk']}, computed {out['computed_at']}.", ""]
+        md += [f"- FAIL: {r}" for r in fail]
+        md += [f"- BLOCKED: {r}" for r in blocked]
+        md += [f"- note: {n}" for n in notes]
+        # Plain-language guidance up top, where a non-expert will actually read it — before
+        # the technical counts/coverage that follow.
+        md += ["", "## Next steps", ""]
+        md += [f"- {s}" for s in steps]
+        md += ["", "Counts: " + ", ".join(f"{k}={v}" for k, v in counts.items())]
+        reb = ("ran" if rcov["ran"] else
+               ("required but missing" if rcov["required"] else "not required"))
+        md += ["", f"Coverage: gates {len(gcov['passed'])}/{len(gcov['required'])} passed "
+               f"({len(gcov['missing'])} missing, {len(gcov['blocked'])} blocked, "
+               f"{len(gcov['not_applicable'])} n/a, {len(gcov['waived'])} waived); "
+               f"panel {len(pcov['roles_filled'])}/{len(pcov['roles_required'])} roles; "
+               f"rebuttal policy '{rcov['policy']}' {reb}; "
+               f"findings {fcov['triaged']}/{fcov['raised']} triaged; "
+               f"{len(coverage['areas_not_reviewed'])} reviewer-attested unreviewed areas"]
+        # Surface every not-applicable determination and its authorizer distinctly — a
+        # skipped gate must never be silent, even when it does not restrict the verdict.
+        md += [f"- not applicable: gate '{na['name']}' (authorized by "
+               f"{na['authorized_by']}): {na['reason']}" for na in gcov["not_applicable"]]
+        md += ["", f"Attestation: sha256 {attestation['digest']} over "
+               f"{attestation['inputs']} recorded artifacts "
+               "(verify with `aggregate.py --check-digest`)"]
+        (run / "verdict.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    finally:
+        # Release the per-run lock on every exit path. Close BEFORE unlink so the removal succeeds on
+        # Windows too (an open handle blocks delete there); a failed unlink leaves a stale lock the
+        # operator can clear rather than crashing the write. Never unlink a lock this process did not
+        # create (lock_fd is None under --lock-already-held — the MCP parent owns and releases it).
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            if lock_path is not None:
+                try:
+                    os.unlink(str(lock_path))
+                except OSError:
+                    pass
 
     print(f"VERDICT: {verdict}  (risk={meta['risk']}, run={meta['run_id']})")
     for r in fail:
