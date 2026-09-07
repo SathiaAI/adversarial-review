@@ -6261,33 +6261,35 @@ def t_mcp_http_initialize_header_matches_negotiated_when_body_omits_version():
         t.shutdown()
 
 
-def t_mcp_http_delete_serializes_with_dispatch_lock():
-    # Codex r3945547146 / r3945547151: DELETE now serializes with request dispatch via _HTTP_DISPATCH_LOCK,
-    # so a session cannot be terminated while a POST re-check + serve_message (or a GET stream commit) holds
-    # the lock -- closing the check-to-dispatch / check-to-200 window. Hold the lock and show a concurrent
-    # DELETE BLOCKS until release. Fails on 5f810d4 (DELETE terminates immediately, not under the lock).
+def t_mcp_http_delete_returns_promptly_during_long_dispatch():
+    # E3-S2b round 6 (CodeRabbit Major r3945707197): do_POST holds _HTTP_DISPATCH_LOCK across serve_message()
+    # for up to ~AR_TIMEOUT_S, so DELETE and the GET stream commit must NOT take that lock or they block for
+    # the whole tool call. Round 5 made DELETE take it (for atomic termination); round 6 reverts that --
+    # strict termination-vs-dispatch ordering is a multi-client property deferred to E3-S2c. HOLD the dispatch
+    # lock (standing in for an in-flight long POST) and show a concurrent DELETE still completes promptly.
+    # Fails on 50c7db8 (DELETE takes the lock and blocks until release). Event-coordinated, no sleep race.
     import threading
-    import time
     t, port = _http_transport()
     try:
         _s, sid, _r = _http_initialize(port)
         assert sid
+        done = threading.Event()
         result = {}
 
         def do_delete():
             result["code"] = _http_method(port, "DELETE", {"Mcp-Session-Id": sid})
+            done.set()
 
         mcpsrv._HTTP_DISPATCH_LOCK.acquire()
         try:
-            th = threading.Thread(target=do_delete)
-            th.start()
-            time.sleep(0.6)                     # long enough for an un-serialized DELETE to complete
-            blocked = "code" not in result       # on the fix the DELETE is still waiting on the lock
+            threading.Thread(target=do_delete, daemon=True).start()
+            # On the fix DELETE never touches the dispatch lock -> it completes while we still hold the lock.
+            # On 50c7db8 it blocks on the held lock and this wait times out.
+            completed = done.wait(5)
         finally:
             mcpsrv._HTTP_DISPATCH_LOCK.release()
-        th.join(5)
-        assert blocked, "DELETE completed while the dispatch lock was held -> not serialized with dispatch"
-        assert result.get("code") == 204, result  # after release it terminates normally
+        assert completed, "DELETE blocked on _HTTP_DISPATCH_LOCK while a POST would hold it (round-5 regression)"
+        assert result.get("code") == 204, result
     finally:
         t.shutdown()
 

@@ -1218,30 +1218,34 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             wake = self.server.sessions.register_wake(sid, pv)
             # Bound every socket write with a timeout FIRST (reliability review, run-20260824-013958): a peer
             # that stops reading fills the TCP send buffer, and without this `wfile.write` would block
-            # forever, pinning this thread + fd (and, below, the dispatch lock). A write timeout turns that
-            # into a bounded OSError that ends the handler. Set before the 200 so even the header write is
-            # bounded while the dispatch lock is held.
+            # forever, pinning this thread + fd. A write timeout turns that into a bounded OSError that ends
+            # the handler.
             self.connection.settimeout(SSE_KEEPALIVE_SECONDS)
-            # Commit the stream ATOMICALLY with session termination (Codex r3945547151): DELETE takes
-            # _HTTP_DISPATCH_LOCK to terminate, so committing the 200 under the SAME lock closes the window
-            # between the final validity read (wake.is_set) and send_response in which a DELETE could
-            # otherwise complete while this handler still emits 200 + ": connected" for a dead session. The
-            # lock is held only for the tiny header write (bounded above) and released BEFORE the long-lived
-            # keepalive loop, which then relies on the wake for prompt termination.
-            with _HTTP_DISPATCH_LOCK:
-                if wake.is_set():
-                    self._json(404, {"error": "unknown or terminated session"})
-                    return
-                # This server emits no server-initiated messages yet (the tool surface is request/response),
-                # so the stream is a valid, idle channel: an initial comment confirms it is live, then it is
-                # held open (periodic keepalives) until the session is terminated, the client disconnects, or
-                # the server shuts down (sse_stop). text/event-stream, uncached, closed at end.
-                self.close_connection = True
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Connection", "close")
-                self.end_headers()
+            # Commit the stream WITHOUT taking _HTTP_DISPATCH_LOCK (E3-S2b round 6, CodeRabbit r3945707197):
+            # do_POST holds that lock across serve_message(), which can run a tool for up to ~AR_TIMEOUT_S,
+            # so committing the GET under the SAME lock (round 5, Codex r3945547151) let a concurrent GET
+            # block for the whole dispatch. register_wake() above is atomic (validity + registration under the
+            # store lock) and returns a pre-set event when the session is already gone, so a DELETE landing
+            # before this check is caught by wake.is_set(), and a DELETE landing AFTER the 200 wakes the
+            # keepalive loop below, which stops at once. What stays best-effort is only the tiny window
+            # between this check and the ": connected" write, in which a just-terminated session can still
+            # receive that one comment line. Strict "no output after terminate" ordering is a multi-client /
+            # revocation property deferred to E3-S2c (auth + remote bind), designed there against the threat
+            # model rather than retrofitted onto the dispatch lock; on this localhost-only, single-user,
+            # pre-auth transport the only racer is the local user and the worst case is a stray ": connected".
+            if wake.is_set():
+                self._json(404, {"error": "unknown or terminated session"})
+                return
+            # This server emits no server-initiated messages yet (the tool surface is request/response), so
+            # the stream is a valid, idle channel: an initial comment confirms it is live, then it is held
+            # open (periodic keepalives) until the session is terminated, the client disconnects, or the
+            # server shuts down (sse_stop). text/event-stream, uncached, closed at end.
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
             stop = self.server.sse_stop
             # Free the slot promptly on a CLIENT disconnect too (Codex r3943958155): a peer that closes
             # right after ": connected" fires no wake, so without polling the slot would linger until the
@@ -1306,14 +1310,17 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         # Terminate BOUND to the pinned version (Codex r3941957895): a DELETE pinned to a version other
         # than the one the session negotiated does not terminate it (returns 404), so it cannot be used
         # to tear down a session it does not actually speak for.
-        # Serialize the termination with request dispatch under _HTTP_DISPATCH_LOCK (Codex r3945547146 /
-        # r3945547151): do_POST re-checks the session, and do_GET commits its stream, WHILE holding this
-        # lock — so taking it here makes termination atomic with those commitments. A DELETE can no longer
-        # land AFTER a POST's in-lock re-check but before serve_message, nor after a GET's commit re-check
-        # but before its 200. terminate() is O(1) (drop the id, fire wakes), so the lock is held only briefly.
-        with _HTTP_DISPATCH_LOCK:
-            terminated = self.server.sessions.terminate(sid, pv)
-        if not terminated:
+        # Terminate WITHOUT taking _HTTP_DISPATCH_LOCK (E3-S2b round 6, CodeRabbit r3945707197): round 5
+        # (Codex r3945547146 / r3945547151) took that lock here to make termination atomic with a POST's
+        # in-lock re-check and a GET's stream commit — but do_POST holds it across serve_message() for up to
+        # ~AR_TIMEOUT_S, so a DELETE could then block for the whole tool call before terminating. terminate()
+        # is internally synchronized on the session store and O(1) (drop the id, fire wakes), so it is
+        # thread-safe on its own and a DELETE now takes effect immediately. What is given up is the strict
+        # ordering (a DELETE landing after a POST's re-check may not preempt an already-admitted tool; a GET
+        # racing this DELETE may still emit one ": connected") — a multi-client / revocation property whose
+        # strict form (including cancelling an in-flight tool) is deferred to E3-S2c, not achievable by mutual
+        # exclusion here. On this localhost-only, single-user, pre-auth transport that ordering is best-effort.
+        if not self.server.sessions.terminate(sid, pv):
             self._json(404, {"error": "unknown or terminated session"})
             return
         self.close_connection = True
