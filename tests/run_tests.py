@@ -7642,6 +7642,67 @@ def t_mcp_aggregate_fallback_freshness_is_mtime_independent():
     assert json.loads(vf.read_text())["verdict"] == "FAIL", "the fresh verdict must be on disk, not the prior"
 
 
+def t_mcp_aggregate_aborts_when_prior_verdict_cannot_be_unlinked():
+    # PR #55 fix-29 (Codex r3945727346): in the rename-FALLBACK path (the .prev move failed, so the prior is
+    # snapshotted to .bak), fix-25 removes the original so freshness is proven by EXISTENCE. If that unlink
+    # ALSO fails — e.g. a Windows handle that shares writes but not deletes — the code swallowed the error and
+    # fell back to the mtime check, which a coarse-granularity filesystem defeats: a fresh FAIL rewritten in
+    # the prior's mtime quantum is mislabeled stale and ROLLED BACK to the prior PASS. h_aggregate now fails
+    # closed — it refuses (ToolError) before running aggregate, leaving verdict.json intact and no .bak
+    # stranded. Fails on e51160c (the except swallowed the unlink error; aggregate ran and the fresh FAIL was
+    # rolled back to PASS, isError with verdict.json restored to PASS — no ToolError raised).
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-unlinkfail-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    vf = rundir / "verdict.json"
+    vf.write_text(json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+    prior_mtime = vf.stat().st_mtime_ns
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+
+    RB = type(vf)
+    orig_replace = RB.replace
+    orig_unlink = RB.unlink
+
+    def blocked_move(self, target):            # force the rename-fallback: the .prev move fails, .bak succeeds
+        if str(target).endswith(".prev"):
+            raise OSError("simulated: cannot rename verdict.json -> .prev")
+        return orig_replace(self, target)
+
+    def blocked_unlink(self, *a, **k):         # the prior verdict.json shares writes but not deletes
+        if self.name == "verdict.json":
+            raise OSError("simulated: cannot unlink verdict.json")
+        return orig_unlink(self, *a, **k)
+
+    def fake(module, argv, timeout=120):
+        # a genuine FRESH verdict, written in the SAME coarse mtime quantum as the prior (the rollback trap)
+        p = rundir / "verdict.json"
+        p.write_text(json.dumps({"verdict": "FAIL", "run_id": "run-20260101-010101"}))
+        os.utime(p, ns=(prior_mtime, prior_mtime))
+        return (1, "FAIL", "")
+
+    orig_cli = mcpsrv._run_cli
+    RB.replace = blocked_move
+    RB.unlink = blocked_unlink
+    mcpsrv._run_cli = fake
+    raised = None
+    try:
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except mcpsrv.ToolError as e:
+            raised = e
+    finally:
+        RB.replace = orig_replace
+        RB.unlink = orig_unlink
+        mcpsrv._run_cli = orig_cli
+        os.chdir(cwd0)
+    assert raised is not None, "h_aggregate must FAIL CLOSED (ToolError) when the prior verdict cannot be unlinked"
+    assert "refusing to aggregate" in str(raised) or "rolled back" in str(raised), str(raised)
+    # the prior verdict.json is left intact (never rolled back to a stale value) and no .bak is stranded
+    assert json.loads(vf.read_text())["verdict"] == "PASS", "prior verdict.json must be left intact on the abort"
+    assert not (rundir / "verdict.json.bak").exists(), "the redundant .bak must be cleaned up on the fail-closed abort"
+
+
 def t_aggregate_console_entry_crash_exits_3():
     # Codex (PR #55) r3942035551: the post-write-crash exit-3 mapping must apply to the INSTALLED console
     # entry (ar-aggregate = adversarial_review.aggregate:main), which calls main() directly and never runs

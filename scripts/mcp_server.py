@@ -696,13 +696,32 @@ def h_aggregate(args):
                 # quantum, `st_mtime_ns` is unchanged and the freshness check below would mislabel a
                 # genuinely fresh verdict as stale and roll it back to .bak. The prior is now durably at
                 # .bak, so removing the original loses nothing and forces aggregate to CREATE a new file
-                # (existence == fresh), exactly as the move-aside path already does. If the unlink itself
-                # fails, before_mtime stays set and the mtime check remains as the (weaker) fallback.
+                # (existence == fresh), exactly as the move-aside path already does.
                 try:
                     vf.unlink()
                     before_mtime = None
-                except OSError:
-                    pass
+                except OSError as e:
+                    # The prior can be neither moved aside (the rename above failed) NOR removed — e.g. a
+                    # Windows handle that shares writes but not deletes. Freshness-by-existence is then
+                    # impossible, and falling back to the mtime check is unsafe: on a coarse-granularity
+                    # filesystem aggregate can rewrite verdict.json within the prior's mtime quantum, the
+                    # freshness check would read st_mtime_ns as unchanged, mislabel a genuinely fresh verdict
+                    # as stale, and the settle would ROLL BACK a fresh FAIL to the prior PASS (Codex
+                    # r3945727346, reproduced). Fail closed — refuse to aggregate rather than risk that
+                    # rollback. verdict.json is untouched (its unlink failed); the redundant .bak just
+                    # snapshotted is best-effort removed so the run dir is left exactly as found. This raise
+                    # precedes the inner aggregate try, so only the outer finally runs — the per-run lock is
+                    # still released, and no settle/restore runs against the intact prior.
+                    try:
+                        cand_bak.unlink()
+                    except OSError:
+                        pass
+                    raise ToolError(
+                        "cannot move the prior verdict aside or remove it, so a fresh aggregate cannot be "
+                        "distinguished from the prior one without trusting filesystem timestamps (which a "
+                        "coarse-granularity filesystem can leave unchanged) — refusing to aggregate so a "
+                        f"fresh verdict is never rolled back to the prior one: {e}. Resolve the lock on "
+                        "verdict.json (or its directory), then re-run ar_aggregate.") from e
         elif vf is not None:
             # verdict.json is absent — a prior aggregate was interrupted BEFORE the settle that would have
             # reconciled it, stranding the last accepted verdict at a sidecar. It may sit at .prev (the
