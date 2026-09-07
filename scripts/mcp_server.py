@@ -593,7 +593,19 @@ def handle(msg):
     requested_version = meta.get(META_PROTOCOL_VERSION)
     is_modern = META_PROTOCOL_VERSION in meta
 
-    # Legacy initialize handshake — selects legacy semantics regardless of _meta.
+    # A body that DECLARES the modern era (params._meta carries io.modelcontextprotocol/protocolVersion)
+    # has NO `initialize` handshake: the 2026-07-28 revision is stateless and removed it. Serving such a
+    # request as the legacy handshake below would negotiate a legacy version and (over HTTP) mint a legacy
+    # Mcp-Session-Id for a client that declared modern — a contradictory state its own modern GET/DELETE
+    # then 404/405 on (Codex r3949809506). Reject it here in the shared core, so the era is validated from
+    # the BODY regardless of transport or whether an HTTP MCP-Protocol-Version header was present.
+    if method == "initialize" and is_modern:
+        return _error(id_, -32601,
+                      "method not found: 'initialize' is the legacy (pre-2026-07-28) handshake; the "
+                      "stateless 2026-07-28 revision has no initialize (omit params._meta to use the "
+                      "legacy handshake)", {"declared": requested_version})
+
+    # Legacy initialize handshake — selects legacy semantics (the body did not declare the modern era).
     if method == "initialize":
         requested = params.get("protocolVersion")
         version = requested if requested in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0]

@@ -6294,6 +6294,28 @@ def t_mcp_http_delete_returns_promptly_during_long_dispatch():
         t.shutdown()
 
 
+def t_mcp_http_modern_meta_initialize_rejected_no_session():
+    # Codex r3949809506: an `initialize` body that DECLARES the modern era (params._meta protocolVersion
+    # 2026-07-28) has no handshake in that revision, so it must NOT be served as a legacy handshake -- even
+    # with NO MCP-Protocol-Version header (the header-keyed era checks are skipped then, so the body-declared
+    # era must be validated in the shared core). handle() now rejects it (-32601), so no legacy session is
+    # minted. Fails on 3c0ee23 (200 + negotiated 2025-06-18 result + an Mcp-Session-Id).
+    t, port = _http_transport()
+    try:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                                "io.modelcontextprotocol/clientCapabilities": {}},
+                                      "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}})
+        s, b, h = _http_post(port, body, {})                       # NO MCP-Protocol-Version header
+        assert s == 200, (s, b[:200])                              # a JSON-RPC error still rides a 200
+        assert "mcp-session-id" not in h, h                        # no legacy session for a modern-declared init
+        resp = json.loads(b)
+        assert resp.get("error", {}).get("code") == -32601, resp
+        assert "result" not in resp, resp
+    finally:
+        t.shutdown()
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
