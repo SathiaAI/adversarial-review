@@ -1036,6 +1036,20 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         # fine (the modern per-request _meta path negotiates in-band); a present-but-unsupported version
         # is rejected (closed 400) with what we speak. GET/DELETE run this too, not just POST — a bogus
         # pinned version must not slip through the session verbs.
+        #
+        # MCP-Protocol-Version is a SINGLETON control header, but a client/intermediary may split or repeat
+        # it across field lines (RFC 9110 §5.3). self.headers.get() reads only the FIRST, so a contradictory
+        # LATER value — `2025-06-18` then `1999-01-01`, or a legacy value then the modern revision — would
+        # bypass this check and the downstream session-version binding, which read the first value too (Codex
+        # r3952163012, reproduced as an initialize with a smuggled second version getting 200 + a session).
+        # Reject when the header carries more than one DISTINCT value: an ambiguous pin must not be silently
+        # resolved to whichever line came first. Identical repeats are harmless (get()'s first value equals
+        # the rest) and pass, so a benign duplicating intermediary is tolerated.
+        vals = self.headers.get_all("MCP-Protocol-Version")
+        if vals and len({v.strip() for v in vals}) > 1:
+            self._json(400, {"error": "conflicting MCP-Protocol-Version headers",
+                             "supportedVersions": list(ALL_PROTOCOLS)})
+            return False
         pv = self.headers.get("MCP-Protocol-Version")
         if pv is not None and pv not in ALL_PROTOCOLS:
             self._json(400, {"error": "unsupported MCP-Protocol-Version",

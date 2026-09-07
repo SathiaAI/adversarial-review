@@ -6022,6 +6022,54 @@ def t_mcp_http_discover_omits_modern_in_strict_mode():
         t2.shutdown()
 
 
+def t_mcp_http_rejects_conflicting_protocol_version_headers():
+    # Codex (PR #54) r3952163012: MCP-Protocol-Version is a SINGLETON control header, but a client/
+    # intermediary may split or repeat it across field lines. self.headers.get() reads only the FIRST, so a
+    # contradictory LATER value bypassed _protocol_ok and the downstream session-version binding (Codex
+    # reproduced initialize 2025-06-18 then 1999-01-01 getting 200 + a session). _protocol_ok now rejects
+    # (400) when the header carries more than one DISTINCT value, on every verb; identical repeats still
+    # pass. On the base commit the two-distinct-line requests return 200 -> this fails there.
+    import socket
+
+    def raw_post_two_pv(port, pv1, pv2, body):
+        b = body.encode("utf-8")
+        req = (b"POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+               b"Content-Type: application/json\r\n"
+               b"MCP-Protocol-Version: " + pv1.encode("ascii") + b"\r\n"
+               b"MCP-Protocol-Version: " + pv2.encode("ascii") + b"\r\n"
+               b"Content-Length: " + str(len(b)).encode("ascii") + b"\r\n\r\n" + b)
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            s.sendall(req)
+            s.settimeout(5)
+            data = b""
+            while True:
+                try:
+                    chunk = s.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            s.close()
+        return int(data.split(b" ", 2)[1]) if data.startswith(b"HTTP/") else 0
+
+    init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                  "clientInfo": {"name": "t", "version": "0"}}})
+    t, port = _http_transport()
+    try:
+        # two DISTINCT version lines -> 400: the contradictory second value can no longer be smuggled past
+        assert raw_post_two_pv(port, "2025-06-18", "1999-01-01", init) == 400, "distinct pv lines must 400"
+        # a legacy value then the modern revision is likewise contradictory -> 400
+        assert raw_post_two_pv(port, "2025-06-18", "2026-07-28", init) == 400, "legacy+modern pv must 400"
+        # identical repeats are harmless (get()'s first == the rest) -> a valid initialize still succeeds
+        assert raw_post_two_pv(port, "2025-06-18", "2025-06-18", init) == 200, "identical repeats must pass"
+    finally:
+        t.shutdown()
+
+
 def t_mcp_http_get_revalidates_session_before_streaming():
     # Codex r3941957879 (TOCTOU): the window between the session check and committing the 200 lets a
     # concurrent DELETE terminate the session, after which the stream must NOT emit 200 + ": connected".
