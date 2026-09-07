@@ -45,6 +45,7 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -174,17 +175,40 @@ def _opt_authorizer(args):
     return v.strip()  # normalize: an audit authorizer must not carry incidental surrounding whitespace
 
 
-def _add_confined_catalog(args, argv):
-    """Validate and forward an optional catalog_file. Confined to a relative path inside the
-    working tree so a crafted value cannot make the CLI read an arbitrary file: no traversal,
-    no POSIX-absolute path, and no Windows-absolute path (drive letter or backslash/UNC).
+# Ceiling on a snapshotted catalog_file (see _snapshot_confined_catalog). A real model catalog is well
+# under a megabyte; this is generous headroom while still refusing a multi-gigabyte DoS file.
+_CATALOG_MAX_BYTES = 16 * 1024 * 1024
 
-    Returns the validated CANONICAL target (a resolved, symlink-free Path) and forwards THAT path to
-    panel.py, so every consumer opens the SAME already-checked file — the in-process loader
-    (_require_loadable_catalog) and the panel.py subprocess both use it. Forwarding the resolved path
-    rather than the mutable relative `cf` closes the check-to-open race in which a re-resolution of `cf`
-    could follow an in-tree symlink swapped AFTER validation to an external file (CodeRabbit
-    r3950286015). Returns None when no catalog was supplied."""
+
+def _cleanup_snapshot(snapshot):
+    """Best-effort removal of the private catalog snapshot _snapshot_confined_catalog created. The caller
+    invokes this in a finally once the panel subprocess (which reads the snapshot synchronously within
+    _cli_result) has returned — on every path: success, rejection, or timeout."""
+    if snapshot is not None:
+        try:
+            snapshot.unlink()
+        except OSError:
+            pass
+
+
+def _snapshot_confined_catalog(args, argv):
+    """Validate an optional catalog_file, COPY it to a private server-owned snapshot, and forward the
+    SNAPSHOT (not the caller's path) to panel.py. Returns the snapshot Path — the caller MUST remove it
+    once the panel subprocess has finished (see _cleanup_snapshot) — or None when no catalog was supplied.
+
+    Confinement (below) proves the catalog is a relative path inside the working tree: no traversal, no
+    POSIX-absolute path, no Windows-absolute path (drive letter or backslash/UNC), and no symlink whose
+    target escapes the tree. But confinement alone is not enough, because every consumer that opens the
+    catalog BY PATH reopens an attacker-controllable location: the in-process loadable check and the
+    panel.py subprocess both do, and panel.py reloads it lazily on reviewer substitution. A symlink
+    swapped at that path AFTER validation would redirect either open outside the tree (or to a FIFO that
+    blocks), and a catalog that aliases any file the run itself writes (context.md, sample_policy.json, ...)
+    is destroyed before the substitution reload. So rather than forward the path, open the validated file
+    ONCE through a race-safe descriptor and copy its bytes to a private snapshot the server owns; both
+    consumers read THAT, which no repo or run activity can change. This closes the check-to-open race and
+    removes the need to enumerate every run-written destination (CodeRabbit r3950684588 / Codex
+    r3950590290 — superseding the r3950286015 canonical-path forwarding and the r3946169158 context.md
+    alias check, both of which still reopened by path)."""
     cf = args.get("catalog_file")
     if cf is None:
         return None
@@ -192,55 +216,68 @@ def _add_confined_catalog(args, argv):
             or cf.startswith(("/", "\\")) or "\\" in cf or _DRIVE_RE.match(cf)):
         raise ToolError("catalog_file must be a relative path within the repository "
                         "(no traversal, no absolute or drive-letter path, no backslashes)")
-    # The string checks above stop only lexical escapes. A relative path can still be a symlink
-    # whose target lives outside the tree, so resolve it (following symlinks) and confirm it
-    # stays within the working directory before handing it to panel.py — otherwise a crafted
-    # symlink could make the CLI read an arbitrary file.
+    # Lexical checks stop only textual escapes; a relative path can still be a symlink whose target lives
+    # outside the tree, so resolve it (following symlinks) and confirm it stays within the working tree.
     root = Path.cwd().resolve()
     target = (root / cf).resolve()
     if target != root and root not in target.parents:
         raise ToolError("catalog_file must resolve to a path within the repository "
                         "(its symlink target escapes the working tree)")
-    argv.extend(["--catalog-file", str(target)])
-    return target
-
-
-# Ceiling on an in-process-loaded catalog_file (see _require_loadable_catalog). A real model catalog is
-# well under a megabyte; this is generous headroom while still refusing a multi-gigabyte DoS file.
-_CATALOG_MAX_BYTES = 16 * 1024 * 1024
-
-
-def _require_loadable_catalog(canonical):
-    """A confined catalog forwarded by h_panel_run must also be LOADABLE before context.md is
-    overwritten. panel.py loads it lazily (on reviewer substitution), AFTER the write, so a confined-
-    but-unusable catalog (missing, unreadable, malformed, or empty after family filtering) would
-    leave completed reviewer reports paired with a freshly-written context on a call the host was
-    told failed. Validate with panel.py's OWN loader so the check never drifts from the run's filter;
-    a file argument takes load_catalog's no-network path. `canonical` is the resolved path
-    _add_confined_catalog returned (None when no catalog) — the SAME path panel.py opens."""
-    if canonical is None:
-        return
-    # Confinement proves WHERE the catalog is, not WHAT it is. A confined path can still be a
-    # NON-REGULAR file — a FIFO/device — and load_catalog opens it IN-PROCESS, on a path that no
-    # _run_cli timeout guards, so opening a FIFO would block the server forever waiting for a writer.
-    # Require a regular file first (is_file() stats without opening, so it never blocks; only open()
-    # on a FIFO does), so untrusted repo content cannot hang ar_panel_run. (Codex, fc4a701.)
-    if not canonical.is_file():
-        raise ToolError("catalog_file must be a regular file")
-    # Bound the in-process read (Codex r3946169157): load_catalog reads and parses the whole file with no
-    # _run_cli timeout, so a crafted multi-gigabyte but regular catalog could stall or exhaust memory before
-    # parsing. Reject by size first, stat()-only (never opening the file). A real model catalog is well
-    # under a megabyte; _CATALOG_MAX_BYTES is generous.
+    # Open the resolved path race-safely, then copy from the OPEN descriptor so no consumer ever reopens
+    # the caller's path. O_NOFOLLOW turns a final-component symlink swapped in after resolution into an
+    # error instead of an out-of-tree read; O_NONBLOCK keeps the open from blocking on a FIFO (so the
+    # fstat below rejects it rather than the read hanging with no _run_cli timeout to guard it); fstat on
+    # the descriptor itself — never a separate stat — proves a regular file and bounds the size with no
+    # TOCTOU. (O_NOFOLLOW/O_NONBLOCK/O_BINARY are absent on some platforms; getattr(...,0) makes them
+    # no-ops there, where resolve() has already stripped symlinks.)
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
     try:
-        size = canonical.stat().st_size
+        fd = os.open(str(target), flags)
     except OSError as e:
-        raise ToolError(f"catalog_file could not be stat'd: {e}") from e
-    if size > _CATALOG_MAX_BYTES:
-        raise ToolError(f"catalog_file is too large ({size} bytes > {_CATALOG_MAX_BYTES}) — a model "
-                        "catalog is far smaller; refusing to load it in-process")
+        raise ToolError(f"catalog_file could not be opened safely: {e}") from e
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ToolError("catalog_file must be a regular file")
+        if info.st_size > _CATALOG_MAX_BYTES:
+            raise ToolError(f"catalog_file is too large ({info.st_size} bytes > {_CATALOG_MAX_BYTES}) — a "
+                            "model catalog is far smaller; refusing to load it")
+        sfd, spath = tempfile.mkstemp(prefix="ar-catalog-", suffix=".json")
+        snapshot = Path(spath)
+        try:
+            remaining = info.st_size
+            while remaining > 0:
+                chunk = os.read(fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                os.write(sfd, chunk)
+                remaining -= len(chunk)
+            os.close(sfd)
+        except BaseException:
+            os.close(sfd)
+            _cleanup_snapshot(snapshot)
+            raise
+    finally:
+        os.close(fd)
+    argv.extend(["--catalog-file", str(snapshot)])
+    return snapshot
+
+
+def _require_loadable_snapshot(snapshot):
+    """A snapshotted catalog forwarded by h_panel_run must also be LOADABLE before context.md is
+    overwritten. panel.py loads it lazily (on reviewer substitution), AFTER the write, so a usable-looking
+    but unloadable catalog (malformed, or empty after family filtering) would otherwise leave completed
+    reviewer reports paired with a freshly-written context on a call the host was told failed. Validate
+    with panel.py's OWN loader so the check never drifts from the run's filter; a file argument takes
+    load_catalog's no-network path. `snapshot` is the private path _snapshot_confined_catalog returned
+    (None when no catalog) — already a server-owned regular file within the size cap, so only loadability
+    is left to decide here."""
+    if snapshot is None:
+        return
     try:
         from panel import load_catalog
-        load_catalog(str(canonical))
+        load_catalog(str(snapshot))
     except (Exception, SystemExit):  # SystemExit = panel's die() on an empty-after-filter catalog
         raise ToolError("catalog_file is not a usable model catalog "
                         "(missing, unreadable, malformed, or empty after filtering)")
@@ -485,8 +522,15 @@ def h_panel_assign(args):
     auth = _opt_authorizer(args)
     if auth:
         argv += ["--authorized-by", auth]
-    _add_confined_catalog(args, argv)
-    return _cli_result("panel", argv, timeout=300)
+    # panel.py assign opens the catalog_file (to resolve the reviewer pool when the live /models catalog
+    # is unavailable), so forward a private snapshot rather than the caller's path — same race-safety as
+    # h_panel_run — and remove it once the subprocess has read it.
+    snapshot = None
+    try:
+        snapshot = _snapshot_confined_catalog(args, argv)
+        return _cli_result("panel", argv, timeout=300)
+    finally:
+        _cleanup_snapshot(snapshot)
 
 
 def _run_context_path(run_args):
@@ -516,29 +560,6 @@ def _write_context(run_args, context):
     return str(cf)
 
 
-def _reject_context_alias(canonical, context_path):
-    """Refuse a catalog whose resolved path ALIASES the run's context.md (Codex r3946169158).
-    _write_context overwrites <run>/context.md immediately after catalog validation, so a catalog that
-    resolves to that same file — named directly, or via an in-tree symlink — is validated and then
-    destroyed by the write, after which panel.py's substitution reload fails on the now-context bytes.
-    A hardlink (same inode, distinct path) is caught too when the target already exists (skipped where
-    st_ino is unavailable). `canonical` is the already-resolved catalog path (None when no catalog)."""
-    if canonical is None:
-        return
-    ctx_resolved = context_path.resolve()
-    if canonical == ctx_resolved:
-        raise ToolError("catalog_file must not be the run's context.md — it is overwritten with the "
-                        "review context and would no longer be a usable catalog")
-    try:
-        if context_path.exists():
-            cs, xs = canonical.stat(), ctx_resolved.stat()
-            if cs.st_ino != 0 and (cs.st_ino, cs.st_dev) == (xs.st_ino, xs.st_dev):
-                raise ToolError("catalog_file must not be hardlinked to the run's context.md — it is "
-                                "overwritten with the review context")
-    except OSError:
-        pass
-
-
 def h_panel_prepare(args):
     run_args = _safe_run(args)
     context = _req_str(args, "context")
@@ -549,33 +570,27 @@ def h_panel_prepare(args):
 def h_panel_run(args):
     run_args = _safe_run(args)
     context = _req_str(args, "context")
-    # Validate the optional catalog_file BEFORE persisting context: _write_context overwrites
-    # <run>/context.md, and a rejected call must not mutate the audit record (which would leave any
-    # completed reviewer reports paired with a freshly-overwritten context). Collect the confined
-    # catalog args first so an escaping value raises before the write; the CLI argv is then built in
-    # the original order. Forward the same confined catalog the assign step may have used: when the
-    # router cannot serve /models, a reviewer failure makes panel.py run reload the catalog to pick
-    # its mandated substitute — without this it would attempt the unavailable live catalog and block.
+    # Snapshot the optional catalog_file to a private server-owned path BEFORE persisting context, and
+    # forward the snapshot to panel.py. Snapshotting before the write means a rejected/escaping catalog
+    # raises before _write_context mutates the audit record, and it decouples the catalog from both the
+    # later by-path reopen and any run-written file it might alias (context.md, sample_policy.json, ...),
+    # so no separate context.md-alias check is needed. Forward it because, when the router cannot serve
+    # /models, a reviewer failure makes panel.py run reload the catalog to pick its mandated substitute.
     catalog_argv = []
-    canonical_cat = _add_confined_catalog(args, catalog_argv)   # resolved path (or None), also forwarded
-    # Confinement proves only WHERE the catalog is; also require it to be LOADABLE before persisting
-    # context, so a confined-but-unusable catalog cannot mutate the audit record on a rejected call.
-    _require_loadable_catalog(canonical_cat)
-    # ...and its resolved path must not ALIAS the server-controlled context.md the write below overwrites
-    # (Codex r3946169158): validation would pass on bytes the write then destroys. Resolve the context path
-    # the same way _write_context will; if the run cannot be resolved yet, _write_context raises that below.
-    if canonical_cat is not None:
-        try:
-            _ctx = _run_context_path(run_args)
-        except ToolError:
-            _ctx = None
-        if _ctx is not None:
-            _reject_context_alias(canonical_cat, _ctx)
-    cf = _write_context(run_args, context)
-    argv = ["run"] + run_args + ["--context-file", cf] + catalog_argv
-    if args.get("force"):
-        argv.append("--force")
-    return _cli_result("panel", argv, timeout=_panel_timeout())
+    snapshot = None
+    try:
+        snapshot = _snapshot_confined_catalog(args, catalog_argv)
+        # The snapshot must also be LOADABLE before persisting context, so an unusable catalog cannot
+        # mutate the audit record on a rejected call.
+        _require_loadable_snapshot(snapshot)
+        cf = _write_context(run_args, context)
+        argv = ["run"] + run_args + ["--context-file", cf] + catalog_argv
+        if args.get("force"):
+            argv.append("--force")
+        return _cli_result("panel", argv, timeout=_panel_timeout())
+    finally:
+        # panel.py has read the snapshot synchronously within _cli_result by the time control reaches here.
+        _cleanup_snapshot(snapshot)
 
 
 def h_panel_ingest(args):

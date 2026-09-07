@@ -6245,77 +6245,66 @@ def t_mcp_panel_run_validates_catalog_loadable_before_writing_context():
 
 
 def t_mcp_catalog_file_size_capped():
-    # Codex r3946169157: _require_loadable_catalog must reject an oversized REGULAR catalog by SIZE before
-    # load_catalog reads and parses it in-process (a path no _run_cli timeout guards). Small files pass the
-    # size gate and are then judged on loadability. On a57bb8f there is no size cap (the symbol is absent).
+    # fix-32 (Codex r3946169157, now enforced in the snapshot path): _snapshot_confined_catalog rejects an
+    # oversized REGULAR catalog by SIZE (fstat on the OPEN descriptor) BEFORE copying it, so a crafted
+    # multi-gigabyte catalog is never read into a snapshot. A small file passes the size gate and is
+    # snapshotted. On base 947241e the symbol is absent -> the test fails there.
     repo = Path(tempfile.mkdtemp(prefix="ar-bigcat-"))
     cwd0 = os.getcwd()
     orig_cap = mcpsrv._CATALOG_MAX_BYTES        # absent on base -> AttributeError -> fails there
     mcpsrv._CATALOG_MAX_BYTES = 128
     os.chdir(repo)
+    snap = None
     try:
         (repo / "big.json").write_text("x" * 512, encoding="utf-8")   # regular, over the (test) cap
         raised = False
         try:
-            # _require_loadable_catalog now takes the RESOLVED path _add_confined_catalog returned (fix-31),
-            # so hand it a canonical Path, not the mutable relative string.
-            mcpsrv._require_loadable_catalog((repo / "big.json").resolve())
+            mcpsrv._snapshot_confined_catalog({"catalog_file": "big.json"}, [])
         except mcpsrv.ToolError as e:
             raised = True
             assert "too large" in str(e), e
-        assert raised, "an oversized catalog_file must be rejected by size before loading"
-        # a small file passes the size gate and is rejected later for a DIFFERENT reason (not usable)
+        assert raised, "an oversized catalog_file must be rejected by size before snapshotting"
+        # a small file passes the size gate and is snapshotted (WHERE/WHAT settled here; loadability separate)
         (repo / "small.json").write_text("not a catalog", encoding="utf-8")
-        try:
-            mcpsrv._require_loadable_catalog((repo / "small.json").resolve())
-            assert False, "expected a loadability rejection"
-        except mcpsrv.ToolError as e:
-            assert "too large" not in str(e), e
+        argv = []
+        snap = mcpsrv._snapshot_confined_catalog({"catalog_file": "small.json"}, argv)
+        assert snap is not None and snap.is_file(), snap
+        assert argv == ["--catalog-file", str(snap)], argv
     finally:
+        mcpsrv._cleanup_snapshot(snap)
         mcpsrv._CATALOG_MAX_BYTES = orig_cap
         os.chdir(cwd0)
 
 
-def t_mcp_catalog_file_aliasing_context_rejected():
-    # Codex r3946169158: a catalog_file that ALIASES the run's context.md (named directly, or via an in-tree
-    # symlink) is validated and then destroyed when _write_context overwrites context.md, so h_panel_run
-    # rejects it via _reject_context_alias before the write. Unit-check the guard (and _run_context_path).
-    # Both symbols are absent on a57bb8f -> the test fails there.
-    repo = Path(tempfile.mkdtemp(prefix="ar-alias-"))
-    rundir = repo / ".adversarial-review" / "run-20260101-010101"
-    rundir.mkdir(parents=True)
-    (rundir / "context.md").write_text("planted", encoding="utf-8")
+def t_mcp_catalog_snapshot_decouples_from_source():
+    # fix-32 / CodeRabbit r3950684588 + Codex r3950590290: _snapshot_confined_catalog copies the validated
+    # catalog to a PRIVATE server-owned snapshot OUTSIDE the tree and forwards THAT, so no consumer reopens
+    # the caller's path. This closes the check-to-open race AND removes any need to reject a catalog that
+    # aliases a run-written file (context.md, sample_policy.json, ...): a later overwrite of the source can
+    # never reach the snapshot. Proves (a) the forwarded path is the snapshot, outside the repo; (b) it is a
+    # faithful copy; (c) mutating then deleting the source afterward leaves the snapshot intact. Absent-symbol
+    # on base 947241e -> fails there.
+    repo = Path(tempfile.mkdtemp(prefix="ar-snap-"))
+    (repo / "catalogs").mkdir()
+    src = repo / "catalogs" / "cat.json"
+    src.write_text(json.dumps({"data": [{"id": "openai/gpt-4o"}]}), encoding="utf-8")
     cwd0 = os.getcwd()
     os.chdir(repo)
+    snap = None
     try:
-        ctx_path = mcpsrv._run_context_path(["--run", "run-20260101-010101"])   # absent on base
-        raised = False
-        try:
-            # _reject_context_alias now takes the RESOLVED catalog path _add_confined_catalog returned
-            # (fix-31), so hand it canonical Paths, not the mutable relative strings.
-            mcpsrv._reject_context_alias((rundir / "context.md").resolve(), ctx_path)
-        except mcpsrv.ToolError as e:
-            raised = True
-            assert "context.md" in str(e), e
-        assert raised, "a catalog_file naming context.md must be rejected"
-        # an in-tree SYMLINK to context.md is an alias too (skip where symlinks are not permitted).
-        # The resolved path _add_confined_catalog would forward follows the link to context.md.
-        try:
-            (repo / "cat-link.json").symlink_to(rundir / "context.md")
-        except (OSError, NotImplementedError):
-            pass
-        else:
-            raised2 = False
-            try:
-                mcpsrv._reject_context_alias((repo / "cat-link.json").resolve(), ctx_path)
-            except mcpsrv.ToolError as e:
-                raised2 = True
-                assert "context.md" in str(e), e
-            assert raised2, "a symlink catalog_file aliasing context.md must be rejected"
-        # a genuinely distinct catalog passes the guard (returns None, does not raise)
-        (repo / "real.json").write_text("{}", encoding="utf-8")
-        mcpsrv._reject_context_alias((repo / "real.json").resolve(), ctx_path)
+        argv = []
+        snap = mcpsrv._snapshot_confined_catalog({"catalog_file": "catalogs/cat.json"}, argv)
+        # (a) the forwarded path IS the snapshot, and it lives OUTSIDE the repo tree
+        assert "--catalog-file" in argv and argv[argv.index("--catalog-file") + 1] == str(snap), argv
+        assert repo.resolve() not in snap.resolve().parents, snap
+        # (b) faithful copy of the source bytes
+        assert json.loads(snap.read_text(encoding="utf-8")) == {"data": [{"id": "openai/gpt-4o"}]}
+        # (c) mutating then deleting the source does not touch the snapshot
+        src.write_text("{}", encoding="utf-8")
+        src.unlink()
+        assert json.loads(snap.read_text(encoding="utf-8"))["data"][0]["id"] == "openai/gpt-4o", snap
     finally:
+        mcpsrv._cleanup_snapshot(snap)
         os.chdir(cwd0)
 
 
@@ -6358,39 +6347,66 @@ def t_mcp_catalog_file_confined_cross_platform():
         res = r["result"]
         assert res["isError"] and "catalog_file must be a relative path" \
             in res["content"][0]["text"], (bad, res)
-    cap = []
-    orig = _patch_run_cli(0, out="ok", capture=cap)
+    # control: a real in-tree catalog is snapshotted and the SNAPSHOT (not the source) is forwarded to
+    # panel.py assign, then removed after the subprocess returns (fix-32).
+    repo = Path(tempfile.mkdtemp(prefix="ar-assign-fwd-"))
+    (repo / "catalogs").mkdir()
+    body = json.dumps({"data": [{"id": "openai/gpt-4o"}]})
+    (repo / "catalogs" / "cat.json").write_text(body, encoding="utf-8")
+    cap = {}
+
+    def fake(module, argv, timeout=120):
+        cap["argv"] = list(argv)
+        p = argv[argv.index("--catalog-file") + 1]
+        cap["path"] = p
+        cap["content"] = Path(p).read_text(encoding="utf-8")   # the snapshot exists during the call
+        return (0, "ok", "")
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    cwd0 = os.getcwd()
+    os.chdir(repo)
     try:
         mcpsrv.h_panel_assign({"catalog_file": "catalogs/cat.json"})
-        argv = cap[-1]["argv"]
-        # fix-31: the RESOLVED (canonical) path is forwarded, not the mutable relative "catalogs/cat.json"
-        assert "--catalog-file" in argv, cap
-        assert str((Path.cwd() / "catalogs" / "cat.json").resolve()) in argv, cap
+        assert "--catalog-file" in cap["argv"], cap
+        assert cap["content"] == body, cap                            # snapshot copied the source faithfully
+        assert Path(cap["path"]).name.startswith("ar-catalog-"), cap  # a private snapshot, not the source
+        assert cap["path"] != str((repo / "catalogs" / "cat.json").resolve()), cap
+        assert not Path(cap["path"]).exists(), cap["path"]            # removed after h_panel_assign returned
     finally:
+        os.chdir(cwd0)
         mcpsrv._run_cli = orig
 
 
 def t_mcp_panel_run_forwards_catalog_file():
-    # ar_panel_run forwards the confined catalog_file so a reviewer substitution can resolve
-    # when the live catalog is unavailable; a bad path is rejected here too. The catalog must be a
-    # LOADABLE model catalog now (see t_mcp_panel_run_validates_catalog_loadable_before_writing_context),
-    # so point it at a real one on disk.
+    # fix-32: ar_panel_run snapshots the confined catalog_file and forwards the SNAPSHOT (so a reviewer
+    # substitution resolves from a stable server-owned copy), then removes it after the subprocess. A bad
+    # path is still rejected. The catalog must be LOADABLE (it goes through _require_loadable_snapshot), so
+    # point it at a real one on disk.
     repo = Path(tempfile.mkdtemp(prefix="ar-panelrun-fwd-"))
     (repo / "catalogs").mkdir()
-    (repo / "catalogs" / "cat.json").write_text(
-        json.dumps({"data": [{"id": "openai/gpt-4o"}]}), encoding="utf-8")
-    cap = []
-    orig_cli = _patch_run_cli(0, out="ok", capture=cap)
+    body = json.dumps({"data": [{"id": "openai/gpt-4o"}]})
+    (repo / "catalogs" / "cat.json").write_text(body, encoding="utf-8")
+    cap = {}
+
+    def fake(module, argv, timeout=120):
+        cap["argv"] = list(argv)
+        p = argv[argv.index("--catalog-file") + 1]
+        cap["path"] = p
+        cap["content"] = Path(p).read_text(encoding="utf-8")   # snapshot exists during the subprocess call
+        return (0, "ok", "")
+    orig_cli = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
     orig_ctx = mcpsrv._write_context
     mcpsrv._write_context = lambda run_args, ctx: "context.md"
     cwd0 = os.getcwd()
     os.chdir(repo)
     try:
         mcpsrv.h_panel_run({"context": "diff", "catalog_file": "catalogs/cat.json"})
-        argv = cap[-1]["argv"]
-        assert "--catalog-file" in argv, argv
-        fwd = argv[argv.index("--catalog-file") + 1]
-        assert fwd == str((repo / "catalogs" / "cat.json").resolve()), fwd   # canonical, not the mutable rel path
+        assert "--catalog-file" in cap["argv"], cap
+        assert cap["content"] == body, cap                            # snapshot copied the source
+        assert Path(cap["path"]).name.startswith("ar-catalog-"), cap  # a private snapshot, not the source
+        assert cap["path"] != str((repo / "catalogs" / "cat.json").resolve()), cap
+        assert not Path(cap["path"]).exists(), cap["path"]            # cleaned up after run returned
         try:
             mcpsrv.h_panel_run({"context": "diff", "catalog_file": "C:\\x.json"})
             assert False, "expected ToolError for a Windows-absolute catalog path"
@@ -6404,8 +6420,8 @@ def t_mcp_panel_run_forwards_catalog_file():
 
 def t_mcp_catalog_file_rejects_symlink_escape():
     # A relative catalog_file that passes the string checks but is a SYMLINK whose target lives
-    # outside the tree must still be rejected — resolving it escapes the repo, so panel.py must
-    # never be handed it. A real in-tree file is still accepted (control).
+    # outside the tree must still be rejected — resolving it escapes the repo, so it is never opened
+    # or snapshotted. A real in-tree file is still accepted (control: snapshotted, snapshot forwarded).
     outside = Path(tempfile.mkdtemp(prefix="ar-outside-"))
     (outside / "secret.json").write_text("{}")
     repo = Path(tempfile.mkdtemp(prefix="ar-repo-"))
@@ -6416,36 +6432,36 @@ def t_mcp_catalog_file_rejects_symlink_escape():
         return  # platform/user without symlink privilege -> nothing to assert here
     cwd0 = os.getcwd()
     os.chdir(repo)
+    snap = None
     try:
         argv = []
         raised = False
         try:
-            mcpsrv._add_confined_catalog({"catalog_file": "evil.json"}, argv)
+            mcpsrv._snapshot_confined_catalog({"catalog_file": "evil.json"}, argv)
         except mcpsrv.ToolError as e:
             raised = True
             assert "escapes the working tree" in str(e), e
         assert raised and argv == [], "symlink-escaping catalog_file must be rejected"
-        # control: a real file INSIDE the tree resolves within cwd and is forwarded. fix-31: the
-        # RESOLVED (canonical) path is both returned and forwarded, not the mutable relative "ok.json".
+        # control: a real in-tree file is snapshotted; the forwarded path is the private snapshot (outside
+        # the repo), not the in-tree source.
         (repo / "ok.json").write_text("{}")
         argv2 = []
-        ret = mcpsrv._add_confined_catalog({"catalog_file": "ok.json"}, argv2)
-        resolved_ok = (repo / "ok.json").resolve()
-        assert ret == resolved_ok, ret
-        assert argv2 == ["--catalog-file", str(resolved_ok)], argv2
+        snap = mcpsrv._snapshot_confined_catalog({"catalog_file": "ok.json"}, argv2)
+        assert argv2 == ["--catalog-file", str(snap)], argv2
+        assert snap.is_file() and repo.resolve() not in snap.resolve().parents, snap
     finally:
+        mcpsrv._cleanup_snapshot(snap)
         os.chdir(cwd0)
 
 
-def t_mcp_catalog_validation_binds_to_resolved_path_not_symlink():
-    # fix-31 / CodeRabbit r3950286015 (TOCTOU): _add_confined_catalog must RETURN the validated canonical
-    # target and forward THAT to panel.py, so a later re-resolution of the mutable relative path cannot
-    # follow an in-tree symlink swapped AFTER validation to an external file. Validate an in-tree symlink,
-    # then swap it to point outside, and confirm the returned/forwarded path still names the original
-    # in-tree file. On base a57bb8f _add_confined_catalog returns None and forwards the relative
-    # "link.json", which re-resolves to the external target after the swap -> this test fails there.
+def t_mcp_catalog_snapshot_survives_symlink_swap():
+    # fix-32 / CodeRabbit r3950684588 (supersedes the fix-31 canonical-forwarding regression): the snapshot
+    # is copied from a race-safe descriptor, so a symlink swapped at the source to an EXTERNAL target AFTER
+    # validation cannot redirect any consumer — they read the snapshot, taken before the swap. An in-tree
+    # symlink is a valid source (resolved, then snapshotted). On base 947241e _snapshot_confined_catalog is
+    # absent -> this test fails there.
     outside = Path(tempfile.mkdtemp(prefix="ar-toctou-out-"))
-    (outside / "secret.json").write_text("{}", encoding="utf-8")
+    (outside / "secret.json").write_text(json.dumps({"data": [{"id": "external/model"}]}), encoding="utf-8")
     repo = Path(tempfile.mkdtemp(prefix="ar-toctou-repo-"))
     (repo / "catalogs").mkdir()
     (repo / "catalogs" / "real.json").write_text(
@@ -6457,23 +6473,19 @@ def t_mcp_catalog_validation_binds_to_resolved_path_not_symlink():
         return  # no symlink privilege -> nothing to assert
     cwd0 = os.getcwd()
     os.chdir(repo)
+    snap = None
     try:
-        in_tree = (repo / "catalogs" / "real.json").resolve()
         argv = []
-        ret = mcpsrv._add_confined_catalog({"catalog_file": "link.json"}, argv)
-        # the resolved in-tree target is returned and forwarded (base returns None -> fails here)
-        assert ret == in_tree, ret
-        fwd = argv[argv.index("--catalog-file") + 1]
-        assert fwd == str(in_tree), fwd
+        snap = mcpsrv._snapshot_confined_catalog({"catalog_file": "link.json"}, argv)
         # swap the symlink to point OUTSIDE the tree, simulating the post-validation race
         link.unlink()
         link.symlink_to(outside / "secret.json")
-        # the forwarded path must STILL name the in-tree file: re-resolving it must not reach the
-        # external target (it is already the resolved regular file, not the swappable symlink)
-        assert Path(fwd).resolve() == in_tree, Path(fwd).resolve()
-        assert Path(fwd).resolve() != (outside / "secret.json").resolve(), \
-            "forwarded catalog path followed the post-validation symlink swap to an external file"
+        # the snapshot still holds the IN-TREE bytes; the external target is never read
+        got = json.loads(snap.read_text(encoding="utf-8"))
+        assert got == {"data": [{"id": "openai/gpt-4o"}]}, got
+        assert got != json.loads((outside / "secret.json").read_text(encoding="utf-8"))
     finally:
+        mcpsrv._cleanup_snapshot(snap)
         os.chdir(cwd0)
 
 
@@ -7068,21 +7080,19 @@ def t_mcp_run_dir_rejects_trailing_newline_dir_name():
 
 
 def t_mcp_require_loadable_catalog_rejects_fifo():
-    # Codex(fc4a701): a catalog_file that is a FIFO passes confinement, and load_catalog opens it
-    # IN-PROCESS with no _run_cli timeout, so the server blocks forever waiting for a writer. The
-    # loadable check now rejects a non-regular file first (is_file() stats without opening, so it never
-    # blocks). Run in a SUBPROCESS with a timeout so the base (unfixed) hang is caught as a failure,
-    # not a hung suite.
+    # Codex(fc4a701), now enforced in the snapshot path: a catalog_file that is a FIFO must be rejected
+    # WITHOUT blocking. _snapshot_confined_catalog opens the resolved path O_NONBLOCK (so the FIFO open
+    # returns immediately instead of waiting for a writer) and fstat-rejects a non-regular file before any
+    # read. Run in a SUBPROCESS with a timeout so a regression that blocks is caught as a failure, not a
+    # hung suite.
     if not hasattr(os, "mkfifo"):
         return  # no FIFOs on this platform (Windows) -> nothing to assert here
     repo = Path(tempfile.mkdtemp(prefix="ar-fifo-"))
     os.mkfifo(repo / "catalog.json")
     script = (
         "import sys; sys.path.insert(0, %r); import mcp_server as m\n"
-        "from pathlib import Path\n"
         "try:\n"
-        # fix-31: _require_loadable_catalog now takes the resolved path _add_confined_catalog returned
-        "    m._require_loadable_catalog(Path('catalog.json').resolve()); print('NO_RAISE')\n"
+        "    m._snapshot_confined_catalog({'catalog_file': 'catalog.json'}, []); print('NO_RAISE')\n"
         "except m.ToolError as e:\n"
         "    print('REJECTED' if 'regular file' in str(e) else 'OTHER:' + str(e))\n"
         % str(SKILL / "scripts"))
@@ -7090,8 +7100,8 @@ def t_mcp_require_loadable_catalog_rejects_fifo():
         r = subprocess.run([sys.executable, "-c", script], cwd=str(repo),
                            capture_output=True, text=True, timeout=8)
     except subprocess.TimeoutExpired:
-        raise AssertionError("_require_loadable_catalog hung on a FIFO catalog_file — it must reject "
-                             "a non-regular file before opening it")
+        raise AssertionError("_snapshot_confined_catalog hung on a FIFO catalog_file — it must open "
+                             "non-blocking and reject a non-regular file before reading it")
     assert "REJECTED" in r.stdout, (r.stdout, r.stderr)
 
 
