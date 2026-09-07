@@ -6257,7 +6257,9 @@ def t_mcp_catalog_file_size_capped():
         (repo / "big.json").write_text("x" * 512, encoding="utf-8")   # regular, over the (test) cap
         raised = False
         try:
-            mcpsrv._require_loadable_catalog("big.json")
+            # _require_loadable_catalog now takes the RESOLVED path _add_confined_catalog returned (fix-31),
+            # so hand it a canonical Path, not the mutable relative string.
+            mcpsrv._require_loadable_catalog((repo / "big.json").resolve())
         except mcpsrv.ToolError as e:
             raised = True
             assert "too large" in str(e), e
@@ -6265,7 +6267,7 @@ def t_mcp_catalog_file_size_capped():
         # a small file passes the size gate and is rejected later for a DIFFERENT reason (not usable)
         (repo / "small.json").write_text("not a catalog", encoding="utf-8")
         try:
-            mcpsrv._require_loadable_catalog("small.json")
+            mcpsrv._require_loadable_catalog((repo / "small.json").resolve())
             assert False, "expected a loadability rejection"
         except mcpsrv.ToolError as e:
             assert "too large" not in str(e), e
@@ -6289,12 +6291,15 @@ def t_mcp_catalog_file_aliasing_context_rejected():
         ctx_path = mcpsrv._run_context_path(["--run", "run-20260101-010101"])   # absent on base
         raised = False
         try:
-            mcpsrv._reject_context_alias(".adversarial-review/run-20260101-010101/context.md", ctx_path)
+            # _reject_context_alias now takes the RESOLVED catalog path _add_confined_catalog returned
+            # (fix-31), so hand it canonical Paths, not the mutable relative strings.
+            mcpsrv._reject_context_alias((rundir / "context.md").resolve(), ctx_path)
         except mcpsrv.ToolError as e:
             raised = True
             assert "context.md" in str(e), e
         assert raised, "a catalog_file naming context.md must be rejected"
-        # an in-tree SYMLINK to context.md is an alias too (skip where symlinks are not permitted)
+        # an in-tree SYMLINK to context.md is an alias too (skip where symlinks are not permitted).
+        # The resolved path _add_confined_catalog would forward follows the link to context.md.
         try:
             (repo / "cat-link.json").symlink_to(rundir / "context.md")
         except (OSError, NotImplementedError):
@@ -6302,14 +6307,14 @@ def t_mcp_catalog_file_aliasing_context_rejected():
         else:
             raised2 = False
             try:
-                mcpsrv._reject_context_alias("cat-link.json", ctx_path)
+                mcpsrv._reject_context_alias((repo / "cat-link.json").resolve(), ctx_path)
             except mcpsrv.ToolError as e:
                 raised2 = True
                 assert "context.md" in str(e), e
             assert raised2, "a symlink catalog_file aliasing context.md must be rejected"
         # a genuinely distinct catalog passes the guard (returns None, does not raise)
         (repo / "real.json").write_text("{}", encoding="utf-8")
-        mcpsrv._reject_context_alias("real.json", ctx_path)
+        mcpsrv._reject_context_alias((repo / "real.json").resolve(), ctx_path)
     finally:
         os.chdir(cwd0)
 
@@ -6357,7 +6362,10 @@ def t_mcp_catalog_file_confined_cross_platform():
     orig = _patch_run_cli(0, out="ok", capture=cap)
     try:
         mcpsrv.h_panel_assign({"catalog_file": "catalogs/cat.json"})
-        assert "--catalog-file" in cap[-1]["argv"] and "catalogs/cat.json" in cap[-1]["argv"], cap
+        argv = cap[-1]["argv"]
+        # fix-31: the RESOLVED (canonical) path is forwarded, not the mutable relative "catalogs/cat.json"
+        assert "--catalog-file" in argv, cap
+        assert str((Path.cwd() / "catalogs" / "cat.json").resolve()) in argv, cap
     finally:
         mcpsrv._run_cli = orig
 
@@ -6379,7 +6387,10 @@ def t_mcp_panel_run_forwards_catalog_file():
     os.chdir(repo)
     try:
         mcpsrv.h_panel_run({"context": "diff", "catalog_file": "catalogs/cat.json"})
-        assert "--catalog-file" in cap[-1]["argv"] and "catalogs/cat.json" in cap[-1]["argv"], cap
+        argv = cap[-1]["argv"]
+        assert "--catalog-file" in argv, argv
+        fwd = argv[argv.index("--catalog-file") + 1]
+        assert fwd == str((repo / "catalogs" / "cat.json").resolve()), fwd   # canonical, not the mutable rel path
         try:
             mcpsrv.h_panel_run({"context": "diff", "catalog_file": "C:\\x.json"})
             assert False, "expected ToolError for a Windows-absolute catalog path"
@@ -6414,11 +6425,54 @@ def t_mcp_catalog_file_rejects_symlink_escape():
             raised = True
             assert "escapes the working tree" in str(e), e
         assert raised and argv == [], "symlink-escaping catalog_file must be rejected"
-        # control: a real file INSIDE the tree resolves within cwd and is forwarded
+        # control: a real file INSIDE the tree resolves within cwd and is forwarded. fix-31: the
+        # RESOLVED (canonical) path is both returned and forwarded, not the mutable relative "ok.json".
         (repo / "ok.json").write_text("{}")
         argv2 = []
-        mcpsrv._add_confined_catalog({"catalog_file": "ok.json"}, argv2)
-        assert argv2 == ["--catalog-file", "ok.json"], argv2
+        ret = mcpsrv._add_confined_catalog({"catalog_file": "ok.json"}, argv2)
+        resolved_ok = (repo / "ok.json").resolve()
+        assert ret == resolved_ok, ret
+        assert argv2 == ["--catalog-file", str(resolved_ok)], argv2
+    finally:
+        os.chdir(cwd0)
+
+
+def t_mcp_catalog_validation_binds_to_resolved_path_not_symlink():
+    # fix-31 / CodeRabbit r3950286015 (TOCTOU): _add_confined_catalog must RETURN the validated canonical
+    # target and forward THAT to panel.py, so a later re-resolution of the mutable relative path cannot
+    # follow an in-tree symlink swapped AFTER validation to an external file. Validate an in-tree symlink,
+    # then swap it to point outside, and confirm the returned/forwarded path still names the original
+    # in-tree file. On base a57bb8f _add_confined_catalog returns None and forwards the relative
+    # "link.json", which re-resolves to the external target after the swap -> this test fails there.
+    outside = Path(tempfile.mkdtemp(prefix="ar-toctou-out-"))
+    (outside / "secret.json").write_text("{}", encoding="utf-8")
+    repo = Path(tempfile.mkdtemp(prefix="ar-toctou-repo-"))
+    (repo / "catalogs").mkdir()
+    (repo / "catalogs" / "real.json").write_text(
+        json.dumps({"data": [{"id": "openai/gpt-4o"}]}), encoding="utf-8")
+    link = repo / "link.json"
+    try:
+        link.symlink_to(repo / "catalogs" / "real.json")   # in-tree at validation time
+    except (OSError, NotImplementedError):
+        return  # no symlink privilege -> nothing to assert
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        in_tree = (repo / "catalogs" / "real.json").resolve()
+        argv = []
+        ret = mcpsrv._add_confined_catalog({"catalog_file": "link.json"}, argv)
+        # the resolved in-tree target is returned and forwarded (base returns None -> fails here)
+        assert ret == in_tree, ret
+        fwd = argv[argv.index("--catalog-file") + 1]
+        assert fwd == str(in_tree), fwd
+        # swap the symlink to point OUTSIDE the tree, simulating the post-validation race
+        link.unlink()
+        link.symlink_to(outside / "secret.json")
+        # the forwarded path must STILL name the in-tree file: re-resolving it must not reach the
+        # external target (it is already the resolved regular file, not the swappable symlink)
+        assert Path(fwd).resolve() == in_tree, Path(fwd).resolve()
+        assert Path(fwd).resolve() != (outside / "secret.json").resolve(), \
+            "forwarded catalog path followed the post-validation symlink swap to an external file"
     finally:
         os.chdir(cwd0)
 
@@ -7025,8 +7079,10 @@ def t_mcp_require_loadable_catalog_rejects_fifo():
     os.mkfifo(repo / "catalog.json")
     script = (
         "import sys; sys.path.insert(0, %r); import mcp_server as m\n"
+        "from pathlib import Path\n"
         "try:\n"
-        "    m._require_loadable_catalog('catalog.json'); print('NO_RAISE')\n"
+        # fix-31: _require_loadable_catalog now takes the resolved path _add_confined_catalog returned
+        "    m._require_loadable_catalog(Path('catalog.json').resolve()); print('NO_RAISE')\n"
         "except m.ToolError as e:\n"
         "    print('REJECTED' if 'regular file' in str(e) else 'OTHER:' + str(e))\n"
         % str(SKILL / "scripts"))
