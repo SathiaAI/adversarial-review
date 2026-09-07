@@ -5928,6 +5928,54 @@ def t_mcp_http_get_requires_sse_accept():
         t.shutdown()
 
 
+def t_mcp_http_get_combines_repeated_accept_lines():
+    # Codex r3951256116: a client/intermediary may split the list-valued Accept header across MULTIPLE
+    # field lines (RFC 9110 5.3). do_GET must combine all of them, not read only the first via
+    # get("Accept"). So `Accept: application/json` + `Accept: text/event-stream` (SSE not on the first
+    # line) must OPEN the stream (200), in either order. Before the fix only the first line was read -> 406.
+    import socket
+
+    def raw_get_two_accepts(port, sid, a1, a2):
+        req = (b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+               b"Mcp-Session-Id: " + sid.encode("ascii") + b"\r\n"
+               b"Accept: " + a1.encode("ascii") + b"\r\n"
+               b"Accept: " + a2.encode("ascii") + b"\r\n\r\n")
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            s.sendall(req)
+            s.settimeout(5)
+            data = b""
+            for _ in range(10):
+                try:
+                    chunk = s.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                data += chunk
+                head, sep, body = data.partition(b"\r\n\r\n")
+                if sep and (int(head.split(b" ", 2)[1]) != 200 or body):
+                    break
+        finally:
+            s.close()
+        return (int(data.split(b" ", 2)[1]) if data.startswith(b"HTTP/") else 0), data
+
+    t, port = _http_transport()
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+        # SSE-admitting value on the SECOND line -> must still open (200), in either order.
+        st1, raw1 = raw_get_two_accepts(port, sid, "application/json", "text/event-stream")
+        assert st1 == 200 and b": connected" in raw1, (st1, raw1[:200])   # was 406 before the fix
+        st2, raw2 = raw_get_two_accepts(port, sid, "text/event-stream", "application/json")
+        assert st2 == 200 and b": connected" in raw2, (st2, raw2[:200])
+        # control: two lines that BOTH exclude SSE -> still 406 (combining must not invent acceptance).
+        st3, raw3 = raw_get_two_accepts(port, sid, "application/json", "text/plain")
+        assert st3 == 406, (st3, raw3[:200])
+    finally:
+        t.shutdown()
+
+
 def t_mcp_http_get_revalidates_session_before_streaming():
     # Codex r3941957879 (TOCTOU): the window between the session check and committing the 200 lets a
     # concurrent DELETE terminate the session, after which the stream must NOT emit 200 + ": connected".

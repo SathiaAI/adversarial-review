@@ -1202,7 +1202,11 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         # Reject a GET that does not accept text/event-stream BEFORE acquiring a stream slot (Codex
         # r3941957888): a client asking only for application/json must neither be handed the SSE body
         # nor charged one of the bounded stream slots for it. An absent Accept means "accept anything".
-        if not _accepts_event_stream(self.headers.get("Accept")):
+        # Combine ALL repeated Accept field lines (RFC 9110 §5.3: a list-valued header may be split across
+        # lines) so a request whose SSE-admitting value is not on the first line is negotiated on the whole
+        # header, not just get("Accept")'s first value (Codex r3951256116).
+        _accept_lines = self.headers.get_all("Accept")   # None when absent; a list of field lines otherwise
+        if not _accepts_event_stream(", ".join(_accept_lines) if _accept_lines else None):
             self._json(406, {"error": "this endpoint streams text/event-stream; send an Accept that "
                              "admits it (text/event-stream, text/*, or */*)"})
             return
