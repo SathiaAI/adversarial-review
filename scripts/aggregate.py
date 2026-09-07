@@ -1148,11 +1148,6 @@ def _aggregate_cli():
                     help="verify the detached attestation.sig sidecar against verdict.json — "
                          "recomputing the attestation from artifacts and checking the signed verdict "
                          "— and exit (0 valid, 1 not verified, 2 missing prerequisite, 3 no verifier)")
-    # Internal (SUPPRESS): set ONLY by mcp_server.h_aggregate when it spawns this process as its child and
-    # ALREADY holds run/verdict.json.lock across its wider move-aside -> aggregate -> settle section. The
-    # child must then NOT re-acquire that lock, or every MCP aggregate would fail against its own held lock.
-    # A direct `ar-aggregate` invocation never sets it and so takes the lock itself. (Codex r3951566976.)
-    ap.add_argument("--lock-already-held", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
     run = resolve_run(args.run)
     if args.check_digest:
@@ -1223,19 +1218,37 @@ def _aggregate_cli():
            "next_steps": steps,
            "counts": counts, "coverage": coverage, "attestation": attestation,
            "risk": meta["risk"], "run_id": meta["run_id"], "computed_at": now_iso()}
-    # fix-37 (Codex r3951566976): serialize this verdict write against a concurrent MCP ar_aggregate.
-    # mcp_server.h_aggregate holds run/verdict.json.lock across its move-aside -> aggregate -> settle
-    # critical section; a direct ar-aggregate that ignored the lock could write verdict.json INSIDE that
-    # window and then be silently rolled back when the MCP settle restored its moved-aside prior (Codex
-    # reproduced a direct BLOCKED reverted to a stale PASS). Take the SAME per-run O_EXCL lock around the
-    # verdict.json/verdict.md writes so a concurrent MCP aggregate (which holds it) forces this CLI to
-    # refuse instead of racing. verdict.json.lock is not *.json, so it never enters the attestation.
-    # --lock-already-held means the MCP wrapper spawned this process and ALREADY holds the lock, so the
-    # child must NOT re-acquire it (that would fail every MCP aggregate against its own held lock).
+    # fix-37 (Codex r3951566976) + fix-38 (CodeRabbit r3951923661): serialize this verdict write against a
+    # concurrent MCP ar_aggregate. mcp_server.h_aggregate holds run/verdict.json.lock across its
+    # move-aside -> aggregate -> settle critical section; a direct ar-aggregate that ignored the lock could
+    # write verdict.json INSIDE that window and then be silently rolled back when the MCP settle restored
+    # its moved-aside prior (Codex reproduced a direct BLOCKED reverted to a stale PASS). Take the SAME
+    # per-run O_EXCL lock around the verdict.json/verdict.md writes so a concurrent MCP aggregate (which
+    # holds it) forces this CLI to refuse instead of racing. verdict.json.lock is not *.json, so it never
+    # enters the attestation.
+    #
+    # The MCP wrapper spawns THIS file as its child while ALREADY holding the lock, so the child must skip
+    # re-acquiring it (else every MCP aggregate would fail against its own held lock). fix-37 signalled that
+    # with a --lock-already-held FLAG, but a flag is accepted from ANY caller — a standalone
+    # `aggregate.py --lock-already-held` could bypass a held lock (CodeRabbit r3951923661). The signal is now
+    # an UNFORGEABLE parent-child capability: the wrapper mints a random token, writes its SHA-256 HASH into
+    # the 0o600 lock file it owns, and hands THIS child the PREIMAGE via AR_AGGREGATE_LOCK_TOKEN. We skip the
+    # lock ONLY when our env token hashes to the lock file's stored hash. A standalone caller has no env
+    # token — and, seeing only the hash in the (owner-only) lock file, cannot invert it to a matching
+    # preimage — so it always takes the lock below and is refused while one is held.
+    lock_path = run / "verdict.json.lock"
+    parent_holds_lock = False
+    _tok = os.environ.get("AR_AGGREGATE_LOCK_TOKEN")
+    if _tok:
+        try:
+            with open(str(lock_path), "r", encoding="utf-8") as _lf:
+                _stored = _lf.read().strip()
+            if _stored and _stored == hashlib.sha256(_tok.encode("ascii")).hexdigest():
+                parent_holds_lock = True   # only the wrapper that owns the lock holds the preimage
+        except OSError:
+            parent_holds_lock = False      # no lock file / unreadable -> acquire below (fail closed)
     lock_fd = None
-    lock_path = None
-    if not args.lock_already_held:
-        lock_path = run / "verdict.json.lock"
+    if not parent_holds_lock:
         try:
             lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:

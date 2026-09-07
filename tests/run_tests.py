@@ -876,20 +876,50 @@ def t_aggregate_cli_refuses_while_verdict_lock_held():
     assert (run / "verdict.json.lock").is_file(), "a lock this process did not create must remain"
 
 
-def t_aggregate_cli_lock_already_held_skips_acquisition():
-    # Re-entrancy for the MCP path: h_aggregate already holds run/verdict.json.lock when it spawns
-    # aggregate.py as its child, so the child must NOT re-acquire it -- otherwise the child's own O_EXCL open
-    # would fail against the parent's lock and EVERY MCP aggregate would reject (also guarded end-to-end by
-    # t_mcp_fail_verdict, which runs the real child while the parent holds the lock). aggregate.py
-    # --lock-already-held skips acquisition and writes the verdict even with the lock present, and does NOT
-    # remove the parent's lock. On the base commit the flag does not exist, so aggregate.py never writes the
-    # verdict under a held lock -- this fails there.
+def t_aggregate_cli_parent_token_skips_lock():
+    # Re-entrancy for the MCP path via an UNFORGEABLE parent-child capability (CodeRabbit r3951923661
+    # replaced fix-37's public --lock-already-held flag): h_aggregate mints a random token, writes its
+    # SHA-256 HASH into the 0o600 verdict.json.lock it owns, and hands its child the PREIMAGE via
+    # AR_AGGREGATE_LOCK_TOKEN. The child skips acquisition ONLY when its env token hashes to the stored
+    # hash -- so the MCP-spawned child writes under the parent's lock without deadlocking (also guarded
+    # end-to-end by t_mcp_fail_verdict, which runs the real child while the parent holds the lock). Here:
+    # lock file holds the hash + matching env preimage -> the verdict is written and the parent's lock is
+    # left in place. On the base commit (fix-37) the flag does not exist and the env token is ignored, so
+    # the child hits the held lock and exits 3 instead of writing -- this fails there.
+    import hashlib
     repo = _complete_sensitive_repo()
     run = latest_run(repo)
-    (run / "verdict.json.lock").write_text("")           # the MCP parent holds it
-    r = sh(["aggregate.py", "--lock-already-held"], repo, expect=2)   # BLOCKED verdict still WRITTEN
+    token = "a1b2c3d4e5f6000112233445566778899aabbccddeeff00112233445566778899"
+    (run / "verdict.json.lock").write_text(hashlib.sha256(token.encode("ascii")).hexdigest())
+    env = dict(ENV); env["AR_AGGREGATE_LOCK_TOKEN"] = token
+    r = sh(["aggregate.py"], repo, expect=2, env=env)    # BLOCKED verdict still WRITTEN under the held lock
     assert (run / "verdict.json").is_file() and "BLOCKED" in r.stdout, (r.stdout, r.stderr)
     assert (run / "verdict.json.lock").is_file(), "the child must not remove the MCP-held lock"
+
+
+def t_aggregate_cli_unforgeable_token_no_public_bypass():
+    # CodeRabbit (PR #55) r3951923661: fix-37's --lock-already-held was accepted from ANY caller, so a
+    # standalone `aggregate.py --lock-already-held` could bypass a held lock and be rolled back. The signal
+    # is now the hash-token capability above, which a standalone invocation cannot forge. This pins both:
+    # (a) a WRONG env token does not match the lock file's stored hash -> the direct call still takes the
+    # lock and is refused (exit 3), never overwriting verdict.json; (b) the retired --lock-already-held flag
+    # is no longer accepted (argparse error), so the naked public bypass is gone.
+    import hashlib
+    repo = _complete_sensitive_repo()
+    sh(["aggregate.py"], repo, expect=2)                  # baseline BLOCKED verdict
+    run = latest_run(repo)
+    baseline = (run / "verdict.json").read_text(encoding="utf-8")
+    # the MCP parent owns the lock, storing the HASH of ITS secret token
+    (run / "verdict.json.lock").write_text(hashlib.sha256(b"the-owners-real-secret").hexdigest())
+    # (a) a wrong preimage cannot invert the stored hash -> no bypass -> refused, verdict untouched
+    env = dict(ENV); env["AR_AGGREGATE_LOCK_TOKEN"] = "attacker-guessed-preimage"
+    r = sh(["aggregate.py"], repo, expect=3, env=env)
+    assert "in progress" in (r.stdout + r.stderr), (r.stdout, r.stderr)
+    assert (run / "verdict.json").read_text(encoding="utf-8") == baseline, "a wrong token must not overwrite"
+    # (b) the retired flag is gone -> argparse rejects it (exit 2), nothing written
+    r2 = sh(["aggregate.py", "--lock-already-held"], repo, expect=2)
+    assert "unrecognized arguments" in (r2.stdout + r2.stderr), (r2.stdout, r2.stderr)
+    assert (run / "verdict.json").read_text(encoding="utf-8") == baseline, "the retired flag must not write"
 
 
 def t_check_digest_unreadable_verdict_is_cannot_verify_not_drift():
@@ -6658,8 +6688,8 @@ def t_mcp_aggregate_pins_run_against_concurrent_init():
     mcpsrv._run_cli = fake
     try:
         r = mcpsrv.h_aggregate({})  # no explicit run -> must pin the newest-at-entry (older)
-        # --run <id> is pinned as the leading args (the TOCTOU concern here); a trailing
-        # --lock-already-held may follow (fix-37: the wrapper holds the lock, so the child skips it).
+        # --run <id> is pinned (the TOCTOU concern here). The aggregate child's re-entrancy token rides in
+        # the ENV now (fix-38), not argv, so argv stays exactly the pinned run.
         assert cap and cap[0]["argv"][:2] == ["--run", "run-20260101-010101"], cap
         assert not r["isError"], r
         assert r["structuredContent"]["run_id"] == "run-20260101-010101", r

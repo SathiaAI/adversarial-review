@@ -39,6 +39,7 @@ Operates on the .adversarial-review/ directory in the server's working directory
 so launch it with the repository under review as the current directory.
 """
 
+import hashlib
 import http.server
 import ipaddress
 import json
@@ -403,7 +404,9 @@ def _panel_timeout():
 
 def _run_cli(module, argv, timeout=120):
     """Invoke a pipeline CLI module as a subprocess (shell=False — no injection).
-    Returns (returncode, stdout, stderr)."""
+    Returns (returncode, stdout, stderr). The child inherits this process's environment — h_aggregate uses
+    that to hand the aggregate child its per-lock re-entrancy token (see there) without exposing it as a
+    public CLI flag."""
     script = SCRIPTS_DIR / f"{module}.py"
     cmd = [sys.executable, str(script), *argv]
     try:
@@ -738,6 +741,7 @@ def h_aggregate(args):
     # in the enclosing finally on EVERY exit path (accepted, rejected, or raised). (Codex, <FIX19>.)
     lock_fd = None
     lock_path = None
+    lock_token = None   # per-lock re-entrancy secret handed to the aggregate child (see below)
     if run_dir is not None and run_dir.is_dir():
         lock_path = run_dir / "verdict.json.lock"
         try:
@@ -753,6 +757,28 @@ def h_aggregate(args):
         except OSError as e:
             raise ToolError(
                 f"cannot acquire the aggregate lock ({lock_path.name}): {e}") from e
+        # Re-entrancy capability for THIS wrapper's aggregate child (CodeRabbit r3951923661). The child
+        # (aggregate.py) also takes verdict.json.lock when run standalone, but must NOT re-acquire the lock
+        # THIS wrapper already holds. The signal that authorizes the child to skip must be one a standalone
+        # invocation cannot forge — an earlier public --lock-already-held flag was accepted from ANY caller,
+        # re-opening the very bypass fix-37 closed. So mint a random token, write its SHA-256 HASH into the
+        # 0o600 lock file we own, and hand the child the PREIMAGE via env (below). The child skips only when
+        # its env token hashes to the stored hash; a standalone caller can read the hash but cannot invert
+        # it to a matching preimage, so it always takes the lock and is refused while one is held. (This
+        # stays cross-platform — inheriting the lock fd would be POSIX-only and break the Windows MCP path.)
+        lock_token = os.urandom(32).hex()
+        try:
+            os.write(lock_fd, hashlib.sha256(lock_token.encode("ascii")).hexdigest().encode("ascii"))
+        except OSError as e:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(str(lock_path))
+            except OSError:
+                pass
+            raise ToolError(f"cannot write the aggregate lock token ({lock_path.name}): {e}") from e
     try:
         # Move any existing verdict aside so a fresh computation is proven by the NEW file's existence.
         # If the move cannot be performed, fall back to an mtime check rather than losing the signal.
@@ -927,12 +953,25 @@ def h_aggregate(args):
         accepted = False
         try:
             # This wrapper holds verdict.json.lock across the whole move-aside -> aggregate -> settle
-            # section, so tell the aggregate child NOT to re-acquire it — otherwise the child's own O_EXCL
-            # open would fail against the lock this process already holds and every MCP aggregate would
-            # reject. Pass the flag ONLY when we actually took the lock (lock_fd is not None); if the run
-            # dir did not resolve here we hold no lock, so the child should take its own. (Codex r3951566976.)
-            agg_argv = run_args + ["--lock-already-held"] if lock_fd is not None else run_args
-            rc, out, err = _run_cli("aggregate", agg_argv)
+            # section, so authorize the aggregate child to skip re-acquiring it — otherwise the child's own
+            # O_EXCL open would fail against the lock this process already holds and every MCP aggregate
+            # would reject. The authorization is the unforgeable token handshake above (CodeRabbit
+            # r3951923661): hand the child the PREIMAGE through the environment it inherits (only when we
+            # actually took the lock — if the run dir did not resolve we hold none, so the child takes its
+            # own). A standalone invocation has no such env token and cannot forge one matching the lock
+            # file's stored hash. Set it just for this call and restore after, so the token never leaks to
+            # other subprocesses; h_aggregate runs under the serialized dispatch lock, so this transient
+            # os.environ mutation is not raced. (Codex r3951566976.)
+            _prev_tok = os.environ.get("AR_AGGREGATE_LOCK_TOKEN")
+            if lock_fd is not None and lock_token is not None:
+                os.environ["AR_AGGREGATE_LOCK_TOKEN"] = lock_token
+            try:
+                rc, out, err = _run_cli("aggregate", run_args)
+            finally:
+                if _prev_tok is None:
+                    os.environ.pop("AR_AGGREGATE_LOCK_TOKEN", None)
+                else:
+                    os.environ["AR_AGGREGATE_LOCK_TOKEN"] = _prev_tok
             body = (out or "").strip()
             if err and err.strip():
                 body = (body + "\n" + err.strip()).strip()
