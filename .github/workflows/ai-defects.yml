@@ -90,8 +90,12 @@ jobs:
           IN_DIFF_REF: ${{ github.event.inputs.diff-ref }}
         run: |
           set -euo pipefail
+          # Attached --diff-ref= form: argparse rejects a separate "--diff-ref -x" (an
+          # option-like value) and would abort this step here, before the diff-ref guard
+          # below could record BLOCKED. The attached form accepts the value so an
+          # option-prefixed diff-ref reaches the fail-closed BLOCKED path below.
           RUN_DIR="$(python scripts/panel.py init --risk NORMAL --dev-providers anthropic \
-                       --diff-ref "$IN_DIFF_REF" | awk '/^initialized /{print $2; exit}')"
+                       --diff-ref="$IN_DIFF_REF" | awk '/^initialized /{print $2; exit}')"
           test -n "$RUN_DIR" && test -d "$RUN_DIR"
           # Establish the scan scope from the diff-ref. Reject option-prefixed values, and
           # append `--` so the ref is parsed strictly as a revision/range: a bare pathspec
