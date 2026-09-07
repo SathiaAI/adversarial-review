@@ -93,12 +93,18 @@ jobs:
           RUN_DIR="$(python scripts/panel.py init --risk NORMAL --dev-providers anthropic \
                        --diff-ref "$IN_DIFF_REF" | awk '/^initialized /{print $2; exit}')"
           test -n "$RUN_DIR" && test -d "$RUN_DIR"
-          # Establish the scan scope. An invalid diff-ref must FAIL CLOSED (BLOCKED), never
-          # silently produce an empty changed_paths.txt that the wrapper reads as empty-diff
-          # PASS. A VALID range with no changed files is a legitimate empty-diff PASS.
-          if ! git diff --name-only "$IN_DIFF_REF" > "$RUN_DIR/changed_paths.txt"; then
+          # Establish the scan scope from the diff-ref. Reject option-prefixed values, and
+          # append `--` so the ref is parsed strictly as a revision/range: a bare pathspec
+          # (e.g. "README.md") then FAILS to resolve instead of silently diffing a path to an
+          # empty result the wrapper would read as an empty-diff PASS. Any resolution failure
+          # is BLOCKED (fail-closed); a VALID range with no changed files is a legitimate PASS.
+          case "$IN_DIFF_REF" in
+            -*) diff_ref_bad=1 ;;
+            *)  diff_ref_bad="" ;;
+          esac
+          if [ -n "$diff_ref_bad" ] || ! git diff --name-only "$IN_DIFF_REF" -- > "$RUN_DIR/changed_paths.txt"; then
             python scripts/gate.py record --run "$RUN_DIR" --name ai-defects --status BLOCKED \
-              --summary "invalid diff-ref '$IN_DIFF_REF' -- scan scope not established"
+              --summary "invalid diff-ref '$IN_DIFF_REF' -- not a resolvable revision/range; scan scope not established"
             echo "----- ai-defects ledger entry -----"
             cat "$RUN_DIR/gates/ai-defects.json"
             echo "::error::ai-defects gate: BLOCKED (invalid diff-ref; scan scope not established)"
