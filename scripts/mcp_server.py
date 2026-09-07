@@ -283,6 +283,31 @@ def _require_loadable_snapshot(snapshot):
                         "(missing, unreadable, malformed, or empty after filtering)")
 
 
+# Ceiling on the policy file read IN-PROCESS for timeout budgeting (Codex r3950830841). A real policy is a
+# few lines; this bounds an untrusted repo's oversized/sparse policy that load_policy's read_text() would
+# otherwise pull whole into the MCP process, which no _run_cli timeout guards.
+_POLICY_MAX_BYTES = 1024 * 1024
+
+
+def _policy_read_bounded():
+    """True iff reading the repo policy file IN-PROCESS is safe — it is absent, or a regular file within
+    _POLICY_MAX_BYTES. False for a non-regular (FIFO/device) or oversized policy, so the caller budgets
+    conservatively instead of reading it here. Never raises; any stat error is treated as unbounded (False)."""
+    try:
+        from _common import POLICY_BASENAMES
+        root = Path.cwd()
+        for name in POLICY_BASENAMES:
+            try:
+                info = (root / name).stat()   # follows symlinks; raises when absent
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _POLICY_MAX_BYTES:
+                return False
+    except Exception:
+        return False
+    return True
+
+
 def _resolved_high_samples():
     """The corroboration sample count panel.py will actually use, resolved with panel.py's own
     precedence: AR_HIGH_SAMPLES env var > policy ``high_samples`` (.adversarial-review.yml/.json) >
@@ -292,6 +317,13 @@ def _resolved_high_samples():
     env = os.environ.get("AR_HIGH_SAMPLES", "")
     if env != "":            # matches resolve_setting: a set, non-empty env var wins over policy
         return env
+    # load_policy() below reads the repo policy file IN-PROCESS (read_text pulls the whole file) with no
+    # _run_cli timeout guarding it, so an untrusted repo's oversized/sparse policy could stall or exhaust
+    # the MCP server here (Codex r3950830841). Skip the in-process read for a non-regular or oversized
+    # policy and budget CONSERVATIVELY (the clamp max) so a slow-but-valid run is still never under-budgeted;
+    # panel.py reads and validates the real policy in its own bounded subprocess.
+    if not _policy_read_bounded():
+        return "25"
     try:
         from _common import load_policy
         pol = load_policy()  # reads the policy file from the server's cwd (the repo under review)

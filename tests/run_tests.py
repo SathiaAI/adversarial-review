@@ -6151,6 +6151,42 @@ def t_mcp_panel_timeout_honors_policy_high_samples():
                 os.environ[_k] = _v
 
 
+def t_mcp_panel_timeout_bounds_oversized_policy_read():
+    # Codex r3950830841: _resolved_high_samples()/_panel_timeout() must NOT read an untrusted oversized (or
+    # non-regular) policy file IN-PROCESS -- load_policy's read_text() pulls the whole file, guarded by no
+    # _run_cli timeout, so an oversized/sparse policy could stall or exhaust the MCP server itself. For an
+    # oversized policy it skips the in-process read and budgets the clamp MAX (never under-counting a valid
+    # run). _policy_read_bounded / _POLICY_MAX_BYTES are absent on the fix-32 base -> this test fails there.
+    repo = Path(tempfile.mkdtemp(prefix="ar-bigpolicy-"))
+    orig_cap = mcpsrv._POLICY_MAX_BYTES        # absent on base -> AttributeError -> fails there
+    mcpsrv._POLICY_MAX_BYTES = 128
+    old_h = os.environ.pop("AR_HIGH_SAMPLES", None)
+    old_t = os.environ.get("AR_TIMEOUT_S")
+    os.environ["AR_TIMEOUT_S"] = "240"
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        # an oversized REGULAR policy: _policy_read_bounded() is False, so budget the max (hs=25) WITHOUT
+        # reading it in-process (a read would parse this bogus content). The point is we never read it.
+        (repo / ".adversarial-review.yml").write_text("x" * 512, encoding="utf-8")
+        assert mcpsrv._policy_read_bounded() is False
+        assert mcpsrv._resolved_high_samples() == "25"
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 24) * 6 + 600), mcpsrv._panel_timeout()
+        # control: a SMALL policy is within the cap and read in-process as before (no high_samples -> hs=1)
+        (repo / ".adversarial-review.yml").write_text("risk: NORMAL\n", encoding="utf-8")
+        assert mcpsrv._policy_read_bounded() is True
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600), mcpsrv._panel_timeout()
+    finally:
+        mcpsrv._POLICY_MAX_BYTES = orig_cap
+        os.chdir(cwd0)
+        if old_h is not None:
+            os.environ["AR_HIGH_SAMPLES"] = old_h
+        if old_t is None:
+            os.environ.pop("AR_TIMEOUT_S", None)
+        else:
+            os.environ["AR_TIMEOUT_S"] = old_t
+
+
 def t_mcp_panel_timeout_budgets_the_substitution_catalog_fetch():
     # The per-role worst case is NINE AR_TIMEOUT_S request budgets, not eight: run_one_role spends 4
     # (two attempts x one corrective retry), then substitution reloads the model catalog LIVE — one
