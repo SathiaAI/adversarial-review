@@ -304,8 +304,22 @@ def _read_policy_racesafe():
     present = [n for n in POLICY_BASENAMES if (root / n).exists()]  # the open below is race-safe regardless
     if not present:
         return None
+    if len(present) > 1:
+        # load_policy() rejects a repo that ships BOTH policy files; mirror that here (CodeRabbit
+        # r3951335743) so a conflicting pair budgets conservatively via the caller's fallback instead of
+        # silently reading whichever we happened to pick first.
+        raise ToolError("both %s exist — keep exactly one" % " and ".join(POLICY_BASENAMES))
     name = present[0]
-    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NOFOLLOW is load-bearing here: the policy path is opened UN-resolved, so without it a symlinked
+    # .adversarial-review.yml would be followed to its (possibly out-of-tree) target. It is absent on some
+    # platforms (Windows), where getattr(...,0) would silently disable that protection — so FAIL CLOSED
+    # (CodeRabbit r3951335750), letting the caller budget conservatively. (The catalog snapshot keeps the
+    # getattr fallback because it opens an already-RESOLVED, symlink-free path, so O_NOFOLLOW is only
+    # defense-in-depth there, not load-bearing.)
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ToolError("cannot open the policy without following symlinks on this platform "
+                        "(os.O_NOFOLLOW unavailable); refusing the in-process read")
+    flags = (os.O_RDONLY | os.O_NOFOLLOW
              | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
     fd = os.open(str(root / name), flags)   # ELOOP if the leaf is a symlink (O_NOFOLLOW)
     try:

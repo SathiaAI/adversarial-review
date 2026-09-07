@@ -6196,6 +6196,24 @@ def t_mcp_panel_timeout_reads_policy_racesafe():
             os.mkfifo(repo3 / ".adversarial-review.yml")
             assert mcpsrv._resolved_high_samples() == "25", "a FIFO policy must be refused, not read"
             assert mcpsrv._panel_timeout() == MAXB, mcpsrv._panel_timeout()
+        # (c2) BOTH policy files present -> refused (mirrors load_policy's both-exist rejection) -> MAX budget
+        repo_both = Path(tempfile.mkdtemp(prefix="ar-pol-both-"))
+        os.chdir(repo_both)
+        (repo_both / ".adversarial-review.yml").write_text("high_samples: 3\n", encoding="utf-8")
+        (repo_both / ".adversarial-review.json").write_text('{"high_samples": 3}', encoding="utf-8")
+        assert mcpsrv._resolved_high_samples() == "25", "both policy files must be refused (CodeRabbit r3951335743)"
+        # (c3) when os.O_NOFOLLOW is unavailable (e.g. Windows) the read fails CLOSED -> MAX, never following a
+        #      policy symlink (CodeRabbit r3951335750). Simulate by removing the attribute.
+        repo_nof = Path(tempfile.mkdtemp(prefix="ar-pol-nof-"))
+        os.chdir(repo_nof)
+        (repo_nof / ".adversarial-review.yml").write_text("high_samples: 3\n", encoding="utf-8")
+        if hasattr(os, "O_NOFOLLOW"):
+            saved_nof = os.O_NOFOLLOW
+            try:
+                del os.O_NOFOLLOW
+                assert mcpsrv._resolved_high_samples() == "25", "no O_NOFOLLOW must fail closed, not follow a symlink"
+            finally:
+                os.O_NOFOLLOW = saved_nof
         # (d) control: a small REGULAR policy is read race-safely and its high_samples honored
         repo4 = Path(tempfile.mkdtemp(prefix="ar-pol-ok-"))
         os.chdir(repo4)
