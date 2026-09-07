@@ -6151,31 +6151,60 @@ def t_mcp_panel_timeout_honors_policy_high_samples():
                 os.environ[_k] = _v
 
 
-def t_mcp_panel_timeout_bounds_oversized_policy_read():
-    # Codex r3950830841: _resolved_high_samples()/_panel_timeout() must NOT read an untrusted oversized (or
-    # non-regular) policy file IN-PROCESS -- load_policy's read_text() pulls the whole file, guarded by no
-    # _run_cli timeout, so an oversized/sparse policy could stall or exhaust the MCP server itself. For an
-    # oversized policy it skips the in-process read and budgets the clamp MAX (never under-counting a valid
-    # run). _policy_read_bounded / _POLICY_MAX_BYTES are absent on the fix-32 base -> this test fails there.
-    repo = Path(tempfile.mkdtemp(prefix="ar-bigpolicy-"))
-    orig_cap = mcpsrv._POLICY_MAX_BYTES        # absent on base -> AttributeError -> fails there
+def t_mcp_panel_timeout_reads_policy_racesafe():
+    # CodeRabbit r3951172615 (fixing fix-33's stat-then-reopen TOCTOU): _resolved_high_samples() must read
+    # the policy through a race-safe descriptor (O_NOFOLLOW rejects a symlink leaf, O_NONBLOCK stops a FIFO
+    # from blocking the open, fstat bounds size) and parse a private snapshot -- NEVER reopen the mutable
+    # path. An unsafe/oversized policy budgets the clamp MAX (never under-counts); a small regular policy is
+    # read as before. On the fix-33 base _resolved_high_samples() used Path.stat() (which FOLLOWS symlinks)
+    # then reopened the path, so the symlink case (b) below reads the target and returns 3, not "25" -> the
+    # test fails there, pinning the TOCTOU this fix closes.
+    orig_cap = mcpsrv._POLICY_MAX_BYTES
     mcpsrv._POLICY_MAX_BYTES = 128
     old_h = os.environ.pop("AR_HIGH_SAMPLES", None)
     old_t = os.environ.get("AR_TIMEOUT_S")
     os.environ["AR_TIMEOUT_S"] = "240"
     cwd0 = os.getcwd()
-    os.chdir(repo)
+    MAXB = max(1800, 240 * (9 + 2 * 24) * 6 + 600)   # hs=25 (clamp max) budget
+    BASE = max(1800, 240 * 9 * 6 + 600)              # hs=1 budget
     try:
-        # an oversized REGULAR policy: _policy_read_bounded() is False, so budget the max (hs=25) WITHOUT
-        # reading it in-process (a read would parse this bogus content). The point is we never read it.
+        # (a) oversized REGULAR policy -> refused by size (fstat), budget the MAX (never read whole in-process)
+        repo = Path(tempfile.mkdtemp(prefix="ar-pol-big-"))
+        os.chdir(repo)
         (repo / ".adversarial-review.yml").write_text("x" * 512, encoding="utf-8")
-        assert mcpsrv._policy_read_bounded() is False
         assert mcpsrv._resolved_high_samples() == "25"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 24) * 6 + 600), mcpsrv._panel_timeout()
-        # control: a SMALL policy is within the cap and read in-process as before (no high_samples -> hs=1)
-        (repo / ".adversarial-review.yml").write_text("risk: NORMAL\n", encoding="utf-8")
-        assert mcpsrv._policy_read_bounded() is True
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600), mcpsrv._panel_timeout()
+        assert mcpsrv._panel_timeout() == MAXB, mcpsrv._panel_timeout()
+        # (b) a SYMLINK policy leaf is refused (O_NOFOLLOW) even if its target is a small valid policy: never
+        #     followed in-process; budget the MAX. panel.py reads the real (symlinked) policy in its subprocess.
+        tgt = Path(tempfile.mkdtemp(prefix="ar-pol-tgt-"))
+        (tgt / "real.yml").write_text("high_samples: 3\n", encoding="utf-8")
+        repo2 = Path(tempfile.mkdtemp(prefix="ar-pol-link-"))
+        os.chdir(repo2)
+        linked = False
+        try:
+            (repo2 / ".adversarial-review.yml").symlink_to(tgt / "real.yml")
+            linked = True
+        except (OSError, NotImplementedError):
+            pass
+        if linked:
+            assert mcpsrv._resolved_high_samples() == "25", "a symlink policy leaf must not be followed in-process"
+            assert mcpsrv._panel_timeout() == MAXB, mcpsrv._panel_timeout()
+        # (c) a FIFO policy is refused WITHOUT blocking the open (O_NONBLOCK + fstat non-regular) -> MAX
+        if hasattr(os, "mkfifo"):
+            repo3 = Path(tempfile.mkdtemp(prefix="ar-pol-fifo-"))
+            os.chdir(repo3)
+            os.mkfifo(repo3 / ".adversarial-review.yml")
+            assert mcpsrv._resolved_high_samples() == "25", "a FIFO policy must be refused, not read"
+            assert mcpsrv._panel_timeout() == MAXB, mcpsrv._panel_timeout()
+        # (d) control: a small REGULAR policy is read race-safely and its high_samples honored
+        repo4 = Path(tempfile.mkdtemp(prefix="ar-pol-ok-"))
+        os.chdir(repo4)
+        (repo4 / ".adversarial-review.yml").write_text("high_samples: 3\n", encoding="utf-8")
+        assert int(mcpsrv._resolved_high_samples()) == 3, mcpsrv._resolved_high_samples()
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 2) * 6 + 600), mcpsrv._panel_timeout()
+        # ...and a policy with no high_samples -> default hs=1
+        (repo4 / ".adversarial-review.yml").write_text("risk: NORMAL\n", encoding="utf-8")
+        assert mcpsrv._panel_timeout() == BASE, mcpsrv._panel_timeout()
     finally:
         mcpsrv._POLICY_MAX_BYTES = orig_cap
         os.chdir(cwd0)

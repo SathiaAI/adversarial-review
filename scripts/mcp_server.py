@@ -283,52 +283,73 @@ def _require_loadable_snapshot(snapshot):
                         "(missing, unreadable, malformed, or empty after filtering)")
 
 
-# Ceiling on the policy file read IN-PROCESS for timeout budgeting (Codex r3950830841). A real policy is a
-# few lines; this bounds an untrusted repo's oversized/sparse policy that load_policy's read_text() would
-# otherwise pull whole into the MCP process, which no _run_cli timeout guards.
+# Ceiling on the policy file read IN-PROCESS for timeout budgeting. A real policy is a few lines; this
+# bounds an untrusted repo's oversized/sparse policy that would otherwise be pulled whole into the MCP
+# process, which no _run_cli timeout guards (Codex r3950830841).
 _POLICY_MAX_BYTES = 1024 * 1024
 
 
-def _policy_read_bounded():
-    """True iff reading the repo policy file IN-PROCESS is safe — it is absent, or a regular file within
-    _POLICY_MAX_BYTES. False for a non-regular (FIFO/device) or oversized policy, so the caller budgets
-    conservatively instead of reading it here. Never raises; any stat error is treated as unbounded (False)."""
+def _read_policy_racesafe():
+    """Return the repo policy (load_policy's dict), or None when no policy file is present — read WITHOUT
+    reopening the untrusted pathname load_policy would (CodeRabbit r3951172615). A stat-then-reopen was a
+    check-to-open race: Path.stat() follows symlinks, so a symlink swapped to a FIFO after the check could
+    block the in-process read (no _run_cli timeout guards it), or redirect it outside the tree. This opens
+    the policy ONCE through a race-safe descriptor — O_NOFOLLOW rejects a symlink leaf (ELOOP), O_NONBLOCK
+    stops a FIFO from blocking the open, and fstat on the descriptor proves a regular file within
+    _POLICY_MAX_BYTES with no TOCTOU — copies its bytes to a private server-owned snapshot, and hands
+    load_policy THAT snapshot, never the mutable path. Raises on an unsafe/oversized policy; load_policy
+    still die()s on a malformed one. (Same race-safe read the catalog uses.)"""
+    from _common import POLICY_BASENAMES, load_policy
+    root = Path.cwd()
+    present = [n for n in POLICY_BASENAMES if (root / n).exists()]  # the open below is race-safe regardless
+    if not present:
+        return None
+    name = present[0]
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    fd = os.open(str(root / name), flags)   # ELOOP if the leaf is a symlink (O_NOFOLLOW)
     try:
-        from _common import POLICY_BASENAMES
-        root = Path.cwd()
-        for name in POLICY_BASENAMES:
-            try:
-                info = (root / name).stat()   # follows symlinks; raises when absent
-            except OSError:
-                continue
-            if not stat.S_ISREG(info.st_mode) or info.st_size > _POLICY_MAX_BYTES:
-                return False
-    except Exception:
-        return False
-    return True
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _POLICY_MAX_BYTES:
+            raise ToolError("policy file must be a regular file within the size cap")
+        buf = b""
+        remaining = info.st_size
+        while remaining > 0:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            buf += chunk
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    snapdir = Path(tempfile.mkdtemp(prefix="ar-policy-"))
+    try:
+        (snapdir / name).write_bytes(buf)
+        return load_policy(root=snapdir)   # parses the SNAPSHOT, never the untrusted path
+    finally:
+        try:
+            (snapdir / name).unlink()
+        except OSError:
+            pass
+        try:
+            snapdir.rmdir()
+        except OSError:
+            pass
 
 
 def _resolved_high_samples():
     """The corroboration sample count panel.py will actually use, resolved with panel.py's own
     precedence: AR_HIGH_SAMPLES env var > policy ``high_samples`` (.adversarial-review.yml/.json) >
-    default "1". Returned unparsed for the caller to int()+clamp. Never raises and never exits — a
-    malformed policy makes panel.py itself die when it runs, so here (merely sizing a subprocess
-    timeout) we fall back to the default rather than take the server down."""
+    default "1". Returned unparsed for the caller to int()+clamp. Never raises and never exits — merely
+    sizing a subprocess timeout, so any unsafe/oversized/malformed policy falls back to a conservative
+    budget rather than taking the server down; panel.py reads and validates the real policy when it runs."""
     env = os.environ.get("AR_HIGH_SAMPLES", "")
     if env != "":            # matches resolve_setting: a set, non-empty env var wins over policy
         return env
-    # load_policy() below reads the repo policy file IN-PROCESS (read_text pulls the whole file) with no
-    # _run_cli timeout guarding it, so an untrusted repo's oversized/sparse policy could stall or exhaust
-    # the MCP server here (Codex r3950830841). Skip the in-process read for a non-regular or oversized
-    # policy and budget CONSERVATIVELY (the clamp max) so a slow-but-valid run is still never under-budgeted;
-    # panel.py reads and validates the real policy in its own bounded subprocess.
-    if not _policy_read_bounded():
-        return "25"
     try:
-        from _common import load_policy
-        pol = load_policy()  # reads the policy file from the server's cwd (the repo under review)
-    except (Exception, SystemExit):  # SystemExit = load_policy's die() on a malformed policy
-        return "1"
+        pol = _read_policy_racesafe()  # race-safe read; never reopens the untrusted policy path
+    except (Exception, SystemExit):    # unsafe/oversized policy, or load_policy die() on a malformed one
+        return "25"                    # budget the clamp max (never under-counts); panel.py reads it bounded
     if pol and "high_samples" in pol["data"]:
         return pol["data"]["high_samples"]
     return "1"
