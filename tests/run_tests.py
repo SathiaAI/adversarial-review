@@ -6244,6 +6244,76 @@ def t_mcp_panel_run_validates_catalog_loadable_before_writing_context():
         os.chdir(cwd0)
 
 
+def t_mcp_catalog_file_size_capped():
+    # Codex r3946169157: _require_loadable_catalog must reject an oversized REGULAR catalog by SIZE before
+    # load_catalog reads and parses it in-process (a path no _run_cli timeout guards). Small files pass the
+    # size gate and are then judged on loadability. On a57bb8f there is no size cap (the symbol is absent).
+    repo = Path(tempfile.mkdtemp(prefix="ar-bigcat-"))
+    cwd0 = os.getcwd()
+    orig_cap = mcpsrv._CATALOG_MAX_BYTES        # absent on base -> AttributeError -> fails there
+    mcpsrv._CATALOG_MAX_BYTES = 128
+    os.chdir(repo)
+    try:
+        (repo / "big.json").write_text("x" * 512, encoding="utf-8")   # regular, over the (test) cap
+        raised = False
+        try:
+            mcpsrv._require_loadable_catalog("big.json")
+        except mcpsrv.ToolError as e:
+            raised = True
+            assert "too large" in str(e), e
+        assert raised, "an oversized catalog_file must be rejected by size before loading"
+        # a small file passes the size gate and is rejected later for a DIFFERENT reason (not usable)
+        (repo / "small.json").write_text("not a catalog", encoding="utf-8")
+        try:
+            mcpsrv._require_loadable_catalog("small.json")
+            assert False, "expected a loadability rejection"
+        except mcpsrv.ToolError as e:
+            assert "too large" not in str(e), e
+    finally:
+        mcpsrv._CATALOG_MAX_BYTES = orig_cap
+        os.chdir(cwd0)
+
+
+def t_mcp_catalog_file_aliasing_context_rejected():
+    # Codex r3946169158: a catalog_file that ALIASES the run's context.md (named directly, or via an in-tree
+    # symlink) is validated and then destroyed when _write_context overwrites context.md, so h_panel_run
+    # rejects it via _reject_context_alias before the write. Unit-check the guard (and _run_context_path).
+    # Both symbols are absent on a57bb8f -> the test fails there.
+    repo = Path(tempfile.mkdtemp(prefix="ar-alias-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    (rundir / "context.md").write_text("planted", encoding="utf-8")
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        ctx_path = mcpsrv._run_context_path(["--run", "run-20260101-010101"])   # absent on base
+        raised = False
+        try:
+            mcpsrv._reject_context_alias(".adversarial-review/run-20260101-010101/context.md", ctx_path)
+        except mcpsrv.ToolError as e:
+            raised = True
+            assert "context.md" in str(e), e
+        assert raised, "a catalog_file naming context.md must be rejected"
+        # an in-tree SYMLINK to context.md is an alias too (skip where symlinks are not permitted)
+        try:
+            (repo / "cat-link.json").symlink_to(rundir / "context.md")
+        except (OSError, NotImplementedError):
+            pass
+        else:
+            raised2 = False
+            try:
+                mcpsrv._reject_context_alias("cat-link.json", ctx_path)
+            except mcpsrv.ToolError as e:
+                raised2 = True
+                assert "context.md" in str(e), e
+            assert raised2, "a symlink catalog_file aliasing context.md must be rejected"
+        # a genuinely distinct catalog passes the guard (returns None, does not raise)
+        (repo / "real.json").write_text("{}", encoding="utf-8")
+        mcpsrv._reject_context_alias("real.json", ctx_path)
+    finally:
+        os.chdir(cwd0)
+
+
 def t_mcp_rebuttal_tool_exposed():
     # The rebuttal round is reachable via MCP: keyless prepare (--prepare) and direct HTTP.
     assert "ar_panel_rebuttal" in mcpsrv.TOOLS_BY_NAME

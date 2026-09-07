@@ -197,6 +197,11 @@ def _add_confined_catalog(args, argv):
     argv.extend(["--catalog-file", cf])
 
 
+# Ceiling on an in-process-loaded catalog_file (see _require_loadable_catalog). A real model catalog is
+# well under a megabyte; this is generous headroom while still refusing a multi-gigabyte DoS file.
+_CATALOG_MAX_BYTES = 16 * 1024 * 1024
+
+
 def _require_loadable_catalog(cf):
     """A confined catalog_file forwarded by h_panel_run must also be LOADABLE before context.md is
     overwritten. panel.py loads it lazily (on reviewer substitution), AFTER the write, so a confined-
@@ -211,8 +216,20 @@ def _require_loadable_catalog(cf):
     # _run_cli timeout guards, so opening a FIFO would block the server forever waiting for a writer.
     # Require a regular file first (is_file() stats without opening, so it never blocks; only open()
     # on a FIFO does), so untrusted repo content cannot hang ar_panel_run. (Codex, fc4a701.)
-    if not (Path.cwd() / cf).resolve().is_file():
+    resolved = (Path.cwd() / cf).resolve()
+    if not resolved.is_file():
         raise ToolError("catalog_file must be a regular file")
+    # Bound the in-process read (Codex r3946169157): load_catalog reads and parses the whole file with no
+    # _run_cli timeout, so a crafted multi-gigabyte but regular catalog could stall or exhaust memory before
+    # parsing. Reject by size first, stat()-only (never opening the file). A real model catalog is well
+    # under a megabyte; _CATALOG_MAX_BYTES is generous.
+    try:
+        size = resolved.stat().st_size
+    except OSError as e:
+        raise ToolError(f"catalog_file could not be stat'd: {e}") from e
+    if size > _CATALOG_MAX_BYTES:
+        raise ToolError(f"catalog_file is too large ({size} bytes > {_CATALOG_MAX_BYTES}) — a model "
+                        "catalog is far smaller; refusing to load it in-process")
     try:
         from panel import load_catalog
         load_catalog(cf)
@@ -464,10 +481,10 @@ def h_panel_assign(args):
     return _cli_result("panel", argv, timeout=300)
 
 
-def _write_context(run_args, context):
-    """Persist the caller-provided context to <run>/context.md and return its path.
-    The path is server-controlled (fixed filename in the run dir), so the context
-    string can never redirect the write elsewhere."""
+def _run_context_path(run_args):
+    """The server-controlled <run>/context.md path (fixed filename in the run dir) that _write_context
+    persists to. Exposed separately so h_panel_run can reject a catalog_file that aliases it BEFORE the
+    write overwrites it."""
     root = Path(os.environ.get("AR_RUN_DIR", ".adversarial-review"))
     if run_args:
         run_dir = root / run_args[1]
@@ -479,9 +496,39 @@ def _write_context(run_args, context):
         if not runs:
             raise ToolError("no runs yet — call ar_init first")
         run_dir = runs[-1]
-    cf = run_dir / "context.md"
+    return run_dir / "context.md"
+
+
+def _write_context(run_args, context):
+    """Persist the caller-provided context to <run>/context.md and return its path.
+    The path is server-controlled (fixed filename in the run dir), so the context
+    string can never redirect the write elsewhere."""
+    cf = _run_context_path(run_args)
     cf.write_text(context, encoding="utf-8")
     return str(cf)
+
+
+def _reject_context_alias(cf, context_path):
+    """Refuse a catalog_file that ALIASES the run's context.md (Codex r3946169158). _write_context
+    overwrites <run>/context.md immediately after catalog validation, so a catalog that resolves to that
+    same file — named directly, or via an in-tree symlink — is validated and then destroyed by the write,
+    after which panel.py's substitution reload fails on the now-context bytes. A hardlink (same inode,
+    distinct path) is caught too when the target already exists (skipped where st_ino is unavailable)."""
+    if cf is None:
+        return
+    resolved = (Path.cwd() / cf).resolve()
+    ctx_resolved = context_path.resolve()
+    if resolved == ctx_resolved:
+        raise ToolError("catalog_file must not be the run's context.md — it is overwritten with the "
+                        "review context and would no longer be a usable catalog")
+    try:
+        if context_path.exists():
+            cs, xs = resolved.stat(), ctx_resolved.stat()
+            if cs.st_ino != 0 and (cs.st_ino, cs.st_dev) == (xs.st_ino, xs.st_dev):
+                raise ToolError("catalog_file must not be hardlinked to the run's context.md — it is "
+                                "overwritten with the review context")
+    except OSError:
+        pass
 
 
 def h_panel_prepare(args):
@@ -506,6 +553,17 @@ def h_panel_run(args):
     # Confinement proves only WHERE the catalog is; also require it to be LOADABLE before persisting
     # context, so a confined-but-unusable catalog cannot mutate the audit record on a rejected call.
     _require_loadable_catalog(args.get("catalog_file"))
+    # ...and it must not ALIAS the server-controlled context.md the write below overwrites (Codex
+    # r3946169158): validation would pass on bytes the write then destroys. Resolve the context path the
+    # same way _write_context will; if the run cannot be resolved yet, _write_context raises that below.
+    cf_arg = args.get("catalog_file")
+    if cf_arg is not None:
+        try:
+            _ctx = _run_context_path(run_args)
+        except ToolError:
+            _ctx = None
+        if _ctx is not None:
+            _reject_context_alias(cf_arg, _ctx)
     cf = _write_context(run_args, context)
     argv = ["run"] + run_args + ["--context-file", cf] + catalog_argv
     if args.get("force"):
