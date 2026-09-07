@@ -20,8 +20,8 @@ PASS/FAIL/BLOCKED honestly):
     1  FAIL     verifier completed, defects / policy violations found
     2  BLOCKED  anything that cannot honestly complete: missing/empty pin, bad digest,
                missing/non-executable binary, incomplete:true, exit 2, timeout,
-               126/127/exec error, unknown nonzero exit, unreadable input, bad argv,
-               empty/unset run dir
+               126/127/exec error, unknown nonzero exit, unreadable/undecodable input,
+               bad argv, empty/unset run dir
 
 Empty diff (zero changed paths) is PASS with reason `empty-diff` -- nothing to verify
 is not a failure. Everything unconfigured or incomplete is BLOCKED, never a silent skip
@@ -35,6 +35,7 @@ BLOCKED even on exit 0 (trust the flag over the exit code).
 """
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -106,9 +107,10 @@ def _resolve_timeout():
     try:
         secs = float(raw)
     except ValueError:
-        blocked("%s must be a positive number of seconds, got %r" % (TIMEOUT_ENV, raw))
-    if secs <= 0:
-        blocked("%s must be a positive number of seconds, got %r" % (TIMEOUT_ENV, raw))
+        blocked("%s must be a positive, finite number of seconds, got %r" % (TIMEOUT_ENV, raw))
+    # Reject nan / inf / overflow: a non-finite watchdog is no watchdog.
+    if not math.isfinite(secs) or secs <= 0:
+        blocked("%s must be a positive, finite number of seconds, got %r" % (TIMEOUT_ENV, raw))
     return secs
 
 
@@ -120,10 +122,12 @@ def main(argv):
     if not Path(run_dir).is_dir():
         blocked("run dir does not exist or is not a directory: %s" % run_dir)
 
-    # Scope: the changed-paths file. Missing/unreadable -> BLOCKED (cannot scope honestly).
+    # Scope: the changed-paths file. Missing / unreadable / undecodable -> BLOCKED
+    # (cannot scope honestly). UnicodeDecodeError is a ValueError, not an OSError, so a
+    # non-UTF-8 path list must be caught here or it would escape as an exit-1 FAIL.
     try:
         raw = Path(diff_file).read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         blocked("cannot read diff file %s: %s" % (diff_file, exc))
     paths = [ln.strip() for ln in raw.splitlines() if ln.strip()]
 
@@ -170,7 +174,9 @@ def main(argv):
         blocked("could not execute verifier (%s)" % exc)
 
     rc = proc.returncode
-    for line in (proc.stdout or "").strip().splitlines()[-3:]:
+    # Surface a short tail of the child's own output (stdout AND stderr) under the prefix.
+    combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    for line in combined.splitlines()[-6:]:
         print("%s verifier: %s" % (LOG, line))
 
     if rc == 1:

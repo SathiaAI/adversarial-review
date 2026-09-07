@@ -78,6 +78,9 @@ def _parse_exit_map(spec):
         code_s, status = (x.strip() for x in part.split("=", 1))
         if status not in ("PASS", "FAIL", "BLOCKED"):
             die(f"--exit-map status must be PASS|FAIL|BLOCKED, got {status!r}")
+        if status == "PASS" and code_s != "0":
+            die(f"--exit-map may not map a nonzero exit to PASS (got {part!r}); PASS is "
+                f"reserved for exit 0 so a failing check can never be weakened to a pass")
         if code_s == "*":
             star = status
         else:
@@ -109,7 +112,8 @@ def cmd_run(args):
             status = estar if estar is not None else "FAIL"
     else:
         status = "PASS" if rc == 0 else "FAIL"
-    default_summary = {"PASS": "pass", "FAIL": "fail", "BLOCKED": "blocked"}[status]
+    default_summary = {"PASS": "pass", "FAIL": "fail",
+                       "BLOCKED": f"blocked (command exited {rc})"}[status]
     write_json(run / "gates" / f"{args.name}.json", {
         "gate": args.name, "command": " ".join(cmd), "exit_code": rc,
         "status": status,

@@ -56,15 +56,24 @@ jobs:
             exit 0
           fi
           dest="$RUNNER_TEMP/ai-defects-verifier"
-          # Fetch to a runner-only path. The token (if any) is passed via a header and
-          # never printed; -f makes a bad fetch a hard error.
+          # Fetch to a runner-only path. A fetch failure (DNS/TLS/HTTP/etc.) must NOT abort
+          # the job: leave AI_DEFECTS_BIN unset and exit 0 so the gate step still runs and
+          # records BLOCKED (fail-closed), never a skipped/absent gate. With a token we do
+          # NOT follow redirects (-L would forward the Authorization header to the redirect
+          # host and leak the token); operators point the URL directly at the artifact.
+          dl_failed=""
           if [ -n "${AI_DEFECTS_FETCH_TOKEN:-}" ]; then
-            curl -fsSL -H "Authorization: Bearer ${AI_DEFECTS_FETCH_TOKEN}" -o "$dest" "$AI_DEFECTS_INSTALL_URL"
+            curl -fsS -H "Authorization: Bearer ${AI_DEFECTS_FETCH_TOKEN}" -o "$dest" "$AI_DEFECTS_INSTALL_URL" || dl_failed=1
           else
-            curl -fsSL -o "$dest" "$AI_DEFECTS_INSTALL_URL"
+            curl -fsSL -o "$dest" "$AI_DEFECTS_INSTALL_URL" || dl_failed=1
+          fi
+          if [ -n "$dl_failed" ]; then
+            echo "::notice::ai-defects: verifier download failed — gate will record BLOCKED (fail-closed)."
+            rm -f "$dest"
+            exit 0
           fi
           got="$(sha256sum "$dest" | awk '{print $1}')"
-          want="$(printf '%s' "$AI_DEFECTS_PIN_DIGEST" | tr 'A-Z' 'a-z' | tr -d '[:space:]' | sed 's/^sha256://')"
+          want="$(printf '%s' "$AI_DEFECTS_PIN_DIGEST" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' | sed 's/^sha256://')"
           if [ "$got" != "$want" ]; then
             echo "::error::ai-defects: pinned binary digest mismatch — refusing to install (values redacted)."
             rm -f "$dest"
@@ -84,9 +93,21 @@ jobs:
           RUN_DIR="$(python scripts/panel.py init --risk NORMAL --dev-providers anthropic \
                        --diff-ref "$IN_DIFF_REF" | awk '/^initialized /{print $2; exit}')"
           test -n "$RUN_DIR" && test -d "$RUN_DIR"
-          git diff --name-only "$IN_DIFF_REF" > "$RUN_DIR/changed_paths.txt" || true
+          # Establish the scan scope. An invalid diff-ref must FAIL CLOSED (BLOCKED), never
+          # silently produce an empty changed_paths.txt that the wrapper reads as empty-diff
+          # PASS. A VALID range with no changed files is a legitimate empty-diff PASS.
+          if ! git diff --name-only "$IN_DIFF_REF" > "$RUN_DIR/changed_paths.txt"; then
+            python scripts/gate.py record --run "$RUN_DIR" --name ai-defects --status BLOCKED \
+              --summary "invalid diff-ref '$IN_DIFF_REF' -- scan scope not established"
+            echo "----- ai-defects ledger entry -----"
+            cat "$RUN_DIR/gates/ai-defects.json"
+            echo "::error::ai-defects gate: BLOCKED (invalid diff-ref; scan scope not established)"
+            exit 1
+          fi
           python scripts/gate.py plan --run "$RUN_DIR" --require ai-defects
-          # The wrapper emits a tri-state exit; --exit-map records BLOCKED on exit 2.
+          # The wrapper emits a tri-state exit; --exit-map records BLOCKED on exit 2. The
+          # ledger status (not this step's exit) is the source of truth, so tolerate the
+          # wrapper's own nonzero exit here and read the recorded status below.
           python scripts/gate.py run --run "$RUN_DIR" --name ai-defects \
             --exit-map "1=FAIL,2=BLOCKED,*=BLOCKED" -- \
             python scripts/ai_defects_verify.py \
@@ -97,8 +118,8 @@ jobs:
           status="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$RUN_DIR/gates/ai-defects.json")"
           case "$status" in
             PASS)    echo "::notice::ai-defects gate: PASS" ;;
-            FAIL)    echo "::error::ai-defects gate: FAIL (defects found)"; exit 1 ;;
-            BLOCKED) echo "::error::ai-defects gate: BLOCKED (fail-closed — supply the pin to reach PASS)"; exit 1 ;;
+            FAIL)    echo "::error::ai-defects gate: FAIL (defects found) — see the ledger entry above"; exit 1 ;;
+            BLOCKED) echo "::error::ai-defects gate: BLOCKED (fail-closed) — see the ai-defects ledger entry above for the reason"; exit 1 ;;
             *)       echo "::error::ai-defects gate: unexpected status '$status'"; exit 1 ;;
           esac
 

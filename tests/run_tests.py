@@ -9528,6 +9528,40 @@ def t_ai_defects_public_silence_detects_vendor():    # T-N6: planted vendor/bran
     assert _silence(d2).returncode != 0
 
 
+def t_ai_defects_gate_exit_map_rejects_nonzero_pass():  # exit-map must never weaken a failing check
+    run = _aidef_rundir()
+    for spec in ("1=PASS", "*=PASS"):
+        sh(["gate.py", "run", "--run", str(run), "--name", "ai-defects",
+            "--exit-map", spec, "--", "true"], cwd=str(run), expect=1)
+    assert not (run / "gates" / "ai-defects.json").exists()
+
+
+def t_ai_defects_undecodable_diff_blocked():            # non-UTF-8 scope input -> BLOCKED, not FAIL
+    run = _aidef_rundir()
+    (run / "changed_paths.txt").write_bytes(b"\xff\xfe\x00 not utf8\n")
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=2)
+    assert "diff file" in r.stdout
+
+
+def t_ai_defects_nonfinite_timeout_blocked():           # nan/inf watchdog is no watchdog -> BLOCKED
+    run = _aidef_rundir()
+    env = _aidef_env(_aidef_fix("exit0_clean.py"), timeout="inf")
+    r = _aidef_wrap(run, env, expect=2)
+    assert "finite" in r.stdout
+
+
+def t_ai_defects_public_silence_readme_variant_and_your_sast():
+    # Every root README* variant is in scope (not just README.md)...
+    d = Path(tempfile.mkdtemp(prefix="ar-silence-"))
+    (d / "README.rst").write_text("Powered by skylos.\n")
+    assert _silence(d).returncode != 0
+    # ...but ordinary second-person guidance ("your SAST") is NOT a first-party claim.
+    d2 = Path(tempfile.mkdtemp(prefix="ar-silence-"))
+    (d2 / "README.md").write_text("Configure your SAST policy before merging.\n")
+    r2 = _silence(d2)
+    assert r2.returncode == 0, r2.stdout
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]

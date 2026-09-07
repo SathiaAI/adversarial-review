@@ -51,5 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: ai-defects public-silence (no vendor brand on public surfaces)
         run: sh scripts/check_ai_defects_public_silence.sh
