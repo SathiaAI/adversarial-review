@@ -1156,86 +1156,22 @@ def _aggregate_cli():
         verify_signature(run)
     if args.sign:
         sign_attestation(run)
-    meta = read_json(run / "run.json")
-
-    fail, blocked, notes = [], [], []
-    counts = {"gates": 0, "reviewers": 0, "findings_high_critical": 0,
-              "findings_medium_low": 0, "confirmed": 0, "unresolved": 0}
-
-    gates, gcov = check_gates(run, meta["risk"], fail, blocked, notes)
-    counts["gates"] = len(gates)
-
-    plan_path = run / "panel" / "plan.json"
-    plan = read_json(plan_path) if plan_path.exists() else {}
-    reports = load_reports(run, plan)
-    counts["reviewers"] = len(reports)
-    pcov = check_panel(run, meta, plan, reports, blocked)
-    rcov = check_rebuttal(run, meta, plan, reports, blocked, notes)
-    fcov = check_findings(run, meta, plan, reports, fail, blocked, counts)
-
-    # First-class coverage: one machine-readable manifest of what this run did and
-    # did not verify, assembled from the same recorded artifacts as the verdict (#8).
-    # Ingest-validated reports always carry a list here, but a hand-recorded artifact
-    # can carry null or a non-list; skip those rather than crash the enforcement
-    # point (run-20260807-210733 panel, correctness-5).
-    areas = set()
-    for rep in reports.values():
-        vals = rep.get("areas_not_reviewed")
-        if isinstance(vals, list):
-            areas.update(str(a) for a in vals)
-    # Cost accounting + cap enforcement, read from the same recorded artifacts (E4-S2). A run
-    # that panel.py aborted on the cost cap BLOCKS — the missing reviewers already do, but name
-    # the cost reason explicitly so it is not mistaken for an ordinary incomplete panel.
-    panel_cost_usd = 0.0
-    mdir = run / "panel" / "meta"
-    if mdir.is_dir():
-        for p in sorted(mdir.glob("*.json")):
-            panel_cost_usd += meta_cost(read_json(p))
-    cost_abort = read_json(run / "cost_abort.json") if (run / "cost_abort.json").exists() else None
-    if isinstance(cost_abort, dict):
-        blocked.append(
-            f"{cost_abort.get('phase') or 'panel'} phase aborted on cost cap "
-            f"${cost_abort.get('cap_usd')} (spent ${cost_abort.get('spent_usd')}); not run: "
-            f"{', '.join(str(r) for r in (cost_abort.get('not_run') or [])) or 'none'}")
-    # Surface the enforced ceiling + its source (recorded by panel.py at run time) so the audit
-    # shows which cap actually applied, not just total spend.
-    cpol = read_json(run / "cost_policy.json") if (run / "cost_policy.json").exists() else None
-    cpol = cpol if isinstance(cpol, dict) else {}
-    coverage = {"risk": meta["risk"], "gates": gcov, "panel": pcov,
-                "rebuttal": rcov, "findings": fcov,
-                "cost_usd": round(panel_cost_usd, 6), "cost_aborted": bool(cost_abort),
-                "cost_cap_usd": cpol.get("cap_usd"), "cost_cap_source": cpol.get("source"),
-                "areas_not_reviewed": sorted(areas)}
-
-    verdict = "FAIL" if fail else ("BLOCKED" if blocked else "PASS")
-    # Plain-language next steps are derived from the verdict + coverage above; they are
-    # read-only over that state and cannot change it (guidance, not gate).
-    steps = next_steps(verdict, fail, blocked, gcov, fcov, counts)
-    # Tamper-evident attestation over every recorded input, computed before the
-    # verdict file exists so re-aggregating an untouched run reproduces it (#5).
-    attestation = compute_attestation(run)
-    out = {"verdict": verdict, "reasons": fail + blocked, "notes": notes,
-           "next_steps": steps,
-           "counts": counts, "coverage": coverage, "attestation": attestation,
-           "risk": meta["risk"], "run_id": meta["run_id"], "computed_at": now_iso()}
-    # fix-37 (Codex r3951566976) + fix-38 (CodeRabbit r3951923661): serialize this verdict write against a
-    # concurrent MCP ar_aggregate. mcp_server.h_aggregate holds run/verdict.json.lock across its
-    # move-aside -> aggregate -> settle critical section; a direct ar-aggregate that ignored the lock could
-    # write verdict.json INSIDE that window and then be silently rolled back when the MCP settle restored
-    # its moved-aside prior (Codex reproduced a direct BLOCKED reverted to a stale PASS). Take the SAME
-    # per-run O_EXCL lock around the verdict.json/verdict.md writes so a concurrent MCP aggregate (which
-    # holds it) forces this CLI to refuse instead of racing. verdict.json.lock is not *.json, so it never
-    # enters the attestation.
+    # fix-39 (Codex r3952220744): acquire the per-run lock BEFORE reading any run artifacts and hold it
+    # through the writes, so the WHOLE read -> compute -> write is one atomic critical section. fix-37/38
+    # took the lock only around the writes; a direct aggregate that had already READ stale artifacts could
+    # then acquire the lock (after a concurrent aggregation committed a fresher verdict) and overwrite it
+    # with the stale computation — replacing a fresh FAIL with an earlier PASS whose attestation omits the
+    # newer artifacts (Codex reproduced this). Holding the lock across the reads makes any concurrent
+    # aggregate of the same run refuse (O_EXCL) rather than interleave, so a stale computation never lands.
     #
-    # The MCP wrapper spawns THIS file as its child while ALREADY holding the lock, so the child must skip
-    # re-acquiring it (else every MCP aggregate would fail against its own held lock). fix-37 signalled that
-    # with a --lock-already-held FLAG, but a flag is accepted from ANY caller — a standalone
-    # `aggregate.py --lock-already-held` could bypass a held lock (CodeRabbit r3951923661). The signal is now
-    # an UNFORGEABLE parent-child capability: the wrapper mints a random token, writes its SHA-256 HASH into
-    # the 0o600 lock file it owns, and hands THIS child the PREIMAGE via AR_AGGREGATE_LOCK_TOKEN. We skip the
-    # lock ONLY when our env token hashes to the lock file's stored hash. A standalone caller has no env
-    # token — and, seeing only the hash in the (owner-only) lock file, cannot invert it to a matching
-    # preimage — so it always takes the lock below and is refused while one is held.
+    # The MCP wrapper (mcp_server.h_aggregate) spawns THIS file as its child while ALREADY holding the lock,
+    # so the child must skip re-acquiring it (else every MCP aggregate would fail against its own held lock).
+    # The re-entrancy signal is an UNFORGEABLE parent-child capability, not a CLI flag a standalone caller
+    # could pass (CodeRabbit r3951923661): the wrapper mints a random token, writes its SHA-256 HASH into the
+    # 0o600 lock file it owns, and hands THIS child the PREIMAGE via AR_AGGREGATE_LOCK_TOKEN. We skip the
+    # lock ONLY when our env token hashes to the lock file's stored hash. A standalone caller has no such
+    # token and, seeing only the hash in the owner-only lock file, cannot invert it — so it always takes the
+    # lock here and is refused while one is held. (verdict.json.lock is not *.json, so it never attests.)
     lock_path = run / "verdict.json.lock"
     parent_holds_lock = False
     _tok = os.environ.get("AR_AGGREGATE_LOCK_TOKEN")
@@ -1260,6 +1196,68 @@ def _aggregate_cli():
             print(f"cannot acquire the aggregate lock ({lock_path.name}): {e}", file=sys.stderr)
             sys.exit(3)
     try:
+        meta = read_json(run / "run.json")
+
+        fail, blocked, notes = [], [], []
+        counts = {"gates": 0, "reviewers": 0, "findings_high_critical": 0,
+                  "findings_medium_low": 0, "confirmed": 0, "unresolved": 0}
+
+        gates, gcov = check_gates(run, meta["risk"], fail, blocked, notes)
+        counts["gates"] = len(gates)
+
+        plan_path = run / "panel" / "plan.json"
+        plan = read_json(plan_path) if plan_path.exists() else {}
+        reports = load_reports(run, plan)
+        counts["reviewers"] = len(reports)
+        pcov = check_panel(run, meta, plan, reports, blocked)
+        rcov = check_rebuttal(run, meta, plan, reports, blocked, notes)
+        fcov = check_findings(run, meta, plan, reports, fail, blocked, counts)
+
+        # First-class coverage: one machine-readable manifest of what this run did and
+        # did not verify, assembled from the same recorded artifacts as the verdict (#8).
+        # Ingest-validated reports always carry a list here, but a hand-recorded artifact
+        # can carry null or a non-list; skip those rather than crash the enforcement
+        # point (run-20260807-210733 panel, correctness-5).
+        areas = set()
+        for rep in reports.values():
+            vals = rep.get("areas_not_reviewed")
+            if isinstance(vals, list):
+                areas.update(str(a) for a in vals)
+        # Cost accounting + cap enforcement, read from the same recorded artifacts (E4-S2). A run
+        # that panel.py aborted on the cost cap BLOCKS — the missing reviewers already do, but name
+        # the cost reason explicitly so it is not mistaken for an ordinary incomplete panel.
+        panel_cost_usd = 0.0
+        mdir = run / "panel" / "meta"
+        if mdir.is_dir():
+            for p in sorted(mdir.glob("*.json")):
+                panel_cost_usd += meta_cost(read_json(p))
+        cost_abort = read_json(run / "cost_abort.json") if (run / "cost_abort.json").exists() else None
+        if isinstance(cost_abort, dict):
+            blocked.append(
+                f"{cost_abort.get('phase') or 'panel'} phase aborted on cost cap "
+                f"${cost_abort.get('cap_usd')} (spent ${cost_abort.get('spent_usd')}); not run: "
+                f"{', '.join(str(r) for r in (cost_abort.get('not_run') or [])) or 'none'}")
+        # Surface the enforced ceiling + its source (recorded by panel.py at run time) so the audit
+        # shows which cap actually applied, not just total spend.
+        cpol = read_json(run / "cost_policy.json") if (run / "cost_policy.json").exists() else None
+        cpol = cpol if isinstance(cpol, dict) else {}
+        coverage = {"risk": meta["risk"], "gates": gcov, "panel": pcov,
+                    "rebuttal": rcov, "findings": fcov,
+                    "cost_usd": round(panel_cost_usd, 6), "cost_aborted": bool(cost_abort),
+                    "cost_cap_usd": cpol.get("cap_usd"), "cost_cap_source": cpol.get("source"),
+                    "areas_not_reviewed": sorted(areas)}
+
+        verdict = "FAIL" if fail else ("BLOCKED" if blocked else "PASS")
+        # Plain-language next steps are derived from the verdict + coverage above; they are
+        # read-only over that state and cannot change it (guidance, not gate).
+        steps = next_steps(verdict, fail, blocked, gcov, fcov, counts)
+        # Tamper-evident attestation over every recorded input, computed before the
+        # verdict file exists so re-aggregating an untouched run reproduces it (#5).
+        attestation = compute_attestation(run)
+        out = {"verdict": verdict, "reasons": fail + blocked, "notes": notes,
+               "next_steps": steps,
+               "counts": counts, "coverage": coverage, "attestation": attestation,
+               "risk": meta["risk"], "run_id": meta["run_id"], "computed_at": now_iso()}
         write_json(run / "verdict.json", out)
 
         md = [f"# Release verdict: {verdict}", "",
@@ -1293,7 +1291,8 @@ def _aggregate_cli():
         # Release the per-run lock on every exit path. Close BEFORE unlink so the removal succeeds on
         # Windows too (an open handle blocks delete there); a failed unlink leaves a stale lock the
         # operator can clear rather than crashing the write. Never unlink a lock this process did not
-        # create (lock_fd is None under --lock-already-held — the MCP parent owns and releases it).
+        # create (lock_fd is None when the parent's token authorized skipping acquisition — the MCP
+        # wrapper owns and releases it).
         if lock_fd is not None:
             try:
                 os.close(lock_fd)

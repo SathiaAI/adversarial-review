@@ -922,6 +922,25 @@ def t_aggregate_cli_unforgeable_token_no_public_bypass():
     assert (run / "verdict.json").read_text(encoding="utf-8") == baseline, "the retired flag must not write"
 
 
+def t_aggregate_cli_lock_precedes_artifact_reads():
+    # Codex (PR #55) r3952220744: fix-37/38 took the lock only around the WRITES, so a direct aggregate that
+    # had already READ stale artifacts could later acquire the lock (after a concurrent aggregation committed
+    # a fresher verdict) and overwrite it with the stale computation. The lock is now taken BEFORE reading
+    # any run artifacts and held through the writes. Deterministic proof: hold the lock AND make run.json
+    # unparseable. On the fix, aggregate.py refuses on the lock ("in progress", exit 3) BEFORE reading
+    # run.json -- no traceback. On the base it reads/parses run.json first and crashes (exit 3 WITH a
+    # traceback, no lock message), so the "in progress"/no-traceback assertions fail there. (resolve_run
+    # only checks the run dir exists; it does not read run.json, so the fix reaches the lock first.)
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    (run / "verdict.json.lock").write_text("")            # a concurrent aggregate holds the lock (no token)
+    (run / "run.json").write_text("{ not valid json")     # first COMPUTE read would crash if reached
+    r = sh(["aggregate.py"], repo, expect=3)
+    blob = r.stdout + r.stderr
+    assert "in progress" in blob, ("must refuse on the lock, not crash reading artifacts", blob)
+    assert "Traceback" not in blob, ("must acquire the lock BEFORE reading/parsing run.json", blob)
+
+
 def t_check_digest_unreadable_verdict_is_cannot_verify_not_drift():
     # A malformed verdict.json makes --check-digest unable to READ the stored attestation, so nothing
     # is compared. That must exit 2 (cannot verify), never 1 (a definitive mismatch): the MCP wrapper
@@ -7443,6 +7462,39 @@ def t_mcp_catalog_snapshot_decouples_from_source():
         os.chdir(cwd0)
 
 
+def t_mcp_catalog_snapshot_fails_closed_without_o_nofollow():
+    # Codex (PR #55) r3952220749: the catalog snapshot's O_NOFOLLOW is LOAD-BEARING, not defense-in-depth --
+    # resolve() canonicalizes the path but does NOT pin the leaf across the reopen, so a concurrent swap of
+    # the resolved leaf to an out-of-tree symlink is caught only by O_NOFOLLOW. fix-35 made the sibling
+    # policy read fail closed when os.O_NOFOLLOW is unavailable, but the catalog snapshot used
+    # getattr(os, "O_NOFOLLOW", 0), silently disabling it on a platform without it (Windows). It now FAILS
+    # CLOSED (raises) when os.O_NOFOLLOW is absent, matching the policy read. Simulate by removing the attr.
+    # On the base getattr(...,0) lets the open proceed and a snapshot is created -> no raise -> fails there.
+    if not hasattr(os, "O_NOFOLLOW"):
+        return  # platform genuinely lacks it; the removal-simulation below is what exercises the guard
+    repo = Path(tempfile.mkdtemp(prefix="ar-cat-nof-"))
+    (repo / "catalogs").mkdir()
+    (repo / "catalogs" / "cat.json").write_text(
+        json.dumps({"data": [{"id": "openai/gpt-4o"}]}), encoding="utf-8")
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    saved = os.O_NOFOLLOW
+    snap = None
+    try:
+        del os.O_NOFOLLOW
+        raised = False
+        try:
+            snap = mcpsrv._snapshot_confined_catalog({"catalog_file": "catalogs/cat.json"}, [])
+        except mcpsrv.ToolError as e:
+            raised = True
+            assert "O_NOFOLLOW" in str(e), e
+        assert raised, "catalog snapshot must fail closed when os.O_NOFOLLOW is unavailable"
+    finally:
+        os.O_NOFOLLOW = saved
+        mcpsrv._cleanup_snapshot(snap)
+        os.chdir(cwd0)
+
+
 def t_mcp_rebuttal_tool_exposed():
     # The rebuttal round is reachable via MCP: keyless prepare (--prepare) and direct HTTP.
     assert "ar_panel_rebuttal" in mcpsrv.TOOLS_BY_NAME
@@ -7760,6 +7812,61 @@ def t_mcp_aggregate_restores_prior_verdict_on_rejected_write():
     finally:
         mcpsrv._run_cli = orig
         os.chdir(cwd0)
+
+
+def t_mcp_aggregate_refuses_symlink_swapped_prev_stash():
+    # Codex (PR #55) r3952220753: a concurrent process with write access to the untrusted run dir can replace
+    # the PREDICTABLE .prev with a symlink AFTER h_aggregate's move-aside but before the settle. os.replace
+    # renames the link itself, so it would PROMOTE that symlink to verdict.json and ar_get_verdict would then
+    # follow it OUT of the run dir (Codex reproduced reading an external file's secret). The settle now
+    # refuses to promote a symlinked stash (lstat) and never leaves verdict.json a symlink. Simulate the swap
+    # inside the _run_cli stub (which runs AFTER the move-aside), then reject: verdict.json must NOT become a
+    # symlink and must not carry the external content. On the base the symlink is promoted -> verdict.json is
+    # a symlink to the external file -> this fails there.
+    repo = Path(tempfile.mkdtemp(prefix="ar-agg-prevswap-"))
+    rundir = repo / ".adversarial-review" / "run-20260101-010101"
+    rundir.mkdir(parents=True)
+    (rundir / "verdict.json").write_text(
+        json.dumps({"verdict": "PASS", "run_id": "run-20260101-010101"}))
+    external = repo / "external-secret.json"
+    external.write_text(json.dumps(
+        {"verdict": "PASS", "run_id": "run-20260101-010101", "secret": "leaked"}), encoding="utf-8")
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    swapped = {"ok": False}
+
+    def fake(module, argv, timeout=120):
+        # runs after the move-aside: verdict.json has been renamed to .prev. Swap .prev -> symlink to external.
+        prev = rundir / "verdict.json.prev"
+        try:
+            if prev.is_file():
+                prev.unlink()
+            prev.symlink_to(external)
+            swapped["ok"] = True
+        except (OSError, NotImplementedError):
+            pass
+        return (3, "", "boom: rejected")   # rejected -> settle tries to restore from the (swapped) .prev
+
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        # The settle refuses to promote the swapped symlink and fails closed. Because the rejected aggregate
+        # ALSO cannot restore the prior (the attacker destroyed it), h_aggregate surfaces that as a ToolError
+        # (never silently) -- expected here. On the base it instead promotes the symlink and returns without
+        # raising, leaving verdict.json a symlink (caught by the assertion below).
+        try:
+            mcpsrv.h_aggregate({"run": "run-20260101-010101"})
+        except mcpsrv.ToolError:
+            pass
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+    if not swapped["ok"]:
+        return  # platform without symlink support; nothing to assert
+    vf = rundir / "verdict.json"
+    assert not vf.is_symlink(), "settle must never leave verdict.json as a symlink to an external file"
+    if vf.exists():
+        assert "leaked" not in vf.read_text(encoding="utf-8"), "verdict.json must not carry external content"
 
 
 def t_mcp_aggregate_surfaces_failed_prior_restore():

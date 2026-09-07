@@ -228,13 +228,21 @@ def _snapshot_confined_catalog(args, argv):
         raise ToolError("catalog_file must resolve to a path within the repository "
                         "(its symlink target escapes the working tree)")
     # Open the resolved path race-safely, then copy from the OPEN descriptor so no consumer ever reopens
-    # the caller's path. O_NOFOLLOW turns a final-component symlink swapped in after resolution into an
+    # the caller's path. O_NOFOLLOW turns a final-component symlink swapped in AFTER resolution into an
     # error instead of an out-of-tree read; O_NONBLOCK keeps the open from blocking on a FIFO (so the
     # fstat below rejects it rather than the read hanging with no _run_cli timeout to guard it); fstat on
     # the descriptor itself — never a separate stat — proves a regular file and bounds the size with no
-    # TOCTOU. (O_NOFOLLOW/O_NONBLOCK/O_BINARY are absent on some platforms; getattr(...,0) makes them
-    # no-ops there, where resolve() has already stripped symlinks.)
-    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # TOCTOU. O_NOFOLLOW is LOAD-BEARING here, not merely defense-in-depth: resolve() canonicalizes the
+    # path but does NOT pin the object across this reopen, so between resolve() and os.open() the
+    # (now-resolved) leaf can be swapped for an out-of-tree symlink, and only O_NOFOLLOW rejects it. On a
+    # platform without O_NOFOLLOW (Windows) getattr(...,0) would silently drop that protection and follow
+    # the swap — so FAIL CLOSED instead (matching _read_policy_racesafe, fix-35), letting the caller
+    # surface the error rather than snapshot an external catalog (Codex r3952220749). O_NONBLOCK/O_BINARY
+    # stay getattr — they are convenience/defense-in-depth, not the confinement guarantee.
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ToolError("cannot open catalog_file without following symlinks on this platform "
+                        "(os.O_NOFOLLOW unavailable); refusing the confined snapshot")
+    flags = (os.O_RDONLY | os.O_NOFOLLOW
              | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
     try:
         fd = os.open(str(target), flags)
@@ -1072,7 +1080,29 @@ def h_aggregate(args):
                     if vf is not None and vf.is_file():
                         vf.unlink()
                     if stash.is_file():
+                        # A concurrent process with write access to the untrusted run dir can replace the
+                        # PREDICTABLE .prev with a symlink AFTER this wrapper created it (via vf.replace(cand)
+                        # above) but before this settle. os.replace() renames the link itself, so it would
+                        # PROMOTE that symlink to verdict.json, after which ar_get_verdict follows it out of
+                        # the run dir and returns an external file's contents (Codex r3952220753, reproduced).
+                        # is_file() FOLLOWS the link, so guard with an lstat (is_symlink) and refuse to promote
+                        # a symlinked stash; the prior is then treated as unrestorable (verdict.json stays
+                        # absent -> RECOVERY_PENDING) rather than exposing an out-of-run target as this run's
+                        # verdict. (The entry guard already rejects a symlinked .prev present at entry; this
+                        # covers the swap that happens AFTER the wrapper creates the stash.)
+                        if stash.is_symlink():
+                            raise OSError(f"recovery stash {stash.name} was replaced by a symlink after "
+                                          "creation; refusing to promote it to verdict.json")
                         stash.replace(vf)
+                        # Belt-and-suspenders against a swap in the tiny window between the lstat and the
+                        # rename: NEVER leave verdict.json as a symlink for ar_get_verdict to follow.
+                        if vf is not None and vf.is_symlink():
+                            try:
+                                vf.unlink()
+                            except OSError:
+                                pass
+                            raise OSError("restored verdict.json resolved to a symlink; removed it "
+                                          "rather than surface an out-of-run target as the verdict")
                 except OSError as e:
                     reconcile_err, reconcile_at = e, stash
             elif stash_bytes is not None:

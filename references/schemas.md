@@ -187,10 +187,12 @@ subcommand's own codes (e.g. `--sign`'s exit 3 for "no signer configured") are u
 
 **Concurrent aggregation — the per-run write lock.** Writing `verdict.json` for a run is serialized by an
 `O_EXCL` lock file, `verdict.json.lock`, in the run directory (it is not `*.json`, so it never enters the
-attestation). Both entry points honor it: the standalone `aggregate.py` CLI acquires it around its
-`verdict.json`/`verdict.md` writes and **exits 3** if it is already held (another aggregate is in progress),
-and `mcp_server`'s `ar_aggregate` holds it across its wider *move-aside → aggregate → settle* section so a
-concurrent aggregate cannot roll back a freshly written verdict. Because `ar_aggregate` spawns `aggregate.py`
+attestation). Both entry points honor it: the standalone `aggregate.py` CLI acquires it **before reading any
+run artifacts** and holds it through the `verdict.json`/`verdict.md` writes — so the whole read→compute→write
+is one critical section (a stale computation can't overwrite a fresher verdict) — and **exits 3** if it is
+already held (another aggregate is in progress); `mcp_server`'s `ar_aggregate` holds it across its wider
+*move-aside → aggregate → settle* section so a concurrent aggregate cannot roll back a freshly written
+verdict. Because `ar_aggregate` spawns `aggregate.py`
 as its child *while already holding* the lock, the child must skip re-acquiring it — authorized by an
 **unforgeable parent→child token**, not a CLI flag (which any caller could pass): the wrapper mints a random
 token, writes its **SHA-256 hash** into the `0o600` lock file it owns, and hands the child the **preimage**
