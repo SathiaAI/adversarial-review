@@ -39,6 +39,7 @@ Operates on the .adversarial-review/ directory in the server's working directory
 so launch it with the repository under review as the current directory.
 """
 
+import hashlib
 import http.server
 import ipaddress
 import json
@@ -47,6 +48,7 @@ import re
 import secrets
 import select
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -55,6 +57,14 @@ from collections import OrderedDict
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
+# Put this dir first on sys.path so the in-process helpers below (`from panel import load_catalog`,
+# `from _common import load_policy`) resolve even under the `ar-mcp` console-script entry point
+# (adversarial_review.mcp_server:main), where those bare module names are not otherwise importable —
+# the same one-liner panel.py and aggregate.py use. Without it a pip-installed server silently fails
+# every catalog_file validation and never applies the policy `high_samples` timeout budget. Inserting
+# the packaged dir FIRST also stops a module in the repo under review (the server's cwd) from ever
+# shadowing these. (Fable, 60cb2c3.)
+sys.path.insert(0, str(SCRIPTS_DIR))
 SERVER_NAME = "adversarial_review_mcp"
 # Legacy handshake versions (initialize / notifications/initialized). Newest first; the
 # initialize handler echoes the client's if we support it, else our latest — per the
@@ -82,11 +92,23 @@ META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 # value from reaching resolve_run() as a path (a value containing a separator, or
 # "..", would otherwise escape .adversarial-review/ and read/write an arbitrary
 # existing directory). Empty/None is allowed: the CLI then targets the newest run.
-RUN_RE = re.compile(r"^run-\d{8}-\d{6}(?:-\d+)?$")
+# RUN_RE anchors with \Z (end-of-string), NOT $: `$` also matches just before a trailing newline, so
+# RUN_RE.match("run-…\n") would admit a directory name ending in a newline. iterdir() yields untrusted
+# repository content, and such a name sorts as a normal run — a crafted `run-99999999-999999\n` dir
+# would then be selected as "newest" and pin every tool to that non-minted directory. \Z rejects it.
+# (Codex, fc4a701.)
+RUN_RE = re.compile(r"^run-\d{8}-\d{6}(?:-\d+)?\Z")
 ROLE_RE = re.compile(r"^[a-z][a-z_]*$")
 PIN_RE = re.compile(r"^[A-Za-z0-9_]+=[A-Za-z0-9][A-Za-z0-9._/-]*$")
 PROVIDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 GATE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# The run id `panel.py init` mints, matched in its stdout so h_init reports the run it
+# actually created rather than inferring it from a directory listing (which races a
+# concurrent init and mis-sorts run-...-9 vs run-...-10).
+RUN_ID_RE = re.compile(r"run-\d{8}-\d{6}(?:-\d+)?")
+# A Windows drive-letter prefix (C:, \\server) — absolute on Windows but not caught by a
+# POSIX leading-"/" check; rejected so a confined relative path cannot be an absolute one.
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
 
 class ToolError(Exception):
@@ -116,8 +138,17 @@ def log(msg):
 
 def _safe_run(args):
     run = args.get("run")
-    if run is None:  # key omitted (or null) — target the newest run
-        return []
+    if run is None:  # key omitted (or null) — resolve the newest run ONCE and pin it explicitly
+        # so every subprocess (and every helper) binds to the SAME run this server selected.
+        # panel.py / aggregate.py resolve "newest" with a lexicographic sort that disagrees with
+        # our numeric _run_key once a -N disambiguator exists (run-...-10 vs run-...-9); resolving
+        # here and passing --run to each CLI keeps every pipeline phase on one audit record and
+        # closes the concurrent-init TOCTOU. If no run exists yet, fall back to no argument so the
+        # CLI emits its own "call ar_init first".
+        try:
+            return ["--run", _run_dir([]).name]
+        except ToolError:
+            return []
     # A provided run must be exactly a minted id. An empty/whitespace string is a
     # caller error, not a silent "newest": reject it so an ambiguous value can never
     # slip past RUN_RE into resolve_run().
@@ -135,9 +166,258 @@ def _req_str(args, key):
     return v
 
 
+def _opt_authorizer(args):
+    """Resolve the optional 'authorized_by' identity. A present value must be a non-empty
+    string: a schema-invalid value (bool, number, list) must NOT be stringified into a named
+    authorizer, or a malformed request could waive a gate / authorize a degraded panel and
+    still produce an apparently-authorized audit artifact."""
+    v = args.get("authorized_by")
+    if v is None:
+        return None
+    if not isinstance(v, str) or not v.strip():
+        raise ToolError("authorized_by must be a non-empty string")
+    return v.strip()  # normalize: an audit authorizer must not carry incidental surrounding whitespace
+
+
+# Ceiling on a snapshotted catalog_file (see _snapshot_confined_catalog). A real model catalog is well
+# under a megabyte; this is generous headroom while still refusing a multi-gigabyte DoS file.
+_CATALOG_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _cleanup_snapshot(snapshot):
+    """Best-effort removal of the private catalog snapshot _snapshot_confined_catalog created. The caller
+    invokes this in a finally once the panel subprocess (which reads the snapshot synchronously within
+    _cli_result) has returned — on every path: success, rejection, or timeout."""
+    if snapshot is not None:
+        try:
+            snapshot.unlink()
+        except OSError:
+            pass
+
+
+def _snapshot_confined_catalog(args, argv):
+    """Validate an optional catalog_file, COPY it to a private server-owned snapshot, and forward the
+    SNAPSHOT (not the caller's path) to panel.py. Returns the snapshot Path — the caller MUST remove it
+    once the panel subprocess has finished (see _cleanup_snapshot) — or None when no catalog was supplied.
+
+    Confinement (below) proves the catalog is a relative path inside the working tree: no traversal, no
+    POSIX-absolute path, no Windows-absolute path (drive letter or backslash/UNC), and no symlink whose
+    target escapes the tree. But confinement alone is not enough, because every consumer that opens the
+    catalog BY PATH reopens an attacker-controllable location: the in-process loadable check and the
+    panel.py subprocess both do, and panel.py reloads it lazily on reviewer substitution. A symlink
+    swapped at that path AFTER validation would redirect either open outside the tree (or to a FIFO that
+    blocks), and a catalog that aliases any file the run itself writes (context.md, sample_policy.json, ...)
+    is destroyed before the substitution reload. So rather than forward the path, open the validated file
+    ONCE through a race-safe descriptor and copy its bytes to a private snapshot the server owns; both
+    consumers read THAT, which no repo or run activity can change. This closes the check-to-open race and
+    removes the need to enumerate every run-written destination (CodeRabbit r3950684588 / Codex
+    r3950590290 — superseding the r3950286015 canonical-path forwarding and the r3946169158 context.md
+    alias check, both of which still reopened by path)."""
+    cf = args.get("catalog_file")
+    if cf is None:
+        return None
+    if (not isinstance(cf, str) or not cf or "\x00" in cf or ".." in cf
+            or cf.startswith(("/", "\\")) or "\\" in cf or _DRIVE_RE.match(cf)):
+        raise ToolError("catalog_file must be a relative path within the repository "
+                        "(no traversal, no absolute or drive-letter path, no backslashes)")
+    # Lexical checks stop only textual escapes; a relative path can still be a symlink whose target lives
+    # outside the tree, so resolve it (following symlinks) and confirm it stays within the working tree.
+    root = Path.cwd().resolve()
+    target = (root / cf).resolve()
+    if target != root and root not in target.parents:
+        raise ToolError("catalog_file must resolve to a path within the repository "
+                        "(its symlink target escapes the working tree)")
+    # Open the resolved path race-safely, then copy from the OPEN descriptor so no consumer ever reopens
+    # the caller's path. O_NOFOLLOW turns a final-component symlink swapped in AFTER resolution into an
+    # error instead of an out-of-tree read; O_NONBLOCK keeps the open from blocking on a FIFO (so the
+    # fstat below rejects it rather than the read hanging with no _run_cli timeout to guard it); fstat on
+    # the descriptor itself — never a separate stat — proves a regular file and bounds the size with no
+    # TOCTOU. O_NOFOLLOW is LOAD-BEARING here, not merely defense-in-depth: resolve() canonicalizes the
+    # path but does NOT pin the object across this reopen, so between resolve() and os.open() the
+    # (now-resolved) leaf can be swapped for an out-of-tree symlink, and only O_NOFOLLOW rejects it. On a
+    # platform without O_NOFOLLOW (Windows) getattr(...,0) would silently drop that protection and follow
+    # the swap — so FAIL CLOSED instead (matching _read_policy_racesafe, fix-35), letting the caller
+    # surface the error rather than snapshot an external catalog (Codex r3952220749). O_NONBLOCK/O_BINARY
+    # stay getattr — they are convenience/defense-in-depth, not the confinement guarantee.
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ToolError("cannot open catalog_file without following symlinks on this platform "
+                        "(os.O_NOFOLLOW unavailable); refusing the confined snapshot")
+    flags = (os.O_RDONLY | os.O_NOFOLLOW
+             | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    try:
+        fd = os.open(str(target), flags)
+    except OSError as e:
+        raise ToolError(f"catalog_file could not be opened safely: {e}") from e
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ToolError("catalog_file must be a regular file")
+        if info.st_size > _CATALOG_MAX_BYTES:
+            raise ToolError(f"catalog_file is too large ({info.st_size} bytes > {_CATALOG_MAX_BYTES}) — a "
+                            "model catalog is far smaller; refusing to load it")
+        sfd, spath = tempfile.mkstemp(prefix="ar-catalog-", suffix=".json")
+        snapshot = Path(spath)
+        try:
+            remaining = info.st_size
+            while remaining > 0:
+                chunk = os.read(fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                os.write(sfd, chunk)
+                remaining -= len(chunk)
+            os.close(sfd)
+        except BaseException:
+            os.close(sfd)
+            _cleanup_snapshot(snapshot)
+            raise
+    finally:
+        os.close(fd)
+    argv.extend(["--catalog-file", str(snapshot)])
+    return snapshot
+
+
+def _require_loadable_snapshot(snapshot):
+    """A snapshotted catalog forwarded by h_panel_run must also be LOADABLE before context.md is
+    overwritten. panel.py loads it lazily (on reviewer substitution), AFTER the write, so a usable-looking
+    but unloadable catalog (malformed, or empty after family filtering) would otherwise leave completed
+    reviewer reports paired with a freshly-written context on a call the host was told failed. Validate
+    with panel.py's OWN loader so the check never drifts from the run's filter; a file argument takes
+    load_catalog's no-network path. `snapshot` is the private path _snapshot_confined_catalog returned
+    (None when no catalog) — already a server-owned regular file within the size cap, so only loadability
+    is left to decide here."""
+    if snapshot is None:
+        return
+    try:
+        from panel import load_catalog
+        load_catalog(str(snapshot))
+    except (Exception, SystemExit):  # SystemExit = panel's die() on an empty-after-filter catalog
+        raise ToolError("catalog_file is not a usable model catalog "
+                        "(missing, unreadable, malformed, or empty after filtering)")
+
+
+# Ceiling on the policy file read IN-PROCESS for timeout budgeting. A real policy is a few lines; this
+# bounds an untrusted repo's oversized/sparse policy that would otherwise be pulled whole into the MCP
+# process, which no _run_cli timeout guards (Codex r3950830841).
+_POLICY_MAX_BYTES = 1024 * 1024
+
+
+def _read_policy_racesafe():
+    """Return the repo policy (load_policy's dict), or None when no policy file is present — read WITHOUT
+    reopening the untrusted pathname load_policy would (CodeRabbit r3951172615). A stat-then-reopen was a
+    check-to-open race: Path.stat() follows symlinks, so a symlink swapped to a FIFO after the check could
+    block the in-process read (no _run_cli timeout guards it), or redirect it outside the tree. This opens
+    the policy ONCE through a race-safe descriptor — O_NOFOLLOW rejects a symlink leaf (ELOOP), O_NONBLOCK
+    stops a FIFO from blocking the open, and fstat on the descriptor proves a regular file within
+    _POLICY_MAX_BYTES with no TOCTOU — copies its bytes to a private server-owned snapshot, and hands
+    load_policy THAT snapshot, never the mutable path. Raises on an unsafe/oversized policy; load_policy
+    still die()s on a malformed one. (Same race-safe read the catalog uses.)"""
+    from _common import POLICY_BASENAMES, load_policy
+    root = Path.cwd()
+    # lexists (not exists): a DANGLING policy symlink is present-but-unsafe, not "absent" — exists() would
+    # drop it and mislead _resolved_high_samples into the non-conservative "1" instead of the max budget;
+    # lexists keeps it, and the O_NOFOLLOW open below then fails closed on it (CodeRabbit r3951475453).
+    present = [n for n in POLICY_BASENAMES if os.path.lexists(root / n)]  # the open below is race-safe regardless
+    if not present:
+        return None
+    if len(present) > 1:
+        # load_policy() rejects a repo that ships BOTH policy files; mirror that here (CodeRabbit
+        # r3951335743) so a conflicting pair budgets conservatively via the caller's fallback instead of
+        # silently reading whichever we happened to pick first.
+        raise ToolError("both %s exist — keep exactly one" % " and ".join(POLICY_BASENAMES))
+    name = present[0]
+    # O_NOFOLLOW is load-bearing here: the policy path is opened UN-resolved, so without it a symlinked
+    # .adversarial-review.yml would be followed to its (possibly out-of-tree) target. It is absent on some
+    # platforms (Windows), where getattr(...,0) would silently disable that protection — so FAIL CLOSED
+    # (CodeRabbit r3951335750), letting the caller budget conservatively. (The catalog snapshot keeps the
+    # getattr fallback because it opens an already-RESOLVED, symlink-free path, so O_NOFOLLOW is only
+    # defense-in-depth there, not load-bearing.)
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ToolError("cannot open the policy without following symlinks on this platform "
+                        "(os.O_NOFOLLOW unavailable); refusing the in-process read")
+    flags = (os.O_RDONLY | os.O_NOFOLLOW
+             | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    fd = os.open(str(root / name), flags)   # ELOOP if the leaf is a symlink (O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _POLICY_MAX_BYTES:
+            raise ToolError("policy file must be a regular file within the size cap")
+        buf = b""
+        remaining = info.st_size
+        while remaining > 0:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            buf += chunk
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    snapdir = Path(tempfile.mkdtemp(prefix="ar-policy-"))
+    try:
+        (snapdir / name).write_bytes(buf)
+        return load_policy(root=snapdir)   # parses the SNAPSHOT, never the untrusted path
+    finally:
+        try:
+            (snapdir / name).unlink()
+        except OSError:
+            pass
+        try:
+            snapdir.rmdir()
+        except OSError:
+            pass
+
+
+def _resolved_high_samples():
+    """The corroboration sample count panel.py will actually use, resolved with panel.py's own
+    precedence: AR_HIGH_SAMPLES env var > policy ``high_samples`` (.adversarial-review.yml/.json) >
+    default "1". Returned unparsed for the caller to int()+clamp. Never raises and never exits — merely
+    sizing a subprocess timeout, so any unsafe/oversized/malformed policy falls back to a conservative
+    budget rather than taking the server down; panel.py reads and validates the real policy when it runs."""
+    env = os.environ.get("AR_HIGH_SAMPLES", "")
+    if env != "":            # matches resolve_setting: a set, non-empty env var wins over policy
+        return env
+    try:
+        pol = _read_policy_racesafe()  # race-safe read; never reopens the untrusted policy path
+    except (Exception, SystemExit):    # unsafe/oversized policy, or load_policy die() on a malformed one
+        return "25"                    # budget the clamp max (never under-counts); panel.py reads it bounded
+    if pol and "high_samples" in pol["data"]:
+        return pol["data"]["high_samples"]
+    return "1"
+
+
+def _panel_timeout():
+    """Subprocess wrapper timeout for a reviewer-calling panel run. panel.py can spend up to
+    NINE AR_TIMEOUT_S request budgets on a single role before giving up: run_one_role makes two
+    outer attempts and each call_reviewer may issue one corrective-JSON retry (2 × 2 = 4 requests);
+    a failed role is then substituted, which FIRST reloads the model catalog live — one /models
+    fetch, also bounded by AR_TIMEOUT_S whenever no cached --catalog-file was supplied (the MCP
+    path leaves it optional) — and THEN repeats the whole run_one_role sequence (4 more): 4 + 1 + 4
+    = 9. On top of that, multi-sample corroboration (E4-S3) resamples each flagged role up to
+    AR_HIGH_SAMPLES times — (hs-1) extra samples, each a call plus one corrective retry (×2);
+    resampling re-calls the SAME model and never substitutes, so it adds no further catalog fetch.
+    Across up to 6 roles (SENSITIVE/CRITICAL) run sequentially that is (9 + 2·(hs-1)) × 6 request
+    budgets, so derive the outer deadline from that — never from an under-count — so a legitimately
+    slow but valid run (including a large corroboration sweep) is not killed before panel.py finishes."""
+    try:
+        req = max(1, int(os.environ.get("AR_TIMEOUT_S", "240")))
+    except (TypeError, ValueError):
+        req = 240
+    # Resolve high_samples the way panel.py does — env var > policy `high_samples` > default — so a
+    # policy-driven corroboration sweep with no env var set is budgeted for, not killed early. The
+    # value is capped at 25 by panel.py (MAX_HIGH_SAMPLES); clamp the same way so an out-of-range
+    # value cannot inflate the deadline past what a real run could ever use.
+    try:
+        hs = int(_resolved_high_samples())
+    except (TypeError, ValueError):
+        hs = 1
+    hs = max(1, min(hs, 25))
+    return max(1800, req * (9 + 2 * (hs - 1)) * 6 + 600)
+
+
 def _run_cli(module, argv, timeout=120):
     """Invoke a pipeline CLI module as a subprocess (shell=False — no injection).
-    Returns (returncode, stdout, stderr)."""
+    Returns (returncode, stdout, stderr). The child inherits this process's environment — h_aggregate uses
+    that to hand the aggregate child its per-lock re-entrancy token (see there) without exposing it as a
+    public CLI flag."""
     script = SCRIPTS_DIR / f"{module}.py"
     cmd = [sys.executable, str(script), *argv]
     try:
@@ -168,20 +448,45 @@ def _cli_result(module, argv, timeout=120, structured=None):
     return _result(body or f"{module} ok", structured=structured)
 
 
-def _read_json(run_args):
-    """Read verdict.json for the resolved run (explicit id, else newest)."""
+def _run_key(name):
+    """Sort key so run-...-10 orders after run-...-9 (numeric disambiguator), not
+    lexicographically. The zero-padded run-YYYYMMDD-HHMMSS base sorts chronologically as
+    text; only the optional -N suffix needs numeric ordering."""
+    parts = name.split("-")
+    if len(parts) == 4 and parts[3].isdigit():
+        return ("-".join(parts[:3]), int(parts[3]))
+    return (name, 0)
+
+
+def _run_dir(run_args):
+    """Resolve the run directory: the explicit --run id, else the newest run (numeric-suffix
+    aware, so run-...-10 beats run-...-9). Raises ToolError if there is no run to resolve."""
     root = Path(os.environ.get("AR_RUN_DIR", ".adversarial-review"))
     if run_args:  # ["--run", "<id>"]
-        run_dir = root / run_args[1]
-    else:
-        if not root.is_dir():
-            raise ToolError(f"no {root}/ directory — call ar_init first")
-        runs = sorted(d for d in root.iterdir() if d.is_dir() and d.name.startswith("run-"))
-        if not runs:
-            raise ToolError(f"no runs under {root}/ — call ar_init first")
-        run_dir = runs[-1]
+        return root / run_args[1]
+    if not root.is_dir():
+        raise ToolError(f"no {root}/ directory — call ar_init first")
+    runs = sorted((d for d in root.iterdir() if d.is_dir() and RUN_RE.match(d.name)),
+                  key=lambda d: _run_key(d.name))
+    if not runs:
+        raise ToolError(f"no runs under {root}/ — call ar_init first")
+    return runs[-1]
+
+
+def _read_json(run_args):
+    """Read verdict.json for the resolved run (explicit id, else newest)."""
+    run_dir = _run_dir(run_args)
     vf = run_dir / "verdict.json"
     if not vf.is_file():
+        # RECOVERY_PENDING vs NO_VERDICT: a stranded .prev/.bak means a prior aggregate was interrupted
+        # before it settled. Recovery is fail-closed — the sidecar is NEVER promoted to a verdict here
+        # (an attacker-writable run dir could plant a forged PASS), so ar_get_verdict does not return it.
+        # Re-run ar_aggregate to recompute a fresh verdict. (CodeRabbit r3942141283 / Codex r3942166700.)
+        if (run_dir / "verdict.json.prev").is_file() or (run_dir / "verdict.json.bak").is_file():
+            raise ToolError(
+                f"no accepted verdict for {run_dir.name}: a prior aggregate was interrupted, leaving a "
+                "recovery sidecar (verdict.json.prev/.bak) that is NOT promoted automatically. Re-run "
+                "ar_aggregate to recompute a fresh verdict; inspect and remove the sidecar if it is stale.")
         raise ToolError(f"no verdict yet for {run_dir.name} — call ar_aggregate first")
     return json.loads(vf.read_text(encoding="utf-8"))
 
@@ -211,12 +516,34 @@ def h_init(args):
     rc, out, err = _run_cli("panel", argv)
     if rc != 0:
         return _result(f"init failed:\n{(out + err).strip()}", is_error=True)
-    # Report the run id that was just created (newest run-* dir).
-    root = Path(os.environ.get("AR_RUN_DIR", ".adversarial-review"))
+    # Report the EXACT run id init just created by parsing its stdout ("initialized <run-dir
+    # path>  …"): take the BASENAME of that path, not the first run-... substring in stdout.
+    # A directory scan races a concurrent init and mis-sorts run-...-9 vs run-...-10, and an
+    # unanchored substring search would match a run-YYYYMMDD-HHMMSS segment inside AR_RUN_DIR or
+    # any ancestor directory rather than the run just created.
     run_id = None
-    if root.is_dir():
-        runs = sorted(d.name for d in root.iterdir() if d.is_dir() and d.name.startswith("run-"))
-        run_id = runs[-1] if runs else None
+    # \S+ would stop at the first space, truncating a run path that contains one (a Windows
+    # "C:\\Users\\Jane Doe\\..." checkout, or a spaced AR_RUN_DIR) and yielding a basename that
+    # fails RUN_ID_RE — a null run_id on an otherwise-successful init. Capture up to the " (risk="
+    # status suffix panel.py appends, falling back to end-of-line if that suffix is ever absent.
+    m = re.search(r"(?m)^initialized\s+(.+?)(?:\s+\(risk=|\s*$)", out or "")
+    if m:
+        base = os.path.basename(m.group(1).rstrip("/\\"))
+        if RUN_ID_RE.fullmatch(base):
+            run_id = base
+    if run_id is None:
+        # init SUCCEEDED (rc == 0) but its stdout could not be parsed for the run id. Do NOT fall back
+        # to a directory scan (_run_dir([])) to guess it: a concurrent init would make that return a
+        # DIFFERENT caller's newer run, handing back a valid-looking WRONG id the client would then
+        # write gates / context / reviewer artifacts into — the very concurrent-scan race the stdout
+        # parse exists to avoid. Surface a tool error instead; the run just created is on disk under
+        # the run root. (Codex, 9b93b4c.)
+        # Name the ACTUAL run root (AR_RUN_DIR, else the .adversarial-review default) — the hint
+        # must point where _run_dir looks, or an AR_RUN_DIR override sends the operator to an empty
+        # .adversarial-review/. (CodeRabbit, 274b460.)
+        root = os.environ.get("AR_RUN_DIR", ".adversarial-review")
+        return _result("init succeeded but its run id could not be parsed from panel.py output — "
+                       f"the new run is under {root}/; locate it there", is_error=True)
     return _result((out or "").strip() or f"initialized {run_id}",
                    structured={"run_id": run_id})
 
@@ -235,8 +562,9 @@ def h_gate_plan(args):
         if not isinstance(w, str) or not GATE_NAME_RE.match(w):
             raise ToolError(f"invalid waive gate name {w!r}")
         argv += ["--waive", w]
-    if args.get("authorized_by"):
-        argv += ["--authorized-by", str(args["authorized_by"])]
+    auth = _opt_authorizer(args)
+    if auth:
+        argv += ["--authorized-by", auth]
     return _cli_result("gate", argv)
 
 
@@ -258,8 +586,9 @@ def h_gate_record(args):
         argv += ["--exit-code", str(ec)]
     if args.get("command"):
         argv += ["--command", str(args["command"])]
-    if args.get("authorized_by"):
-        argv += ["--authorized-by", str(args["authorized_by"])]
+    auth = _opt_authorizer(args)
+    if auth:
+        argv += ["--authorized-by", auth]
     return _cli_result("gate", argv)
 
 
@@ -274,36 +603,43 @@ def h_panel_assign(args):
         argv += ["--pin", pin]
     if args.get("allow_degraded"):
         argv.append("--allow-degraded")
-    if args.get("authorized_by"):
-        argv += ["--authorized-by", str(args["authorized_by"])]
-    cf = args.get("catalog_file")
-    if cf is not None:
-        # Untrusted path: confine it to a relative path inside the working tree so a
-        # crafted value ('../../etc/shadow', '/etc/passwd') cannot make the CLI read an
-        # arbitrary file. No traversal, no absolute paths, no NULs.
-        if not isinstance(cf, str) or not cf or ".." in cf or cf.startswith("/") or "\x00" in cf:
-            raise ToolError("catalog_file must be a relative path within the repository "
-                            "(no '..', no absolute path)")
-        argv += ["--catalog-file", cf]
-    return _cli_result("panel", argv, timeout=300)
+    auth = _opt_authorizer(args)
+    if auth:
+        argv += ["--authorized-by", auth]
+    # panel.py assign opens the catalog_file (to resolve the reviewer pool when the live /models catalog
+    # is unavailable), so forward a private snapshot rather than the caller's path — same race-safety as
+    # h_panel_run — and remove it once the subprocess has read it.
+    snapshot = None
+    try:
+        snapshot = _snapshot_confined_catalog(args, argv)
+        return _cli_result("panel", argv, timeout=300)
+    finally:
+        _cleanup_snapshot(snapshot)
 
 
-def _write_context(run_args, context):
-    """Persist the caller-provided context to <run>/context.md and return its path.
-    The path is server-controlled (fixed filename in the run dir), so the context
-    string can never redirect the write elsewhere."""
+def _run_context_path(run_args):
+    """The server-controlled <run>/context.md path (fixed filename in the run dir) that _write_context
+    persists to. Exposed separately so h_panel_run can reject a catalog_file that aliases it BEFORE the
+    write overwrites it."""
     root = Path(os.environ.get("AR_RUN_DIR", ".adversarial-review"))
     if run_args:
         run_dir = root / run_args[1]
         if not run_dir.is_dir():
             raise ToolError(f"run directory not found: {run_dir.name}")
     else:
-        runs = sorted((d for d in root.iterdir() if d.is_dir() and d.name.startswith("run-")),
-                      key=lambda d: d.name) if root.is_dir() else []
+        runs = sorted((d for d in root.iterdir() if d.is_dir() and RUN_RE.match(d.name)),
+                      key=lambda d: _run_key(d.name)) if root.is_dir() else []
         if not runs:
             raise ToolError("no runs yet — call ar_init first")
         run_dir = runs[-1]
-    cf = run_dir / "context.md"
+    return run_dir / "context.md"
+
+
+def _write_context(run_args, context):
+    """Persist the caller-provided context to <run>/context.md and return its path.
+    The path is server-controlled (fixed filename in the run dir), so the context
+    string can never redirect the write elsewhere."""
+    cf = _run_context_path(run_args)
     cf.write_text(context, encoding="utf-8")
     return str(cf)
 
@@ -318,11 +654,27 @@ def h_panel_prepare(args):
 def h_panel_run(args):
     run_args = _safe_run(args)
     context = _req_str(args, "context")
-    cf = _write_context(run_args, context)
-    argv = ["run"] + run_args + ["--context-file", cf]
-    if args.get("force"):
-        argv.append("--force")
-    return _cli_result("panel", argv, timeout=300)
+    # Snapshot the optional catalog_file to a private server-owned path BEFORE persisting context, and
+    # forward the snapshot to panel.py. Snapshotting before the write means a rejected/escaping catalog
+    # raises before _write_context mutates the audit record, and it decouples the catalog from both the
+    # later by-path reopen and any run-written file it might alias (context.md, sample_policy.json, ...),
+    # so no separate context.md-alias check is needed. Forward it because, when the router cannot serve
+    # /models, a reviewer failure makes panel.py run reload the catalog to pick its mandated substitute.
+    catalog_argv = []
+    snapshot = None
+    try:
+        snapshot = _snapshot_confined_catalog(args, catalog_argv)
+        # The snapshot must also be LOADABLE before persisting context, so an unusable catalog cannot
+        # mutate the audit record on a rejected call.
+        _require_loadable_snapshot(snapshot)
+        cf = _write_context(run_args, context)
+        argv = ["run"] + run_args + ["--context-file", cf] + catalog_argv
+        if args.get("force"):
+            argv.append("--force")
+        return _cli_result("panel", argv, timeout=_panel_timeout())
+    finally:
+        # panel.py has read the snapshot synchronously within _cli_result by the time control reaches here.
+        _cleanup_snapshot(snapshot)
 
 
 def h_panel_ingest(args):
@@ -347,31 +699,514 @@ def h_panel_ingest(args):
             pass
 
 
-def h_aggregate(args):
+def h_panel_rebuttal(args):
+    """Run the adversarial rebuttal round. With prepare=True, write per-reviewer rebuttal
+    request bodies for a keyless host to execute and ingest; otherwise call the reviewers over
+    HTTP using the router key in the environment (with the scaled panel timeout)."""
     run_args = _safe_run(args)
-    rc, out, err = _run_cli("aggregate", run_args)
-    body = (out or "").strip()
-    if err and err.strip():
-        body = (body + "\n" + err.strip()).strip()
-    structured = None
+    # Validate that `prepare` is an ACTUAL boolean before it selects the transport (Codex r3894216938):
+    # this server does not auto-validate tool arguments against the advertised schema, so a truthy
+    # non-boolean (e.g. the string "false", or a number/list) would otherwise be treated as enabled and
+    # take the keyless prepare path instead of running the direct rebuttal — rejecting it is safer than
+    # guessing intent.
+    prepare = args.get("prepare", False)
+    if not isinstance(prepare, bool):
+        raise ToolError("prepare must be a boolean")
+    argv = ["rebuttal", *run_args]
+    if prepare:
+        # Keyless path: write per-reviewer rebuttal request bodies for the host to execute,
+        # then ingest each with ar_panel_ingest phase='rebuttal'. No network -> default timeout.
+        argv.append("--prepare")
+        return _cli_result("panel", argv)
+    # Direct path: call the reviewers over HTTP (needs the router key in the environment).
+    return _cli_result("panel", argv, timeout=_panel_timeout())
+
+
+def h_aggregate(args):
+    """Aggregate the run into a fresh verdict. _safe_run pins the target run so aggregate.py binds
+    to the same run whose freshness is checked here (no lexicographic-vs-numeric or concurrent-init
+    split). Freshness is proven by moving any pre-existing verdict.json ASIDE and requiring
+    aggregate to write a NEW one — never by an mtime bump, which a coarse-granularity filesystem
+    can leave unchanged on a same-quantum rewrite — so a stale PASS is never surfaced as this run's
+    result. A failed aggregate restores the prior verdict and surfaces the error."""
+    run_args = _safe_run(args)
+    # _safe_run returns [] ONLY when no run exists (run omitted and none minted yet). Refuse rather
+    # than invoke aggregate.py unpinned: an unpinned aggregate resolves the newest run ITSELF, so a
+    # run that a concurrent external caller inits in the meantime would be aggregated — and its
+    # verdict.json mutated — by THIS call, altering a run the caller never selected. Nothing can be
+    # legitimately aggregated without a run, so require ar_init first. (CodeRabbit merge-risk, 9b93b4c.)
+    if not run_args:
+        raise ToolError("no run to aggregate — call ar_init first")
     try:
-        structured = _read_json(run_args)
+        run_dir = _run_dir(run_args)
     except ToolError:
-        pass
-    # aggregate exits 0 PASS, 1 FAIL, 2 BLOCKED — all are successful computations,
-    # not tool errors. Surface the verdict; only a missing verdict.json is an error.
-    if structured is None:
-        return _result(f"aggregate exited {rc} but wrote no verdict:\n{body}", is_error=True)
-    return _result(body or structured.get("verdict", ""), structured=structured)
+        run_dir = None
+    vf = (run_dir / "verdict.json") if run_dir is not None else None
+    # Per-run interprocess lock: the process-wide HTTP dispatch lock does NOT serialize two
+    # independently launched ar-mcp processes aggregating the SAME run, so both could move the
+    # prior verdict to the one shared .prev and then race the settle below, unlinking each other's
+    # verdict with no stash left to restore (reproduced: neither verdict.json nor .prev survives).
+    # An O_EXCL lockfile makes the move-aside + aggregate + settle mutually exclusive per run: the
+    # second caller refuses here instead of adopting the first's sidecar. verdict.json.lock is NOT
+    # *.json, so it never enters the attestation. Held across the whole critical section and released
+    # in the enclosing finally on EVERY exit path (accepted, rejected, or raised). (Codex, <FIX19>.)
+    lock_fd = None
+    lock_path = None
+    lock_token = None   # per-lock re-entrancy secret handed to the aggregate child (see below)
+    if run_dir is not None and run_dir.is_dir():
+        lock_path = run_dir / "verdict.json.lock"
+        try:
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as e:
+            # Another aggregate holds the lock (or a prior one was killed before releasing it). Refuse
+            # rather than run concurrently and corrupt the shared sidecar. Do NOT unlink it — this
+            # process does not own it. `from e` satisfies Ruff B904.
+            raise ToolError(
+                "another ar_aggregate is in progress for this run (lock file "
+                f"{lock_path.name} is held). If no aggregate is running, a prior one was killed "
+                "before releasing it — remove the stale lock file and re-run ar_aggregate") from e
+        except OSError as e:
+            raise ToolError(
+                f"cannot acquire the aggregate lock ({lock_path.name}): {e}") from e
+        # Re-entrancy capability for THIS wrapper's aggregate child (CodeRabbit r3951923661). The child
+        # (aggregate.py) also takes verdict.json.lock when run standalone, but must NOT re-acquire the lock
+        # THIS wrapper already holds. The signal that authorizes the child to skip must be one a standalone
+        # invocation cannot forge — an earlier public --lock-already-held flag was accepted from ANY caller,
+        # re-opening the very bypass fix-37 closed. So mint a random token, write its SHA-256 HASH into the
+        # 0o600 lock file we own, and hand the child the PREIMAGE via env (below). The child skips only when
+        # its env token hashes to the stored hash; a standalone caller can read the hash but cannot invert
+        # it to a matching preimage, so it always takes the lock and is refused while one is held. (This
+        # stays cross-platform — inheriting the lock fd would be POSIX-only and break the Windows MCP path.)
+        lock_token = os.urandom(32).hex()
+        try:
+            os.write(lock_fd, hashlib.sha256(lock_token.encode("ascii")).hexdigest().encode("ascii"))
+        except OSError as e:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(str(lock_path))
+            except OSError:
+                pass
+            raise ToolError(f"cannot write the aggregate lock token ({lock_path.name}): {e}") from e
+    try:
+        # Move any existing verdict aside so a fresh computation is proven by the NEW file's existence.
+        # If the move cannot be performed, fall back to an mtime check rather than losing the signal.
+        stash = None
+        before_mtime = None
+        stash_bytes = None
+        stash_backup = None  # durable on-disk copy of the prior when the aside-move fell back to bytes
+        stranded = None      # a RECOVERY_PENDING sidecar (verdict.json absent): never promoted here,
+                             # only superseded for audit once a fresh verdict is accepted (settle below)
+        if vf is not None and vf.is_file():
+            cand = vf.parent / (vf.name + ".prev")
+            cand_bak = vf.parent / (vf.name + ".bak")
+            if (cand.is_file() or cand_bak.is_file()
+                    or cand.is_symlink() or cand_bak.is_symlink()):
+                # A recovery sidecar (.prev/.bak) is ALREADY present next to verdict.json — a prior
+                # aggregate left it unreconciled. (A non-file at that path — e.g. a leftover .prev
+                # directory — is not a verdict sidecar; it is left to the move-aside fallback below, which
+                # already handles a rename that cannot land.) `is_symlink()` (lstat, does not follow) is
+                # checked TOO: a sidecar that is a SYMLINK — including a DANGLING one, which `is_file()`
+                # reports as absent — must never be adopted or written through, or the snapshot write
+                # below would follow it and create/overwrite an attacker-chosen out-of-run file, and the
+                # settle would move an attacker's symlink into verdict.json for ar_get_verdict to read
+                # back (a symlinked sidecar in an untrusted run root is an arbitrary read/write vector).
+                # (Codex P1 r3930666146.) That state is AMBIGUOUS and unsafe to guess
+                # at: it is
+                # EITHER a run killed mid-settle (the sidecar is the last accepted verdict and THIS
+                # verdict.json is the crashed run's unreliable output) OR a run that SUCCEEDED whose
+                # best-effort sidecar cleanup then failed (verdict.json is the NEWER accepted verdict and
+                # the sidecar is obsolete). Disk state cannot tell the two apart, and guessing wrong loses
+                # data either way: restoring the sidecar on a later rejection would roll a newer accepted
+                # verdict BACK to an older one, while overwriting it would destroy the last accepted
+                # verdict. So refuse and surface it — the operator reconciles the sidecar and nothing is
+                # silently rolled back or lost. This fail-closed guard supersedes fix-16's preserve-and-
+                # track of an existing .prev (which rolled back a newer verdict) and removes the .bak
+                # overwrite (which clobbered a good backup). (Codex, 274b460.)
+                raise ToolError(
+                    f"a recovery sidecar ({cand.name} or {cand_bak.name}) from a prior aggregate is "
+                    "present (as a regular file or a symlink) next to verdict.json — the prior run did "
+                    "not reconcile it, so which file holds the last accepted verdict is ambiguous (and a "
+                    "symlinked sidecar is never a valid recovery file). Inspect both and keep the "
+                    "accepted verdict (remove the stale/symlinked sidecar), then re-run ar_aggregate")
+            try:
+                vf.replace(cand)
+                stash = cand
+            except OSError:
+                # Could not move the prior aside under its .prev name. Keep an mtime for the freshness
+                # check AND snapshot the prior's bytes (an unchanged mtime is NOT proof the file is
+                # intact — a coarse-granularity filesystem can leave st_mtime_ns unchanged on a
+                # same-quantum overwrite — so the restore rewrites these bytes rather than trusting
+                # mtime). Persist that snapshot to a DURABLE sidecar (verdict.json.bak) BEFORE
+                # aggregating: an in-memory copy alone is lost if the process is killed between
+                # aggregate's overwrite and the restore, or if the write-back itself fails. No .bak
+                # pre-exists here — the guard above refused if one did — so this never overwrites a good
+                # backup. If the prior can be neither read NOR durably backed up, abort before aggregation
+                # so it is never lost. (.bak, like .prev, is not *.json, so it never enters the
+                # attestation.) (Codex, 52c686f & 274b460; CodeRabbit, 60cb2c3.)
+                try:
+                    before_mtime = vf.stat().st_mtime_ns
+                    stash_bytes = vf.read_bytes()
+                except OSError as e:
+                    # Surface the filesystem cause: the tools/call handler sends only str(ToolError)
+                    # to the client, so include {e}; `from e` also satisfies Ruff B904. (CodeRabbit, 274b460.)
+                    raise ToolError("cannot read the prior verdict.json to guarantee a restore — refusing "
+                                    f"to aggregate so a prior verdict is never lost: {e}") from e
+                # Create the backup sidecar ATOMICALLY (CodeRabbit r3941991607). lstat-then-write_bytes was
+                # TOCTOU: a symlink swapped in at .bak after the lstat would be FOLLOWED by write_bytes and
+                # overwrite its target. os.open with O_CREAT|O_EXCL|O_WRONLY fails if ANYTHING already exists
+                # at the path — a regular file, symlink, FIFO, socket, or directory — so a pre-existing or
+                # raced sidecar can be neither followed nor blocked on; the snapshot is written through the
+                # returned fd. (A regular/symlink .bak was already refused by the entry guard; O_EXCL closes
+                # the residual race and also rejects a non-regular .bak without opening/blocking on it.)
+                try:
+                    bak_fd = os.open(str(cand_bak), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                except FileExistsError as e:
+                    raise ToolError(
+                        f"the backup sidecar path {cand_bak.name} already exists — refusing to snapshot the "
+                        "prior verdict through it so ar_aggregate cannot follow a symlink or clobber a file; "
+                        "remove it, then re-run ar_aggregate") from e
+                except OSError as e:
+                    raise ToolError("cannot create the backup sidecar to guarantee a restore — refusing to "
+                                    f"aggregate so a prior verdict is never lost: {e}") from e
+                try:
+                    with os.fdopen(bak_fd, "wb") as bf:
+                        bf.write(stash_bytes)
+                except OSError as e:
+                    raise ToolError("cannot write the backup sidecar to guarantee a restore — refusing to "
+                                    f"aggregate so a prior verdict is never lost: {e}") from e
+                stash_backup = cand_bak
+                # Prove freshness by EXISTENCE, not mtime (Codex r3942166702). The aside-move failed, so
+                # verdict.json is still in place; if aggregate rewrites it within the same coarse mtime
+                # quantum, `st_mtime_ns` is unchanged and the freshness check below would mislabel a
+                # genuinely fresh verdict as stale and roll it back to .bak. The prior is now durably at
+                # .bak, so removing the original loses nothing and forces aggregate to CREATE a new file
+                # (existence == fresh), exactly as the move-aside path already does.
+                try:
+                    vf.unlink()
+                    before_mtime = None
+                except OSError as e:
+                    # The prior can be neither moved aside (the rename above failed) NOR removed — e.g. a
+                    # Windows handle that shares writes but not deletes. Freshness-by-existence is then
+                    # impossible, and falling back to the mtime check is unsafe: on a coarse-granularity
+                    # filesystem aggregate can rewrite verdict.json within the prior's mtime quantum, the
+                    # freshness check would read st_mtime_ns as unchanged, mislabel a genuinely fresh verdict
+                    # as stale, and the settle would ROLL BACK a fresh FAIL to the prior PASS (Codex
+                    # r3945727346, reproduced). Fail closed — refuse to aggregate rather than risk that
+                    # rollback. verdict.json is untouched (its unlink failed); the redundant .bak just
+                    # snapshotted is best-effort removed so the run dir is left exactly as found. This raise
+                    # precedes the inner aggregate try, so only the outer finally runs — the per-run lock is
+                    # still released, and no settle/restore runs against the intact prior.
+                    try:
+                        cand_bak.unlink()
+                    except OSError:
+                        pass
+                    raise ToolError(
+                        "cannot move the prior verdict aside or remove it, so a fresh aggregate cannot be "
+                        "distinguished from the prior one without trusting filesystem timestamps (which a "
+                        "coarse-granularity filesystem can leave unchanged) — refusing to aggregate so a "
+                        f"fresh verdict is never rolled back to the prior one: {e}. Resolve the lock on "
+                        "verdict.json (or its directory), then re-run ar_aggregate.") from e
+        elif vf is not None:
+            # verdict.json is absent — a prior aggregate was interrupted BEFORE the settle that would have
+            # reconciled it, stranding the last accepted verdict at a sidecar. It may sit at .prev (the
+            # move-aside path: verdict.json was renamed to .prev, then the run died before settling) OR at
+            # .bak (the rename-FALLBACK path: the move-aside failed, so the prior was durably snapshotted to
+            # .bak, then the run died — or its restore failed — leaving verdict.json unwritten). The durable
+            # .bak MUST stay recoverable here too: ignoring it would aggregate with no stash and, worse, a
+            # successful retry would leave the stale .bak behind, so the NEXT call refuses at the entry guard
+            # above over an unrecoverable sidecar. Adopt exactly one regular, non-symlink sidecar as this
+            # run's stash — restored on a rejected aggregate, discarded once a fresh verdict supersedes it (a
+            # .bak restores by the same rename a .prev uses, so no separate bytes path is needed here).
+            # (CodeRabbit r3941598640.)
+            cand = vf.parent / (vf.name + ".prev")
+            cand_bak = vf.parent / (vf.name + ".bak")
+            if cand.is_symlink() or cand_bak.is_symlink():
+                # A symlinked sidecar in an untrusted run root is an arbitrary read/write vector: adopted, it
+                # would be moved into verdict.json for ar_get_verdict to follow (Codex P1 r3930666147). It is
+                # never a valid recovery file — refuse rather than adopt or silently ignore it, so this path
+                # treats a symlinked sidecar exactly as the entry guard above does.
+                raise ToolError(
+                    f"a recovery sidecar ({cand.name} or {cand_bak.name}) next to an absent verdict.json is "
+                    "a symlink — a symlinked sidecar is never a valid recovery file. Remove it, then re-run "
+                    "ar_aggregate")
+            prev_ok = cand.is_file()
+            bak_ok = cand_bak.is_file()
+            if prev_ok and bak_ok:
+                # A .prev AND a .bak both hold a candidate last-accepted verdict — which is authoritative is
+                # ambiguous, and adopting one could restore a stale verdict over a newer one. Refuse and
+                # surface it (as the entry guard does) rather than guess. (CodeRabbit r3941598640.)
+                raise ToolError(
+                    f"both recovery sidecars ({cand.name} and {cand_bak.name}) are present while "
+                    "verdict.json is absent — which holds the last accepted verdict is ambiguous. Inspect "
+                    "both and keep the accepted verdict (remove the other), then re-run ar_aggregate")
+            # verdict.json is absent with a stranded sidecar: RECOVERY_PENDING. Do NOT adopt it as a
+            # promotable stash. Fix-24 validated the sidecar by re-verifying its attestation digest, but
+            # compute_attestation() hashes the run's PUBLIC *.json artifacts — all attacker-writable — and
+            # never binds the verdict VALUE, so a planted PASS whose (freely recomputable) digest matches
+            # passed that check and, on a rejected retry, the settle promoted it to verdict.json for
+            # ar_get_verdict to return (CodeRabbit r3942141283 / Codex r3942166700). Recovery is now
+            # fail-closed: ar_aggregate only recomputes a FRESH verdict here and NEVER promotes a sidecar.
+            # A rejected/crashed retry leaves verdict.json absent (RECOVERY_PENDING persists); a successful
+            # one supersedes the stranded sidecar for audit (settle below). Promotion of a stranded sidecar
+            # is the sole job of ar_recover, behind a signature-over-the-complete-verdict gate or an
+            # explicit operator confirmation bound to the sidecar bytes.
+            stranded = cand if prev_ok else (cand_bak if bak_ok else None)
+        # The moved-aside verdict is reconciled in the single finally below, which runs on EVERY exit
+        # path — the accepted return, the rejected return, and a raised invocation (e.g. _run_cli's
+        # subprocess timeout). Earlier revisions restored the prior in several separate branches and
+        # each added branch was a fresh chance to strand or leak one; routing every path through one
+        # settle point (the same try/finally shape h_panel_ingest and the http server already use)
+        # makes that class of bug unrepresentable. `accepted` flips true only once a fresh, well-formed
+        # verdict is actually in hand.
+        accepted = False
+        try:
+            # This wrapper holds verdict.json.lock across the whole move-aside -> aggregate -> settle
+            # section, so authorize the aggregate child to skip re-acquiring it — otherwise the child's own
+            # O_EXCL open would fail against the lock this process already holds and every MCP aggregate
+            # would reject. The authorization is the unforgeable token handshake above (CodeRabbit
+            # r3951923661): hand the child the PREIMAGE through the environment it inherits (only when we
+            # actually took the lock — if the run dir did not resolve we hold none, so the child takes its
+            # own). A standalone invocation has no such env token and cannot forge one matching the lock
+            # file's stored hash. Set it just for this call and restore after, so the token never leaks to
+            # other subprocesses; h_aggregate runs under the serialized dispatch lock, so this transient
+            # os.environ mutation is not raced. (Codex r3951566976.)
+            _prev_tok = os.environ.get("AR_AGGREGATE_LOCK_TOKEN")
+            if lock_fd is not None and lock_token is not None:
+                os.environ["AR_AGGREGATE_LOCK_TOKEN"] = lock_token
+            try:
+                rc, out, err = _run_cli("aggregate", run_args)
+            finally:
+                if _prev_tok is None:
+                    os.environ.pop("AR_AGGREGATE_LOCK_TOKEN", None)
+                else:
+                    os.environ["AR_AGGREGATE_LOCK_TOKEN"] = _prev_tok
+            body = (out or "").strip()
+            if err and err.strip():
+                body = (body + "\n" + err.strip()).strip()
+            if vf is None:  # the run dir may not have resolved before the call — resolve it now
+                try:
+                    vf = _run_dir(run_args) / "verdict.json"
+                except ToolError:
+                    vf = None
+            # aggregate exits 0 PASS / 1 FAIL / 2 BLOCKED for a real verdict and writes verdict.json as
+            # its final step. If it exited some other way (e.g. crashed on a malformed artifact) or did
+            # NOT write a fresh verdict, never surface a pre-existing verdict as success.
+            fresh = bool(vf and vf.is_file()
+                         and (before_mtime is None or vf.stat().st_mtime_ns != before_mtime))
+            # Reject with a SPECIFIC reason (stale / crashed / malformed / unrecognized / wrong-run) so an
+            # operator can tell them apart — WITHOUT changing which verdicts are accepted. `reason` stays
+            # "" only when a fresh, recognized verdict for THIS run is in hand.
+            reason = ""
+            if rc not in (0, 1, 2):
+                reason = "exit code is not a verdict result (expected 0, 1, or 2)"
+            elif not fresh:
+                reason = "aggregate wrote no fresh verdict.json"
+            else:
+                try:
+                    structured = json.loads(vf.read_text(encoding="utf-8"))
+                except (OSError, ValueError, RecursionError):
+                    # A fresh file that is unreadable, MALFORMED, or pathologically deep (json.loads raises
+                    # RecursionError on deep nesting — NOT a ValueError) is not a usable verdict. Guarding
+                    # read/parse here (as check_digest does) yields a clean rejected result rather than
+                    # crashing h_aggregate past the return below. (CodeRabbit, 7da1420; Codex, 60cb2c3.)
+                    structured = None
+                # A fresh OBJECT is not enough: accept only a RECOGNIZED verdict value FOR THE PINNED RUN.
+                # run_args always carries --run here (h_aggregate refuses an empty run_args at entry), so
+                # the fresh verdict aggregate wrote must carry that same run_id — a stray/foreign object
+                # (an empty {}, an unknown verdict, or another run's verdict) is rejected below. Attestation
+                # PRESENCE is deliberately not gated here — that is check_digest's concern. (CodeRabbit, bdccc64.)
+                pinned = run_args[run_args.index("--run") + 1] if "--run" in run_args else None
+                # aggregate.py maps its verdict to its exit code (PASS=0, FAIL=1, BLOCKED=2) and writes
+                # verdict.json BEFORE the human-readable verdict.md; if it crashes AFTER that write (e.g. an
+                # untrusted run has verdict.md as a directory, so the markdown write raises), it exits
+                # nonzero while a fresh, well-formed verdict.json is already on disk. Requiring the exit code
+                # to MATCH the written verdict (below) makes such a post-write crash a rejection, not an
+                # accepted verdict that carries a traceback. (Codex r3941637886.)
+                verdict_exit = {"PASS": 0, "FAIL": 1, "BLOCKED": 2}
+                if not isinstance(structured, dict):
+                    reason = "the fresh verdict.json was unreadable, malformed, or not a JSON object"
+                elif structured.get("verdict") not in ("PASS", "FAIL", "BLOCKED"):
+                    reason = f"unrecognized verdict value {structured.get('verdict')!r}"
+                elif not (pinned is None or structured.get("run_id") == pinned):
+                    reason = (f"verdict run_id {structured.get('run_id')!r} does not match the resolved "
+                              f"run {pinned!r}")
+                elif rc != verdict_exit[structured["verdict"]]:
+                    reason = (f"aggregate exit code {rc} does not match the written verdict "
+                              f"{structured['verdict']!r} (expected {verdict_exit[structured['verdict']]}) "
+                              "— aggregate likely crashed after writing verdict.json, so it is not a "
+                              "completed aggregation")
+                else:
+                    accepted = True  # only now: a fresh, recognized verdict for THIS run is in hand
+                    return _result(body or structured.get("verdict", ""), structured=structured)
+            return _result(f"aggregate exited {rc} without an accepted verdict ({reason}):\n{body}",
+                           is_error=True)
+        finally:
+            # Single settle point for the moved-aside verdict. On acceptance the stash is a superseded
+            # copy — discard it. On ANY non-acceptance (rejected exit, or a raised/timed-out invocation)
+            # remove whatever rejected verdict was written and restore the prior — from the .prev stash if
+            # the aside-move succeeded, else by rewriting the durable .bak snapshot — so ar_get_verdict
+            # always sees either the freshly accepted verdict or the last accepted one, never a
+            # rejected/partial verdict, never a stranded sidecar.
+            # A restore that FAILS here (a transient OSError — a Windows file lock, a vanished parent)
+            # must NOT be swallowed: doing so silently strands the accepted prior at its sidecar while
+            # ar_get_verdict sees no verdict, or a rejected one, with no signal. Capture such a failure and
+            # surface it, naming the sidecar the prior survives at. On a NORMAL return, raise a ToolError.
+            # When ANOTHER exception is already unwinding (e.g. _run_cli's subprocess timeout) do not
+            # silently drop it: fold the restore failure INTO that error when it is a ToolError, else log
+            # it — so a client is never told only "aggregate timed out" while its accepted verdict sits
+            # stranded and ar_get_verdict can no longer return it. (Codex, 13d473f & 60cb2c3.)
+            reconcile_err = None
+            reconcile_at = None  # sidecar the un-restored prior survives at, for the recovery message
+            rejected_unremoved = False  # a rejected verdict.json that could not be removed NOR moved aside
+            if accepted:
+                # Drop the superseded copies: the moved-aside prior (stash / stash_backup), and — on the
+                # RECOVERY_PENDING path — the stranded sidecar, now superseded by the fresh authoritative
+                # verdict. Leaving the stranded sidecar in place would trip the entry guard on the NEXT
+                # aggregate (a sidecar beside verdict.json is refused as unreconciled).
+                for s in (stash, stash_backup, stranded):  # at most one of stash/stash_backup is set
+                    if s is not None and s.is_file():
+                        try:
+                            s.unlink()
+                        except OSError:
+                            pass
+            elif stash is not None:
+                # Prior was moved aside to .prev — drop any rejected verdict aggregate wrote, then restore
+                # the prior from the stash. BOTH steps run under one guard so a failure of EITHER (the
+                # unlink or the .prev -> verdict.json move) is recorded, not swallowed.
+                try:
+                    if vf is not None and vf.is_file():
+                        vf.unlink()
+                    if stash.is_file():
+                        # A concurrent process with write access to the untrusted run dir can replace the
+                        # PREDICTABLE .prev with a symlink AFTER this wrapper created it (via vf.replace(cand)
+                        # above) but before this settle. os.replace() renames the link itself, so it would
+                        # PROMOTE that symlink to verdict.json, after which ar_get_verdict follows it out of
+                        # the run dir and returns an external file's contents (Codex r3952220753, reproduced).
+                        # is_file() FOLLOWS the link, so guard with an lstat (is_symlink) and refuse to promote
+                        # a symlinked stash; the prior is then treated as unrestorable (verdict.json stays
+                        # absent -> RECOVERY_PENDING) rather than exposing an out-of-run target as this run's
+                        # verdict. (The entry guard already rejects a symlinked .prev present at entry; this
+                        # covers the swap that happens AFTER the wrapper creates the stash.)
+                        if stash.is_symlink():
+                            raise OSError(f"recovery stash {stash.name} was replaced by a symlink after "
+                                          "creation; refusing to promote it to verdict.json")
+                        stash.replace(vf)
+                        # Belt-and-suspenders against a swap in the tiny window between the lstat and the
+                        # rename: NEVER leave verdict.json as a symlink for ar_get_verdict to follow.
+                        if vf is not None and vf.is_symlink():
+                            try:
+                                vf.unlink()
+                            except OSError:
+                                pass
+                            raise OSError("restored verdict.json resolved to a symlink; removed it "
+                                          "rather than surface an out-of-run target as the verdict")
+                except OSError as e:
+                    reconcile_err, reconcile_at = e, stash
+            elif stash_bytes is not None:
+                # The aside-move failed, so the prior was byte-snapshotted (and durably backed up to .bak).
+                # Rewrite the bytes verbatim — a write can succeed on the very filesystem whose rename
+                # failed, and it overwrites any rejected verdict written in the same mtime quantum (this
+                # restore never trusts mtime). On success drop the now-redundant .bak; on failure the prior
+                # is NOT lost — it survives at .bak, which the error names.
+                if vf is not None:
+                    try:
+                        vf.write_bytes(stash_bytes)
+                    except OSError as e:
+                        reconcile_err, reconcile_at = e, stash_backup
+                if reconcile_err is None and stash_backup is not None and stash_backup.is_file():
+                    try:
+                        stash_backup.unlink()
+                    except OSError:
+                        pass
+            else:
+                # No prior verdict was moved aside — remove any rejected verdict aggregate wrote. A leftover
+                # here strands no PRIOR, but the rejected verdict.json itself is NOT an accepted verdict, and
+                # a later ar_get_verdict would return it as one (Codex r3944027644 reproduced an exit-3/PASS
+                # whose cleanup hit a PermissionError, after which ar_get_verdict returned PASS). So do NOT
+                # swallow the failure: if the unlink fails (transient OSError / Windows lock), move the file
+                # aside to a non-verdict, non-sidecar name (.rejected — not *.json, so never attested; not
+                # .prev/.bak, so never a recovery candidate) so it can never be read back as a verdict; only
+                # if THAT also fails do we surface the failure so the rejected file is never silently readable.
+                if vf is not None and vf.is_file():
+                    try:
+                        vf.unlink()
+                    except OSError:
+                        try:
+                            vf.replace(vf.parent / (vf.name + ".rejected"))
+                        except OSError as e:
+                            reconcile_err, reconcile_at, rejected_unremoved = e, vf, True
+            if reconcile_err is not None:
+                if rejected_unremoved:
+                    # A rejected verdict that could be neither removed nor moved aside: warn that the
+                    # leftover verdict.json is NOT an accepted verdict and must be removed before it is read.
+                    detail = ("aggregate was rejected but the rejected verdict.json could be neither removed "
+                              f"nor moved aside ({reconcile_err}); it is NOT an accepted verdict — remove it "
+                              "before calling ar_get_verdict, which would otherwise return it as a verdict")
+                else:
+                    where = reconcile_at.name if reconcile_at is not None else "verdict.json.prev"
+                    detail = ("aggregate was rejected but the prior verdict could not be restored "
+                              f"({reconcile_err}); the last accepted verdict is preserved at {where} — "
+                              "restore it manually before trusting ar_get_verdict")
+                exc = sys.exc_info()[1]
+                if exc is None:
+                    raise ToolError(detail)
+                if isinstance(exc, ToolError):
+                    # Fold the restore failure INTO the in-flight tool error so the client is told BOTH,
+                    # never only the original (e.g. "aggregate timed out") with the prior silently
+                    # stranded and unrecoverable via ar_get_verdict. (Codex, 60cb2c3.)
+                    raise ToolError(f"{exc}; additionally, {detail}")
+                # An unexpected non-ToolError is louder and must not be masked — but still record the
+                # reconcile failure so it is never fully silent during that unwind. Log `detail` (always
+                # assigned for BOTH the prior-restore and rejected-output branches); the earlier code read
+                # `where`, which the rejected_unremoved branch never sets — an UnboundLocalError that would
+                # itself mask the original exception (CodeRabbit r3945458785).
+                log(detail)
+    finally:
+        # Release the per-run lock on every exit path. Close BEFORE unlink so the removal succeeds on
+        # Windows too (an open handle blocks delete there). A failure to unlink leaves a stale lock
+        # the operator can clear — never crash the settle over it, and never unlink a lock this
+        # process did not create (lock_fd is None then). (Codex, <FIX19>.)
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            if lock_path is not None:
+                try:
+                    os.unlink(str(lock_path))
+                except OSError:
+                    pass
 
 
 def h_check_digest(args):
     run_args = _safe_run(args)
-    rc, out, err = _run_cli("aggregate", run_args + ["--check-digest"])
+    # aggregate.py resolves the run BEFORE --check-digest runs; a missing or typo'd run makes
+    # resolve_run die() with exit 1 — the SAME code this wrapper maps to {"intact": false}
+    # ("drifted"). That would report "there is no run to verify" as detected TAMPERING. Confirm the
+    # run exists here so a genuine exit 1 can only be check_digest's real attestation MISMATCH — the
+    # cannot-verify contract this handler exists to keep (a missing run is a tool error, not drift).
+    # (Fable, 60cb2c3.)
+    try:
+        rd = _run_dir(run_args)
+    except ToolError:
+        raise ToolError("no run to verify — call ar_init and ar_aggregate first")
+    if not rd.is_dir():
+        raise ToolError(f"run {rd.name} not found — check the run id, or aggregate the run first")
+    rc, out, err = _run_cli("aggregate", [*run_args, "--check-digest"])
     body = ((out or "") + (err or "")).strip()
-    intact = rc == 0
-    return _result(body or ("attestation intact" if intact else "attestation drifted"),
-                   structured={"intact": intact})
+    # aggregate --check-digest exits 0 = intact, 1 = drifted (a definitive mismatch), 2 = the
+    # digest could not be checked at all (no verdict.json, or a verdict from before
+    # attestations existed). Only 0/1 are a real answer; anything else is a tool error, not a
+    # silent "drifted".
+    if rc == 0:
+        return _result(body or "attestation intact", structured={"intact": True})
+    if rc == 1:
+        return _result(body or "attestation drifted", structured={"intact": False})
+    return _result(body or f"cannot verify attestation (--check-digest exited {rc}); "
+                   "aggregate the run first", is_error=True)
 
 
 def h_get_verdict(args):
@@ -446,7 +1281,7 @@ TOOLS = [
     _t("ar_panel_assign",
        "Assign the independent reviewer panel from the router's live model catalog, "
        "excluding every development provider family and giving each role a distinct "
-       "family. Pin models with entries like 'security=google/gemini-3.6-flash'.",
+       "family. Pin models with entries like 'security=<provider>/<model-slug>'.",
        {"run": _RUN_PROP,
         "pin": {"type": "array", "items": {"type": "string"},
                 "description": "Role pins, each 'role=provider/model-slug'."},
@@ -469,7 +1304,8 @@ TOOLS = [
        "the server should execute the panel itself instead of prepare/ingest.",
        {"run": _RUN_PROP,
         "context": {"type": "string", "description": "The full review context (no secrets or .env content)."},
-        "force": {"type": "boolean", "description": "Re-run reviewers even if reports already exist."}},
+        "force": {"type": "boolean", "description": "Re-run reviewers even if reports already exist."},
+        "catalog_file": {"type": "string", "description": "Path to a cached catalog JSON (the same one passed to ar_panel_assign), so a reviewer substitution can resolve when the live catalog is unavailable."}},
        ["context"], _NET, h_panel_run),
 
     _t("ar_panel_ingest",
@@ -481,6 +1317,20 @@ TOOLS = [
         "response": {"type": "string", "description": "The reviewer's raw JSON response text."},
         "phase": {"type": "string", "enum": ["panel", "rebuttal"], "description": "Which round this response belongs to. Default panel."}},
        ["role", "response"], _WRITE_LOCAL, h_panel_ingest),
+
+    _t("ar_panel_rebuttal",
+       "Run the adversarial rebuttal round: each reviewer now sees the others' high/critical "
+       "findings and must refute, corroborate, or extend each with evidence. Required before a run "
+       "with high/critical findings can reach a verdict whenever the run's rebuttal policy demands "
+       "it: 'critical' (CRITICAL runs), 'contention' (SENSITIVE and CRITICAL; the default), or "
+       "'any' (every tier, including NORMAL). Set prepare=true to write per-reviewer rebuttal "
+       "request bodies for your host to execute, then ingest each with ar_panel_ingest "
+       "phase='rebuttal' (the keyless path); omit prepare to have the server call the reviewers "
+       "directly over HTTP.",
+       {"run": _RUN_PROP,
+        "prepare": {"type": "boolean", "description": "Write rebuttal request bodies for host "
+                    "execution (keyless) instead of calling the reviewers directly over HTTP."}},
+       [], _NET, h_panel_rebuttal),
 
     _t("ar_aggregate",
        "Compute the deterministic release verdict (PASS/FAIL/BLOCKED) from all recorded "
@@ -523,7 +1373,9 @@ def _ok(id_, result):
 _INSTRUCTIONS = (
     "Drive an adversarial review: ar_init -> ar_gate_plan -> run your gates and "
     "ar_gate_record each -> ar_panel_assign -> ar_panel_prepare+ar_panel_ingest "
-    "(or ar_panel_run) -> ar_aggregate for the verdict. Launch this server with the "
+    "(or ar_panel_run) -> ar_panel_rebuttal when the run's rebuttal policy requires it "
+    "(high/critical findings; prepare+ingest its request bodies the same way) -> "
+    "ar_aggregate for the verdict. Launch this server with the "
     "repository under review as the working directory."
 )
 
@@ -653,8 +1505,12 @@ def handle(msg):
         tool = TOOLS_BY_NAME.get(name)
         if not tool:
             return _error(id_, -32602, f"unknown tool: {name}")
-        arguments = params.get("arguments") or {}
-        if not isinstance(arguments, dict):
+        arguments = params.get("arguments")
+        if arguments is None:
+            arguments = {}
+        elif not isinstance(arguments, dict):
+            # A falsy non-dict ([], "", 0, false) must be rejected, not silently defaulted to
+            # {} by `or {}` — otherwise a malformed request becomes an empty-argument call.
             return _error(id_, -32602, "arguments must be an object")
         try:
             return _ok(id_, _finalize_result(tool["handler"](arguments), is_modern))
