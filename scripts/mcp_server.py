@@ -854,6 +854,13 @@ def _accepts_event_stream(accept):
         if r > best_rank:  # a more specific matching range overrides a less specific one (RFC precedence)
             best_rank = r
             best_ok = q > 0
+        elif r == best_rank:
+            # Equal-specificity alternatives: an ACCEPTABLE one wins regardless of field order, so
+            # `text/event-stream;q=0, text/event-stream;q=1` (or the same split across combined Accept field
+            # lines) admits the stream instead of the first occurrence permanently deciding it 406 (Codex
+            # r3951751953). Only a TIE is OR-merged; a MORE specific range still overrides via the branch
+            # above, so `*/*;q=1, text/event-stream;q=0` still correctly refuses (the specific q=0 wins).
+            best_ok = best_ok or (q > 0)
     return best_ok
 
 
@@ -1151,6 +1158,24 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
                 self._json(404, {"error": "unknown or terminated session"})
                 return
             out = serve_message(raw)
+        # In strict mode (require_session) the stateless modern revision cannot be served here: it carries no
+        # session, and every non-initialize/non-discover request without one is 400'd above -- and a legacy
+        # session cannot back it (it is version-bound). So server/discover must not ADVERTISE a version this
+        # configuration will reject, or a client selects it and is turned away (Codex r3951751963). Filter the
+        # modern revision out of the discover response on THIS transport posture only; the transport-agnostic
+        # _discover_result stays era-complete for stdio and for non-strict HTTP. A client then negotiates a
+        # legacy, session-bearing version instead. (server/discover is exempt from the session gate above, so
+        # it still answers in strict mode.)
+        if out is not None and self.server.require_session and method == "server/discover":
+            try:
+                _d = json.loads(out)
+                _res = _d.get("result") if isinstance(_d, dict) else None
+                if isinstance(_res, dict) and isinstance(_res.get("supportedVersions"), list):
+                    _res["supportedVersions"] = [v for v in _res["supportedVersions"]
+                                                 if v not in MODERN_PROTOCOLS]
+                    out = json.dumps(_d)
+            except (ValueError, RecursionError):
+                pass  # leave the response unchanged if it is not the shape we expect
         if out is None:
             # A notification (or any message handle() declines to answer) -> 202 Accepted, no body.
             self.send_response(202)

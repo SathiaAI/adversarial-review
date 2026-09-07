@@ -5976,6 +5976,52 @@ def t_mcp_http_get_combines_repeated_accept_lines():
         t.shutdown()
 
 
+def t_accepts_event_stream_equal_rank_tie_is_order_independent():
+    # Codex (PR #54) r3951751953: with equal-specificity Accept alternatives of differing quality, the
+    # strict `r > best_rank` comparison let the FIRST occurrence permanently decide, so
+    # `text/event-stream;q=0, text/event-stream;q=1` was 406 while the reverse opened the stream -- an
+    # order-dependent result that also arises after combining repeated Accept field lines. Ties are now
+    # OR-merged (an acceptable equal-rank alternative wins), so the outcome is order-independent. On the base
+    # commit the first-wins comparison returns False for the q=0-first ordering -> this fails there.
+    f = mcpsrv._accepts_event_stream
+    assert f("text/event-stream;q=0, text/event-stream;q=1") is True   # was False (406) before the fix
+    assert f("text/event-stream;q=1, text/event-stream;q=0") is True   # order-independent
+    # A MORE specific range still overrides a less specific one: a specific q=0 beats a general q=1 (the
+    # tie-merge must not leak across ranks).
+    assert f("*/*;q=1, text/event-stream;q=0") is False
+    assert f("text/event-stream;q=0, */*;q=1") is False
+    # Unchanged baselines: plain accept, absent (accept-anything), and an all-excluding list.
+    assert f("text/event-stream") is True
+    assert f(None) is True
+    assert f("application/json, text/plain") is False
+
+
+def t_mcp_http_discover_omits_modern_in_strict_mode():
+    # Codex (PR #54) r3951751963: in strict mode (AR_MCP_HTTP_REQUIRE_SESSION) the stateless modern revision
+    # cannot be served -- it carries no session, every non-initialize/non-discover request without one is
+    # 400'd, and a legacy session cannot back it (version-bound) -- so server/discover must not ADVERTISE a
+    # version this configuration will reject. Strict-mode discover omits MODERN_PROTOCOLS; normal-mode
+    # discover still advertises them. On the base commit strict-mode discover still lists the modern revision
+    # -> this fails there.
+    req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
+    t, port = _http_transport(require_session=True)         # strict: modern omitted
+    try:
+        status, body, _h = _http_post(port, req)            # discover is exempt from the session gate
+        assert status == 200, status
+        versions = json.loads(body)["result"]["supportedVersions"]
+        assert "2026-07-28" not in versions, versions
+        assert versions, "legacy (session-bearing) versions must still be advertised"
+    finally:
+        t.shutdown()
+    t2, port2 = _http_transport()                           # normal: modern advertised
+    try:
+        status, body, _h = _http_post(port2, req)
+        versions = json.loads(body)["result"]["supportedVersions"]
+        assert "2026-07-28" in versions, versions
+    finally:
+        t2.shutdown()
+
+
 def t_mcp_http_get_revalidates_session_before_streaming():
     # Codex r3941957879 (TOCTOU): the window between the session check and committing the 200 lets a
     # concurrent DELETE terminate the session, after which the stream must NOT emit 200 + ": connected".
