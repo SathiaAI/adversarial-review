@@ -9392,10 +9392,11 @@ def t_ai_defects_exit0_pass():                       # T-P1
 
 
 def t_ai_defects_empty_diff_pass():                  # T-P3 / T-E2 (A12)
-    run = _aidef_rundir(paths=())
-    (run / "changed_paths.txt").write_text("\n   \n")  # only blank lines
+    run = _aidef_rundir(paths=())  # zero paths -> an empty changed_paths.txt
     r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py"), digest=""), expect=0)
     assert "empty-diff" in r.stdout  # PASS reached BEFORE the (absent) pin is needed
+    # NB: a whitespace-only line is a real (space-named) file, NOT empty -- see
+    # t_ai_defects_whitespace_filename_scanned.
 
 
 def t_ai_defects_exit1_fail():                       # T-N1
@@ -9560,6 +9561,58 @@ def t_ai_defects_public_silence_readme_variant_and_your_sast():
     (d2 / "README.md").write_text("Configure your SAST policy before merging.\n")
     r2 = _silence(d2)
     assert r2.returncode == 0, r2.stdout
+
+
+def t_ai_defects_relative_binpath_blocked():           # exec exactly the digest-verified file
+    run = _aidef_rundir()
+    e = dict(ENV)
+    e["AI_DEFECTS_BIN"] = "verifier-bare-name"  # relative -> hashed file != PATH-exec'd file
+    e["AI_DEFECTS_PIN_VERSION"] = "1.0.0"
+    e["AI_DEFECTS_PIN_DIGEST"] = "0" * 64
+    r = _aidef_wrap(run, e, expect=2)
+    assert "absolute" in r.stdout
+
+
+def t_ai_defects_whitespace_filename_scanned():        # a space-named Git file is NOT empty-diff
+    run = _aidef_rundir()
+    (run / "changed_paths.txt").write_text("   \n")  # a file literally named three spaces
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=0)
+    assert "empty-diff" not in r.stdout and "completed" in r.stdout
+
+
+def t_ai_defects_binary_output_pass():                 # non-UTF-8 child output must not crash->FAIL
+    run = _aidef_rundir()
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_binary_output.py")), expect=0)
+    assert "PASS" in r.stdout
+
+
+def t_ai_defects_timeout_kills_child_tree():           # timeout kills the whole process group
+    run = _aidef_rundir()
+    env = _aidef_env(_aidef_fix("spawn_child_timeout.py"), timeout=1)
+    r = _aidef_wrap(run, env, expect=2)
+    assert "timed out" in r.stdout
+    import time as _time
+    _time.sleep(5)  # past the worker's 3s write window
+    assert not (run / "child-marker").exists(), "spawned worker survived the timeout tree-kill"
+
+
+def t_ai_defects_summary_nonobject_blocked():          # summary must be a JSON object
+    run = _aidef_rundir()
+    (run / "ai-defects.json").write_text("[]")
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=2)
+    assert "not a JSON object" in r.stdout
+
+
+def t_ai_defects_summary_nonbool_incomplete_blocked():  # 'incomplete' must be a boolean
+    run = _aidef_rundir()
+    (run / "ai-defects.json").write_text('{"incomplete": []}')
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=2)
+    assert "non-boolean" in r.stdout
+
+
+def t_ai_defects_public_silence_bad_root_blocked():    # a bad scan root fails closed (exit 2)
+    r = _silence("/nonexistent/ar-root-does-not-exist")
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
 
 
 def main():

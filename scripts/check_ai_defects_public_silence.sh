@@ -15,6 +15,13 @@ if [ -z "$ROOT" ]; then
   ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 fi
 
+# A misspelled/missing ROOT would make every scope path absent and silently "pass"
+# without scanning anything -- fail closed on a bad scan root (matches the grep-error path).
+if [ ! -d "$ROOT" ]; then
+  echo "ai-defects public-silence check ERROR: scan root is not a directory: $ROOT" >&2
+  exit 2
+fi
+
 # Case-insensitive extended-regex denylist. 'skylos' is the known scanner brand; the
 # phrases are mislabelled-product / first-party-authorship claims. 'our SAST' is anchored
 # on its left with a start-or-non-alphanumeric boundary so ordinary second-person
