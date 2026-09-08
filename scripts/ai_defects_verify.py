@@ -117,16 +117,21 @@ def _resolve_timeout():
 
 
 def _kill_tree(proc):
-    """Kill the verifier AND any workers it spawned. The child is started in its own
-    process group (POSIX) so a timeout can take down the whole tree, not just the
-    immediate process (an orphaned worker could keep writing into the run dir)."""
+    """Kill the verifier AND any workers it spawned, not just the immediate process (an
+    orphaned worker could keep writing into the run dir). POSIX: the child runs in its own
+    process group (start_new_session), so signal the whole group. Windows: kill the process
+    tree by PID with `taskkill /T` (proc.kill would terminate only the parent)."""
     try:
         if os.name == "posix":
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         else:
-            proc.kill()
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True)
     except OSError:
-        pass
+        try:
+            proc.kill()  # last resort: at least drop the immediate process
+        except OSError:
+            pass
 
 
 def _run_verifier(cmd, timeout_s):
