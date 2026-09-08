@@ -9615,6 +9615,95 @@ def t_ai_defects_public_silence_bad_root_blocked():    # a bad scan root fails c
     assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
 
 
+# --- diff-ref scope resolver (scripts/ai_defects_diffscope.py) ------------------------
+# The ai-defects CI job resolves the scan scope from a git diff-ref. That logic used to be
+# inline in the workflow_dispatch job, which CI never runs -- so "a bad diff-ref must not
+# become an empty-diff PASS" was untested. These exercise the extracted, CI-run resolver.
+
+def _aidef_git_repo():
+    d = Path(tempfile.mkdtemp(prefix="ar-aidef-git-"))
+
+    def g(*a):
+        r = subprocess.run(["git", *a], cwd=str(d), capture_output=True, text=True)
+        assert r.returncode == 0, "git %s failed: %s" % (" ".join(a), r.stderr)
+
+    g("init", "-q")
+    g("config", "user.email", "t@ar.local")
+    g("config", "user.name", "ar-test")
+    g("config", "commit.gpgsign", "false")
+    (d / "a.txt").write_text("one\n")
+    g("add", "a.txt")
+    g("commit", "-qm", "c1")
+    (d / "a.txt").write_text("one\ntwo\n")
+    g("commit", "-qam", "c2")
+    return d
+
+
+def _aidef_emptydir():
+    return Path(tempfile.mkdtemp(prefix="ar-aidef-run-"))  # a run dir with NO changed_paths.txt
+
+
+def _diffscope(repo, run_dir, ref, expect):
+    return sh(["ai_defects_diffscope.py", "--run-dir", str(run_dir), "--diff-ref", ref],
+              cwd=str(repo), expect=expect)
+
+
+def t_ai_defects_diffscope_valid_range():              # valid range -> writes the changed list
+    repo = _aidef_git_repo(); run = _aidef_emptydir()
+    _diffscope(repo, run, "HEAD~1...HEAD", expect=0)
+    cp = run / "changed_paths.txt"
+    assert cp.is_file() and "a.txt" in cp.read_text()
+
+
+def t_ai_defects_diffscope_valid_empty_range_pass():   # valid range, no changes -> legit empty-diff
+    repo = _aidef_git_repo(); run = _aidef_emptydir()
+    _diffscope(repo, run, "HEAD...HEAD", expect=0)
+    cp = run / "changed_paths.txt"
+    assert cp.is_file() and cp.read_text().strip() == ""
+
+
+def t_ai_defects_diffscope_invalid_ref_blocked():      # bad ref -> BLOCKED, no changed_paths.txt
+    repo = _aidef_git_repo(); run = _aidef_emptydir()
+    r = _diffscope(repo, run, "bogus...HEAD", expect=2)
+    assert "BLOCKED" in r.stdout and not (run / "changed_paths.txt").exists()
+
+
+def t_ai_defects_diffscope_pathspec_blocked():         # a bare tracked filename is not a revision
+    repo = _aidef_git_repo(); run = _aidef_emptydir()
+    _diffscope(repo, run, "a.txt", expect=2)
+    assert not (run / "changed_paths.txt").exists()
+
+
+def t_ai_defects_diffscope_option_prefixed_blocked():  # -x is rejected before touching git
+    repo = _aidef_git_repo(); run = _aidef_emptydir()
+    r = _diffscope(repo, run, "-x", expect=2)
+    assert "option-prefixed" in r.stdout and not (run / "changed_paths.txt").exists()
+
+
+def t_ai_defects_diffscope_empty_ref_blocked():        # missing/empty diff-ref -> BLOCKED
+    repo = _aidef_git_repo(); run = _aidef_emptydir()
+    _diffscope(repo, run, "", expect=2)
+    assert not (run / "changed_paths.txt").exists()
+
+
+def t_ai_defects_diffscope_clears_stale_changed_paths():  # a failed resolution leaves no leftover
+    repo = _aidef_git_repo(); run = _aidef_emptydir()
+    (run / "changed_paths.txt").write_text("stale/leftover.py\n")
+    _diffscope(repo, run, "bogus...HEAD", expect=2)
+    assert not (run / "changed_paths.txt").exists(), "stale changed_paths survived a failed resolution"
+
+
+def t_ai_defects_invalid_diffref_never_empty_diff_pass():
+    # End-to-end: a bad diff-ref must NOT become an empty-diff PASS. The resolver fails closed
+    # (no changed_paths.txt), and the verify wrapper handed that absent file BLOCKS -- it does
+    # not read an empty file and record empty-diff PASS.
+    repo = _aidef_git_repo(); run = _aidef_emptydir()
+    _diffscope(repo, run, "not-a-ref", expect=2)
+    assert not (run / "changed_paths.txt").exists()
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=2)
+    assert "cannot read diff file" in r.stdout and "empty-diff" not in r.stdout
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
