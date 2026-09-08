@@ -9331,6 +9331,290 @@ def t_mcp_aggregate_reconcile_failure_does_not_mask_original_error():
     assert isinstance(got, Boom), ("expected the original error to propagate, got", type(got).__name__, repr(got)[:150])
 
 
+# ---------------------------------------------------------------- ai-defects gate
+# Wrapper (scripts/ai_defects_verify.py) + gate.py --exit-map status mapping. Fixtures
+# under tests/fixtures/ai_defects/ are mock "verifiers"; NONE is the real pinned binary
+# (the verifier is adopted by command and never committed/redistributed). Covers the
+# TRD Section 9 IDs that apply to Adversarial Review: T-P1/P3/P4, T-N1..N6, T-E1/E3/E4/
+# E7/E8/E9/E10, plus gate mapping, plan inclusion, and fail-closed extras.
+
+AIDEF_FIX = SKILL / "tests" / "fixtures" / "ai_defects"
+AIDEF_WRAPPER = SKILL / "scripts" / "ai_defects_verify.py"
+
+
+def _aidef_fix(name):
+    p = AIDEF_FIX / name
+    try:
+        os.chmod(p, 0o755)  # exec bit may be lost in transit; tests must not depend on it
+    except OSError:
+        pass
+    return p
+
+
+def _sha256_file(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def _aidef_env(binpath, digest=None, version="1.0.0", timeout=None):
+    e = dict(ENV)
+    e["AI_DEFECTS_BIN"] = str(binpath)
+    e["AI_DEFECTS_PIN_VERSION"] = version
+    e["AI_DEFECTS_PIN_DIGEST"] = digest if digest is not None else _sha256_file(binpath)
+    if timeout is not None:
+        e["AI_DEFECTS_TIMEOUT_S"] = str(timeout)
+    return e
+
+
+def _aidef_rundir(paths=("scripts/x.py",)):
+    d = Path(tempfile.mkdtemp(prefix="ar-aidef-"))
+    (d / "changed_paths.txt").write_text("\n".join(paths) + ("\n" if paths else ""))
+    return d
+
+
+def _aidef_wrap(run, env, expect, extra=None):
+    args = ["ai_defects_verify.py", "--run-dir", str(run),
+            "--diff-file", str(Path(run) / "changed_paths.txt")]
+    if extra:
+        args += extra
+    return sh(args, cwd=str(run), expect=expect, env=env)
+
+
+def _silence(root):
+    return subprocess.run(
+        ["sh", str(SKILL / "scripts" / "check_ai_defects_public_silence.sh"), str(root)],
+        capture_output=True, text=True)
+
+
+def t_ai_defects_exit0_pass():                       # T-P1
+    run = _aidef_rundir()
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=0)
+    assert "PASS" in r.stdout
+
+
+def t_ai_defects_empty_diff_pass():                  # T-P3 / T-E2 (A12)
+    run = _aidef_rundir(paths=())  # zero paths -> an empty changed_paths.txt
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py"), digest=""), expect=0)
+    assert "empty-diff" in r.stdout  # PASS reached BEFORE the (absent) pin is needed
+    # NB: a whitespace-only line is a real (space-named) file, NOT empty -- see
+    # t_ai_defects_whitespace_filename_scanned.
+
+
+def t_ai_defects_exit1_fail():                       # T-N1
+    run = _aidef_rundir()
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit1_defects.py")), expect=1)
+    assert "FAIL" in r.stdout
+
+
+def t_ai_defects_exit2_blocked():                    # T-N2
+    run = _aidef_rundir()
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit2_incomplete.py")), expect=2)
+    assert "BLOCKED" in r.stdout
+
+
+def t_ai_defects_missing_pin_blocked():              # T-N3
+    run = _aidef_rundir()
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py"), digest=""), expect=2)
+    assert "AI_DEFECTS_PIN_DIGEST" in r.stdout
+
+
+def t_ai_defects_extra_argv_blocked():               # T-N4
+    run = _aidef_rundir()
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=2,
+                    extra=["--evil"])
+    assert "unexpected argument" in r.stdout
+
+
+def t_ai_defects_wildcard_rejected():                # T-N5
+    run = _aidef_rundir()
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=2, extra=[":*"])
+    assert "unexpected argument" in r.stdout  # no wildcard/passthrough accepted
+
+
+def t_ai_defects_timeout_blocked():                  # T-E1
+    run = _aidef_rundir()
+    env = _aidef_env(_aidef_fix("sleep_timeout.py"), timeout=1)
+    r = _aidef_wrap(run, env, expect=2)
+    assert "timed out" in r.stdout
+
+
+def t_ai_defects_exec_error_blocked():               # T-E4 (wrong arch / not an image)
+    run = _aidef_rundir()
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("not_a_binary.bin")), expect=2)
+    assert "execute" in r.stdout
+
+
+def t_ai_defects_incomplete_json_blocked():          # T-E7
+    run = _aidef_rundir()
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_incomplete_json.py")), expect=2)
+    assert "incomplete" in r.stdout
+
+
+def t_ai_defects_bad_summary_json_blocked():         # fail-closed: present-but-corrupt summary
+    run = _aidef_rundir()
+    (run / "ai-defects.json").write_text("{ not valid json")
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=2)
+    assert "unreadable" in r.stdout
+
+
+def t_ai_defects_unknown_exit_blocked():             # T-E8
+    run = _aidef_rundir()
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit99_unknown.py")), expect=2)
+    assert "fail-closed" in r.stdout
+
+
+def t_ai_defects_digest_mismatch_blocked():          # T-E9
+    run = _aidef_rundir()
+    env = _aidef_env(_aidef_fix("exit0_clean.py"), digest="0" * 64)
+    r = _aidef_wrap(run, env, expect=2)
+    assert "digest mismatch" in r.stdout
+
+
+def t_ai_defects_unset_rundir_blocked():             # T-E10
+    r = sh(["ai_defects_verify.py", "--run-dir", "", "--diff-file", "x"],
+           cwd=str(SKILL), expect=2)
+    assert "--run-dir" in r.stdout
+
+
+def t_ai_defects_missing_binary_blocked():           # T-E3
+    run = _aidef_rundir()
+    r = _aidef_wrap(run, _aidef_env("/no/such/verifier", digest="0" * 64), expect=2)
+    assert "not found" in r.stdout
+
+
+def t_ai_defects_gate_maps_exit_taxonomy():          # WP-AR-4: gate ledger PASS/FAIL/BLOCKED
+    for fixture, want in [("exit0_clean.py", "PASS"), ("exit1_defects.py", "FAIL"),
+                          ("exit2_incomplete.py", "BLOCKED")]:
+        run = _aidef_rundir()
+        env = _aidef_env(_aidef_fix(fixture))
+        sh(["gate.py", "run", "--run", str(run), "--name", "ai-defects",
+            "--exit-map", "1=FAIL,2=BLOCKED,*=BLOCKED", "--",
+            sys.executable, str(AIDEF_WRAPPER),
+            "--run-dir", str(run), "--diff-file", str(run / "changed_paths.txt")],
+           cwd=str(run), expect=None, env=env)
+        rec = read(run / "gates" / "ai-defects.json")
+        assert rec["status"] == want, (fixture, rec["status"], want)
+        assert rec["gate"] == "ai-defects"
+
+
+def t_ai_defects_gate_exit_map_rejects_bad_spec():   # malformed --exit-map dies, no bogus record
+    run = _aidef_rundir()
+    sh(["gate.py", "run", "--run", str(run), "--name", "ai-defects",
+        "--exit-map", "2=NOPE", "--", "true"], cwd=str(run), expect=1)
+    assert not (run / "gates" / "ai-defects.json").exists()
+
+
+def t_ai_defects_plan_includes_gate():               # WP-AR-4: NORMAL+ plan can include ai-defects
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic",
+        "--diff-ref", "main...HEAD"], repo)
+    run = latest_run(repo)
+    sh(["gate.py", "plan", "--run", str(run), "--require", "ai-defects"], repo)
+    req = read(run / "gates" / "_required.json")
+    assert "ai-defects" in req["required"], req["required"]
+
+
+def t_ai_defects_public_silence_clean_tree():        # T-P4 / T-R3: real public surfaces are clean
+    r = _silence(SKILL)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def t_ai_defects_public_silence_detects_vendor():    # T-N6: planted vendor/brand fails the check
+    d = Path(tempfile.mkdtemp(prefix="ar-silence-"))
+    (d / "README.md").write_text("We run skylos under the hood.\n")
+    r = _silence(d)
+    assert r.returncode != 0 and "README.md" in r.stdout
+    d2 = Path(tempfile.mkdtemp(prefix="ar-silence-"))
+    (d2 / "references").mkdir()
+    (d2 / "references" / "x.md").write_text("we built this engine ourselves\n")
+    assert _silence(d2).returncode != 0
+
+
+def t_ai_defects_gate_exit_map_rejects_nonzero_pass():  # exit-map must never weaken a failing check
+    run = _aidef_rundir()
+    for spec in ("1=PASS", "*=PASS"):
+        sh(["gate.py", "run", "--run", str(run), "--name", "ai-defects",
+            "--exit-map", spec, "--", "true"], cwd=str(run), expect=1)
+    assert not (run / "gates" / "ai-defects.json").exists()
+
+
+def t_ai_defects_undecodable_diff_blocked():            # non-UTF-8 scope input -> BLOCKED, not FAIL
+    run = _aidef_rundir()
+    (run / "changed_paths.txt").write_bytes(b"\xff\xfe\x00 not utf8\n")
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=2)
+    assert "diff file" in r.stdout
+
+
+def t_ai_defects_nonfinite_timeout_blocked():           # nan/inf watchdog is no watchdog -> BLOCKED
+    run = _aidef_rundir()
+    env = _aidef_env(_aidef_fix("exit0_clean.py"), timeout="inf")
+    r = _aidef_wrap(run, env, expect=2)
+    assert "finite" in r.stdout
+
+
+def t_ai_defects_public_silence_readme_variant_and_your_sast():
+    # Every root README* variant is in scope (not just README.md)...
+    d = Path(tempfile.mkdtemp(prefix="ar-silence-"))
+    (d / "README.rst").write_text("Powered by skylos.\n")
+    assert _silence(d).returncode != 0
+    # ...but ordinary second-person guidance ("your SAST") is NOT a first-party claim.
+    d2 = Path(tempfile.mkdtemp(prefix="ar-silence-"))
+    (d2 / "README.md").write_text("Configure your SAST policy before merging.\n")
+    r2 = _silence(d2)
+    assert r2.returncode == 0, r2.stdout
+
+
+def t_ai_defects_relative_binpath_blocked():           # exec exactly the digest-verified file
+    run = _aidef_rundir()
+    e = dict(ENV)
+    e["AI_DEFECTS_BIN"] = "verifier-bare-name"  # relative -> hashed file != PATH-exec'd file
+    e["AI_DEFECTS_PIN_VERSION"] = "1.0.0"
+    e["AI_DEFECTS_PIN_DIGEST"] = "0" * 64
+    r = _aidef_wrap(run, e, expect=2)
+    assert "absolute" in r.stdout
+
+
+def t_ai_defects_whitespace_filename_scanned():        # a space-named Git file is NOT empty-diff
+    run = _aidef_rundir()
+    (run / "changed_paths.txt").write_text("   \n")  # a file literally named three spaces
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=0)
+    assert "empty-diff" not in r.stdout and "completed" in r.stdout
+
+
+def t_ai_defects_binary_output_pass():                 # non-UTF-8 child output must not crash->FAIL
+    run = _aidef_rundir()
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_binary_output.py")), expect=0)
+    assert "PASS" in r.stdout
+
+
+def t_ai_defects_timeout_kills_child_tree():           # timeout kills the whole process group
+    run = _aidef_rundir()
+    env = _aidef_env(_aidef_fix("spawn_child_timeout.py"), timeout=1)
+    r = _aidef_wrap(run, env, expect=2)
+    assert "timed out" in r.stdout
+    import time as _time
+    _time.sleep(5)  # past the worker's 3s write window
+    assert not (run / "child-marker").exists(), "spawned worker survived the timeout tree-kill"
+
+
+def t_ai_defects_summary_nonobject_blocked():          # summary must be a JSON object
+    run = _aidef_rundir()
+    (run / "ai-defects.json").write_text("[]")
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=2)
+    assert "not a JSON object" in r.stdout
+
+
+def t_ai_defects_summary_nonbool_incomplete_blocked():  # 'incomplete' must be a boolean
+    run = _aidef_rundir()
+    (run / "ai-defects.json").write_text('{"incomplete": []}')
+    r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=2)
+    assert "non-boolean" in r.stdout
+
+
+def t_ai_defects_public_silence_bad_root_blocked():    # a bad scan root fails closed (exit 2)
+    r = _silence("/nonexistent/ar-root-does-not-exist")
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+
+
 def main():
     srv = mock_router.start(PORT)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("t_")]
