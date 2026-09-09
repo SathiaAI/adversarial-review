@@ -9653,6 +9653,7 @@ def t_ai_defects_diffscope_valid_range():              # valid range -> writes t
     _diffscope(repo, run, "HEAD~1...HEAD", expect=0)
     cp = run / "changed_paths.txt"
     assert cp.is_file() and "a.txt" in cp.read_text()
+    assert not (run / "changed_paths.txt.tmp").exists()  # atomic publish left no temp behind
 
 
 def t_ai_defects_diffscope_valid_empty_range_pass():   # valid range, no changes -> legit empty-diff

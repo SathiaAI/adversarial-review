@@ -19,6 +19,7 @@ never silently produce an empty file that downstream reads as an empty-diff PASS
 a bare pathspec such as "README.md" then fails to resolve instead of diffing that path to
 an empty result.
 """
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -75,9 +76,19 @@ def main(argv):
         err = (proc.stderr or b"").decode("utf-8", "replace").strip()
         blocked("diff-ref %r is not a resolvable revision/range: %s" % (diff_ref, err[:200]))
 
+    # Publish atomically: write a same-directory temp file, then os.replace it into place.
+    # A partial write (e.g. disk exhaustion) then never leaves a truncated changed_paths.txt
+    # behind -- upholding the contract that a failed resolution leaves NO scope file.
+    tmp = out.with_name(out.name + ".tmp")
     try:
-        out.write_bytes(proc.stdout or b"")
+        tmp.write_bytes(proc.stdout or b"")
+        os.replace(str(tmp), str(out))
     except OSError as exc:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
         blocked("cannot write %s: %s" % (CHANGED, exc))
     n = len([ln for ln in (proc.stdout or b"").decode("utf-8", "replace").splitlines() if ln])
     print("%s diff-scope: %d changed path(s) from %r" % (LOG, n, diff_ref))
