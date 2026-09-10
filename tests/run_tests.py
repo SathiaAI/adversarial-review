@@ -5600,15 +5600,17 @@ def t_ingest_notes_corroboration_not_applied_on_mcp():
         mock_router.reset()
 
 
-def _http_transport(origins=(), max_bytes=4096, require_session=None, max_sessions=None, max_streams=None):
+def _http_transport(origins=(), max_bytes=4096, require_session=None, max_sessions=None, max_streams=None,
+                    token=None, max_workers=None, read_timeout=None):
     """Start an HttpTransport on an ephemeral localhost port in a daemon thread; return (transport, port).
     Offline — binds 127.0.0.1 only, no external network. require_session/max_sessions/max_streams (E3-S2b)
-    default to None so the transport reads the env (require off, 128 sessions, 64 streams); tests inject
-    explicit values."""
+    and token/max_workers/read_timeout (E3-S2c) default to None so the transport reads the env (require off,
+    128 sessions, 64 streams, no auth, 128 workers, 30s read timeout); tests inject explicit values."""
     import threading
     t = mcpsrv.HttpTransport(host="127.0.0.1", port=0, origins=origins, max_bytes=max_bytes,
                              require_session=require_session, max_sessions=max_sessions,
-                             max_streams=max_streams)
+                             max_streams=max_streams, token=token, max_workers=max_workers,
+                             read_timeout=read_timeout)
     _host, port = t.bind()
     threading.Thread(target=t.serve_forever, daemon=True).start()
     return t, port
@@ -5816,10 +5818,11 @@ def t_mcp_http_missing_or_empty_content_length_is_safe():
 
 
 def t_mcp_http_non_loopback_bind_is_refused():
-    # test_quality-6 / security-1: E3-S2a ships NO authentication, so HttpTransport.bind() must REFUSE
-    # any non-loopback host (0.0.0.0 / LAN / hostname / "::") rather than expose an unauthenticated tool
-    # surface to the network. An EMPTY host is refused too: the socket layer binds "" to 0.0.0.0 (all
-    # interfaces), so it must NOT count as loopback. Loopback targets still bind normally.
+    # test_quality-6 / security-1: WITHOUT a token, HttpTransport.bind() must REFUSE any non-loopback host
+    # (0.0.0.0 / LAN / hostname / "::") rather than expose an UNAUTHENTICATED tool surface to the network
+    # (E3-S2c: a remote bind is permitted only once a token authenticates it — see the token test below).
+    # An EMPTY host is refused too: the socket layer binds "" to 0.0.0.0 (all interfaces), so it must NOT
+    # count as loopback. Loopback targets still bind normally.
     for host in ("0.0.0.0", "192.168.1.10", "10.0.0.1", "example.com", "::", ""):
         try:
             mcpsrv.HttpTransport(host=host, port=0).bind()
@@ -5854,6 +5857,259 @@ def t_mcp_http_ipv6_loopback_binds():
         assert port > 0 and t.httpd.address_family == socket.AF_INET6, (host, port)
     finally:
         t.httpd.server_close()
+
+
+def _authbody():
+    return json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+
+
+def t_mcp_http_auth_required_when_token_set():
+    # E3-S2c: with AR_MCP_HTTP_TOKEN set, a request with NO Authorization -> 401 + a Bearer challenge;
+    # the correct Bearer token -> 200.
+    tok = "s3cret-token-abcdefghij0123"  # >= HTTP_MIN_TOKEN_LEN
+    t, port = _http_transport(token=tok)
+    try:
+        s_no, _b, h = _http_post(port, _authbody())                         # missing Authorization
+        assert s_no == 401, s_no
+        assert "bearer" in h.get("www-authenticate", "").lower(), h
+        s_ok, _b2, _h2 = _http_post(port, _authbody(), {"Authorization": "Bearer " + tok})
+        assert s_ok == 200, s_ok
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_auth_rejects_wrong_token():
+    # E3-S2c: a wrong token (same length AND different length), a wrong scheme, and a bare/empty credential
+    # all -> 401. Never a 200 on anything but the exact token.
+    tok = "correct-token-0123456789abc"
+    t, port = _http_transport(token=tok)
+    try:
+        wrong_same = "x" * len(tok)  # same length, different value
+        for hdr in ("Bearer " + wrong_same, "Bearer short", "Basic " + tok, "Bearer", "Bearer ", tok):
+            s, _b, _h = _http_post(port, _authbody(), {"Authorization": hdr})
+            assert s == 401, (hdr, s)
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_no_auth_when_token_unset():
+    # E3-S2c: with no token configured, behavior is unchanged — a request with no Authorization is served.
+    t, port = _http_transport()  # token=None -> reads env (unset in tests) -> no auth
+    try:
+        s, _b, _h = _http_post(port, _authbody())
+        assert s == 200, s
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_origin_precedes_auth():
+    # E3-S2c: the Origin/rebinding boundary check runs BEFORE auth. A disallowed browser Origin -> 403,
+    # not 401 — so attacker bytes never reach the credential comparator for a request already doomed on
+    # Origin, and the existing per-verb check order is preserved.
+    tok = "order-token-0123456789abcdef"
+    t, port = _http_transport(origins=("https://ok.example",), token=tok)
+    try:
+        s, _b, _h = _http_post(port, _authbody(), {"Origin": "https://evil.example"})  # bad origin, no auth
+        assert s == 403, s   # 403 (origin), not 401 (auth)
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_discover_gated_when_token_set():
+    # E3-S2c: server/discover is gated behind auth too — no pre-auth catalog/version leak. Unauthenticated
+    # -> 401; authenticated -> 200 with the supported versions.
+    tok = "discover-gate-token-abcdef012"
+    t, port = _http_transport(token=tok)
+    try:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
+        s_no, _b, _h = _http_post(port, body)
+        assert s_no == 401, s_no
+        s_ok, b_ok, _h2 = _http_post(port, body, {"Authorization": "Bearer " + tok})
+        assert s_ok == 200 and b"supportedVersions" in b_ok, (s_ok, b_ok[:120])
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_auth_no_dispatch_before_auth():
+    # E3-S2c: an unauthenticated request must NOT reach serve_message() — no tool dispatch, no side effect.
+    tok = "dispatch-guard-token-12345678"
+    calls = []
+    orig = mcpsrv.serve_message
+    mcpsrv.serve_message = lambda raw: (calls.append(1), orig(raw))[1]
+    t, port = _http_transport(token=tok)
+    try:
+        s_no, _b, _h = _http_post(port, _authbody())                       # no auth
+        assert s_no == 401 and calls == [], (s_no, len(calls))             # serve_message never called
+        s_ok, _b2, _h2 = _http_post(port, _authbody(), {"Authorization": "Bearer " + tok})
+        assert s_ok == 200 and len(calls) == 1, (s_ok, len(calls))         # only the authed request dispatched
+    finally:
+        mcpsrv.serve_message = orig
+        t.shutdown()
+
+
+def t_mcp_http_auth_uses_constant_time_compare():
+    # E3-S2c: the token comparison goes through hmac.compare_digest (constant-time), not `==`.
+    tok = "ct-compare-token-0123456789ab"
+    seen = []
+    orig = mcpsrv.hmac.compare_digest
+    mcpsrv.hmac.compare_digest = lambda a, b: (seen.append(1), orig(a, b))[1]
+    t, port = _http_transport(token=tok)
+    try:
+        s, _b, _h = _http_post(port, _authbody(), {"Authorization": "Bearer " + tok})
+        assert s == 200 and seen, (s, seen)
+    finally:
+        mcpsrv.hmac.compare_digest = orig
+        t.shutdown()
+
+
+def t_mcp_http_blank_token_fails_closed():
+    # E3-S2c: a PRESENT but blank/whitespace or too-short AR_MCP_HTTP_TOKEN fails loudly (never silently
+    # disables auth); an UNSET var means no auth (None); a real token resolves. HttpTransport inherits this
+    # via http_token() so a blank env token aborts startup rather than binding an open surface.
+    import os as _os
+    saved = _os.environ.get("AR_MCP_HTTP_TOKEN")
+    try:
+        for bad in ("", "   ", "short"):
+            _os.environ["AR_MCP_HTTP_TOKEN"] = bad
+            try:
+                mcpsrv.http_token()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("http_token() must reject %r" % bad)
+        _os.environ.pop("AR_MCP_HTTP_TOKEN", None)
+        assert mcpsrv.http_token() is None
+        _os.environ["AR_MCP_HTTP_TOKEN"] = "a-perfectly-fine-token-12345"
+        assert mcpsrv.http_token() == "a-perfectly-fine-token-12345"
+        # a blank env token must also abort a real startup (token param None -> reads env)
+        _os.environ["AR_MCP_HTTP_TOKEN"] = ""
+        try:
+            mcpsrv.HttpTransport(host="127.0.0.1", port=0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("HttpTransport must fail closed on a blank AR_MCP_HTTP_TOKEN")
+    finally:
+        if saved is None:
+            _os.environ.pop("AR_MCP_HTTP_TOKEN", None)
+        else:
+            _os.environ["AR_MCP_HTTP_TOKEN"] = saved
+
+
+def t_mcp_http_remote_bind_allowed_with_token():
+    # E3-S2c: a non-loopback bind IS permitted once a token authenticates it. Bind an ephemeral port on
+    # 0.0.0.0 then close immediately (do not serve).
+    tok = "remote-bind-token-0123456789a"
+    t = mcpsrv.HttpTransport(host="0.0.0.0", port=0, token=tok)
+    try:
+        host, port = t.bind()
+        assert host == "0.0.0.0" and port > 0, (host, port)
+    finally:
+        if t.httpd is not None:
+            t.httpd.server_close()
+
+
+def t_mcp_http_max_workers_must_exceed_max_streams():
+    # E3-S2c: the worker pool must exceed the SSE stream cap or held-open streams starve dispatch; bind()
+    # fails fast on the misconfiguration. A valid ratio binds.
+    for mw, ms in ((4, 4), (4, 8)):
+        t = mcpsrv.HttpTransport(host="127.0.0.1", port=0, max_workers=mw, max_streams=ms)
+        try:
+            t.bind()
+        except ValueError as e:
+            assert "MAX_WORKERS" in str(e) or "must exceed" in str(e), str(e)
+        else:
+            if t.httpd is not None:
+                t.httpd.server_close()
+            raise AssertionError("bind() must refuse max_workers(%d) <= max_streams(%d)" % (mw, ms))
+    t = mcpsrv.HttpTransport(host="127.0.0.1", port=0, max_workers=8, max_streams=4)
+    try:
+        _h, port = t.bind()
+        assert port > 0
+    finally:
+        if t.httpd is not None:
+            t.httpd.server_close()
+
+
+def t_mcp_http_bounded_worker_pool():
+    # E3-S2c: the worker pool caps concurrent connections. With max_workers=2, two in-flight requests hold
+    # both workers (one inside serve_message, one blocked on the process-wide dispatch lock — both hold their
+    # worker permit); a third connection is refused (socket closed with no HTTP response) rather than served.
+    import threading as _th, socket as _sock, time as _time
+    release = _th.Event()        # held until the test lets the two in-flight requests finish
+    orig = mcpsrv.serve_message
+
+    def blocking(raw):
+        release.wait(10)
+        return orig(raw)
+
+    mcpsrv.serve_message = blocking
+    t, port = _http_transport(max_workers=2, max_streams=1)
+    body = _authbody().encode("utf-8")
+    req = (b"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: "
+           + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+    held = []
+    try:
+        for _ in range(2):
+            s = _sock.create_connection(("127.0.0.1", port), timeout=5)
+            s.sendall(req)
+            held.append(s)
+        # wait until both worker permits are taken (both connections occupy the bounded pool)
+        deadline = _time.time() + 5
+        while t.httpd._worker_sem._value != 0 and _time.time() < deadline:
+            _time.sleep(0.02)
+        assert t.httpd._worker_sem._value == 0, "pool not fully occupied (value=%r)" % t.httpd._worker_sem._value
+        third = _sock.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            third.sendall(req)
+            third.settimeout(5)
+            data = b""
+            while True:
+                try:
+                    chunk = third.recv(4096)
+                except _sock.timeout:
+                    chunk = b""
+                if not chunk:
+                    break
+                data += chunk
+            assert data == b"", "third connection should get no HTTP response, got %r" % data[:80]
+        finally:
+            third.close()
+    finally:
+        release.set()
+        for s in held:
+            try:
+                s.recv(65536)
+            except OSError:
+                pass
+            s.close()
+        mcpsrv.serve_message = orig
+        t.shutdown()
+
+
+def t_mcp_http_read_timeout_bounds_slow_loris():
+    # E3-S2c: a client that opens a connection and stalls a partial request is dropped within ~the read
+    # timeout, not pinned to the worker forever.
+    import socket as _sock, time as _time
+    t, port = _http_transport(read_timeout=1)
+    try:
+        s = _sock.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\n")  # partial: headers never terminated
+            s.settimeout(5)
+            start = _time.time()
+            while True:
+                try:
+                    chunk = s.recv(4096)
+                except _sock.timeout:
+                    chunk = b""
+                if not chunk:
+                    break
+            assert _time.time() - start < 4, "slow-loris connection not dropped promptly"
+        finally:
+            s.close()
+    finally:
+        t.shutdown()
 
 
 def t_mcp_http_transfer_encoding_is_rejected():
