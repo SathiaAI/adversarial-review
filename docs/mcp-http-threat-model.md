@@ -13,11 +13,14 @@ A host reachable only through MCP therefore cannot use this server to run comman
 
 ## Assets to protect
 - The reviewer tool surface exposed over MCP (read/dispatch of `ar_*` tools + `server/discover`).
-- The run artifacts. An **active** run dir is **mutable** — the reachable `ar_gate_plan`,
-  `ar_gate_record`, `ar_panel_prepare`, `ar_panel_run`, `ar_panel_ingest`, and `ar_aggregate` tools write
-  gate, context, panel, and verdict files under the selected run — while a **completed** run is the
-  immutable audit record. Their integrity (an active run not corrupted, a completed run not altered) is
-  itself an asset. The transport adds no new write path here — it exposes exactly the tools stdio does.
+- The run artifacts. An **active** run dir is **mutable** — the reachable `ar_gate_plan`, `ar_gate_record`,
+  `ar_panel_prepare`, `ar_panel_run`, `ar_panel_ingest`, and `ar_aggregate` tools write gate, context,
+  panel, and verdict files under the selected run. A **completed** run is the audit record, but the
+  transport enforces **no** completion guard — `ar_aggregate` can be re-run against an existing run and
+  recompute/replace `verdict.json` — so its integrity is a **by-convention** property (don't mutate a
+  finished run), not a transport-enforced one. That integrity is itself an asset. The transport adds no new
+  write path here — it exposes exactly the tools stdio does; a completion-state write guard would be a
+  change to the tools, not the transport.
 - The host process and its resources (threads, file descriptors, memory).
 
 **Explicitly NOT reachable over MCP:** the OpenRouter key, signing keys, and gate/command execution.
@@ -38,7 +41,7 @@ every request must authenticate**, on every host including loopback.
 | **Tampering / session hijack** — guessing or fixating a session id | **Cryptographically-random**, server-minted `Mcp-Session-Id` (via `secrets`), bound to the negotiated protocol version, rotatable/terminable; a client-supplied id the server never minted is refused **404**. | Shipped S2b |
 | **Denial of service / resource exhaustion** — oversized bodies, slow-loris, unbounded concurrency/sessions/streams | Max body size (**413**); `Transfer-Encoding` refused (**400**, anti-smuggling); **bounded, evicting session store** (`AR_MCP_HTTP_MAX_SESSIONS`); **bounded SSE stream pool** (`AR_MCP_HTTP_MAX_STREAMS` → **503**); **bounded worker/connection pool** (`AR_MCP_HTTP_MAX_WORKERS`, refuse-by-close past the cap, enforced `> MAX_STREAMS` at bind); **per-recv socket read timeout** (`AR_MCP_HTTP_READ_TIMEOUT`) on the request read and response write; a malformed/oversized message frames as a JSON-RPC error and never crashes the listener. | Body/limits S2a; sessions/streams S2b; **worker pool + read timeout S2c** |
 | **Information disclosure** — stack traces or secrets in error bodies/headers | JSON-RPC errors only (no tracebacks on the wire — `serve_message` normalizes to `-32603`); tools already scrub secrets; minimal `Server` header; the bearer token is **env-only** (never argv/URL/query) and **never logged**; a 401 body is a constant that never echoes the supplied credential. | Shipped S2a; token hygiene S2c |
-| **Repudiation** | None new from the transport: a **completed** run is the immutable audit record and the verdict is computed by `aggregate.py`; an **active** run dir is mutable by the same tools stdio already exposes, so the transport adds no new tampering path. | n/a |
+| **Repudiation** | None new from the transport: the verdict is computed by `aggregate.py`, and every write path (including re-running `ar_aggregate` to recompute a completed run's `verdict.json`) is one stdio already exposes — the transport adds no new tampering path. Run-dir integrity is by convention, not transport-enforced (see Assets). | n/a |
 
 ## Authentication design (E3-S2c)
 - **Token presence is the switch.** `AR_MCP_HTTP_TOKEN` unset → no auth, loopback-only. Set → auth enforced on
