@@ -40,6 +40,7 @@ so launch it with the repository under review as the current directory.
 """
 
 import hashlib
+import hmac
 import http.server
 import ipaddress
 import json
@@ -1579,15 +1580,26 @@ class StdioTransport:
 # terminable, GET opens the SSE channel, bounded+evicting store) is LEGACY — MCP revisions through
 # 2025-11-25 — and each id is bound to the version its initialize negotiated (Codex r3941957895).
 # Sessions are OPTIONAL on the legacy path, so a version-less client still works;
-# AR_MCP_HTTP_REQUIRE_SESSION makes them mandatory. There is still NO authentication (that is E3-S2c):
-# the listener binds 127.0.0.1 by default and MUST NOT be exposed to a network until auth lands. See
-# the committed threat model in docs/.
+# AR_MCP_HTTP_REQUIRE_SESSION makes them mandatory. Bearer-token auth (E3-S2c) gates EVERY request when
+# AR_MCP_HTTP_TOKEN is set; with no token the listener binds 127.0.0.1 only (a non-loopback bind is refused).
+# A remote bind speaks plaintext HTTP, so it MUST sit behind a TLS terminator. See the threat model in docs/.
 HTTP_DEFAULT_HOST = "127.0.0.1"
 HTTP_DEFAULT_PORT = 8730
 HTTP_DEFAULT_MAX_BYTES = 1_048_576  # 1 MiB: a JSON-RPC control message is tiny; caps an oversized-body DoS
 HTTP_DEFAULT_MAX_SESSIONS = 128     # bounded session store: a flood of `initialize`s cannot exhaust memory
 HTTP_DEFAULT_MAX_STREAMS = 64       # bounded concurrent GET/SSE streams: each pins a thread+fd, so cap their
                                     # count independently of the session store (one valid id != unlimited streams)
+HTTP_DEFAULT_MAX_WORKERS = 128      # bounded worker/connection pool (E3-S2c): stdlib ThreadingHTTPServer spawns
+                                    # one thread per connection, unbounded — a connection flood would exhaust
+                                    # threads/fds. Cap it. MUST exceed MAX_STREAMS (an SSE GET holds its worker for
+                                    # the stream's whole life), else streams starve POST dispatch; bind() enforces it.
+HTTP_DEFAULT_READ_TIMEOUT = 30      # per-recv socket read timeout, seconds (E3-S2c): bounds an idle slow-loris on
+                                    # the request read + a stalled response write. Dispatch does no socket IO, so it
+                                    # never interrupts a running tool. (A sub-timeout dribble still holds a worker —
+                                    # the bounded pool caps that blast radius; a true wall-clock deadline is follow-up.)
+HTTP_MIN_TOKEN_LEN = 16             # reject a too-short AR_MCP_HTTP_TOKEN: a brute-forceable secret must not be
+                                    # allowed to authenticate a network-reachable surface.
+AUTH_HEADER = "Authorization"       # bearer-token header (E3-S2c)
 SESSION_HEADER = "Mcp-Session-Id"   # LEGACY session id header (revisions through 2025-11-25; issued at initialize)
 SSE_KEEPALIVE_SECONDS = 15          # GET/SSE idle keepalive-comment cadence; also the shutdown re-check tick
 
@@ -1641,6 +1653,25 @@ def http_config():
     return host, port, origins, max_bytes
 
 
+def http_token():
+    """Resolve the bearer token from AR_MCP_HTTP_TOKEN (E3-S2c). Returns None when the variable is UNSET
+    (no auth; the transport then binds loopback-only, same-user trust). A variable that is PRESENT but
+    blank, or shorter than HTTP_MIN_TOKEN_LEN, FAILS LOUDLY — it must never silently disable auth or
+    authenticate a network-reachable surface with a trivially guessable secret. Surrounding whitespace is
+    trimmed (so `TOKEN=$(cat file)` with a trailing newline still works); the trimmed value is the secret."""
+    raw = os.environ.get("AR_MCP_HTTP_TOKEN")
+    if raw is None:
+        return None
+    tok = raw.strip()
+    if not tok:
+        raise ValueError("AR_MCP_HTTP_TOKEN is set but blank: refusing to start (fail closed). Unset it to "
+                         "run loopback-only without auth, or set a real token.")
+    if len(tok) < HTTP_MIN_TOKEN_LEN:
+        raise ValueError("AR_MCP_HTTP_TOKEN must be at least %d characters (got %d): a short token is "
+                         "brute-forceable over the network." % (HTTP_MIN_TOKEN_LEN, len(tok)))
+    return tok
+
+
 def origin_allowed(origin, allowed):
     """DNS-rebinding defense. A browser page attacking a localhost server ALWAYS sends an Origin
     header on a cross-origin fetch, so a *present* Origin must be in the allowlist; an *absent* Origin
@@ -1651,9 +1682,10 @@ def origin_allowed(origin, allowed):
 
 
 def is_loopback_host(host):
-    """True only for a loopback bind target — 'localhost', 127.0.0.0/8, or ::1. E3-S2a has NO auth,
-    so binding anywhere else would expose an unauthenticated tool surface to the network; bind()
-    refuses it. A hostname other than 'localhost' is treated as non-loopback (refused) — we do not
+    """True only for a loopback bind target — 'localhost', 127.0.0.0/8, or ::1. Without a token, binding
+    anywhere else would expose an unauthenticated tool surface to the network, so bind() refuses a
+    non-loopback host unless AR_MCP_HTTP_TOKEN is set (E3-S2c). A hostname other than 'localhost' is
+    treated as non-loopback (refused) — we do not
     resolve DNS to decide safety. An EMPTY host is NOT loopback: the socket layer binds "" to 0.0.0.0
     (all interfaces), so it is refused too — the resolved default (http_config) is always 127.0.0.1."""
     h = (host or "").strip().lower()
@@ -1851,6 +1883,46 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return  # quiet; serve_message() already logs handler crashes via log()
 
+    def setup(self):
+        # Apply the per-server socket read timeout (E3-S2c) BEFORE the base handler wires rfile/wfile, so a
+        # slow-loris dribbling the request line/headers/body — or a peer that stalls reading the response —
+        # cannot pin this worker thread indefinitely. self.server is set by BaseRequestHandler before setup();
+        # StreamRequestHandler.setup() calls settimeout(self.timeout). The SSE GET path re-sets its own
+        # SSE_KEEPALIVE_SECONDS timeout after this. None => no timeout (unchanged default).
+        self.timeout = getattr(self.server, "read_timeout", None)
+        super().setup()
+
+    def _auth_ok(self):
+        # Bearer-token auth (E3-S2c). A no-op PASS when the transport has no token configured (loopback-only,
+        # same-user trust — bind() refuses a non-loopback host without a token). When a token IS set, EVERY
+        # request must carry exactly one `Authorization: Bearer <token>`; missing / malformed / duplicated /
+        # mismatched -> a closed 401 with a generic body (never echoing the supplied credential) and a
+        # `WWW-Authenticate: Bearer` challenge. Called AFTER the Origin/protocol boundary checks (a bad-Origin
+        # browser is already 403'd, so attacker bytes never reach compare_digest for a request already doomed)
+        # and BEFORE any body read or dispatch, so an unauthenticated caller triggers no tool work. The token
+        # comes only from the environment (never argv/URL/query) and is never logged.
+        token = getattr(self.server, "token", None)
+        if token is None:
+            return True
+        vals = self.headers.get_all(AUTH_HEADER) or []
+        if len(vals) != 1:  # missing, or an ambiguous / smuggled duplicate Authorization header
+            return self._auth_fail()
+        scheme, _sep, param = vals[0].partition(" ")
+        provided = param.strip()
+        if scheme.strip().lower() != "bearer" or not provided:
+            return self._auth_fail()
+        # Constant-time compare (hmac.compare_digest) so a mismatch does not leak how many leading bytes
+        # matched. Both sides are utf-8 bytes; the operator-side min-length guard (http_token) mitigates the
+        # length-equality side channel compare_digest cannot hide.
+        if not hmac.compare_digest(provided.encode("utf-8"), token.encode("utf-8")):
+            return self._auth_fail()
+        return True
+
+    def _auth_fail(self):
+        # 401 + a Bearer challenge; the body is a constant that never reflects what the client sent.
+        self._json(401, {"error": "authentication required"}, {"WWW-Authenticate": "Bearer"})
+        return False
+
     def _json(self, status, payload, extra=None):
         # Every _json() response is a rejection (Origin/version/size) or a non-POST method — none of
         # them drains the request body. On a keep-alive HTTP/1.1 connection an undrained body would
@@ -1920,6 +1992,10 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         # (2) HTTP-level protocol-version negotiation (shared with GET/DELETE); reject an unsupported
         #     pinned version before touching the body.
         if not self._protocol_ok():
+            return
+        # (2.5) Bearer auth (E3-S2c): after the cheap boundary checks, before any body read or dispatch, so an
+        #       unauthenticated caller triggers no body read and no tool work. A no-op when no token is set.
+        if not self._auth_ok():
             return
         pv = self.headers.get("MCP-Protocol-Version")
         # (3) Frame strictly by Content-Length: reject any Transfer-Encoding (chunked et al.), even when
@@ -2083,6 +2159,8 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             return
         if not self._protocol_ok():
             return
+        if not self._auth_ok():  # bearer auth (E3-S2c), after the boundary checks; a no-op when no token is set
+            return
         pv = self.headers.get("MCP-Protocol-Version")
         if pv in MODERN_PROTOCOLS:
             self._json(405, {"error": "the event stream is a legacy session channel; MCP "
@@ -2209,6 +2287,8 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             return
         if not self._protocol_ok():
             return
+        if not self._auth_ok():  # bearer auth (E3-S2c), after the boundary checks; a no-op when no token is set
+            return
         pv = self.headers.get("MCP-Protocol-Version")
         if pv in MODERN_PROTOCOLS:
             self._json(405, {"error": "no session to terminate; MCP " + ", ".join(MODERN_PROTOCOLS)
@@ -2241,17 +2321,53 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
 
+class _BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    """ThreadingHTTPServer with a bounded worker/connection pool (E3-S2c). stdlib ThreadingMixIn spawns one
+    (daemon) thread per accepted connection, UNBOUNDED — a connection flood would exhaust threads/fds. A
+    BoundedSemaphore caps concurrent worker threads: acquired before the worker thread is spawned
+    (process_request) and released exactly once when it ends (process_request_thread's finally) OR if the
+    spawn itself raises. Past the cap a new connection is closed immediately (shutdown_request), not framed
+    with a 503 body — writing a body to a flood is the work the flood wants. max_workers MUST exceed the SSE
+    stream cap (an SSE GET holds its worker for the stream's whole life); HttpTransport.bind() enforces that."""
+
+    def __init__(self, *args, max_workers=HTTP_DEFAULT_MAX_WORKERS, **kwargs):
+        self._worker_sem = threading.BoundedSemaphore(max_workers)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._worker_sem.acquire(blocking=False):
+            # pool full: refuse fast, without spawning a worker or writing a response body
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)  # ThreadingMixIn: spawns the worker thread
+        except BaseException:
+            # thread spawn failed AFTER acquire (e.g. RuntimeError: can't start new thread) — the worker
+            # will never run its finally, so release the permit here so the pool does not leak a slot.
+            self._worker_sem.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_sem.release()
+
+
 class HttpTransport:
     """Dual-era Streamable-HTTP transport over stdlib http.server, reusing serve_message() — the
     E3-S2a endpoint plus the E3-S2b legacy session lifecycle. POST (JSON-RPC: json response / 202
     notification) serves both eras; GET (per-session SSE channel) and DELETE (terminate a session) are
     the LEGACY verbs and are 405 when pinned to the stateless 2026-07-28 revision, which has no
     sessions. `initialize` mints an Mcp-Session-Id from a bounded, evicting store, bound to the version
-    it negotiated. NO auth yet (E3-S2c): binds 127.0.0.1 by default and MUST NOT be exposed remotely
-    until auth lands. Binding is split from serving so the framing is testable offline."""
+    it negotiated. Bearer-token auth (E3-S2c): with AR_MCP_HTTP_TOKEN set, every request must authenticate
+    and a non-loopback bind is permitted (behind a TLS terminator — the token is plaintext); with no token
+    it binds 127.0.0.1 only. A bounded worker pool caps concurrent connections. Binding is split from
+    serving so the framing is testable offline."""
 
     def __init__(self, host=None, port=None, origins=None, max_bytes=None,
-                 max_sessions=None, require_session=None, max_streams=None):
+                 max_sessions=None, require_session=None, max_streams=None,
+                 token=None, max_workers=None, read_timeout=None):
         h, p, o, m = http_config()
         self.host = h if host is None else host
         self.port = p if port is None else port
@@ -2261,32 +2377,53 @@ class HttpTransport:
                              if max_sessions is None else max_sessions)
         self.max_streams = (_http_int_env("AR_MCP_HTTP_MAX_STREAMS", HTTP_DEFAULT_MAX_STREAMS, minimum=1)
                             if max_streams is None else max_streams)
+        self.max_workers = (_http_int_env("AR_MCP_HTTP_MAX_WORKERS", HTTP_DEFAULT_MAX_WORKERS, minimum=1)
+                            if max_workers is None else max_workers)
+        self.read_timeout = (_http_int_env("AR_MCP_HTTP_READ_TIMEOUT", HTTP_DEFAULT_READ_TIMEOUT, minimum=1)
+                             if read_timeout is None else read_timeout)
         self.require_session = (_http_bool_env("AR_MCP_HTTP_REQUIRE_SESSION")
                                 if require_session is None else require_session)
+        # E3-S2c bearer token: None => no auth (bind() then refuses a non-loopback host). http_token()
+        # fails closed on a blank/too-short env token; an explicitly-passed token (tests) is used as given.
+        self.token = http_token() if token is None else token
         self.sessions = _SessionStore(self.max_sessions)
         self.httpd = None
 
     def bind(self):
         """Create + bind the server (no serving yet); return the actual (host, port) — the port is
-        OS-assigned when 0 was requested. Split out so offline tests can bind an ephemeral port.
-        Refuses a non-loopback host: E3-S2a has no authentication, so a network-reachable bind is
-        never allowed here (it becomes possible only once auth lands, E3-S2c)."""
-        if not is_loopback_host(self.host):
+        OS-assigned when 0 was requested. Split out so offline tests can bind an ephemeral port. Refuses a
+        non-loopback host UNLESS a token is set (E3-S2c): an unauthenticated surface must never be
+        network-reachable. A non-loopback bind speaks plaintext HTTP — the bearer token travels in
+        cleartext — so it MUST sit behind a TLS-terminating proxy or a trusted network; a startup WARNING
+        says so. Also enforces max_workers > max_streams so held-open SSE streams cannot starve dispatch."""
+        # E3-S2c: a network-reachable bind requires authentication. Without a token, refuse any non-loopback
+        # host (the S2a/S2b posture); with a token, a remote bind is permitted but plaintext (warned below).
+        if self.token is None and not is_loopback_host(self.host):
             raise ValueError(
-                "refusing to bind the ar-mcp HTTP transport to non-loopback host %r: E3-S2a has NO "
-                "authentication, so a network-reachable bind is refused. Keep AR_MCP_HTTP_HOST on "
-                "loopback (127.0.0.1 / ::1 / localhost) until auth lands (E3-S2c)." % (self.host,))
+                "refusing to bind the ar-mcp HTTP transport to non-loopback host %r without a token: an "
+                "unauthenticated surface must not be network-reachable. Set AR_MCP_HTTP_TOKEN to expose it "
+                "(behind a TLS terminator — the bearer token is sent in cleartext), or keep AR_MCP_HTTP_HOST "
+                "on loopback (127.0.0.1 / ::1 / localhost)." % (self.host,))
+        # The worker pool must exceed the SSE stream cap, or held-open streams (each pins a worker for its
+        # whole life) can starve POST dispatch. Fail fast on the misconfiguration rather than deadlock later.
+        if self.max_workers <= self.max_streams:
+            raise ValueError(
+                "AR_MCP_HTTP_MAX_WORKERS (%d) must exceed AR_MCP_HTTP_MAX_STREAMS (%d): an SSE GET holds a "
+                "worker for the stream's whole life, so a worker pool no larger than the stream cap lets "
+                "held-open streams starve POST dispatch." % (self.max_workers, self.max_streams))
         # Pick the address family from the host so an IPv6 loopback (::1) actually binds — the default
         # ThreadingHTTPServer is AF_INET, which cannot bind an IPv6 address. Defer bind/activate so the
         # family can be set first, and clean up the socket if the bind itself fails.
-        httpd = http.server.ThreadingHTTPServer((self.host, self.port), _MCPHTTPHandler,
-                                                bind_and_activate=False)
+        httpd = _BoundedThreadingHTTPServer((self.host, self.port), _MCPHTTPHandler,
+                                            bind_and_activate=False, max_workers=self.max_workers)
         httpd.address_family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
         httpd.daemon_threads = True
         httpd.allowed_origins = self.origins
         httpd.max_bytes = self.max_bytes
         httpd.sessions = self.sessions
         httpd.require_session = self.require_session
+        httpd.token = self.token                # E3-S2c: bearer token (None => no auth; handler _auth_ok)
+        httpd.read_timeout = self.read_timeout   # E3-S2c: per-recv socket read timeout applied in handler setup()
         httpd.sse_streams = threading.BoundedSemaphore(self.max_streams)  # cap concurrent GET/SSE streams
         httpd.sse_stop = threading.Event()  # set on shutdown so open SSE streams end promptly
         try:
@@ -2296,14 +2433,19 @@ class HttpTransport:
             httpd.server_close()
             raise
         self.httpd = httpd
+        if self.token is not None and not is_loopback_host(self.host):
+            log("WARNING: ar-mcp HTTP bound to non-loopback %s over plaintext HTTP — the bearer token is "
+                "sent in cleartext. Put a TLS-terminating reverse proxy in front, or use a trusted network."
+                % (self.host,))
         return httpd.server_address
 
     def serve_forever(self):
         if self.httpd is None:
             self.bind()
         addr = self.httpd.server_address
+        _auth = "bearer-auth ON" if self.token is not None else "NO auth (loopback-only)"
         log(f"http transport ready on {addr[0]}:{addr[1]} "
-            "(localhost-only, sessions but NO auth — E3-S2b; do not expose remotely until E3-S2c)")
+            f"({_auth}; sessions E3-S2b; bounded pool {self.max_workers}w/{self.max_streams}s)")
         try:
             self.httpd.serve_forever()
         finally:
