@@ -13,7 +13,11 @@ A host reachable only through MCP therefore cannot use this server to run comman
 
 ## Assets to protect
 - The reviewer tool surface exposed over MCP (read/dispatch of `ar_*` tools + `server/discover`).
-- The run artifacts those tools can read (the immutable run dir is the audit record).
+- The run artifacts. An **active** run dir is **mutable** — the reachable `ar_gate_plan`,
+  `ar_gate_record`, `ar_panel_prepare`, `ar_panel_run`, `ar_panel_ingest`, and `ar_aggregate` tools write
+  gate, context, panel, and verdict files under the selected run — while a **completed** run is the
+  immutable audit record. Their integrity (an active run not corrupted, a completed run not altered) is
+  itself an asset. The transport adds no new write path here — it exposes exactly the tools stdio does.
 - The host process and its resources (threads, file descriptors, memory).
 
 **Explicitly NOT reachable over MCP:** the OpenRouter key, signing keys, and gate/command execution.
@@ -34,15 +38,17 @@ every request must authenticate**, on every host including loopback.
 | **Tampering / session hijack** — guessing or fixating a session id | **Cryptographically-random**, server-minted `Mcp-Session-Id` (via `secrets`), bound to the negotiated protocol version, rotatable/terminable; a client-supplied id the server never minted is refused **404**. | Shipped S2b |
 | **Denial of service / resource exhaustion** — oversized bodies, slow-loris, unbounded concurrency/sessions/streams | Max body size (**413**); `Transfer-Encoding` refused (**400**, anti-smuggling); **bounded, evicting session store** (`AR_MCP_HTTP_MAX_SESSIONS`); **bounded SSE stream pool** (`AR_MCP_HTTP_MAX_STREAMS` → **503**); **bounded worker/connection pool** (`AR_MCP_HTTP_MAX_WORKERS`, refuse-by-close past the cap, enforced `> MAX_STREAMS` at bind); **per-recv socket read timeout** (`AR_MCP_HTTP_READ_TIMEOUT`) on the request read and response write; a malformed/oversized message frames as a JSON-RPC error and never crashes the listener. | Body/limits S2a; sessions/streams S2b; **worker pool + read timeout S2c** |
 | **Information disclosure** — stack traces or secrets in error bodies/headers | JSON-RPC errors only (no tracebacks on the wire — `serve_message` normalizes to `-32603`); tools already scrub secrets; minimal `Server` header; the bearer token is **env-only** (never argv/URL/query) and **never logged**; a 401 body is a constant that never echoes the supplied credential. | Shipped S2a; token hygiene S2c |
-| **Repudiation** | None new: the audit record is the immutable run dir, unchanged by transport; the verdict is still computed by `aggregate.py`. | n/a |
+| **Repudiation** | None new from the transport: a **completed** run is the immutable audit record and the verdict is computed by `aggregate.py`; an **active** run dir is mutable by the same tools stdio already exposes, so the transport adds no new tampering path. | n/a |
 
 ## Authentication design (E3-S2c)
 - **Token presence is the switch.** `AR_MCP_HTTP_TOKEN` unset → no auth, loopback-only. Set → auth enforced on
   every request (POST/GET/DELETE), on every host. A **blank or too-short (<16 char) token fails closed at
   startup** — it never silently disables auth or authenticates a network surface with a guessable secret.
-- **Check order per verb:** `Origin` (rebinding) → protocol version → **auth** → dispatch. Running the cheap
-  network-boundary checks first means attacker bytes never reach the credential comparator for a request already
-  doomed on Origin; a bad-Origin browser gets **403**, a no-credential programmatic client gets **401**.
+- **Check order per verb:** `Origin` (rebinding) → **auth** → protocol version → dispatch. Origin stays first so a
+  bad-Origin browser is **403**'d without its bytes reaching the credential comparator; **auth runs before the
+  protocol-version check** so an unauthenticated caller gets **401** and never learns `supportedVersions` from a
+  version-negotiation **400** (a pre-auth catalog leak Codex caught on PR #58, closed by this ordering). A
+  no-credential programmatic client (no Origin) gets **401**.
 - **Credential parsing:** exactly one `Authorization: Bearer <token>` header (a missing, malformed, or duplicate
   header → 401); scheme is case-insensitive; the token is compared with `hmac.compare_digest` on utf-8 bytes.
 - **`server/discover` is gated** behind auth like every other method — an unauthenticated caller gets 401 and
@@ -65,6 +71,13 @@ every request must authenticate**, on every host including loopback.
   time by design). A long-running tool (up to `AR_TIMEOUT_S`) makes concurrent authenticated POSTs queue, each
   holding a worker; the bounded pool caps this at `MAX_WORKERS`. A bounded pending-queue / busy-503 admission is
   a possible follow-up.
+- **Control-plane starvation at minimal worker counts.** The bounded worker pool does not distinguish a
+  control-plane verb (a `DELETE` terminating a session) from data-plane work. At a minimal config
+  (`AR_MCP_HTTP_MAX_WORKERS=2`, `AR_MCP_HTTP_MAX_STREAMS=1`) one SSE stream plus one long-running POST can occupy
+  both workers, so a `DELETE` is fast-closed and the session cannot be terminated (nor its stream woken) until
+  the in-flight work finishes — the "immediate termination" property degrades under saturation (Codex, PR #58).
+  The default (128 workers / 64 streams) leaves ample headroom; reserving dedicated control-plane capacity is a
+  follow-up, composing with the best-effort-cancellation note below.
 - **Cancellation is best-effort, not forced.** SSE client-disconnect frees the stream slot promptly and a
   DELETE wakes streams (both tested). A client that disconnects mid-POST does **not** abort the running
   subprocess — it completes and its result is discarded. Preemptive "kill-means-kill" cancellation of an

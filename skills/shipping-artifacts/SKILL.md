@@ -29,8 +29,11 @@ someone else confirm it **without rerunning your reasoning**:
 - **Honest status.** If a check could not run (a missing permission, an unavailable binary),
   the artifact records **BLOCKED / unknown** — never a faked pass. A BLOCKED verdict from an
   honest gap is a correct artifact; a green one you can't back is a lie that outlives you.
-- **The sandbox is not storage.** Push a keepable commit the same turn you make it; a build
-  environment can vanish. The durable artifact is on the remote, not in a scratch dir.
+- **The sandbox is not storage.** A build environment can vanish, so don't let keepable work live only
+  in a scratch dir. But **push only when you have explicit authorization to push** — this repo makes that
+  non-negotiable (see `AGENTS.md`). Where you may push, do it the same turn you commit; where you may not,
+  keep the work safe another way (a durable clone, a patch) and hand the commit to whoever merges. The
+  durable artifact is the recorded commit, not the scratch copy.
 
 ## Anti-pattern
 "I ran it and it looked fine." Ship the output, the run id, the diff, or the verdict — the

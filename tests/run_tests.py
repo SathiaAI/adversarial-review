@@ -5915,6 +5915,38 @@ def t_mcp_http_origin_precedes_auth():
         t.shutdown()
 
 
+def t_mcp_http_auth_precedes_protocol_version_leak():
+    # E3-S2c (Codex, PR #58): auth runs BEFORE the protocol-version check, so an unauthenticated request
+    # carrying an UNSUPPORTED MCP-Protocol-Version is 401 (auth) — NOT 400 with the supportedVersions
+    # catalog. An unauthenticated caller must learn nothing about supported versions. With a valid token,
+    # a bad version returns the 400 negotiation error (with the catalog) as usual.
+    tok = "proto-leak-token-0123456789ab"
+    t, port = _http_transport(token=tok)
+    try:
+        s_no, b_no, _h = _http_post(port, _authbody(), {"MCP-Protocol-Version": "1999-01-01"})  # no auth
+        assert s_no == 401, s_no
+        assert b"supportedVersions" not in b_no, b_no[:160]   # no catalog leak pre-auth
+        s_ok, b_ok, _h2 = _http_post(port, _authbody(),
+                                     {"Authorization": "Bearer " + tok, "MCP-Protocol-Version": "1999-01-01"})
+        assert s_ok == 400 and b"supportedVersions" in b_ok, (s_ok, b_ok[:160])
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_explicit_token_validated():
+    # E3-S2c (CodeRabbit, PR #58): an explicit constructor token is validated exactly like the env token,
+    # so a remote bind can never be enabled with a blank / too-short / non-string secret.
+    for bad in ("", "   ", "short", 12345):
+        try:
+            mcpsrv.HttpTransport(host="127.0.0.1", port=0, token=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("HttpTransport must reject explicit token %r" % (bad,))
+    t = mcpsrv.HttpTransport(host="127.0.0.1", port=0, token="a-valid-explicit-token-12345")
+    assert t.token == "a-valid-explicit-token-12345", t.token
+
+
 def t_mcp_http_discover_gated_when_token_set():
     # E3-S2c: server/discover is gated behind auth too — no pre-auth catalog/version leak. Unauthenticated
     # -> 401; authenticated -> 200 with the supported versions.
@@ -6067,8 +6099,8 @@ def t_mcp_http_bounded_worker_pool():
             while True:
                 try:
                     chunk = third.recv(4096)
-                except _sock.timeout:
-                    chunk = b""
+                except _sock.timeout as exc:  # a timeout would mean the server left the excess conn open
+                    raise AssertionError("third connection was not closed promptly (worker pool full)") from exc
                 if not chunk:
                     break
                 data += chunk

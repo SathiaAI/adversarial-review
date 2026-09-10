@@ -24,8 +24,11 @@ propagates the error into your own work.
 1. **Read the claim** (roadmap status, changelog line, handoff, a "DONE" checkbox).
 2. **Read the code that would implement it** — the actual function, the actual test, the
    actual workflow. Not a summary of it; the lines.
-3. **Prove presence or absence.** `grep`/pickaxe (`git log -S`), run the test, inspect the
-   artifact. An absence is proven by a search that comes back empty, not by not finding it.
+3. **Prove presence or absence within a defined scope.** Search the relevant source *and* generated
+   artifacts (`grep`/pickaxe `git log -S`, run the test, inspect the output). An empty result is evidence
+   only for the scope you searched — generated files, dynamic registration, aliases, and excluded paths
+   can still hold the implementation — so record it as **inconclusive** when those remain possible, not
+   as proof of global absence.
 4. **When they disagree, the code is authoritative.** Update your plan to reality, and record
    the discrepancy (in the PR, the changelog, or a decision note) — do not silently "fix" the
    doc to match a reality you assumed, and do not silently build on the false claim.

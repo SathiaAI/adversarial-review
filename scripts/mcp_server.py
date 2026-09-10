@@ -1653,23 +1653,32 @@ def http_config():
     return host, port, origins, max_bytes
 
 
+def _validate_token(tok, label="AR_MCP_HTTP_TOKEN"):
+    """Trim + validate a bearer token, failing LOUDLY on a non-string, blank, or shorter-than-
+    HTTP_MIN_TOKEN_LEN value. Shared by the env path (http_token) and an explicitly-constructed
+    HttpTransport token (CodeRabbit, PR #58) so NEITHER can enable auth — or permit a remote bind — with a
+    blank or trivially-guessable secret. Surrounding whitespace is trimmed (so `TOKEN=$(cat file)` with a
+    trailing newline works); the trimmed value is the secret."""
+    if not isinstance(tok, str):
+        raise ValueError("%s must be a string, got %r" % (label, type(tok).__name__))
+    tok = tok.strip()
+    if not tok:
+        raise ValueError("%s is blank: refusing to start (fail closed). Unset it to run loopback-only "
+                         "without auth, or set a real token." % label)
+    if len(tok) < HTTP_MIN_TOKEN_LEN:
+        raise ValueError("%s must be at least %d characters (got %d): a short token is brute-forceable "
+                         "over the network." % (label, HTTP_MIN_TOKEN_LEN, len(tok)))
+    return tok
+
+
 def http_token():
     """Resolve the bearer token from AR_MCP_HTTP_TOKEN (E3-S2c). Returns None when the variable is UNSET
-    (no auth; the transport then binds loopback-only, same-user trust). A variable that is PRESENT but
-    blank, or shorter than HTTP_MIN_TOKEN_LEN, FAILS LOUDLY — it must never silently disable auth or
-    authenticate a network-reachable surface with a trivially guessable secret. Surrounding whitespace is
-    trimmed (so `TOKEN=$(cat file)` with a trailing newline still works); the trimmed value is the secret."""
+    (no auth; the transport then binds loopback-only, same-user trust). A variable that is PRESENT is
+    validated by _validate_token (blank / too-short fails closed)."""
     raw = os.environ.get("AR_MCP_HTTP_TOKEN")
     if raw is None:
         return None
-    tok = raw.strip()
-    if not tok:
-        raise ValueError("AR_MCP_HTTP_TOKEN is set but blank: refusing to start (fail closed). Unset it to "
-                         "run loopback-only without auth, or set a real token.")
-    if len(tok) < HTTP_MIN_TOKEN_LEN:
-        raise ValueError("AR_MCP_HTTP_TOKEN must be at least %d characters (got %d): a short token is "
-                         "brute-forceable over the network." % (HTTP_MIN_TOKEN_LEN, len(tok)))
-    return tok
+    return _validate_token(raw)
 
 
 def origin_allowed(origin, allowed):
@@ -1989,13 +1998,15 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         # (1) DNS-rebinding defense first: reject a disallowed browser Origin before touching the body.
         if not self._origin_ok():
             return
-        # (2) HTTP-level protocol-version negotiation (shared with GET/DELETE); reject an unsupported
+        # (2) Bearer auth (E3-S2c): after Origin (rebinding) but BEFORE the protocol-version check and any
+        #     body read/dispatch. An unauthenticated caller must trigger no tool work AND must not learn
+        #     `supportedVersions` from a protocol-version 400 (Codex, PR #58): the version negotiation error
+        #     names the catalog, so it must sit behind auth. A no-op when no token is set.
+        if not self._auth_ok():
+            return
+        # (3) HTTP-level protocol-version negotiation (shared with GET/DELETE); reject an unsupported
         #     pinned version before touching the body.
         if not self._protocol_ok():
-            return
-        # (2.5) Bearer auth (E3-S2c): after the cheap boundary checks, before any body read or dispatch, so an
-        #       unauthenticated caller triggers no body read and no tool work. A no-op when no token is set.
-        if not self._auth_ok():
             return
         pv = self.headers.get("MCP-Protocol-Version")
         # (3) Frame strictly by Content-Length: reject any Transfer-Encoding (chunked et al.), even when
@@ -2157,9 +2168,9 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         # CodeRabbit r3941912010). Origin defense applies (a browser EventSource sends Origin).
         if not self._origin_ok():
             return
-        if not self._protocol_ok():
+        if not self._auth_ok():  # bearer auth (E3-S2c): after Origin, BEFORE protocol (no pre-auth version leak)
             return
-        if not self._auth_ok():  # bearer auth (E3-S2c), after the boundary checks; a no-op when no token is set
+        if not self._protocol_ok():
             return
         pv = self.headers.get("MCP-Protocol-Version")
         if pv in MODERN_PROTOCOLS:
@@ -2285,9 +2296,9 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         # bearing it is refused 404 by the validation in do_POST/do_GET.
         if not self._origin_ok():
             return
-        if not self._protocol_ok():
+        if not self._auth_ok():  # bearer auth (E3-S2c): after Origin, BEFORE protocol (no pre-auth version leak)
             return
-        if not self._auth_ok():  # bearer auth (E3-S2c), after the boundary checks; a no-op when no token is set
+        if not self._protocol_ok():
             return
         pv = self.headers.get("MCP-Protocol-Version")
         if pv in MODERN_PROTOCOLS:
@@ -2383,9 +2394,10 @@ class HttpTransport:
                              if read_timeout is None else read_timeout)
         self.require_session = (_http_bool_env("AR_MCP_HTTP_REQUIRE_SESSION")
                                 if require_session is None else require_session)
-        # E3-S2c bearer token: None => no auth (bind() then refuses a non-loopback host). http_token()
-        # fails closed on a blank/too-short env token; an explicitly-passed token (tests) is used as given.
-        self.token = http_token() if token is None else token
+        # E3-S2c bearer token: None => no auth (bind() then refuses a non-loopback host). BOTH the env path
+        # (http_token) and an explicit constructor token are validated (non-string / blank / too-short fails
+        # closed) so a remote bind can never be permitted with a weak secret (CodeRabbit, PR #58).
+        self.token = http_token() if token is None else _validate_token(token, label="HttpTransport(token=...)")
         self.sessions = _SessionStore(self.max_sessions)
         self.httpd = None
 

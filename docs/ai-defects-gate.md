@@ -24,8 +24,9 @@ never rounded up to PASS.
 ## Why closed argv
 The wrapper invokes the pinned binary with exactly `--run-dir <dir> --diff-file <file>` — no
 shell, no wildcards, no `$*` passthrough. The verifier is a program run by command, not a
-string interpolated into a shell, so a crafted path or filename cannot become an argument or
-a command. A relative or wildcard binary path is refused.
+string interpolated into a shell, so shell metacharacters in a path or filename cannot create extra
+`argv` entries or a shell command (the values are still passed as the two fixed arguments). A relative
+or wildcard binary path is refused.
 
 ## Diff-ref scope resolution is fail-closed too
 Resolving the git `diff-ref` into a changed-paths list lives in `scripts/ai_defects_diffscope.py`
