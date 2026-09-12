@@ -5813,7 +5813,7 @@ def _http_modern(port, method, params=None, version="2026-07-28", caps=True, id_
     if caps:
         meta["io.modelcontextprotocol/clientCapabilities"] = {}
     body["params"]["_meta"] = meta
-    headers = {"Mcp-Method": method}
+    headers = {"Content-Type": "application/json", "Mcp-Method": method}
     if method == "tools/call":
         name = (params or {}).get("name")
         if name:
@@ -5870,6 +5870,31 @@ def t_mcp_http_modern_result_carries_resulttype():
         t.shutdown()
 
 
+def t_mcp_http_modern_tool_call_finalized():
+    # changelog #8: a SUCCESSFUL modern tools/call over HTTP carries resultType "complete" + its
+    # structuredContent -- the true mirror of the stdio t_mcp_modern_successful_tool_call. Unlike the
+    # tools/list resultType check, this exercises _http_modern's Mcp-Name (params.name) routing header
+    # AND the modern tool-call result framing over the HTTP transport. ar_init creates a run, so run in a
+    # fresh repo with cwd pinned to it.
+    repo = fresh_repo()
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        t, port = _http_transport()
+        try:
+            status, resp, hdrs = _http_modern(port, "tools/call",
+                                              {"name": "ar_init",
+                                               "arguments": {"risk": "NORMAL", "dev_providers": ["anthropic"]}})
+            assert status == 200 and hdrs.get("content-type") == "application/json", hdrs
+            res = resp["result"]
+            assert res["resultType"] == "complete" and not res.get("isError"), res
+            assert res["structuredContent"]["run_id"].startswith("run-"), res
+        finally:
+            t.shutdown()
+    finally:
+        os.chdir(cwd0)
+
+
 def t_mcp_http_modern_tools_list_is_cacheable():
     # changelog #5 (minor, SEP-2549): tools/list results carry ttlMs + cacheScope (CacheableResult).
     # Confirm both survive the HTTP framing (a client caches off these hints).
@@ -5890,7 +5915,8 @@ def t_mcp_http_legacy_tools_list_has_no_modern_fields():
         status, raw, _ = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
         assert status == 200, status
         tl = json.loads(raw)["result"]
-        assert "resultType" not in tl and "ttlMs" not in tl and "cacheScope" not in tl, tl
+        assert ("resultType" not in tl and "ttlMs" not in tl and "cacheScope" not in tl
+                and "_meta" not in tl), tl
     finally:
         t.shutdown()
 
@@ -5915,8 +5941,9 @@ def t_mcp_http_falsy_id_is_response_not_notification():
 # Maps each transport-agnostic DISPATCH conformance behavior to the stdio test that pins it, the HTTP
 # parity test that proves it survives the HTTP framing, and the MCP 2026-07-28 clause it satisfies.
 # CURATED on purpose (never a name-grep of all t_mcp_*, which would false-positive on the ~80
-# pipeline/aggregate tests). The drift guard below fails if any referenced test is missing, so a future
-# engineer who adds a dispatch behavior is forced to cover it over HTTP too.
+# pipeline/aggregate tests). The drift guard below is a regression guard for THIS curated set: it fails
+# if a listed test is renamed or removed. It does NOT auto-detect a new unlisted dispatch behavior --
+# adding a row for one is a manual, reviewed step (see the guard's docstring).
 # Clause refs: https://modelcontextprotocol.io/specification/2026-07-28/changelog
 _S2D_CONFORMANCE = [
     # (behavior_id, stdio_test, http_test, clause)
@@ -5929,7 +5956,7 @@ _S2D_CONFORMANCE = [
     ("missing-capabilities", "t_mcp_modern_missing_capabilities_is_invalid_params",
      "t_mcp_http_modern_missing_capabilities_is_invalid_params", "changelog #2: clientCapabilities required"),
     ("resulttype-required", "t_mcp_modern_successful_tool_call",
-     "t_mcp_http_modern_result_carries_resulttype", "changelog #8: resultType required on all results"),
+     "t_mcp_http_modern_tool_call_finalized", "changelog #8: resultType required on all results"),
     ("cacheable-list", "t_mcp_modern_tools_list_is_cacheable",
      "t_mcp_http_modern_tools_list_is_cacheable", "changelog #5 minor: ttlMs/cacheScope on list results"),
     ("legacy-unchanged", "t_mcp_legacy_responses_unchanged",
