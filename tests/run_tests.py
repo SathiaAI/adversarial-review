@@ -5741,6 +5741,245 @@ def t_mcp_http_malformed_body_is_parse_error():
         t.shutdown()
 
 
+def t_mcp_batch_toplevel_array_is_invalid_request():
+    # E3-S2d conformance: JSON-RPC batching was removed in MCP 2025-06-18 and not reinstated in
+    # 2026-07-28. A top-level JSON array is a single Invalid Request (-32600, id null) at the shared
+    # core -- never iterated, never partially executed, never a crash -- so both transports reject it
+    # identically by construction (handle() rejects any non-dict before method routing).
+    for arr in ([], [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}],
+                [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                 {"jsonrpc": "2.0", "id": 2, "method": "server/discover"}]):
+        r = mcpsrv.handle(arr)
+        assert r["error"]["code"] == -32600 and r["id"] is None, r
+        s = json.loads(mcpsrv.serve_message(json.dumps(arr)))
+        assert s["error"]["code"] == -32600 and s["id"] is None, s
+
+
+def t_mcp_batch_no_element_dispatched_no_side_effect():
+    # A top-level array carrying a state-mutating tools/call must NOT execute any element: the array is
+    # rejected wholesale (-32600) before dispatch, so no run directory is created. Guards against a
+    # future refactor that iterates a batch array.
+    repo = fresh_repo()
+    cwd0 = os.getcwd()
+    try:
+        os.chdir(repo)
+        arr = [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "ar_init",
+                           "arguments": {"risk": "NORMAL", "dev_providers": ["anthropic"]},
+                           "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                     "io.modelcontextprotocol/clientCapabilities": {}}}}]
+        r = json.loads(mcpsrv.serve_message(json.dumps(arr)))
+        assert r["error"]["code"] == -32600 and r["id"] is None, r
+        assert list((repo / ".adversarial-review").glob("run-*")) == [], "no element may be dispatched"
+    finally:
+        os.chdir(cwd0)
+
+
+def t_mcp_http_batch_array_is_invalid_request():
+    # Over HTTP a top-level array decodes fine but is an invalid JSON-RPC request: it returns the in-band
+    # -32600 (id null) with HTTP 200 -- the SAME convention as the malformed-body -32700 path (in-band
+    # JSON-RPC errors ride 200; non-200 is reserved for transport-layer rejections). No element dispatched.
+    t, port = _http_transport()
+    try:
+        for arr in ([], [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}]):
+            status, body, _ = _http_post(port, json.dumps(arr))
+            assert status == 200, status
+            err = json.loads(body)
+            assert err["error"]["code"] == -32600 and err["id"] is None, err
+    finally:
+        t.shutdown()
+
+
+def t_mcp_falsy_id_is_request():
+    # JSON-RPC (core, both eras): a request with a present-but-falsy id (0 or "") is a REQUEST, not a
+    # notification -- notification detection is id PRESENCE (`"id" not in msg`), not truthiness -- so
+    # handle() must return a response echoing that id, never None. The HTTP mirror is
+    # t_mcp_http_falsy_id_is_response_not_notification; a true notification (no id) still returns None.
+    for id_val in (0, ""):
+        r = mcpsrv.handle({"jsonrpc": "2.0", "id": id_val, "method": "server/discover"})
+        assert r is not None and r["id"] == id_val and "result" in r, r
+    assert mcpsrv.handle({"jsonrpc": "2.0", "method": "server/discover"}) is None  # no id => notification
+
+
+def _http_modern(port, method, params=None, version="2026-07-28", caps=True, id_=1):
+    """POST a modern (stateless, 2026-07-28) request over HTTP. Declares its version + clientCapabilities
+    in params._meta, and sends the 2026-07-28 routing headers Mcp-Method (and Mcp-Name for tools/call) so
+    the requests are spec-shaped. No MCP-Protocol-Version header is sent, so an unsupported version is
+    exercised in-band (body -32022) rather than at the header-level 400. Returns (status, parsed_body, headers).
+    NOTE: the server does not yet REQUIRE these routing headers (documented known gap); sending them keeps
+    the conformance requests forward-compatible when header enforcement lands."""
+    body = {"jsonrpc": "2.0", "id": id_, "method": method, "params": dict(params or {})}
+    meta = {"io.modelcontextprotocol/protocolVersion": version}
+    if caps:
+        meta["io.modelcontextprotocol/clientCapabilities"] = {}
+    body["params"]["_meta"] = meta
+    headers = {"Content-Type": "application/json", "Mcp-Method": method}
+    if method == "tools/call":
+        name = (params or {}).get("name")
+        if name:
+            headers["Mcp-Name"] = name
+    status, raw, hdrs = _http_post(port, json.dumps(body), headers)
+    return status, (json.loads(raw) if raw else None), hdrs
+
+
+def t_mcp_http_modern_ping_is_method_not_found():
+    # E3-S2d conformance (MCP 2026-07-28 changelog #5: `ping` removed). A modern ping over HTTP is
+    # method-not-found (-32601), NOT a bare {} (which would omit the required resultType) -- CONFORMANT,
+    # not a deviation. Legacy ping still returns {} (covered by the stdio parity test).
+    t, port = _http_transport()
+    try:
+        status, resp, _ = _http_modern(port, "ping")
+        assert status == 200, status
+        assert resp["error"]["code"] == -32601, resp
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_modern_unsupported_version_is_32022():
+    # changelog #2/#12: a version mismatch returns UnsupportedProtocolVersionError (-32022). Proven over
+    # HTTP in the response BODY (the header-level 400 negotiation is a separate existing test).
+    t, port = _http_transport()
+    try:
+        status, resp, _ = _http_modern(port, "tools/list", version="1900-01-01")
+        assert status == 200, status
+        assert resp["error"]["code"] == -32022, resp
+        assert resp["error"]["data"]["requested"] == "1900-01-01", resp
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_modern_missing_capabilities_is_invalid_params():
+    # changelog #2: modern requests carry clientCapabilities in _meta; omitting it is Invalid params (-32602).
+    t, port = _http_transport()
+    try:
+        status, resp, _ = _http_modern(port, "tools/list", caps=False)
+        assert status == 200, status
+        assert resp["error"]["code"] == -32602, resp
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_modern_result_carries_resulttype():
+    # changelog #8: all modern results carry a required resultType. Confirm it survives the HTTP framing.
+    t, port = _http_transport()
+    try:
+        status, resp, hdrs = _http_modern(port, "tools/list")
+        assert status == 200 and hdrs.get("content-type") == "application/json", hdrs
+        assert resp["result"]["resultType"] == "complete", resp
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_modern_tool_call_finalized():
+    # changelog #8: a SUCCESSFUL modern tools/call over HTTP carries resultType "complete" + its
+    # structuredContent -- the true mirror of the stdio t_mcp_modern_successful_tool_call. Unlike the
+    # tools/list resultType check, this exercises _http_modern's Mcp-Name (params.name) routing header
+    # AND the modern tool-call result framing over the HTTP transport. ar_init creates a run, so run in a
+    # fresh repo with cwd pinned to it.
+    repo = fresh_repo()
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        t, port = _http_transport()
+        try:
+            status, resp, hdrs = _http_modern(port, "tools/call",
+                                              {"name": "ar_init",
+                                               "arguments": {"risk": "NORMAL", "dev_providers": ["anthropic"]}})
+            assert status == 200 and hdrs.get("content-type") == "application/json", hdrs
+            res = resp["result"]
+            assert res["resultType"] == "complete" and not res.get("isError"), res
+            assert res["structuredContent"]["run_id"].startswith("run-"), res
+        finally:
+            t.shutdown()
+    finally:
+        os.chdir(cwd0)
+
+
+def t_mcp_http_modern_tools_list_is_cacheable():
+    # changelog #5 (minor, SEP-2549): tools/list results carry ttlMs + cacheScope (CacheableResult).
+    # Confirm both survive the HTTP framing (a client caches off these hints).
+    t, port = _http_transport()
+    try:
+        status, resp, _ = _http_modern(port, "tools/list")
+        assert status == 200, status
+        assert isinstance(resp["result"]["ttlMs"], int) and resp["result"]["cacheScope"] == "public", resp
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_legacy_tools_list_has_no_modern_fields():
+    # Dual-era: a LEGACY tools/list over HTTP (no _meta) must NOT leak modern fields (resultType/ttlMs/
+    # cacheScope), matching the stdio parity test. Guards against the HTTP layer stamping modern fields.
+    t, port = _http_transport()
+    try:
+        status, raw, _ = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        assert status == 200, status
+        tl = json.loads(raw)["result"]
+        assert ("resultType" not in tl and "ttlMs" not in tl and "cacheScope" not in tl
+                and "_meta" not in tl), tl
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_falsy_id_is_response_not_notification():
+    # JSON-RPC: a request with a present-but-falsy id (0 or "") is a REQUEST, not a notification -- it must
+    # return HTTP 200 echoing that id, never 202. Guards notification detection (id PRESENCE, not truthiness)
+    # across the HTTP framing -- the `if not x:` bug class the repo already scarred on for arguments.
+    t, port = _http_transport()
+    try:
+        for id_val in (0, ""):
+            status, raw, _ = _http_post(port, json.dumps(
+                {"jsonrpc": "2.0", "id": id_val, "method": "server/discover"}))
+            assert status == 200, (id_val, status)
+            resp = json.loads(raw)
+            assert resp["id"] == id_val and "result" in resp, resp
+    finally:
+        t.shutdown()
+
+
+# --- E3-S2d conformance manifest + drift guard --------------------------------------------------
+# Maps each transport-agnostic DISPATCH conformance behavior to the stdio test that pins it, the HTTP
+# parity test that proves it survives the HTTP framing, and the MCP 2026-07-28 clause it satisfies.
+# CURATED on purpose (never a name-grep of all t_mcp_*, which would false-positive on the ~80
+# pipeline/aggregate tests). The drift guard below is a regression guard for THIS curated set: it fails
+# if a listed test is renamed or removed. It does NOT auto-detect a new unlisted dispatch behavior --
+# adding a row for one is a manual, reviewed step (see the guard's docstring).
+# Clause refs: https://modelcontextprotocol.io/specification/2026-07-28/changelog
+_S2D_CONFORMANCE = [
+    # (behavior_id, stdio_test, http_test, clause)
+    ("batch-rejected", "t_mcp_batch_toplevel_array_is_invalid_request",
+     "t_mcp_http_batch_array_is_invalid_request", "JSON-RPC batching removed 2025-06-18; not reinstated"),
+    ("modern-ping-removed", "t_mcp_modern_ping_is_method_not_found",
+     "t_mcp_http_modern_ping_is_method_not_found", "changelog #5: ping removed"),
+    ("unsupported-version", "t_mcp_modern_unsupported_version_rejected",
+     "t_mcp_http_modern_unsupported_version_is_32022", "changelog #2/#12: UnsupportedProtocolVersion -32022"),
+    ("missing-capabilities", "t_mcp_modern_missing_capabilities_is_invalid_params",
+     "t_mcp_http_modern_missing_capabilities_is_invalid_params", "changelog #2: clientCapabilities required"),
+    ("resulttype-required", "t_mcp_modern_successful_tool_call",
+     "t_mcp_http_modern_tool_call_finalized", "changelog #8: resultType required on all results"),
+    ("cacheable-list", "t_mcp_modern_tools_list_is_cacheable",
+     "t_mcp_http_modern_tools_list_is_cacheable", "changelog #5 minor: ttlMs/cacheScope on list results"),
+    ("legacy-unchanged", "t_mcp_legacy_responses_unchanged",
+     "t_mcp_http_legacy_tools_list_has_no_modern_fields",
+     "dual-era: legacy list carries no modern fields (resultType/ttlMs/cacheScope/_meta)"),
+    ("falsy-id-is-request", "t_mcp_falsy_id_is_request",
+     "t_mcp_http_falsy_id_is_response_not_notification", "JSON-RPC: id present (even 0/'') => a response"),
+]
+
+
+def t_mcp_s2d_conformance_manifest_covers_http():
+    # E3-S2d drift guard (regression guard for the CURATED conformance set): every row's stdio AND HTTP
+    # test must still exist and be callable, so renaming or deleting a listed conformance test breaks CI.
+    # It does NOT auto-detect a NEW dispatch behavior added without a row -- there is no authoritative
+    # behavior registry to diff against, so adding a row for a new behavior stays a manual, reviewed step
+    # (adding one here is cheap and is the intended workflow). Curated on purpose (pipeline/aggregate t_mcp_* excluded).
+    g = globals()
+    missing = [(beh, name) for beh, stdio_t, http_t, _c in _S2D_CONFORMANCE
+               for name in (stdio_t, http_t) if not callable(g.get(name))]
+    assert not missing, "conformance manifest references missing tests: %r" % (missing,)
+    assert len(_S2D_CONFORMANCE) >= 8, "conformance set unexpectedly shrank"
+
+
 def t_mcp_http_unsupported_verbs_are_405():
     # E3-S2b: GET (SSE stream) and DELETE (terminate a session) are real verbs now — without a session
     # they are 400 (Mcp-Session-Id required), not 405. Every OTHER verb stays 405 (Allow: POST,GET,DELETE).
