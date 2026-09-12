@@ -5802,14 +5802,23 @@ def t_mcp_falsy_id_is_request():
 
 
 def _http_modern(port, method, params=None, version="2026-07-28", caps=True, id_=1):
-    """POST a modern (stateless, 2026-07-28) request over HTTP: declares its version + clientCapabilities
-    in params._meta, no MCP-Protocol-Version header (the stateless path). Returns (status, parsed_body, headers)."""
+    """POST a modern (stateless, 2026-07-28) request over HTTP. Declares its version + clientCapabilities
+    in params._meta, and sends the 2026-07-28 routing headers Mcp-Method (and Mcp-Name for tools/call) so
+    the requests are spec-shaped. No MCP-Protocol-Version header is sent, so an unsupported version is
+    exercised in-band (body -32022) rather than at the header-level 400. Returns (status, parsed_body, headers).
+    NOTE: the server does not yet REQUIRE these routing headers (documented known gap); sending them keeps
+    the conformance requests forward-compatible when header enforcement lands."""
     body = {"jsonrpc": "2.0", "id": id_, "method": method, "params": dict(params or {})}
     meta = {"io.modelcontextprotocol/protocolVersion": version}
     if caps:
         meta["io.modelcontextprotocol/clientCapabilities"] = {}
     body["params"]["_meta"] = meta
-    status, raw, hdrs = _http_post(port, json.dumps(body))
+    headers = {"Mcp-Method": method}
+    if method == "tools/call":
+        name = (params or {}).get("name")
+        if name:
+            headers["Mcp-Name"] = name
+    status, raw, hdrs = _http_post(port, json.dumps(body), headers)
     return status, (json.loads(raw) if raw else None), hdrs
 
 
@@ -5924,16 +5933,19 @@ _S2D_CONFORMANCE = [
     ("cacheable-list", "t_mcp_modern_tools_list_is_cacheable",
      "t_mcp_http_modern_tools_list_is_cacheable", "changelog #5 minor: ttlMs/cacheScope on list results"),
     ("legacy-unchanged", "t_mcp_legacy_responses_unchanged",
-     "t_mcp_http_legacy_tools_list_has_no_modern_fields", "dual-era: legacy responses byte-identical"),
+     "t_mcp_http_legacy_tools_list_has_no_modern_fields",
+     "dual-era: legacy list carries no modern fields (resultType/ttlMs/cacheScope/_meta)"),
     ("falsy-id-is-request", "t_mcp_falsy_id_is_request",
      "t_mcp_http_falsy_id_is_response_not_notification", "JSON-RPC: id present (even 0/'') => a response"),
 ]
 
 
 def t_mcp_s2d_conformance_manifest_covers_http():
-    # E3-S2d drift guard: every listed dispatch conformance behavior must have BOTH a stdio test and an
-    # HTTP parity test DEFINED in this module. Fails if any referenced test is missing -- so adding a
-    # dispatch behavior without HTTP coverage breaks CI. Curated (pipeline/aggregate t_mcp_* excluded).
+    # E3-S2d drift guard (regression guard for the CURATED conformance set): every row's stdio AND HTTP
+    # test must still exist and be callable, so renaming or deleting a listed conformance test breaks CI.
+    # It does NOT auto-detect a NEW dispatch behavior added without a row -- there is no authoritative
+    # behavior registry to diff against, so adding a row for a new behavior stays a manual, reviewed step
+    # (adding one here is cheap and is the intended workflow). Curated on purpose (pipeline/aggregate t_mcp_* excluded).
     g = globals()
     missing = [(beh, name) for beh, stdio_t, http_t, _c in _S2D_CONFORMANCE
                for name in (stdio_t, http_t) if not callable(g.get(name))]
