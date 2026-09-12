@@ -5741,6 +5741,55 @@ def t_mcp_http_malformed_body_is_parse_error():
         t.shutdown()
 
 
+def t_mcp_batch_toplevel_array_is_invalid_request():
+    # E3-S2d conformance: JSON-RPC batching was removed in MCP 2025-06-18 and not reinstated in
+    # 2026-07-28. A top-level JSON array is a single Invalid Request (-32600, id null) at the shared
+    # core -- never iterated, never partially executed, never a crash -- so both transports reject it
+    # identically by construction (handle() rejects any non-dict before method routing).
+    for arr in ([], [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}],
+                [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                 {"jsonrpc": "2.0", "id": 2, "method": "server/discover"}]):
+        r = mcpsrv.handle(arr)
+        assert r["error"]["code"] == -32600 and r["id"] is None, r
+        s = json.loads(mcpsrv.serve_message(json.dumps(arr)))
+        assert s["error"]["code"] == -32600 and s["id"] is None, s
+
+
+def t_mcp_batch_no_element_dispatched_no_side_effect():
+    # A top-level array carrying a state-mutating tools/call must NOT execute any element: the array is
+    # rejected wholesale (-32600) before dispatch, so no run directory is created. Guards against a
+    # future refactor that iterates a batch array.
+    repo = fresh_repo()
+    cwd0 = os.getcwd()
+    try:
+        os.chdir(repo)
+        arr = [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "ar_init",
+                           "arguments": {"risk": "NORMAL", "dev_providers": ["anthropic"]},
+                           "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                     "io.modelcontextprotocol/clientCapabilities": {}}}}]
+        r = json.loads(mcpsrv.serve_message(json.dumps(arr)))
+        assert r["error"]["code"] == -32600 and r["id"] is None, r
+        assert list((repo / ".adversarial-review").glob("run-*")) == [], "no element may be dispatched"
+    finally:
+        os.chdir(cwd0)
+
+
+def t_mcp_http_batch_array_is_invalid_request():
+    # Over HTTP a top-level array decodes fine but is an invalid JSON-RPC request: it returns the in-band
+    # -32600 (id null) with HTTP 200 -- the SAME convention as the malformed-body -32700 path (in-band
+    # JSON-RPC errors ride 200; non-200 is reserved for transport-layer rejections). No element dispatched.
+    t, port = _http_transport()
+    try:
+        for arr in ([], [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}]):
+            status, body, hdrs = _http_post(port, json.dumps(arr))
+            assert status == 200, status
+            err = json.loads(body)
+            assert err["error"]["code"] == -32600 and err["id"] is None, err
+    finally:
+        t.shutdown()
+
+
 def t_mcp_http_unsupported_verbs_are_405():
     # E3-S2b: GET (SSE stream) and DELETE (terminate a session) are real verbs now — without a session
     # they are 400 (Mcp-Session-Id required), not 405. Every OTHER verb stays 405 (Allow: POST,GET,DELETE).
