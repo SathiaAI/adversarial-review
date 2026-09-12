@@ -5782,12 +5782,23 @@ def t_mcp_http_batch_array_is_invalid_request():
     t, port = _http_transport()
     try:
         for arr in ([], [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}]):
-            status, body, hdrs = _http_post(port, json.dumps(arr))
+            status, body, _ = _http_post(port, json.dumps(arr))
             assert status == 200, status
             err = json.loads(body)
             assert err["error"]["code"] == -32600 and err["id"] is None, err
     finally:
         t.shutdown()
+
+
+def t_mcp_falsy_id_is_request():
+    # JSON-RPC (core, both eras): a request with a present-but-falsy id (0 or "") is a REQUEST, not a
+    # notification -- notification detection is id PRESENCE (`"id" not in msg`), not truthiness -- so
+    # handle() must return a response echoing that id, never None. The HTTP mirror is
+    # t_mcp_http_falsy_id_is_response_not_notification; a true notification (no id) still returns None.
+    for id_val in (0, ""):
+        r = mcpsrv.handle({"jsonrpc": "2.0", "id": id_val, "method": "server/discover"})
+        assert r is not None and r["id"] == id_val and "result" in r, r
+    assert mcpsrv.handle({"jsonrpc": "2.0", "method": "server/discover"}) is None  # no id => notification
 
 
 def _http_modern(port, method, params=None, version="2026-07-28", caps=True, id_=1):
@@ -5914,7 +5925,7 @@ _S2D_CONFORMANCE = [
      "t_mcp_http_modern_tools_list_is_cacheable", "changelog #5 minor: ttlMs/cacheScope on list results"),
     ("legacy-unchanged", "t_mcp_legacy_responses_unchanged",
      "t_mcp_http_legacy_tools_list_has_no_modern_fields", "dual-era: legacy responses byte-identical"),
-    ("falsy-id-is-request", "t_mcp_falsy_arguments_rejected",
+    ("falsy-id-is-request", "t_mcp_falsy_id_is_request",
      "t_mcp_http_falsy_id_is_response_not_notification", "JSON-RPC: id present (even 0/'') => a response"),
 ]
 

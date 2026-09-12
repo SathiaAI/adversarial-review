@@ -1,7 +1,7 @@
 # MCP Streamable-HTTP conformance (E3-S2d)
 
 **Pinned revision:** MCP **2026-07-28** ([changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog)).
-**Scope:** the `ar-mcp` Streamable-HTTP transport in `scripts/mcp_server.py`. This is a **read/dispatch-only** surface (it never executes gates or commands), stdlib-only, Python 3.9+.
+**Scope:** the `ar-mcp` Streamable-HTTP transport in `scripts/mcp_server.py`. The transport **dispatches the registered `ar_*` MCP tool handlers** (the same set stdio exposes) through `serve_message()`; some of those handlers create or modify run state via `panel.py` / `aggregate.py` (e.g. `ar_init` starts a run). It is **not an arbitrary command-execution surface** — there is no shell and no `gate run -- <command>` reachable over HTTP, and the verdict is still computed solely by `aggregate.py`. Stdlib-only, Python 3.9+.
 
 ## What this suite guarantees
 
@@ -31,7 +31,11 @@ JSON-RPC batching was removed in MCP 2025-06-18 and **not** reinstated in 2026-0
 The 2026-07-28 revision **removed the HTTP GET stream** and replaced it with a POST `subscriptions/listen` stream for opt-in server→client notifications (changelog #4), and **removed SSE resumability** / `Last-Event-ID` (#9). This server:
 
 - Treats the `initialize` → `Mcp-Session-Id` → GET(SSE)/DELETE lifecycle as **legacy** (≤2025-11-25). A **modern** (`2026-07-28`) GET or DELETE is **`405`** — the modern era is POST-only here.
-- Does **not** implement `subscriptions/listen` (no server-initiated change notifications). This is a **documented non-goal** for a read/dispatch-only reviewer surface, not a conformance gap. If server→client notifications are ever needed, that is a separate story designed against the threat model.
+- Does **not** implement `subscriptions/listen` (no server-initiated change notifications). This is a **documented non-goal** for a reviewer surface that dispatches only the fixed `ar_*` tool set, not a conformance gap. If server→client notifications are ever needed, that is a separate story designed against the threat model.
+
+## Known gaps (tracked, not closed by S2d)
+
+- **Required routing headers (2026-07-28 changelog #4).** The revision requires `Mcp-Method` (and `Mcp-Name` for `tools/call`) on Streamable-HTTP POSTs, and defines a `HeaderMismatch` error (`-32020`). This transport routes a modern request off its `params._meta` version and already enforces the `MCP-Protocol-Version` header/`_meta` **agreement** and **rejects conflicting/duplicate** version headers (see the E3-S2b review rounds) — but it does **not** yet *require* `Mcp-Method`/`Mcp-Name`. Enforcing them is a **server behavior change**, out of scope for this test/doc story; tracked as a follow-up.
 
 ## Drift guard
 
