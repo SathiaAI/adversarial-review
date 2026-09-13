@@ -10245,3 +10245,61 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# --- E1-S4 live report reproducibility (Codex, PR #60): a committed live baseline must retain per-rep
+# model->role assignment + per-role attribution and an integrity digest, so the per-model TP that seeds
+# the model-degraded alarm is recomputable and verifiable from the file alone -- run_live deletes the
+# paid panels, so aggregate-only totals were previously unreproducible. ---
+def _import_run():
+    sys.path.insert(0, str(SKILL / "evals"))
+    import run
+    return run
+
+
+def _live_unit(rep, models, roles, tp, fp=0, cost=0.02, category="security"):
+    """A synthetic run_live per-(case,rep) unit, shaped like the ones run_live builds."""
+    return {"case_id": "c", "category": category, "tier": "NORMAL", "rep": rep,
+            "tp": tp, "partial": 0, "fn": 0, "fp": fp, "noise": 0, "must_detect_total": tp,
+            "cost_usd": cost, "roles": roles, "models": models,
+            "_role_cost": {r: 0.0 for r in models}}
+
+
+def t_eval_live_report_per_rep_carries_model_and_role_attribution():
+    run = _import_run()
+    roles = {"correctness": {"emitted": 2, "tp": 1, "partial": 0, "unmatched": 1}}
+    units = [_live_unit(1, {"correctness": "mistral"}, roles, tp=1),
+             _live_unit(2, {"correctness": "glm"}, roles, tp=1)]
+    row = run._case_rollup("c", {"category": "security", "tier": "NORMAL"}, units)
+    assert len(row["per_rep"]) == 2
+    for pr in row["per_rep"]:
+        assert "models" in pr and "roles" in pr, "per-rep record dropped model/role attribution"
+    assert row["per_rep"][0]["models"] == {"correctness": "mistral"}
+    assert row["per_rep"][1]["models"] == {"correctness": "glm"}
+    assert row["per_rep"][0]["roles"]["correctness"]["tp"] == 1
+
+
+def t_eval_live_by_model_recomputable_from_per_rep():
+    run = _import_run()
+    roles = {"correctness": {"emitted": 1, "tp": 1, "partial": 0, "unmatched": 0}}
+    units = [_live_unit(1, {"correctness": "mistral"}, roles, tp=1),
+             _live_unit(2, {"correctness": "mistral"}, roles, tp=1)]
+    by_model = run._roll_models(units)
+    assert by_model["mistral"]["tp"] == 2
+    row = run._case_rollup("c", {"category": "security", "tier": "NORMAL"}, units)
+    recomputed = {}
+    for pr in row["per_rep"]:
+        for role, model in pr["models"].items():
+            recomputed[model] = recomputed.get(model, 0) + pr["roles"][role]["tp"]
+    assert recomputed == {"mistral": 2}, "by_model TP not reproducible from committed per_rep detail"
+
+
+def t_eval_live_result_digest_is_stable_and_sensitive():
+    run = _import_run()
+    result = {"corpus": "corpus", "reps": 5, "aggregate": {"by_model": {"m": {"tp": 5}}}}
+    d1 = run._result_digest(result)
+    assert d1["algo"] == "sha256" and len(d1["value"]) == 64
+    with_digest = dict(result); with_digest["digest"] = d1
+    assert run._result_digest(with_digest) == d1, "digest must exclude its own key (self-consistent)"
+    result2 = {"corpus": "corpus", "reps": 5, "aggregate": {"by_model": {"m": {"tp": 4}}}}
+    assert run._result_digest(result2) != d1, "digest must change when a scored number changes"

@@ -191,9 +191,12 @@ python evals/thresholds.py compare --baseline evals/report/live-<old>.json --cur
 It flags any overall or per-category detection-rate drop greater than `live.max_detection_drop`
 (default 20%) and lists any model whose true-positive contribution fell — a **candidate for pin removal
 / substitution**. Runbook: when a model is flagged, first rule out a transport blip (re-run that case);
-if the drop holds, drop the model from the pool or pin a replacement family and note it in the PR. The **first adopted baseline live report is now committed**: `evals/report/live-20260913-013515-60344.json`
-(2026-09-13; reps=5 over 30 panels; detection 100% - 4 defects each caught in all 5 reps - 13 false
-positives on the two clean cases, spend $1.79). It **supersedes** the earlier `live-20260823-211755`
+if the drop holds, drop the model from the pool or pin a replacement family and note it in the PR. The **first adopted baseline live report is now committed**: `evals/report/live-20260913-163900-59056.json`
+(2026-09-13; reps=5 over 30 panels; detection 100% - 4 defects each caught in all 5 reps - 21 false
+positives on the two clean cases, spend $1.83). It is **reproducible**: each per-rep record retains its
+role->model assignment and per-role attribution, and the report carries a top-level sha256 `digest`, so
+`by_model`/`by_role` (which seed the alarm) can be recomputed and integrity-checked from the file alone
+even though `run_live` deletes the paid panels. It **supersedes** the earlier `live-20260823-211755`
 run (an exploratory reps=2 dev run that was never adopted as a baseline). **Run the monthly calibration
 at `--reps 5`** to match it: the overall/per-category detection-*rate* signal is rep-independent, but the
 per-model true-positive signal in `compare` is a **raw count**, so a differing rep count would make it
@@ -201,7 +204,7 @@ fire spuriously. Diff a later run against it:
 
 ```
 python evals/run.py --mode live --reps 5
-python evals/thresholds.py compare --baseline evals/report/live-20260913-013515-60344.json --current evals/report/live-<new>.json
+python evals/thresholds.py compare --baseline evals/report/live-20260913-163900-59056.json --current evals/report/live-<new>.json
 ```
 
 ## Scoring (`score.py`)

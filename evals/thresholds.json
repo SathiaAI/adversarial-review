@@ -16,6 +16,6 @@
   },
   "live": {
     "max_detection_drop": 0.2,
-    "_comment": "`evals/thresholds.py compare` flags any overall/per-category detection-rate drop greater than this fraction, and any model whose true-positive contribution fell, between two live calibration reports. Baseline: `evals/report/live-20260913-013515-60344.json` (first adopted baseline, 2026-09-13, reps=5 - supersedes the exploratory live-20260823-211755 reps=2 run; detection 100%, 13 FPs on the two clean cases). Run `compare` at reps=5 to match this baseline: detection-rate signals are rep-independent, but the per-model true-positive signal is a raw count and needs matching reps."
+    "_comment": "`evals/thresholds.py compare` flags any overall/per-category detection-rate drop greater than this fraction, and any model whose true-positive contribution fell, between two live calibration reports. Baseline: `evals/report/live-20260913-163900-59056.json` (first adopted baseline, 2026-09-13, reps=5, reproducible - per-rep model/role attribution + sha256 digest; supersedes the exploratory live-20260823-211755 reps=2 run; detection 100%, 21 FPs on the two clean cases). Run `compare` at reps=5 to match this baseline: detection-rate signals are rep-independent, but the per-model true-positive signal is a raw count and needs matching reps."
   }
 }

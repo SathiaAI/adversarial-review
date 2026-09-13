@@ -1,0 +1,1591 @@
+{
+  "generated_at": "2026-09-13T16:39:00Z",
+  "mode": "live",
+  "python": "3.11",
+  "result": {
+    "aggregate": {
+      "by_category": {
+        "clean": {
+          "cases": 10,
+          "detection_rate": null,
+          "fn": 0,
+          "fp": 21,
+          "must_detect_total": 0,
+          "noise": 0,
+          "partial": 0,
+          "partial_rate": null,
+          "tp": 0
+        },
+        "correctness": {
+          "cases": 5,
+          "detection_rate": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "must_detect_total": 5,
+          "noise": 0,
+          "partial": 0,
+          "partial_rate": 0.0,
+          "tp": 5
+        },
+        "output_fidelity": {
+          "cases": 5,
+          "detection_rate": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "must_detect_total": 5,
+          "noise": 0,
+          "partial": 0,
+          "partial_rate": 0.0,
+          "tp": 5
+        },
+        "security": {
+          "cases": 5,
+          "detection_rate": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "must_detect_total": 5,
+          "noise": 5,
+          "partial": 0,
+          "partial_rate": 0.0,
+          "tp": 5
+        },
+        "test_quality": {
+          "cases": 5,
+          "detection_rate": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "must_detect_total": 5,
+          "noise": 0,
+          "partial": 0,
+          "partial_rate": 0.0,
+          "tp": 5
+        }
+      },
+      "by_model": {
+        "deepseek/deepseek-v4.1-flash": {
+          "cost_usd": 0.018147225,
+          "emitted": 6,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "google/gemini-3.8-flash": {
+          "cost_usd": 0.181491,
+          "emitted": 15,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "mistralai/mistral-medium-3-5": {
+          "cost_usd": 0.235044,
+          "emitted": 43,
+          "partial": 0,
+          "tp": 15,
+          "unmatched": 5
+        },
+        "qwen/qwen3.8-max-0902": {
+          "cost_usd": 0.962634,
+          "emitted": 101,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 31
+        },
+        "x-ai/grok-4.6": {
+          "cost_usd": 0.4218679999999999,
+          "emitted": 10,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "z-ai/glm-5.3-flash": {
+          "cost_usd": 0.012931600000000001,
+          "emitted": 5,
+          "partial": 0,
+          "tp": 5,
+          "unmatched": 0
+        }
+      },
+      "by_role": {
+        "correctness": {
+          "emitted": 35,
+          "partial": 0,
+          "tp": 20,
+          "unmatched": 5
+        },
+        "data_privacy": {
+          "emitted": 5,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "output_fidelity": {
+          "emitted": 16,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "reliability": {
+          "emitted": 13,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "security": {
+          "emitted": 10,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 0
+        },
+        "test_quality": {
+          "emitted": 101,
+          "partial": 0,
+          "tp": 0,
+          "unmatched": 31
+        }
+      },
+      "by_tier": {
+        "NORMAL": {
+          "cases": 25,
+          "detection_rate": 1.0,
+          "fn": 0,
+          "fp": 21,
+          "must_detect_total": 15,
+          "noise": 0,
+          "partial": 0,
+          "partial_rate": 0.0,
+          "tp": 15
+        },
+        "SENSITIVE": {
+          "cases": 5,
+          "detection_rate": 1.0,
+          "fn": 0,
+          "fp": 0,
+          "must_detect_total": 5,
+          "noise": 5,
+          "partial": 0,
+          "partial_rate": 0.0,
+          "tp": 5
+        }
+      },
+      "overall": {
+        "cases": 30,
+        "detection_rate": 1.0,
+        "fn": 0,
+        "fp": 21,
+        "must_detect_total": 20,
+        "noise": 5,
+        "partial": 0,
+        "partial_rate": 0.0,
+        "tp": 20
+      }
+    },
+    "budget_usd": 20.0,
+    "cases": [
+      {
+        "case_id": "clean-clamp-helper",
+        "category": "clean",
+        "cost_usd": 0.304633,
+        "detection_rate": null,
+        "fn": 0,
+        "fp": 16,
+        "noise": 0,
+        "partial": 0,
+        "per_rep": [
+          {
+            "cost_usd": 0.061496,
+            "fn": 0,
+            "fp": 2,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 1,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 1
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 2,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 2
+              }
+            },
+            "tp": 0
+          },
+          {
+            "cost_usd": 0.050407,
+            "fn": 0,
+            "fp": 3,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 2,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 1
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 3
+              }
+            },
+            "tp": 0
+          },
+          {
+            "cost_usd": 0.06715,
+            "fn": 0,
+            "fp": 4,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 3,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 1
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 4,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 4
+              }
+            },
+            "tp": 0
+          },
+          {
+            "cost_usd": 0.063147,
+            "fn": 0,
+            "fp": 4,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 4,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 1
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 4,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 4
+              }
+            },
+            "tp": 0
+          },
+          {
+            "cost_usd": 0.062434,
+            "fn": 0,
+            "fp": 3,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 5,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 1
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 3
+              }
+            },
+            "tp": 0
+          }
+        ],
+        "reps": 5,
+        "tier": "NORMAL",
+        "tp": 0
+      },
+      {
+        "case_id": "clean-refactor-total",
+        "category": "clean",
+        "cost_usd": 0.184341,
+        "detection_rate": null,
+        "fn": 0,
+        "fp": 5,
+        "noise": 0,
+        "partial": 0,
+        "per_rep": [
+          {
+            "cost_usd": 0.029956,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 1,
+            "roles": {
+              "correctness": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 1
+              }
+            },
+            "tp": 0
+          },
+          {
+            "cost_usd": 0.040095,
+            "fn": 0,
+            "fp": 2,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 2,
+            "roles": {
+              "correctness": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 3
+              }
+            },
+            "tp": 0
+          },
+          {
+            "cost_usd": 0.029709,
+            "fn": 0,
+            "fp": 1,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 3,
+            "roles": {
+              "correctness": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 2,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 2
+              }
+            },
+            "tp": 0
+          },
+          {
+            "cost_usd": 0.040711,
+            "fn": 0,
+            "fp": 1,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 4,
+            "roles": {
+              "correctness": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 2,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 2
+              }
+            },
+            "tp": 0
+          },
+          {
+            "cost_usd": 0.04387,
+            "fn": 0,
+            "fp": 1,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 5,
+            "roles": {
+              "correctness": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 2,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 2
+              }
+            },
+            "tp": 0
+          }
+        ],
+        "reps": 5,
+        "tier": "NORMAL",
+        "tp": 0
+      },
+      {
+        "case_id": "corr-offbyone-pagination",
+        "category": "correctness",
+        "cost_usd": 0.35753,
+        "detection_rate": 1.0,
+        "fn": 0,
+        "fp": 0,
+        "noise": 0,
+        "partial": 0,
+        "per_rep": [
+          {
+            "cost_usd": 0.080933,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 1,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 2,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.080362,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 2,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 5,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.068849,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 3,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.057886,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 4,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.069499,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 5,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 5,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          }
+        ],
+        "reps": 5,
+        "tier": "NORMAL",
+        "tp": 5
+      },
+      {
+        "case_id": "out-inverted-finalize",
+        "category": "output_fidelity",
+        "cost_usd": 0.33807,
+        "detection_rate": 1.0,
+        "fn": 0,
+        "fp": 0,
+        "noise": 0,
+        "partial": 0,
+        "per_rep": [
+          {
+            "cost_usd": 0.076592,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 1,
+            "roles": {
+              "correctness": {
+                "emitted": 2,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 5,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.070143,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 2,
+            "roles": {
+              "correctness": {
+                "emitted": 2,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.057303,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 3,
+            "roles": {
+              "correctness": {
+                "emitted": 2,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.070064,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 4,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 5,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.063969,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 5,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 2,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          }
+        ],
+        "reps": 5,
+        "tier": "NORMAL",
+        "tp": 5
+      },
+      {
+        "case_id": "sec-idor-invoice",
+        "category": "security",
+        "cost_usd": 0.393787,
+        "detection_rate": 1.0,
+        "fn": 0,
+        "fp": 0,
+        "noise": 5,
+        "partial": 0,
+        "per_rep": [
+          {
+            "cost_usd": 0.087344,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "z-ai/glm-5.3-flash",
+              "data_privacy": "google/gemini-3.8-flash",
+              "output_fidelity": "deepseek/deepseek-v4.1-flash",
+              "reliability": "mistralai/mistral-medium-3-5",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 1,
+            "partial": 0,
+            "rep": 1,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "data_privacy": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "reliability": {
+                "emitted": 4,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 5,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 1
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.06598,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "z-ai/glm-5.3-flash",
+              "data_privacy": "google/gemini-3.8-flash",
+              "output_fidelity": "deepseek/deepseek-v4.1-flash",
+              "reliability": "mistralai/mistral-medium-3-5",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 1,
+            "partial": 0,
+            "rep": 2,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "data_privacy": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "reliability": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 4,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 1
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.08475,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "z-ai/glm-5.3-flash",
+              "data_privacy": "google/gemini-3.8-flash",
+              "output_fidelity": "deepseek/deepseek-v4.1-flash",
+              "reliability": "mistralai/mistral-medium-3-5",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 1,
+            "partial": 0,
+            "rep": 3,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "data_privacy": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "reliability": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 4,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 1
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.075027,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "z-ai/glm-5.3-flash",
+              "data_privacy": "google/gemini-3.8-flash",
+              "output_fidelity": "deepseek/deepseek-v4.1-flash",
+              "reliability": "mistralai/mistral-medium-3-5",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 1,
+            "partial": 0,
+            "rep": 4,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "data_privacy": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "reliability": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 6,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 1
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.080686,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "z-ai/glm-5.3-flash",
+              "data_privacy": "google/gemini-3.8-flash",
+              "output_fidelity": "deepseek/deepseek-v4.1-flash",
+              "reliability": "mistralai/mistral-medium-3-5",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 1,
+            "partial": 0,
+            "rep": 5,
+            "roles": {
+              "correctness": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "data_privacy": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 2,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "reliability": {
+                "emitted": 4,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 1,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 4,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 1
+              }
+            },
+            "tp": 1
+          }
+        ],
+        "reps": 5,
+        "tier": "SENSITIVE",
+        "tp": 5
+      },
+      {
+        "case_id": "test-weak-assert-charge",
+        "category": "test_quality",
+        "cost_usd": 0.253754,
+        "detection_rate": 1.0,
+        "fn": 0,
+        "fp": 0,
+        "noise": 0,
+        "partial": 0,
+        "per_rep": [
+          {
+            "cost_usd": 0.051463,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 1,
+            "roles": {
+              "correctness": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.050993,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 2,
+            "roles": {
+              "correctness": {
+                "emitted": 2,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.048946,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 3,
+            "roles": {
+              "correctness": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.05227,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 4,
+            "roles": {
+              "correctness": {
+                "emitted": 2,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 3,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          },
+          {
+            "cost_usd": 0.050082,
+            "fn": 0,
+            "fp": 0,
+            "models": {
+              "correctness": "mistralai/mistral-medium-3-5",
+              "output_fidelity": "google/gemini-3.8-flash",
+              "security": "x-ai/grok-4.6",
+              "test_quality": "qwen/qwen3.8-max-0902"
+            },
+            "noise": 0,
+            "partial": 0,
+            "rep": 5,
+            "roles": {
+              "correctness": {
+                "emitted": 2,
+                "partial": 0,
+                "tp": 1,
+                "unmatched": 0
+              },
+              "output_fidelity": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "security": {
+                "emitted": 0,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              },
+              "test_quality": {
+                "emitted": 4,
+                "partial": 0,
+                "tp": 0,
+                "unmatched": 0
+              }
+            },
+            "tp": 1
+          }
+        ],
+        "reps": 5,
+        "tier": "NORMAL",
+        "tp": 5
+      }
+    ],
+    "clean_fp": 21,
+    "clean_fp_rate": 2.1,
+    "clean_units": 10,
+    "complete": true,
+    "corpus": "corpus",
+    "digest": {
+      "algo": "sha256",
+      "value": "45cf9dc66019ad86fa8c5fc43284c4ba792acefd2c0d73c0dab674e4dd4ada41"
+    },
+    "line_tol": 3,
+    "not_run": [],
+    "reps": 5,
+    "spent_usd": 1.832116,
+    "stop_reason": null
+  },
+  "schema": "adversarial-review/eval-report/1"
+}
