@@ -10243,10 +10243,6 @@ def main():
     sys.exit(1 if FAILED else 0)
 
 
-if __name__ == "__main__":
-    main()
-
-
 # --- E1-S4 live report reproducibility (Codex, PR #60): a committed live baseline must retain per-rep
 # model->role assignment + per-role attribution and an integrity digest, so the per-model TP that seeds
 # the model-degraded alarm is recomputable and verifiable from the file alone -- run_live deletes the
@@ -10332,3 +10328,23 @@ def t_eval_live_report_cost_reconciles_from_per_rep():
             if model == "mistral":
                 recomputed += pr["role_cost_usd"][role]
     assert round(recomputed, 6) == round(by_model["mistral"]["cost_usd"], 6)
+
+
+def t_eval_thresholds_verify_digest_detects_tamper():
+    # Codex (PR #60): `thresholds.py compare` must reject a report whose integrity digest does not match
+    # its payload, so the digest actually protects the calibration gate (not decoration).
+    run = _import_run()
+    sys.path.insert(0, str(SKILL / "evals"))
+    import thresholds as th
+    result = {"corpus": "corpus", "reps": 5,
+              "aggregate": {"overall": {"detection_rate": 1.0}, "by_model": {}}}
+    result["digest"] = run._result_digest(result)
+    report = {"schema": "x", "mode": "live", "result": result}
+    assert th.verify_digest(report) is None, "a valid digest must verify"
+    result["aggregate"]["overall"]["detection_rate"] = 0.5  # tamper without re-digesting
+    assert th.verify_digest(report) is not None, "an edited payload must fail digest verification"
+    assert th.verify_digest({"result": {"corpus": "c", "aggregate": {}}}) is not None, "missing digest -> reject"
+
+
+if __name__ == "__main__":
+    main()
