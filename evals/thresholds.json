@@ -16,6 +16,6 @@
   },
   "live": {
     "max_detection_drop": 0.2,
-    "_comment": "`evals/thresholds.py compare` flags any overall/per-category detection-rate drop greater than this fraction, and any model whose true-positive contribution fell, between two live calibration reports. No baseline live report is committed yet (pending the first run)."
+    "_comment": "`evals/thresholds.py compare` flags any overall/per-category detection-rate drop greater than this fraction, and any model whose true-positive contribution fell, between two live calibration reports. Baseline: `evals/report/live-20260913-013515-60344.json` (first live calibration, 2026-09-13; reps=5 over 30 panels; detection 100%, 13 FPs on the two clean cases, spend $1.79)."
   }
 }

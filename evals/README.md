@@ -191,9 +191,13 @@ python evals/thresholds.py compare --baseline evals/report/live-<old>.json --cur
 It flags any overall or per-category detection-rate drop greater than `live.max_detection_drop`
 (default 20%) and lists any model whose true-positive contribution fell — a **candidate for pin removal
 / substitution**. Runbook: when a model is flagged, first rule out a transport blip (re-run that case);
-if the drop holds, drop the model from the pool or pin a replacement family and note it in the PR. The
-baseline live report is committed after the **first** calibration (the E1-S4 `$20` run); until then
-`compare` has nothing to diff against.
+if the drop holds, drop the model from the pool or pin a replacement family and note it in the PR. The **first baseline live report is now committed**: `evals/report/live-20260913-013515-60344.json`
+(2026-09-13; reps=5 over 30 panels; detection 100%, 13 false positives on the two clean cases, spend
+$1.79). Diff a later run against it:
+
+```
+python evals/thresholds.py compare --baseline evals/report/live-20260913-013515-60344.json --current evals/report/live-<new>.json
+```
 
 ## Scoring (`score.py`)
 
