@@ -5222,6 +5222,10 @@ def t_eval_thresholds_cli():
                               "by_model": {"m": {"tp": 2}}}}
         cur = {"aggregate": {"overall": {"detection_rate": 0.2}, "by_category": {},
                              "by_model": {"m": {"tp": 0}}}}
+        sys.path.insert(0, str(SKILL / "evals"))
+        import run as _run
+        base["digest"] = _run._result_digest(base)
+        cur["digest"] = _run._result_digest(cur)
         (d / "base.json").write_text(json.dumps(base))
         (d / "cur.json").write_text(json.dumps(cur))
         r3 = subprocess.run([sys.executable, thr_py, "compare", "--baseline", str(d / "base.json"),
@@ -5234,6 +5238,12 @@ def t_eval_thresholds_cli():
                              "--current", str(d / "cur.json"), "--max-drop", "nan"],
                             env=ENV, capture_output=True, text=True)
         assert r5.returncode == 2 and "finite fraction" in r5.stderr, (r5.returncode, r5.stderr[-200:])
+        # a report with no integrity digest is rejected before comparison (Codex, PR #60)
+        nod = {"aggregate": {"overall": {"detection_rate": 1.0}, "by_category": {}, "by_model": {}}}
+        (d / "nod.json").write_text(json.dumps(nod))
+        r6 = subprocess.run([sys.executable, thr_py, "compare", "--baseline", str(d / "nod.json"),
+                             "--current", str(d / "base.json")], env=ENV, capture_output=True, text=True)
+        assert r6.returncode == 2 and "INTEGRITY" in r6.stderr, (r6.returncode, r6.stderr[-200:])
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
