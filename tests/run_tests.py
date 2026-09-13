@@ -10303,3 +10303,32 @@ def t_eval_live_result_digest_is_stable_and_sensitive():
     assert run._result_digest(with_digest) == d1, "digest must exclude its own key (self-consistent)"
     result2 = {"corpus": "corpus", "reps": 5, "aggregate": {"by_model": {"m": {"tp": 4}}}}
     assert run._result_digest(result2) != d1, "digest must change when a scored number changes"
+
+
+def t_eval_live_report_cost_reconciles_from_per_rep():
+    # Codex/CodeRabbit (PR #60): the published case + per-model cost rollups must be recomputable from
+    # the report ALONE. per_rep stores UNROUNDED cost_usd and a public role_cost_usd map, so summing
+    # them reproduces the case cost_usd (round-then-sum drift eliminated) and the by_model cost.
+    run = _import_run()
+    roles = {"correctness": {"emitted": 1, "tp": 1, "partial": 0, "unmatched": 0}}
+    def unit(rep, cost):
+        return {"case_id": "c", "category": "security", "tier": "NORMAL", "rep": rep,
+                "tp": 1, "partial": 0, "fn": 0, "fp": 0, "noise": 0, "must_detect_total": 1,
+                "cost_usd": cost, "roles": roles, "models": {"correctness": "mistral"},
+                "_role_cost": {"correctness": cost}}
+    # costs chosen so round-each-then-sum != sum-then-round (the exact drift CodeRabbit flagged)
+    units = [unit(1, 0.0333335), unit(2, 0.0333335), unit(3, 0.0333335)]
+    row = run._case_rollup("c", {"category": "security", "tier": "NORMAL"}, units)
+    for pr in row["per_rep"]:
+        assert pr["cost_usd"] == 0.0333335, "per_rep cost must be unrounded"
+        assert pr["role_cost_usd"] == {"correctness": 0.0333335}, "per_rep must publish role_cost_usd"
+    # case cost_usd is exactly reproducible from the published per_rep costs
+    assert round(sum(pr["cost_usd"] for pr in row["per_rep"]), 6) == row["cost_usd"]
+    # by_model cost is exactly reproducible from published role_cost_usd + models
+    by_model = run._roll_models(units)
+    recomputed = 0.0
+    for pr in row["per_rep"]:
+        for role, model in pr["models"].items():
+            if model == "mistral":
+                recomputed += pr["role_cost_usd"][role]
+    assert round(recomputed, 6) == round(by_model["mistral"]["cost_usd"], 6)

@@ -335,7 +335,8 @@ def _case_rollup(case_id, meta, units):
         "noise": sum(u["noise"] for u in units),
         "cost_usd": round(sum(u["cost_usd"] for u in units), 6),
         "per_rep": [{"rep": u["rep"], "tp": u["tp"], "partial": u["partial"], "fn": u["fn"],
-                     "fp": u["fp"], "noise": u["noise"], "cost_usd": round(u["cost_usd"], 6),
+                     "fp": u["fp"], "noise": u["noise"], "cost_usd": u["cost_usd"],
+                     "role_cost_usd": u["_role_cost"],
                      "models": u["models"], "roles": u["roles"]}
                     for u in units],
     }
