@@ -16,6 +16,7 @@ Two guards, both stdlib-only and 3.9-safe:
     python evals/thresholds.py compare --baseline OLD.json --current NEW.json
 """
 import argparse
+import hashlib
 import json
 import math
 import subprocess
@@ -72,6 +73,24 @@ def check_offline(result, thresholds):
         if "max_fp" in cthr and (not isinstance(cfp, (int, float)) or cfp > cthr["max_fp"]):
             breaches.append("category %s fp %s > ceiling %d" % (cat, cfp, cthr["max_fp"]))
     return breaches
+
+
+def verify_digest(report):
+    """Return None if the report's integrity digest matches its payload, else a human-readable reason.
+    The digest (written by evals/run.py `_result_digest`) is sha256 over the canonical `result` WITHOUT
+    its own `digest` key; a mismatch or a missing digest means the report cannot be trusted as generated,
+    so `compare` must reject it before gating on its numbers (Codex, PR #60)."""
+    res = _result(report)
+    dig = res.get("digest") if isinstance(res, dict) else None
+    if not isinstance(dig, dict) or "value" not in dig:
+        return "no integrity digest present (regenerate with a current evals/run.py)"
+    body = {k: v for k, v in res.items() if k != "digest"}
+    canon = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    actual = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+    if actual != dig.get("value"):
+        return "digest mismatch (recomputed %s != recorded %s) -- report edited after generation" % (
+            actual[:12], str(dig.get("value"))[:12])
+    return None
 
 
 def compare_live(baseline, current, max_drop):
@@ -174,6 +193,11 @@ def main(argv=None):
         return 2
     base = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
     cur = json.loads(Path(args.current).read_text(encoding="utf-8"))
+    for label, rep in (("baseline", base), ("current", cur)):
+        why = verify_digest(rep)
+        if why:
+            print("REPORT INTEGRITY: %s report failed digest verification: %s" % (label, why), file=sys.stderr)
+            return 2
     regs = compare_live(base, cur, md)
     if regs:
         print("LIVE MODEL DEGRADATION vs baseline:", file=sys.stderr)

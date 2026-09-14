@@ -21,6 +21,7 @@ The scored payload (`result`) is deterministic: same corpus + same scripts -> by
 only, Python 3.9+ — as portable as the pipeline it measures.
 """
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -334,9 +335,21 @@ def _case_rollup(case_id, meta, units):
         "noise": sum(u["noise"] for u in units),
         "cost_usd": round(sum(u["cost_usd"] for u in units), 6),
         "per_rep": [{"rep": u["rep"], "tp": u["tp"], "partial": u["partial"], "fn": u["fn"],
-                     "fp": u["fp"], "noise": u["noise"], "cost_usd": round(u["cost_usd"], 6)}
+                     "fp": u["fp"], "noise": u["noise"], "cost_usd": u["cost_usd"],
+                     "role_cost_usd": u["_role_cost"],
+                     "models": u["models"], "roles": u["roles"]}
                     for u in units],
     }
+
+
+def _result_digest(result):
+    """Integrity / reproducibility stamp for a committed live report: sha256 over the canonical scored
+    payload (the result WITHOUT its own ``digest`` key). Lets a later reader verify the aggregate
+    (``by_model`` / ``by_role``, which seed the model-degraded alarm) is a faithful rollup of the
+    retained per-rep ``models`` + ``roles`` detail, and that neither was edited after the run."""
+    body = {k: v for k, v in result.items() if k != "digest"}
+    canon = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return {"algo": "sha256", "value": hashlib.sha256(canon.encode("utf-8")).hexdigest()}
 
 
 def run_live(corpus_dir, only=None, reps=1, line_tol=score.DEFAULT_LINE_TOL,
@@ -441,7 +454,7 @@ def run_live(corpus_dir, only=None, reps=1, line_tol=score.DEFAULT_LINE_TOL,
     agg["by_role"] = _roll_roles(units)
     agg["by_model"] = _roll_models(units)
     clean = [u for u in units if u["category"] == "clean"]
-    return {
+    result = {
         "corpus": corpus_dir.name, "line_tol": line_tol, "reps": reps,
         "budget_usd": budget_usd, "spent_usd": round(spent, 6),
         "complete": not stopped, "stop_reason": stop_reason, "not_run": not_run,
@@ -449,6 +462,8 @@ def run_live(corpus_dir, only=None, reps=1, line_tol=score.DEFAULT_LINE_TOL,
         "clean_fp_rate": (sum(u["fp"] for u in clean) / len(clean)) if clean else None,
         "cases": cases_out, "aggregate": agg,
     }
+    result["digest"] = _result_digest(result)
+    return result
 
 
 def _md_cell(value):

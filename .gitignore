@@ -8,3 +8,8 @@ dist/
 *.egg-info/
 .coverage
 context.md
+
+_suite*.txt
+_live.out
+_live.err
+
