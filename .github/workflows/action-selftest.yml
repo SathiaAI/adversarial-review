@@ -1,6 +1,8 @@
-# Self-test the composite action (action.yml): run it, keyless, on this repo's own trivial
-# gate and assert the honest keyless verdict is BLOCKED *for missing panel coverage* with
-# fail-on=fail tolerating it so the job stays green. Guards the action against regressions (E2-S1).
+# Self-test the composite action (action.yml) end-to-end on this repo, keyless. Three checks:
+# (1) fail-on=fail TOLERATES the honest keyless BLOCKED (missing panel) so the job stays green;
+# (2) the default fail-on=blocked FAILS the job on that same BLOCKED (exit 2) — the gate actually gates;
+# (3) a failing gate is a FAIL that fails the job even under fail-on=fail (exit 1), never downgraded.
+# Guards the action against regressions (E2-S1).
 name: action-selftest
 
 on:
@@ -55,3 +57,42 @@ jobs:
           vj="$(ls -t .adversarial-review/*/verdict.json | head -1)"
           test -n "$vj" || { echo "no verdict.json found"; exit 1; }
           python -c "import json,sys; d=json.load(open(sys.argv[1])); rs=[r.lower() for r in d.get('reasons',[])]; assert d['verdict']=='BLOCKED', d['verdict']; assert any('panel plan missing' in r for r in rs), d.get('reasons'); print('action self-test OK: keyless BLOCKED includes the missing-panel reason (exit ${{ steps.ar.outputs.exit-code }})')" "$vj"
+
+      - name: Run the action (keyless, default fail-on=blocked) — expect a job-failing BLOCKED
+        id: blocked
+        continue-on-error: true
+        uses: ./
+        with:
+          risk: NORMAL
+          dev-providers: anthropic
+          gates: |
+            build=python -m py_compile scripts/aggregate.py
+          fail-on: blocked    # default: a BLOCKED verdict MUST fail the job
+          diff-ref: ${{ github.event.pull_request.base.sha || 'HEAD~1' }}...HEAD
+      - name: Assert fail-on=blocked fails the job on BLOCKED (the tolerated path is covered above)
+        run: |
+          # Proves the gate actually GATES: under the default fail-on=blocked a BLOCKED verdict
+          # must fail the job (exit 1), while the action still exposes verdict=BLOCKED / exit-code=2.
+          test "${{ steps.blocked.outcome }}" = "failure" || { echo "expected the action step to FAIL the job, got outcome='${{ steps.blocked.outcome }}'"; exit 1; }
+          test "${{ steps.blocked.outputs.verdict }}" = "BLOCKED" || { echo "expected verdict=BLOCKED, got '${{ steps.blocked.outputs.verdict }}'"; exit 1; }
+          test "${{ steps.blocked.outputs.exit-code }}" = "2" || { echo "expected exit-code=2, got '${{ steps.blocked.outputs.exit-code }}'"; exit 1; }
+          echo "action self-test OK: fail-on=blocked fails the job on a BLOCKED verdict (exit 2)"
+      - name: Run the action with a FAILING gate under fail-on=fail — expect a job-failing FAIL
+        id: failgate
+        continue-on-error: true
+        uses: ./
+        with:
+          risk: NORMAL
+          dev-providers: anthropic
+          gates: |
+            alwaysfail=bash -c 'exit 1'
+          fail-on: fail    # lenient mode tolerates BLOCKED but MUST NOT tolerate a real FAIL
+          diff-ref: ${{ github.event.pull_request.base.sha || 'HEAD~1' }}...HEAD
+      - name: Assert a recorded FAIL fails the job even under fail-on=fail
+        run: |
+          # FAIL takes precedence over BLOCKED in aggregate.py, and fail-on=fail only tolerates
+          # BLOCKED — so a failing gate must still fail the job (exit 1), never be downgraded to a warning.
+          test "${{ steps.failgate.outcome }}" = "failure" || { echo "expected the action step to FAIL the job, got outcome='${{ steps.failgate.outcome }}'"; exit 1; }
+          test "${{ steps.failgate.outputs.verdict }}" = "FAIL" || { echo "expected verdict=FAIL, got '${{ steps.failgate.outputs.verdict }}'"; exit 1; }
+          test "${{ steps.failgate.outputs.exit-code }}" = "1" || { echo "expected exit-code=1, got '${{ steps.failgate.outputs.exit-code }}'"; exit 1; }
+          echo "action self-test OK: a recorded FAIL fails the job even under fail-on=fail (exit 1)"
