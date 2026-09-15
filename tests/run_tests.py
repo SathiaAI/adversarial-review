@@ -6114,6 +6114,22 @@ def t_mcp_http_legacy_needs_no_routing_headers():
         t.shutdown()
 
 
+def t_mcp_http_modern_header_mismatch_message_is_bounded():
+    # SAT-1115 dogfood hardening (correctness + output_fidelity reviewers): a mismatched routing header is
+    # reflected into the HeaderMismatch message, so an oversized client value must be length-bounded
+    # (_clip) rather than echoed wholesale. Still -32020; the message must not carry the full 5000-char echo.
+    t, port = _http_transport()
+    try:
+        huge = "x" * 5000
+        status, resp, _ = _http_modern_raw(port, "tools/list", routing_headers={"Mcp-Method": huge})
+        assert status == 200, status
+        assert resp["error"]["code"] == -32020, resp
+        assert len(resp["error"]["message"]) < 500, len(resp["error"]["message"])
+        assert huge not in resp["error"]["message"], "oversized header value must not be echoed wholesale"
+    finally:
+        t.shutdown()
+
+
 # --- E3-S2d conformance manifest + drift guard --------------------------------------------------
 # Maps each transport-agnostic DISPATCH conformance behavior to the stdio test that pins it, the HTTP
 # parity test that proves it survives the HTTP framing, and the MCP 2026-07-28 clause it satisfies.

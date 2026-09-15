@@ -2008,6 +2008,16 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    @staticmethod
+    def _clip(v, limit=120):
+        # Bound a client-controlled value before it is reflected into a HeaderMismatch message
+        # (dogfood SAT-1115: correctness + output_fidelity flagged the raw %r echo). The value is
+        # already length-bounded (headers by http.server, body by max_bytes), same-connection, and
+        # json.dumps-escaped, so this is defense-in-depth against reflecting an oversized value, not a
+        # disclosure fix. A non-str (e.g. a JSON number/None params.name) is repr'd first.
+        s = v if isinstance(v, str) else repr(v)
+        return s if len(s) <= limit else s[:limit] + "...(+%d)" % (len(s) - limit)
+
     def do_POST(self):
         # (1) DNS-rebinding defense first: reject a disallowed browser Origin before touching the body.
         if not self._origin_ok():
@@ -2137,7 +2147,7 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             hm = next(iter(hm_vals))
             if hm != method:
                 self._routing_error(peeked, "Mcp-Method header (%r) does not match the request method (%r)"
-                                    % (hm, method))
+                                    % (self._clip(hm), self._clip(method)))
                 return
             if method == "tools/call":
                 name = None
@@ -2154,7 +2164,7 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
                 hn = next(iter(hn_vals))
                 if hn != name:
                     self._routing_error(peeked, "Mcp-Name header (%r) does not match params.name (%r)"
-                                        % (hn, name))
+                                        % (self._clip(hn), self._clip(name)))
                     return
         # (6) Dispatch through the transport-agnostic core, serialized (see _HTTP_DISPATCH_LOCK) so the
         #     stateful tool handlers keep stdio's one-at-a-time invariant. serve_message() accepts bytes
