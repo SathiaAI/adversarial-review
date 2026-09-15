@@ -67,7 +67,8 @@ jobs:
           dev-providers: anthropic
           gates: |
             build=python -m py_compile scripts/aggregate.py
-          fail-on: blocked    # default: a BLOCKED verdict MUST fail the job
+          # fail-on omitted on purpose (CodeRabbit): exercise the Action's DEFAULT, so a change of
+          # the default away from 'blocked' regresses this test instead of silently passing.
           diff-ref: ${{ github.event.pull_request.base.sha || 'HEAD~1' }}...HEAD
       - name: Assert fail-on=blocked fails the job on BLOCKED (the tolerated path is covered above)
         run: |
