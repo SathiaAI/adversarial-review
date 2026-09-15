@@ -6038,17 +6038,34 @@ def t_mcp_http_modern_mcp_name_mismatch_is_header_mismatch():
         os.chdir(cwd0)
 
 
-def t_mcp_http_modern_notification_missing_method_header_is_mismatch():
-    # SAT-1115 (notification case, documented): a modern notification POST (method present, NO id) still
-    # routes on Mcp-Method, so enforcement applies. Missing -> a normal in-band -32020 error with id null
-    # (the client sent a routable POST) rather than the usual 202-no-body a VALID notification would get.
+def t_mcp_http_modern_notification_header_violation_is_202_no_reply():
+    # SAT-1115 (notification case; Codex PR #62): a modern notification POST (method present, NO id) with a
+    # missing routing header is NOT dispatched, but JSON-RPC forbids replying to a notification (and the
+    # transport returns None for any id-less message), so it gets 202 no-body exactly as a VALID
+    # notification would -- never a -32020 error object with id null. Enforcement still blocks dispatch; it
+    # simply cannot answer an id-less message.
     t, port = _http_transport()
     try:
         status, resp, _ = _http_modern_raw(port, "notifications/initialized",
-                                           include_id=False, routing_headers={})
-        assert status == 200, status
-        assert resp["error"]["code"] == -32020, resp
-        assert resp["id"] is None, resp
+                                           include_id=False, routing_headers={})   # no Mcp-Method
+        assert status == 202, status
+        assert resp is None, resp   # empty body -> no JSON-RPC reply to a notification
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_modern_discover_requires_mcp_method():
+    # SAT-1115 (Codex PR #62): a server/discover that EXPLICITLY declares the modern era (params._meta
+    # version) is a modern POST and must carry `Mcp-Method: server/discover` -- the discover exemption only
+    # covers the version-agnostic probe (no modern _meta, which never reaches the gate). Missing -> -32020;
+    # a correct header dispatches the discovery result.
+    t, port = _http_transport()
+    try:
+        status, resp, _ = _http_modern_raw(port, "server/discover", routing_headers={})   # modern _meta, no header
+        assert status == 200 and resp["error"]["code"] == -32020, resp
+        status2, resp2, _ = _http_modern_raw(port, "server/discover",
+                                             routing_headers={"Mcp-Method": "server/discover"})
+        assert status2 == 200 and "result" in resp2, resp2   # correct header -> dispatches
     finally:
         t.shutdown()
 
