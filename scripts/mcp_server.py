@@ -1994,6 +1994,44 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             return False
         return True
 
+    def _routing_error(self, peeked, message, pv=None):
+        # A routing-header violation (2026-07-28 changelog #4). A NOTIFICATION (no id) gets NO JSON-RPC
+        # reply: JSON-RPC 2.0 forbids replying to a notification and handle() returns None for any id-less
+        # message, so enforcement here means NOT dispatching and answering 202 no-body exactly as a valid
+        # notification would -- never an error object with id null (Codex, PR #62). A REQUEST (id present)
+        # gets the in-band HeaderMismatch (-32020) on HTTP 200, mirroring how UnsupportedProtocolVersion
+        # (-32022) is surfaced (non-200 stays reserved for transport-layer rejects: 401/403/413), and it
+        # echoes the pinned MCP-Protocol-Version like every other in-band POST response so a version-aware
+        # client does not misclassify it (Codex, PR #62).
+        if isinstance(peeked, dict) and "id" not in peeked:
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        rid = peeked.get("id") if isinstance(peeked, dict) else None
+        body = json.dumps({"jsonrpc": "2.0", "id": rid,
+                           "error": {"code": -32020, "message": "HeaderMismatch: " + message}}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        if pv is not None:
+            self.send_header("MCP-Protocol-Version", pv)  # echo the pinned version, like the main sender
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    @staticmethod
+    def _clip(v, limit=120):
+        # Bound a client-controlled value before it is reflected into a HeaderMismatch message
+        # (dogfood SAT-1115: correctness + output_fidelity flagged the raw %r echo). The value is
+        # already length-bounded (headers by http.server, body by max_bytes), same-connection, and
+        # json.dumps-escaped, so this is defense-in-depth against reflecting an oversized value, not a
+        # disclosure fix. A non-str (e.g. a JSON number/None params.name) is repr'd first.
+        s = v if isinstance(v, str) else repr(v)
+        if len(s) <= limit:
+            return s
+        marker = "...(+%d more)" % (len(s) - limit)
+        return s[:max(0, limit - len(marker))] + marker  # reserve suffix space so `limit` is a true bound
+
     def do_POST(self):
         # (1) DNS-rebinding defense first: reject a disallowed browser Origin before touching the body.
         if not self._origin_ok():
@@ -2101,6 +2139,50 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
                 and not is_initialize and method != "server/discover"):
             self._json(400, {"error": "Mcp-Session-Id required"})
             return
+        # (5b) Routing-header enforcement (SAT-1115, 2026-07-28 changelog #4). Gated to the modern era off
+        #      the SAME params._meta version signal the transport routes on, so every legacy (<=2025-11-25)
+        #      client -- which carries no routing headers -- is untouched. The gate fires ONLY when the body
+        #      explicitly declares a modern _meta version, so a version-agnostic `server/discover` probe (no
+        #      modern _meta) never reaches it; a discover that DOES declare the modern revision is enforced
+        #      like any modern POST -- it must carry `Mcp-Method: server/discover` -- so the routing header and
+        #      the executed method stay consistent for an intermediary (Codex, PR #62). A missing-when-required
+        #      OR body-disagreeing header is a HeaderMismatch (-32020); _routing_error delivers it in-band on
+        #      HTTP 200 for a request and, for a notification (no id), answers 202 no-body WITHOUT dispatching
+        #      (JSON-RPC gives a notification no reply). Enforced AFTER Origin->auth->version->session so it
+        #      adds no new pre-auth disclosure. Correct headers fall through and dispatch byte-identically.
+        #      Header values are whitespace-stripped and identical repeats tolerated, matching the
+        #      MCP-Protocol-Version conflicting-header convention above; only DISTINCT values are a conflict.
+        if isinstance(meta_pv, str) and meta_pv in MODERN_PROTOCOLS:
+            hm_all = self.headers.get_all("Mcp-Method")
+            if not hm_all:
+                self._routing_error(peeked, "missing required Mcp-Method header", pv)
+                return
+            hm_vals = {v.strip() for v in hm_all}
+            if len(hm_vals) > 1:
+                self._routing_error(peeked, "conflicting Mcp-Method headers", pv)
+                return
+            hm = next(iter(hm_vals))
+            if hm != method:
+                self._routing_error(peeked, "Mcp-Method header (%r) does not match the request method (%r)"
+                                    % (self._clip(hm), self._clip(method)), pv)
+                return
+            if method == "tools/call":
+                name = None
+                if isinstance(peeked, dict) and isinstance(peeked.get("params"), dict):
+                    name = peeked["params"].get("name")
+                hn_all = self.headers.get_all("Mcp-Name")
+                if not hn_all:
+                    self._routing_error(peeked, "missing required Mcp-Name header for tools/call", pv)
+                    return
+                hn_vals = {v.strip() for v in hn_all}
+                if len(hn_vals) > 1:
+                    self._routing_error(peeked, "conflicting Mcp-Name headers", pv)
+                    return
+                hn = next(iter(hn_vals))
+                if hn != name:
+                    self._routing_error(peeked, "Mcp-Name header (%r) does not match params.name (%r)"
+                                        % (self._clip(hn), self._clip(name)), pv)
+                    return
         # (6) Dispatch through the transport-agnostic core, serialized (see _HTTP_DISPATCH_LOCK) so the
         #     stateful tool handlers keep stdio's one-at-a-time invariant. serve_message() accepts bytes
         #     and never raises: a malformed body frames as -32700, a handler crash as -32603.
