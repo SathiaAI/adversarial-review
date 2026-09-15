@@ -5947,6 +5947,173 @@ def t_mcp_http_falsy_id_is_response_not_notification():
         t.shutdown()
 
 
+# --- SAT-1115: routing-header (Mcp-Method / Mcp-Name) enforcement -------------------------------
+def _http_modern_raw(port, method, params=None, version="2026-07-28", caps=True, id_=1,
+                     include_id=True, routing_headers=None):
+    """POST a modern (stateless 2026-07-28) body over HTTP with EXPLICIT control of the routing headers --
+    unlike _http_modern (which always sends a correct Mcp-Method, and Mcp-Name for tools/call). Sends ONLY
+    the headers in `routing_headers` (plus Content-Type), so a test can OMIT, mismatch, or correctly set
+    Mcp-Method / Mcp-Name to exercise SAT-1115 enforcement. include_id=False builds a notification (no id).
+    Returns (status, parsed_body_or_None, headers). (Duplicate/conflicting headers cannot be sent via urllib
+    -- that path is exercised at the socket level in t_mcp_http_modern_conflicting_mcp_method_*.)"""
+    body = {"jsonrpc": "2.0", "method": method, "params": dict(params or {})}
+    if include_id:
+        body["id"] = id_
+    meta = {"io.modelcontextprotocol/protocolVersion": version}
+    if caps:
+        meta["io.modelcontextprotocol/clientCapabilities"] = {}
+    body["params"]["_meta"] = meta
+    headers = {"Content-Type": "application/json"}
+    headers.update(routing_headers or {})
+    status, raw, hdrs = _http_post(port, json.dumps(body), headers)
+    return status, (json.loads(raw) if raw else None), hdrs
+
+
+def t_mcp_http_modern_missing_mcp_method_is_header_mismatch():
+    # SAT-1115 / changelog #4: a modern (2026-07-28) POST MUST carry Mcp-Method. Absent -> HeaderMismatch
+    # (-32020), delivered in-band on HTTP 200 (like -32022), and NOT dispatched.
+    t, port = _http_transport()
+    try:
+        status, resp, _ = _http_modern_raw(port, "tools/list", routing_headers={})   # no Mcp-Method
+        assert status == 200, status
+        assert resp["error"]["code"] == -32020, resp
+        assert resp["id"] == 1, resp
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_modern_mcp_method_mismatch_is_header_mismatch():
+    # SAT-1115: Mcp-Method must EQUAL the body method (a router must not be able to route to a different
+    # method than the body executes). A disagreeing header -> -32020.
+    t, port = _http_transport()
+    try:
+        status, resp, _ = _http_modern_raw(port, "tools/list",
+                                           routing_headers={"Mcp-Method": "server/discover"})
+        assert status == 200, status
+        assert resp["error"]["code"] == -32020, resp
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_modern_tools_call_missing_mcp_name_is_header_mismatch():
+    # SAT-1115: tools/call additionally REQUIRES Mcp-Name. Mcp-Method present + correct but Mcp-Name absent
+    # -> -32020, and NO tool runs (no run dir), proving enforcement precedes dispatch.
+    repo = fresh_repo()
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        t, port = _http_transport()
+        try:
+            status, resp, _ = _http_modern_raw(
+                port, "tools/call",
+                {"name": "ar_init", "arguments": {"risk": "NORMAL", "dev_providers": ["anthropic"]}},
+                routing_headers={"Mcp-Method": "tools/call"})   # Mcp-Name missing
+            assert status == 200, status
+            assert resp["error"]["code"] == -32020, resp
+            assert list((repo / ".adversarial-review").glob("run-*")) == [], "no tool may run on a header mismatch"
+        finally:
+            t.shutdown()
+    finally:
+        os.chdir(cwd0)
+
+
+def t_mcp_http_modern_mcp_name_mismatch_is_header_mismatch():
+    # SAT-1115: Mcp-Name must EQUAL params.name for tools/call. A disagreeing name -> -32020 (and no run).
+    repo = fresh_repo()
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        t, port = _http_transport()
+        try:
+            status, resp, _ = _http_modern_raw(
+                port, "tools/call",
+                {"name": "ar_init", "arguments": {"risk": "NORMAL", "dev_providers": ["anthropic"]}},
+                routing_headers={"Mcp-Method": "tools/call", "Mcp-Name": "ar_status"})
+            assert status == 200, status
+            assert resp["error"]["code"] == -32020, resp
+            assert list((repo / ".adversarial-review").glob("run-*")) == [], "no tool may run on a header mismatch"
+        finally:
+            t.shutdown()
+    finally:
+        os.chdir(cwd0)
+
+
+def t_mcp_http_modern_notification_missing_method_header_is_mismatch():
+    # SAT-1115 (notification case, documented): a modern notification POST (method present, NO id) still
+    # routes on Mcp-Method, so enforcement applies. Missing -> a normal in-band -32020 error with id null
+    # (the client sent a routable POST) rather than the usual 202-no-body a VALID notification would get.
+    t, port = _http_transport()
+    try:
+        status, resp, _ = _http_modern_raw(port, "notifications/initialized",
+                                           include_id=False, routing_headers={})
+        assert status == 200, status
+        assert resp["error"]["code"] == -32020, resp
+        assert resp["id"] is None, resp
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_modern_correct_routing_headers_dispatch():
+    # SAT-1115: correct Mcp-Method (+ Mcp-Name for tools/call) dispatch byte-identically to today -- a real
+    # ar_init finalizes over HTTP. This is the positive control for enforcement (mirrors _http_modern, which
+    # sends the same headers). Run in a fresh repo since ar_init creates a run.
+    repo = fresh_repo()
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    try:
+        t, port = _http_transport()
+        try:
+            status, resp, hdrs = _http_modern_raw(
+                port, "tools/call",
+                {"name": "ar_init", "arguments": {"risk": "NORMAL", "dev_providers": ["anthropic"]}},
+                routing_headers={"Mcp-Method": "tools/call", "Mcp-Name": "ar_init"})
+            assert status == 200 and hdrs.get("content-type") == "application/json", (status, hdrs)
+            res = resp["result"]
+            assert res["resultType"] == "complete" and not res.get("isError"), res
+            assert res["structuredContent"]["run_id"].startswith("run-"), res
+        finally:
+            t.shutdown()
+    finally:
+        os.chdir(cwd0)
+
+
+def t_mcp_http_modern_conflicting_mcp_method_is_header_mismatch():
+    # SAT-1115: two DISTINCT Mcp-Method values is an ambiguous route and must not be silently resolved to
+    # whichever came first -> -32020 (mirrors the MCP-Protocol-Version conflicting-header convention).
+    # urllib cannot send duplicate headers, so build the request at the socket level. Identical repeats are
+    # tolerated (covered implicitly: the stripped-value set collapses to one).
+    t, port = _http_transport()
+    try:
+        body = json.dumps({"jsonrpc": "2.0", "id": 5, "method": "tools/list",
+                           "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                                "io.modelcontextprotocol/clientCapabilities": {}}}}).encode("utf-8")
+        req = (b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"
+               b"Content-Type: application/json\r\n"
+               b"Mcp-Method: tools/list\r\nMcp-Method: server/discover\r\n"
+               b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)
+        status, raw = _http_raw(port, req)
+        assert status == 200, (status, raw[:200])
+        payload = json.loads(raw.split(b"\r\n\r\n", 1)[1])
+        assert payload["error"]["code"] == -32020, payload
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_legacy_needs_no_routing_headers():
+    # SAT-1115 (the load-bearing regression guard): a LEGACY POST (no params._meta) carries NO routing
+    # headers and MUST dispatch exactly as today -- enforcement is era-gated off the modern _meta version,
+    # never global. A legacy tools/list with zero routing headers returns its normal result.
+    t, port = _http_transport()
+    try:
+        status, raw, _ = _http_post(port, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        assert status == 200, status
+        got = json.loads(raw)
+        assert "result" in got and got["id"] == 1, got
+        assert "error" not in got, got   # never a -32020: legacy is untouched
+    finally:
+        t.shutdown()
+
+
 # --- E3-S2d conformance manifest + drift guard --------------------------------------------------
 # Maps each transport-agnostic DISPATCH conformance behavior to the stdio test that pins it, the HTTP
 # parity test that proves it survives the HTTP framing, and the MCP 2026-07-28 clause it satisfies.
@@ -5974,6 +6141,10 @@ _S2D_CONFORMANCE = [
      "dual-era: legacy list carries no modern fields (resultType/ttlMs/cacheScope/_meta)"),
     ("falsy-id-is-request", "t_mcp_falsy_id_is_request",
      "t_mcp_http_falsy_id_is_response_not_notification", "JSON-RPC: id present (even 0/'') => a response"),
+    # HTTP-only transport behavior (no stdio analogue): routing headers exist only on the Streamable-HTTP
+    # POST, so stdio_test is None and the drift guard below skips a None slot.
+    ("routing-headers-enforced", None, "t_mcp_http_modern_missing_mcp_method_is_header_mismatch",
+     "changelog #4: Mcp-Method/Mcp-Name required on modern POST; HeaderMismatch -32020 (SAT-1115)"),
 ]
 
 
@@ -5983,11 +6154,13 @@ def t_mcp_s2d_conformance_manifest_covers_http():
     # It does NOT auto-detect a NEW dispatch behavior added without a row -- there is no authoritative
     # behavior registry to diff against, so adding a row for a new behavior stays a manual, reviewed step
     # (adding one here is cheap and is the intended workflow). Curated on purpose (pipeline/aggregate t_mcp_* excluded).
+    # A row may carry stdio_test=None for an HTTP-only transport behavior (e.g. routing headers, which exist
+    # only on the Streamable-HTTP POST); skip a None slot, still require every named test to be callable.
     g = globals()
     missing = [(beh, name) for beh, stdio_t, http_t, _c in _S2D_CONFORMANCE
-               for name in (stdio_t, http_t) if not callable(g.get(name))]
+               for name in (stdio_t, http_t) if name is not None and not callable(g.get(name))]
     assert not missing, "conformance manifest references missing tests: %r" % (missing,)
-    assert len(_S2D_CONFORMANCE) >= 8, "conformance set unexpectedly shrank"
+    assert len(_S2D_CONFORMANCE) >= 9, "conformance set unexpectedly shrank"
 
 
 def t_mcp_http_unsupported_verbs_are_405():
@@ -7269,8 +7442,11 @@ def t_mcp_http_modern_header_requires_modern_body():
         modern = json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list",
                              "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
                                                   "io.modelcontextprotocol/clientCapabilities": {}}}})
-        s_m, _b3, _h3 = _http_post(port, modern, {"MCP-Protocol-Version": "2026-07-28"})   # modern body -> ok
-        assert s_m == 200, s_m
+        # SAT-1115: a modern POST now requires the Mcp-Method routing header; send it (matching) so this line
+        # keeps proving a modern body genuinely DISPATCHES (a real result), not that a -32020 gate rode a 200.
+        s_m, _b3, _h3 = _http_post(port, modern,
+                                   {"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/list"})
+        assert s_m == 200 and "result" in json.loads(_b3), (s_m, _b3[:200])   # modern body -> dispatched ok
     finally:
         t.shutdown()
 
@@ -7396,7 +7572,9 @@ def t_mcp_http_modern_meta_initialize_rejected_no_session():
                            "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
                                                 "io.modelcontextprotocol/clientCapabilities": {}},
                                       "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}})
-        s, b, h = _http_post(port, body, {})                       # NO MCP-Protocol-Version header
+        # SAT-1115: routing-header enforcement now requires Mcp-Method on a modern POST; send it (matching the
+        # method) so this test still exercises the -32601 modern-initialize rejection, not the -32020 gate.
+        s, b, h = _http_post(port, body, {"Mcp-Method": "initialize"})   # NO MCP-Protocol-Version header
         assert s == 200, (s, b[:200])                              # a JSON-RPC error still rides a 200
         assert "mcp-session-id" not in h, h                        # no legacy session for a modern-declared init
         resp = json.loads(b)
