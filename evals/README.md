@@ -207,6 +207,14 @@ python evals/run.py --mode live --reps 5
 python evals/thresholds.py compare --baseline evals/report/live-20260913-195628-10144.json --current evals/report/live-<new>.json
 ```
 
+**Automated monthly run (CI).** `.github/workflows/live-calibration.yml` runs exactly this — the
+`--reps 5` live calibration then `thresholds.py compare` against the committed baseline — on the 1st of
+each month (and on demand via *workflow_dispatch*). It is **opt-in**: it does nothing until the
+`OPENROUTER_API_KEY` repo secret is set (Settings → Secrets and variables → Actions), never runs in
+PR/push CI, and is hard-capped by `--budget-usd 20`. A regression (`compare` non-zero) **fails the job**
+so GitHub notifies; the new report is uploaded as a build artifact (90-day retention) to inspect and, if
+it is a better baseline, commit in its place — update the `BASELINE` path in the workflow when you do.
+
 ## Scoring (`score.py`)
 
 `evals/score.py` grades a list of reviewer findings (a report's `findings` array) against a case's
