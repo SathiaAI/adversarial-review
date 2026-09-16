@@ -183,6 +183,13 @@ runs:
         AR_SCRIPTS: ${{ github.action_path }}/scripts
       run: |
         set -uo pipefail
+        # Validate fail-on up front: an unknown value would otherwise fall through to the
+        # else-branch below and be treated as "blocked" silently, ignoring the operator's
+        # intent. Reject anything but the two documented values with a loud, closed error.
+        case "$IN_FAIL_ON" in
+          fail|blocked) : ;;
+          *) echo "::error::adversarial-review: invalid fail-on '$IN_FAIL_ON' (expected 'blocked' or 'fail')"; exit 1 ;;
+        esac
         # GitHub runs composite steps with bash -e; capture aggregate.py's exit code
         # explicitly (|| code=$?) so a FAIL/BLOCKED verdict maps through fail-on and writes
         # the step summary below, instead of aborting this step at the aggregate call.
