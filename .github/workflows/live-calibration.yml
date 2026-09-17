@@ -1,8 +1,11 @@
 # Monthly live calibration of the reviewer panel (E1-S4/S5 follow-through). Runs the meta-eval
-# against REAL models and compares the result to the committed baseline; a detection/cost
-# regression (thresholds.py compare) fails the job so GitHub notifies. Opt-in via the
-# OPENROUTER_API_KEY repo secret — this workflow never runs in PR/push CI and never spends a cent
-# without that secret. Manual runs (and reps/budget overrides) via workflow_dispatch.
+# against REAL models and compares the result to the committed baseline; a detection-rate or
+# per-model true-positive regression (thresholds.py compare) fails the job so GitHub notifies.
+# Opt-in via the OPENROUTER_API_KEY secret, scoped to the protected `live-calibration`
+# environment so only code on the trusted branch can read it — this workflow never runs in
+# PR/push CI. Spend is bounded per run by --budget-usd (default 20); the cap is checked before
+# each panel, so a run can overshoot by at most one panel's cost. Manual runs (and reps/budget
+# overrides) via workflow_dispatch.
 name: live-calibration
 
 on:
@@ -11,10 +14,10 @@ on:
   workflow_dispatch:
     inputs:
       reps:
-        description: "Panels per case (keep 5 to stay comparable to the committed baseline)"
+        description: "Panels per case (must be 5 to compare against the committed baseline; other values run but skip the comparison)"
         default: "5"
       budget-usd:
-        description: "Hard USD ceiling for the whole run"
+        description: "Per-run USD budget (must be > 0 and <= 20)"
         default: "20"
 
 permissions:
@@ -27,6 +30,9 @@ concurrency:
 jobs:
   calibrate:
     runs-on: ubuntu-latest
+    # Protected environment: restrict its deployment branches to `main` and (optionally) require
+    # approval so a manual dispatch at an attacker-controlled --ref cannot read the API key.
+    environment: live-calibration
     env:
       BASELINE: evals/report/live-20260913-195628-10144.json
     steps:
@@ -43,29 +49,62 @@ jobs:
           KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           if [ -z "$KEY" ]; then
-            echo "::warning::OPENROUTER_API_KEY secret is not set — skipping the live calibration. Add it under Settings → Secrets and variables → Actions to enable the monthly run."
+            echo "::warning::OPENROUTER_API_KEY is not set for the live-calibration environment — skipping. Add it under Settings → Environments → live-calibration to enable the monthly run."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Validate manual inputs (budget ceiling + reps)
+        id: validate
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          REPS: ${{ github.event.inputs.reps || '5' }}
+          BUDGET: ${{ github.event.inputs.budget-usd || '20' }}
+        run: |
+          set -euo pipefail
+          # reps: positive integer.
+          if ! printf '%s' "$REPS" | grep -Eq '^[0-9]+$' || [ "$REPS" -lt 1 ]; then
+            echo "::error::live-calibration: reps must be a positive integer (got '$REPS')."
+            exit 1
+          fi
+          # budget: positive number, and never above the advertised $20 ceiling. 0 is rejected
+          # because evals/run.py treats --budget-usd 0 as "no cap".
+          if ! printf '%s' "$BUDGET" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
+            echo "::error::live-calibration: budget-usd must be a positive number (got '$BUDGET')."
+            exit 1
+          fi
+          if ! awk "BEGIN{ exit !($BUDGET > 0 && $BUDGET <= 20) }"; then
+            echo "::error::live-calibration: budget-usd must be > 0 and <= 20 (got '$BUDGET')."
+            exit 1
+          fi
+          echo "reps=$REPS" >> "$GITHUB_OUTPUT"
+          echo "budget=$BUDGET" >> "$GITHUB_OUTPUT"
 
       - name: Run live calibration (real models, budget-capped)
         id: run
         if: steps.guard.outputs.skip != 'true'
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          REPS: ${{ github.event.inputs.reps || '5' }}
-          BUDGET: ${{ github.event.inputs.budget-usd || '20' }}
+          REPS: ${{ steps.validate.outputs.reps }}
+          BUDGET: ${{ steps.validate.outputs.budget }}
         run: |
           set -euo pipefail
           python evals/run.py --mode live --reps "$REPS" --budget-usd "$BUDGET" --out evals/report
           # run.py writes evals/report/live-<stamp>.json — the newest live-*.json is this run's report.
           report="$(ls -t evals/report/live-*.json | head -1)"
+          summary="${report%.json}.summary.md"
           echo "report=$report" >> "$GITHUB_OUTPUT"
+          echo "summary=$summary" >> "$GITHUB_OUTPUT"
+          echo "reps=$REPS" >> "$GITHUB_OUTPUT"
           echo "Calibration report: $report"
 
       - name: Compare to the committed baseline (fails on regression → notifies)
-        if: steps.guard.outputs.skip != 'true'
+        # Only compare when reps == 5. thresholds.py compares RAW per-model true-positive counts,
+        # not rates, so a run with fewer reps would look like a regression against the 5-rep
+        # baseline. Non-5 runs still produce a report + artifact; they just skip the gate.
+        if: ${{ steps.guard.outputs.skip != 'true' && steps.run.outputs.reps == '5' }}
         env:
           REPORT: ${{ steps.run.outputs.report }}
+          SUMMARY: ${{ steps.run.outputs.summary }}
         run: |
           set -uo pipefail
           {
@@ -73,23 +112,32 @@ jobs:
             echo
             echo "- Baseline: \`$BASELINE\`"
             echo "- New report: \`$REPORT\`"
-            summary="${REPORT%.json}.summary.md"
-            if [ -f "$summary" ]; then echo; cat "$summary"; fi
+            if [ -f "$SUMMARY" ]; then echo; cat "$SUMMARY"; fi
           } >> "$GITHUB_STEP_SUMMARY"
           code=0
           python evals/thresholds.py compare --baseline "$BASELINE" --current "$REPORT" || code=$?
           if [ "$code" -ne 0 ]; then
-            echo "::error::live-calibration: thresholds.py compare flagged a regression or degraded model (exit $code) — see the run summary. Investigate before adopting this as the new baseline."
+            echo "::error::live-calibration: thresholds.py compare flagged a detection-rate or per-model true-positive regression (exit $code) — see the run summary. Investigate before adopting this as the new baseline."
             exit "$code"
           fi
           echo "::notice::live-calibration: no regression against the committed baseline."
 
+      - name: Note skipped comparison (non-baseline reps)
+        if: ${{ steps.guard.outputs.skip != 'true' && steps.run.outputs.reps != '5' }}
+        env:
+          REPS: ${{ steps.run.outputs.reps }}
+        run: |
+          echo "::notice::live-calibration: ran with reps=$REPS (≠ 5) — skipped the baseline comparison because per-model counts are not comparable to the 5-rep baseline. Report uploaded for manual inspection."
+
       - name: Upload the calibration report (even on a regression)
-        if: ${{ !cancelled() && steps.guard.outputs.skip != 'true' }}
+        # Gate on the run step having emitted a report path, and upload exactly that run's files —
+        # never glob, which would sweep in the stale baselines already committed in the checkout.
+        if: ${{ !cancelled() && steps.guard.outputs.skip != 'true' && steps.run.outputs.report != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: live-calibration-report
           path: |
-            evals/report/live-*.json
-            evals/report/live-*.summary.md
+            ${{ steps.run.outputs.report }}
+            ${{ steps.run.outputs.summary }}
+          if-no-files-found: error
           retention-days: 90
