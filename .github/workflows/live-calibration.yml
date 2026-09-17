@@ -129,7 +129,7 @@ jobs:
           code=0
           python evals/thresholds.py compare --baseline "$BASELINE" --current "$REPORT" || code=$?
           if [ "$code" -eq 1 ]; then
-            echo "::error::live-calibration: thresholds.py compare flagged a detection-rate or per-model true-positive regression (exit 1) — see the run summary. Investigate before adopting this as the new baseline."
+            echo "::error::live-calibration: thresholds.py compare flagged a regression (exit 1) — a detection-rate drop, a per-model true-positive drop, or an incomplete current report — see the run summary. Investigate before adopting this as the new baseline."
             exit 1
           elif [ "$code" -ne 0 ]; then
             echo "::error::live-calibration: thresholds.py compare could not complete — a report integrity/comparison error (exit $code), NOT a detection regression. The committed baseline or this run's report may be corrupted, edited, or tamper-flagged (sha256 digest mismatch); verify both files before re-running."
