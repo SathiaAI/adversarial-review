@@ -32,7 +32,9 @@ from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import family_of, meta_cost, now_iso, read_json, resolve_run, write_json
+from _common import (family_of, load_policy, meta_cost, now_iso, read_json, resolve_run,
+                     resolve_waiver_clock, validate_not_applicable_gate, validate_waived_gate,
+                     write_json)
 
 HIGH = ("critical", "high")
 
@@ -46,9 +48,19 @@ def load_reports(run, plan):
     return reports
 
 
-def check_gates(run, tier, fail, blocked, notes):
+def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, None)):
     """Returns (results, gates_coverage). Coverage is derived from the same records
-    the verdict uses — an unrecorded fact stays invisible in both."""
+    the verdict uses — an unrecorded fact stays invisible in both.
+
+    A waived gate stays a member of `required` (it is never dropped from the set this
+    checks) and is represented as its own gates/<name>.json record with status WAIVED,
+    exactly like a NOT_APPLICABLE record — so both are independently re-validated here
+    from what is actually on disk (expiry, cap, authorizer, reason, CRITICAL rules),
+    never trusted just because gate.py's own plan-time checks passed. `pol_data` is the
+    loaded repo policy's data mapping (or {} when there is none); `clock` is the
+    (clock_date, error) pair from resolve_waiver_clock, resolved once by the caller."""
+    pol_data = pol_data or {}
+    clock_date, clock_err = clock
     gcov = {"plan_recorded": False, "required": [], "recorded": [], "passed": [],
             "failed": [], "blocked": [], "not_applicable": [], "missing": [],
             "waived": []}
@@ -59,12 +71,6 @@ def check_gates(run, tier, fail, blocked, notes):
     gplan = read_json(req_path)
     gcov["plan_recorded"] = True
     gcov["required"] = list(gplan.get("required", []))
-    for w in gplan.get("waived", []):
-        gcov["waived"].append({"name": w.get("name"), "authorized_by": w.get("authorized_by")})
-        if not w.get("authorized_by"):
-            blocked.append(f"gate '{w['name']}' waived without an authorizer")
-        else:
-            notes.append(f"gate '{w['name']}' waived by {w['authorized_by']}")
     results = {}
     for name in gplan.get("required", []):
         p = run / "gates" / f"{name}.json"
@@ -78,29 +84,44 @@ def check_gates(run, tier, fail, blocked, notes):
         # Tri-state: BLOCKED means the check could not be run/verified — unknown, not
         # pass and not fail. Absent status falls back to the exit code (older records).
         status = rec.get("status")
-        if status == "BLOCKED":
+        if status == "WAIVED":
+            # A waiver's expiry can only be judged against a trustworthy clock — if the
+            # CI-provided clock itself could not be parsed, no waiver can be honestly
+            # evaluated, so every waived gate is BLOCKED rather than silently guessing
+            # 'today' (fail closed; see resolve_waiver_clock).
+            err = (f"cannot verify waiver expiry: {clock_err}" if clock_date is None
+                   else validate_waived_gate(name, tier, rec, pol_data, clock_date))
+            if err:
+                gcov["blocked"].append({"name": name, "reason": err})
+                blocked.append(f"gate '{name}': {err}")
+            else:
+                who = rec.get("authorized_by").strip()
+                reason = rec.get("reason").strip()
+                expires = rec.get("expires")
+                gcov["waived"].append({"name": name, "authorized_by": who, "reason": reason,
+                                       "expires": expires, "tier": tier})
+                notes.append(f"gate '{name}' waived by {who} until {expires}: {reason}")
+        elif status == "BLOCKED":
             reason = rec.get("summary", "could not verify")
             gcov["blocked"].append({"name": name, "reason": reason})
             blocked.append(f"gate '{name}' blocked: {reason}")
         elif status == "NOT_APPLICABLE":
             # A gate that genuinely does not apply to this stack does NOT restrict the
-            # verdict — but it is an accountable, on-record determination, so an N/A
-            # without a named authorizer and a reason is itself a BLOCK (unaccountable
-            # skips are exactly what this pipeline exists to prevent).
-            # Guard against non-string values (JSON null, numbers, objects): a
-            # `null` authorizer must read as absent, not as the string "None". Only a
-            # non-empty *string* counts as accountable.
-            who = rec.get("authorized_by")
-            reason = rec.get("summary")
-            who = who.strip() if isinstance(who, str) else ""
-            reason = reason.strip() if isinstance(reason, str) else ""
-            if not who or not reason:
-                gcov["blocked"].append(
-                    {"name": name, "reason": "NOT_APPLICABLE without an authorizer and reason"})
-                blocked.append(f"gate '{name}' marked NOT_APPLICABLE without a named "
-                               "authorizer and reason — an inapplicable gate must still "
-                               "be accountable")
+            # verdict — but it is an accountable, on-record determination, so an invalid
+            # N/A record (missing authorizer/reason, or one of the CRITICAL restrictions)
+            # is itself a BLOCK (unaccountable skips are exactly what this pipeline exists
+            # to prevent).
+            err = validate_not_applicable_gate(name, tier, rec, pol_data)
+            if err:
+                gcov["blocked"].append({"name": name, "reason": err})
+                blocked.append(f"gate '{name}': {err}")
             else:
+                # Guard against non-string values (JSON null, numbers, objects): a `null`
+                # authorizer must read as absent, not as the string "None" — already
+                # enforced by validate_not_applicable_gate, re-derived here only to build
+                # the coverage entry from the same (now known-good) strings.
+                who = rec.get("authorized_by").strip()
+                reason = rec.get("summary").strip()
                 gcov["not_applicable"].append(
                     {"name": name, "authorized_by": who, "reason": reason})
                 notes.append(f"gate '{name}' not applicable (authorized by {who}): {reason}")
@@ -1202,7 +1223,16 @@ def _aggregate_cli():
         counts = {"gates": 0, "reviewers": 0, "findings_high_critical": 0,
                   "findings_medium_low": 0, "confirmed": 0, "unresolved": 0}
 
-        gates, gcov = check_gates(run, meta["risk"], fail, blocked, notes)
+        pol = load_policy()  # malformed policy dies here too — never silently ignored
+        pol_data = pol["data"] if pol is not None else {}
+        # Resolved once per aggregate run: GITHUB_RUN_STARTED_AT's date if set (else today
+        # UTC). A set-but-unparseable value is fail-closed — every waiver is BLOCKED rather
+        # than silently falling back to today (see check_gates/resolve_waiver_clock).
+        clock = resolve_waiver_clock()
+        if clock[1]:
+            blocked.append(clock[1])
+
+        gates, gcov = check_gates(run, meta["risk"], fail, blocked, notes, pol_data, clock)
         counts["gates"] = len(gates)
 
         plan_path = run / "panel" / "plan.json"
@@ -1283,6 +1313,10 @@ def _aggregate_cli():
         # skipped gate must never be silent, even when it does not restrict the verdict.
         md += [f"- not applicable: gate '{na['name']}' (authorized by "
                f"{na['authorized_by']}): {na['reason']}" for na in gcov["not_applicable"]]
+        # Surface every active waiver and its authorizer/expiry distinctly too — a waived
+        # gate must never be silent, even though (like N/A) it does not restrict the verdict.
+        md += [f"- waived: gate '{w['name']}' (authorized by {w['authorized_by']}, "
+               f"expires {w['expires']}): {w['reason']}" for w in gcov["waived"]]
         md += ["", f"Attestation: sha256 {attestation['digest']} over "
                f"{attestation['inputs']} recorded artifacts "
                "(verify with `aggregate.py --check-digest`)"]

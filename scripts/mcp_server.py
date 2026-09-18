@@ -564,6 +564,20 @@ def h_gate_plan(args):
             raise ToolError(f"invalid waive gate name {w!r}")
         argv += ["--waive", w]
     auth = _opt_authorizer(args)
+    if waive:
+        # A waiver is never produced half-formed here: reason, expiry, and an authorizer
+        # are all required up front, so this tool can never hand gate.py a request that
+        # would only be caught later at aggregate time.
+        reason = args.get("waive_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ToolError("waiving a gate requires waive_reason (a real justification, "
+                            "at least 16 characters, not a placeholder)")
+        expires = args.get("waive_expires")
+        if not isinstance(expires, str) or not expires.strip():
+            raise ToolError("waiving a gate requires waive_expires 'YYYY-MM-DD'")
+        if not auth:
+            raise ToolError("waiving a gate requires authorized_by")
+        argv += ["--waive-reason", reason, "--waive-expires", expires]
     if auth:
         argv += ["--authorized-by", auth]
     return _cli_result("gate", argv)
@@ -1259,7 +1273,21 @@ TOOLS = [
         "require": {"type": "array", "items": {"type": "string"},
                     "description": "Explicit gate names to require, overriding the tier default."},
         "waive": {"type": "array", "items": {"type": "string"},
-                  "description": "Gate names to drop from the required set (each needs authorized_by)."},
+                  "description": "Gate names to waive. The gate stays required — a waiver is "
+                                 "recorded as its own accountable, time-boxed exception "
+                                 "(status WAIVED) and independently re-validated at aggregate "
+                                 "time (expiry, cap, authorizer, reason). Each entry needs "
+                                 "waive_reason, waive_expires, and authorized_by; mutation can "
+                                 "never be waived on CRITICAL tier."},
+        "waive_reason": {"type": "string",
+                         "description": "Required when waiving: a real justification for the "
+                                        "waiver, at least 16 characters and not a placeholder "
+                                        "like 'tbd' or 'n/a'."},
+        "waive_expires": {"type": "string",
+                          "description": "Required when waiving: expiry date 'YYYY-MM-DD', "
+                                         "strictly after the aggregate run's clock date and "
+                                         "within the policy's max_waiver_days cap (default 14) "
+                                         "of when it was planned."},
         "authorized_by": {"type": "string", "description": "Named authorizer, required when waiving a gate."}},
        [], _WRITE_LOCAL, h_gate_plan),
 

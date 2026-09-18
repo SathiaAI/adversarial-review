@@ -100,9 +100,9 @@ this file.
 
 ```json
 {"gate": "unit", "command": "npm test", "exit_code": 0,
- "status": "PASS|FAIL|BLOCKED|NOT_APPLICABLE",
+ "status": "PASS|FAIL|BLOCKED|NOT_APPLICABLE|WAIVED",
  "summary": "312 passed", "output_tail": "...", "recorded_at": "ISO-8601",
- "source": "run|record", "authorized_by": "name (NOT_APPLICABLE only)"}
+ "source": "run|record|plan", "authorized_by": "name (NOT_APPLICABLE/WAIVED only)"}
 ```
 
 `status` BLOCKED marks required coverage that could not be run or verified (`exit_code`
@@ -113,6 +113,24 @@ aggregator requires a named `authorized_by` and a non-empty `summary`, and an N/
 missing either is itself BLOCKED. Every N/A gate is listed distinctly (with its
 authorizer) in `verdict.json` coverage (`gates.not_applicable`) and in `verdict.md`, so a
 skipped gate is never silent. Absent `status` falls back to the exit code.
+
+`status` WAIVED (written by `gate.py plan --waive`, `source: "plan"`) is the third
+accountable, non-restricting exception: `{"gate": "mutation", "status": "WAIVED",
+"authorized_by": "name", "reason": "why (>=16 chars, not a placeholder)",
+"expires": "YYYY-MM-DD", "tier": "SENSITIVE", "planned_at": "ISO-8601",
+"source": "plan"}`. Unlike the pre-M1 waiver, the waived gate is **never removed from
+`required`** — this record is what the aggregator checks for it, and it is
+**independently re-validated at every aggregate run** (never trusted just because
+`gate.py plan` wrote it): `authorized_by` and `reason` as for NOT_APPLICABLE; `expires`
+must be a strict `YYYY-MM-DD` strictly after the run's clock date (today UTC, or the date
+part of `GITHUB_RUN_STARTED_AT` when set — a set-but-unparseable value BLOCKS the run
+rather than guessing); and `expires` must be no more than policy `max_waiver_days`
+(default 14) after `planned_at`. On CRITICAL tier, waiving (or marking NOT_APPLICABLE)
+any gate is refused unless policy sets `allow_critical_waivers: true`; `mutation` on
+CRITICAL is refused regardless of that setting — it stays BLOCKED until real CRITICAL
+mutation coverage ships (M4). Every waived gate is listed distinctly (with its
+authorizer, reason, and expiry) in `verdict.json` coverage (`gates.waived`) and in
+`verdict.md`.
 
 ## Validation record — `validation/<slug>.json` (one per deduped issue)
 
@@ -165,7 +183,8 @@ human-readable `verdict.md` is written alongside `verdict.json`.
  "coverage": {"risk": "TIER",
    "gates": {"plan_recorded": true, "required": [], "recorded": [], "passed": [],
              "failed": [], "blocked": [{"name": "", "reason": ""}], "missing": [],
-             "waived": [{"name": "", "authorized_by": ""}]},
+             "waived": [{"name": "", "authorized_by": "", "reason": "",
+                         "expires": "YYYY-MM-DD", "tier": ""}]},
    "panel": {"roles_required": [], "roles_filled": [], "substitutions": 0,
              "degraded": null, "dev_families_excluded": []},
    "rebuttal": {"policy": "contention", "required": false, "ran": false},

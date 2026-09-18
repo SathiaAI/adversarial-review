@@ -4,7 +4,7 @@ import json
 import math
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 RUN_ROOT = Path(os.environ.get("AR_RUN_DIR", ".adversarial-review"))
@@ -80,7 +80,8 @@ def family_of(slug):
 
 POLICY_BASENAMES = (".adversarial-review.yml", ".adversarial-review.json")
 POLICY_KEYS = ("risk", "dev_providers", "rebuttal_policy", "required_gates", "pins",
-               "mutation", "max_cost_usd", "high_samples")
+               "mutation", "max_cost_usd", "high_samples",
+               "allow_critical_waivers", "max_waiver_days")
 VALID_RISKS = ("NORMAL", "SENSITIVE", "CRITICAL")
 VALID_REBUTTAL = ("critical", "contention", "any")
 MAX_HIGH_SAMPLES = 25  # practical upper bound on corroboration samples (E4-S3): bounds the
@@ -304,6 +305,148 @@ def _validate_mutation(v, name):
                 die(f"{name}: mutation.{k} must be a list of non-empty path/glob strings")
 
 
+def _policy_bool(v):
+    """A policy boolean: a real bool (JSON), or the literal string 'true'/'false' (the YAML
+    subset never coerces scalars). Anything else is not a usable boolean here."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+        return v.strip().lower() == "true"
+    return None
+
+
+# --------------------------------------------------------------- gate waivers (M1)
+# A waiver is a time-boxed, accountable exception, never a permanent hole: it must name an
+# authorizer, give a real reason, and expire — and it is independently re-validated from the
+# gates/<name>.json record itself at aggregate time, never trusted just because gate.py wrote
+# it (a hand-edited/tampered record is caught exactly like a fresh one). See references/gates.md.
+WAIVER_REASON_PLACEHOLDERS = {"tbd", "n/a", "na", "temp", "fixme", "todo", "none", ""}
+WAIVER_REASON_MIN_LEN = 16
+DEFAULT_MAX_WAIVER_DAYS = 14
+
+
+def validate_waiver_reason(reason):
+    """Return an error string, or None when `reason` is an acceptable justification: a
+    non-empty string, long enough to be a real explanation, and not a placeholder."""
+    if not isinstance(reason, str):
+        return "reason must be a string"
+    r = reason.strip()
+    if not r:
+        return "reason is required"
+    if r.lower() in WAIVER_REASON_PLACEHOLDERS:
+        return f"reason {r!r} is a placeholder, not a real justification"
+    if len(r) < WAIVER_REASON_MIN_LEN:
+        return f"reason must be at least {WAIVER_REASON_MIN_LEN} characters, got {len(r)}"
+    return None
+
+
+def parse_waiver_expiry(expires):
+    """Strict YYYY-MM-DD only (no datetimes, no other separators) — returns a `date`, or
+    None when `expires` is missing, malformed, or not that exact shape."""
+    if not isinstance(expires, str):
+        return None
+    s = expires.strip()
+    if len(s) != 10 or s[4] != "-" or s[7] != "-":
+        return None
+    y, m, d = s[0:4], s[5:7], s[8:10]
+    if not (y.isdigit() and m.isdigit() and d.isdigit()):
+        return None
+    try:
+        return date(int(y), int(m), int(d))
+    except ValueError:
+        return None
+
+
+def _date_from_iso(value):
+    """The date part of an ISO-8601 datetime (or bare date) string, or None if `value`
+    is not a string or is not parseable."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    s = value.strip()
+    if s[-1:] in ("Z", "z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s).date()
+    except ValueError:
+        return None
+
+
+def resolve_waiver_clock():
+    """The 'now' date waiver expiries are compared against: the date part of
+    GITHUB_RUN_STARTED_AT when that env var is set, else today in UTC. Returns
+    (clock_date, error). When the env var is set but cannot be parsed, returns
+    (None, <message>) — fail closed: callers must BLOCK rather than fall back to
+    today, since silently guessing the clock would defeat the whole expiry check."""
+    raw = os.environ.get("GITHUB_RUN_STARTED_AT", "")
+    if not raw.strip():
+        return datetime.now(timezone.utc).date(), None
+    d = _date_from_iso(raw)
+    if d is None:
+        return None, (f"GITHUB_RUN_STARTED_AT={raw!r} could not be parsed as a date/time — "
+                       "the run is BLOCKED rather than guessing the current date")
+    return d, None
+
+
+def _validate_gate_exception_common(kind, gate_name, tier, authorized_by, reason, pol_data):
+    """Checks shared by a WAIVED and a NOT_APPLICABLE gate record: the CRITICAL-tier
+    restrictions, a named authorizer, and a real reason. `kind` is 'WAIVED' or
+    'NOT_APPLICABLE', used only for messages. Returns an error string, or None."""
+    # Mutation on CRITICAL can NEVER be waived or marked not-applicable, regardless of policy:
+    # CRITICAL mutation coverage stays BLOCKED by design until the mutation-runner milestone
+    # (M4) implements it for real — a green verdict must never be reachable by waiving/N-A'ing
+    # the one gate meant to catch that gap.
+    if tier == "CRITICAL" and gate_name == "mutation":
+        return ("mutation cannot be waived or marked NOT_APPLICABLE on CRITICAL tier — "
+                "CRITICAL mutation coverage stays BLOCKED by design until the mutation-runner "
+                "milestone (M4); run and record the real gate instead")
+    if tier == "CRITICAL" and not (_policy_bool(pol_data.get("allow_critical_waivers")) or False):
+        return (f"{kind} of a CRITICAL-tier gate requires policy allow_critical_waivers: true "
+                "(default false) — CRITICAL waivers/NOT_APPLICABLE are disabled by default")
+    who = authorized_by.strip() if isinstance(authorized_by, str) else ""
+    if not who:
+        return f"{kind} without a named authorizer"
+    err = validate_waiver_reason(reason)
+    if err:
+        return f"{kind} with an invalid reason: {err}"
+    return None
+
+
+def validate_waived_gate(gate_name, tier, rec, pol_data, clock_date):
+    """Independently re-validate a gates/<name>.json record with status WAIVED (never
+    trusting that gate.py's own plan-time checks ran, or ran correctly): named authorizer,
+    real reason, CRITICAL restrictions, a strict future YYYY-MM-DD expiry, and the
+    max_waiver_days cap measured from the record's own planned_at. `tier` is the run's
+    ACTUAL current tier (never the record's own claim), and `clock_date` is the resolved
+    'now' from resolve_waiver_clock (the caller must already have handled its error case).
+    Returns an error string, or None when the waiver is valid."""
+    err = _validate_gate_exception_common("WAIVED", gate_name, tier,
+                                          rec.get("authorized_by"), rec.get("reason"), pol_data)
+    if err:
+        return err
+    expires = parse_waiver_expiry(rec.get("expires"))
+    if expires is None:
+        return f"expires {rec.get('expires')!r} is missing or not a valid YYYY-MM-DD date"
+    if not (expires > clock_date):
+        return f"waiver expired {expires.isoformat()} (as of {clock_date.isoformat()})"
+    planned_ref = _date_from_iso(rec.get("planned_at"))
+    if planned_ref is None:
+        return "waiver record is missing a valid planned_at date — cannot verify the waiver-lifetime cap"
+    n = _policy_number(pol_data.get("max_waiver_days"))
+    max_days = int(n) if n is not None and n >= 1 else DEFAULT_MAX_WAIVER_DAYS
+    if expires > planned_ref + timedelta(days=max_days):
+        return (f"waiver expires {expires.isoformat()}, more than {max_days} days after it was "
+                f"planned ({planned_ref.isoformat()}) — waivers are capped at {max_days} days")
+    return None
+
+
+def validate_not_applicable_gate(gate_name, tier, rec, pol_data):
+    """Independently re-validate a gates/<name>.json record with status NOT_APPLICABLE:
+    named authorizer, real reason, and the CRITICAL restrictions. Returns an error string,
+    or None when the record is valid."""
+    return _validate_gate_exception_common("NOT_APPLICABLE", gate_name, tier,
+                                           rec.get("authorized_by"), rec.get("summary"), pol_data)
+
+
 def _validate_policy(data, name):
     if not isinstance(data, dict):
         die(f"{name}: top level must be a mapping of settings")
@@ -342,6 +485,15 @@ def _validate_policy(data, name):
                     f"got {slug!r}")
     if "mutation" in data:
         _validate_mutation(data["mutation"], name)
+    if "allow_critical_waivers" in data:
+        if _policy_bool(data["allow_critical_waivers"]) is None:
+            die(f"{name}: allow_critical_waivers must be true or false, got "
+                f"{data['allow_critical_waivers']!r}")
+    if "max_waiver_days" in data:
+        v = data["max_waiver_days"]
+        n = _policy_number(v)
+        if n is None or n < 1 or n >= 2 ** 53 or n != int(n):
+            die(f"{name}: max_waiver_days must be a positive integer, got {v!r}")
     if "max_cost_usd" in data:
         v = data["max_cost_usd"]
         # A documented disable token, or a finite non-negative number. Reject at load so a bare
