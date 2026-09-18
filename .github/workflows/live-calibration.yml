@@ -61,14 +61,19 @@ jobs:
           BUDGET: ${{ github.event.inputs.budget-usd || '20' }}
         run: |
           set -euo pipefail
+          # These inputs are attacker-controlled on a manual dispatch, so validate with shell
+          # pattern matches that admit ONLY the expected characters. A `case` glob matches the
+          # whole value (not line-by-line like grep), so any newline or stray character is
+          # rejected — nothing here is ever interpolated into awk/shell as code.
+          #
           # reps: a canonical positive integer, capped at 10. The cap matters because run_live
           # keeps iterating after the budget is spent (one not_run entry per remaining rep), so a
-          # huge value would burn the runner's CPU/memory before any report is written. The length
-          # guard rejects >2-digit inputs before arithmetic so an enormous value can't overflow it.
-          if ! printf '%s' "$REPS" | grep -Eq '^[0-9]+$'; then
-            echo "::error::live-calibration: reps must be a positive integer (got '$REPS')."
-            exit 1
-          fi
+          # huge value would burn the runner's CPU/memory before any report is written.
+          case "$REPS" in
+            ""|*[!0-9]*)
+              echo "::error::live-calibration: reps must be a positive integer (got '$REPS')."
+              exit 1 ;;
+          esac
           if [ "${#REPS}" -gt 2 ]; then
             echo "::error::live-calibration: reps must be between 1 and 10 (got '$REPS'); the baseline is 5."
             exit 1
@@ -78,13 +83,16 @@ jobs:
             echo "::error::live-calibration: reps must be between 1 and 10 (got '$REPS'); the baseline is 5."
             exit 1
           fi
-          # budget: positive number, and never above the advertised $20 ceiling. 0 is rejected
-          # because evals/run.py treats --budget-usd 0 as "no cap".
-          if ! printf '%s' "$BUDGET" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
-            echo "::error::live-calibration: budget-usd must be a positive number (got '$BUDGET')."
-            exit 1
-          fi
-          if ! awk "BEGIN{ exit !($BUDGET > 0 && $BUDGET <= 20) }"; then
+          # budget: a single-line positive number, never above the advertised $20 ceiling. The
+          # case guard admits only digits and at most one dot (so a newline, letter, or awk
+          # snippet is rejected outright); the value is then passed to awk as DATA via -v, never
+          # spliced into the program. 0 is rejected because evals/run.py treats 0 as "no cap".
+          case "$BUDGET" in
+            ""|*[!0-9.]*|*.*.*|.)
+              echo "::error::live-calibration: budget-usd must be a positive number like 20 or 12.5 (got '$BUDGET')."
+              exit 1 ;;
+          esac
+          if ! awk -v b="$BUDGET" 'BEGIN{ exit !(b+0 > 0 && b+0 <= 20) }'; then
             echo "::error::live-calibration: budget-usd must be > 0 and <= 20 (got '$BUDGET')."
             exit 1
           fi
