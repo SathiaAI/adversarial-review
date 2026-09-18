@@ -27,7 +27,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - uses: SathiaAI/adversarial-review@main
+      - uses: SathiaAI/adversarial-review@v0   # moving major (auto patch/minor); or pin @v0.2.0 / a full SHA for an immutable ref
         with:
           # risk / dev-providers may come from .adversarial-review.yml instead.
           # gates: newline-separated name=command; each runs through gate.py.
