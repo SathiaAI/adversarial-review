@@ -15,7 +15,6 @@ Stdlib only. Exit codes: 0 ok, 1 error, 2 BLOCKED.
 """
 import argparse
 import difflib
-import hashlib
 import json
 import math
 import os
@@ -644,17 +643,16 @@ def call_reviewer(base, key, body, schema, corrective=None, prior_usage=None):
     return obj, content, usage, provider
 
 
-def failed_meta_name(role, model, attempt):
-    """Filename for a billed-but-failed reviewer attempt's meta record. A custom OpenAI-compatible
-    catalog can return very long model IDs; embedding the whole sanitized slug can exceed the
-    filesystem's per-component limit (commonly 255 bytes) and turn a recoverable reviewer failure
-    into an OSError crash in run_one_role. Keep a readable prefix and, when the slug is long, append
-    a short digest of the FULL model ID so two distinct long IDs sharing a prefix never collide."""
-    slug = re.sub(r"[^A-Za-z0-9._-]", "_", str(model))
-    if len(slug) > 80:
-        digest = hashlib.sha1(str(model).encode("utf-8")).hexdigest()[:12]
-        slug = slug[:64] + "." + digest
-    return f"{role}.failed.{slug}.{attempt}.json"
+def failed_meta_name(role, model, attempt, boundary):
+    """Filename for a billed-but-failed reviewer attempt's meta record. Uniqueness comes from
+    ``boundary`` — the per-invocation nonce run_one_role already generates — so a distinct substitute
+    model (each substitute runs in its own run_one_role call), a retry, or a resumed invocation each
+    write a DISTINCT file; panel_cost() then never loses a billed failure to an overwrite, and two
+    model IDs that sanitize to the same slug (e.g. ``vendor/a/b`` and ``vendor/a_b``) can't collide.
+    The model slug is kept only for readability and truncated so a very long custom model ID can't
+    exceed the filesystem's per-component limit (commonly 255 bytes)."""
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", str(model))[:80]
+    return f"{role}.failed.{slug}.{boundary}.{attempt}.json"
 
 
 def run_one_role(run, meta, plan, role, context_text, base, key):
@@ -686,11 +684,13 @@ def run_one_role(run, meta, plan, role, context_text, base, key):
             # accrued before the failure to the exception). Persist it as a status=failed meta so
             # panel_cost() counts spend that produced no report — without this the per-substitute
             # cost gate under-counts and a run could exceed AR_MAX_COST_USD across the primary +
-            # substitution attempts. Distinct filename per (model, attempt) so a later success meta
-            # never overwrites it. Mirrors the corroboration-sample failure record (CodeRabbit #66).
+            # substitution attempts. failed_meta_name() keys the filename on this invocation's
+            # boundary nonce, so a substitute, a retry, or a resume writes a distinct record instead
+            # of overwriting an earlier billed failure. Mirrors the corroboration-sample failure
+            # record (CodeRabbit #66).
             failed_usage = getattr(e, "usage", None)
             if failed_usage:
-                write_json(run / "panel" / "meta" / failed_meta_name(role, info["model"], attempt), {
+                write_json(run / "panel" / "meta" / failed_meta_name(role, info["model"], attempt, boundary), {
                     "model": info["model"], "family": info["family"], "status": "failed",
                     "usage": failed_usage, "cost": failed_usage.get("cost"),
                     "attempt": attempt, "completed_at": now_iso()})
@@ -944,9 +944,10 @@ def cmd_run(args):
         # empty completion, the role failed even though other independent families were still
         # available -- BLOCKing an otherwise-passing panel. Try substitutes across the eligible pool --
         # priority families first, then any remaining eligible family, deterministically, up to
-        # MAX_SUBSTITUTIONS candidates -- stopping at the first that produces a report. Family
-        # independence and dev-family
-        # exclusion are re-checked every step, so this never weakens panel independence.
+        # MAX_SUBSTITUTIONS candidates -- stopping at the first that produces a report. The excluded
+        # set (every role's initially assigned family) and the dev-family exclusion are both applied
+        # on every candidate, so a substitute is always an independent, non-dev family and this never
+        # weakens panel independence.
         catalog = load_catalog(args.catalog_file)
         dev = set(plan["dev_families_excluded"])
         by_family = {}
@@ -955,10 +956,15 @@ def cmd_run(args):
         rest = sorted(f for f in by_family if f not in ROLE_FAMILY_PRIORITY[role])
         substituted = False
         tried = 0
+        # Freeze the excluded families to the INITIAL assignment (every role's family, including
+        # this role's own original/pinned family). Recomputing this inside the loop would drop the
+        # role's original family the moment a substitute overwrites plan["roles"][role], so a later
+        # candidate — e.g. a pinned family sitting mid-priority — could re-select the family that
+        # already failed as primary and burn a substitution attempt on it (CodeRabbit #66).
+        used = {v["family"] for v in plan["roles"].values()}
         for fam in list(ROLE_FAMILY_PRIORITY[role]) + rest:
             if tried >= MAX_SUBSTITUTIONS:
                 break
-            used = {v["family"] for v in plan["roles"].values()}
             if fam in used or fam in dev or fam not in by_family:
                 continue
             # Re-check the cost ceiling before every paid substitute, exactly as the primary path

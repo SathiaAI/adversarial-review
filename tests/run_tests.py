@@ -5529,21 +5529,28 @@ def t_call_reviewer_preserves_usage_when_corrective_retry_errors():
 
 
 def t_failed_meta_filename_is_bounded():
-    # E4-S2 (Codex #66 r2): a custom OpenAI-compatible catalog can return a very long model ID; the
-    # billed-failure meta filename must stay within the filesystem per-component limit (255) so a
-    # recoverable reviewer failure never becomes an OSError crash in run_one_role. Two distinct long
-    # IDs sharing a prefix must still map to distinct filenames (digest of the FULL ID).
+    # E4-S2 (Codex #66 r2 + CodeRabbit r3): the billed-failure meta filename must (1) stay within the
+    # filesystem per-component limit (255) so a very long custom model ID never crashes run_one_role
+    # with OSError, and (2) be UNIQUE per attempt so panel_cost() never loses a billed failure to an
+    # overwrite. Uniqueness is keyed on the per-invocation boundary nonce: a substitute (its own
+    # run_one_role call), a retry, or a resumed invocation each get a distinct file, and two model IDs
+    # that sanitize to the same slug (vendor/a/b vs vendor/a_b) cannot collide within one invocation.
     import panel
-    long_a = "vendor/" + ("m" * 260)
-    long_b = "vendor/" + ("m" * 258) + "zz"          # identical first 64 chars as long_a
-    na = panel.failed_meta_name("security", long_a, 1)
-    nb = panel.failed_meta_name("security", long_b, 1)
-    assert len(na) <= 255 and len(nb) <= 255, (len(na), len(nb))
-    assert na.startswith("security.failed.") and na.endswith(".1.json"), na
-    assert na != nb, "distinct long model IDs sharing a prefix must not collide"
-    # a normal short model ID keeps its readable slug unchanged (no digest suffix)
-    assert panel.failed_meta_name("security", "openai/gpt-5.6-sol", 2) \
-        == "security.failed.openai_gpt-5.6-sol.2.json"
+    b = "abcd1234abcd1234"
+    long_id = "vendor/" + ("m" * 260)
+    n = panel.failed_meta_name("security", long_id, 1, b)
+    assert len(n) <= 255, len(n)
+    assert n.startswith("security.failed.") and n.endswith(".1.json"), n
+    assert b in n, "the per-invocation boundary must be in the filename so distinct calls don't collide"
+    # a different invocation (boundary) yields a distinct file even for the same model + attempt
+    assert panel.failed_meta_name("security", long_id, 1, "0000ffff0000ffff") != n
+    # model IDs that sanitize to the same slug map to distinct files when they run in distinct
+    # invocations (each substitute is its own run_one_role call with its own boundary)
+    assert panel.failed_meta_name("security", "vendor/a/b", 1, "1111") \
+        != panel.failed_meta_name("security", "vendor/a_b", 1, "2222")
+    # a normal short model ID keeps its readable slug
+    assert panel.failed_meta_name("security", "openai/gpt-5.6-sol", 2, b) \
+        == "security.failed.openai_gpt-5.6-sol.abcd1234abcd1234.2.json"
 
 
 def t_high_samples_rejects_invalid_values():
