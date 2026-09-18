@@ -191,8 +191,18 @@ def main(argv=None):
     if not (isinstance(md, (int, float)) and math.isfinite(md) and 0 <= md <= 1):
         print("invalid max drop %r: must be a finite fraction in [0, 1]" % (md,), file=sys.stderr)
         return 2
-    base = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
-    cur = json.loads(Path(args.current).read_text(encoding="utf-8"))
+    loaded = {}
+    for label, path in (("baseline", args.baseline), ("current", args.current)):
+        try:
+            loaded[label] = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            # Missing, unreadable, or malformed report: the comparison never ran, so this is a
+            # cannot-compare error (exit 2), NOT a detection regression (exit 1). Mirrors the
+            # digest-verification failure below.
+            print("REPORT LOAD: %s report %r could not be read as JSON: %s" % (label, path, e), file=sys.stderr)
+            return 2
+    base = loaded["baseline"]
+    cur = loaded["current"]
     for label, rep in (("baseline", base), ("current", cur)):
         why = verify_digest(rep)
         if why:

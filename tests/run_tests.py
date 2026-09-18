@@ -5244,6 +5244,15 @@ def t_eval_thresholds_cli():
         r6 = subprocess.run([sys.executable, thr_py, "compare", "--baseline", str(d / "nod.json"),
                              "--current", str(d / "base.json")], env=ENV, capture_output=True, text=True)
         assert r6.returncode == 2 and "INTEGRITY" in r6.stderr, (r6.returncode, r6.stderr[-200:])
+        # a missing report is a cannot-compare error (exit 2), never a detection regression (Codex, PR #64)
+        r7 = subprocess.run([sys.executable, thr_py, "compare", "--baseline", str(d / "does-not-exist.json"),
+                             "--current", str(d / "base.json")], env=ENV, capture_output=True, text=True)
+        assert r7.returncode == 2 and "LOAD" in r7.stderr, (r7.returncode, r7.stderr[-200:])
+        # malformed JSON is likewise a cannot-compare error, not exit 1 (Codex, PR #64)
+        (d / "bad-json.json").write_text("{not json")
+        r8 = subprocess.run([sys.executable, thr_py, "compare", "--baseline", str(d / "bad-json.json"),
+                             "--current", str(d / "base.json")], env=ENV, capture_output=True, text=True)
+        assert r8.returncode == 2 and "LOAD" in r8.stderr, (r8.returncode, r8.stderr[-200:])
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

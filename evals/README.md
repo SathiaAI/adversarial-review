@@ -207,6 +207,26 @@ python evals/run.py --mode live --reps 5
 python evals/thresholds.py compare --baseline evals/report/live-20260913-195628-10144.json --current evals/report/live-<new>.json
 ```
 
+**Automated monthly run (CI).** `.github/workflows/live-calibration.yml` runs exactly this — the
+`--reps 5` live calibration then `thresholds.py compare` against the committed baseline — on the 1st of
+each month (and on demand via *workflow_dispatch*). It is **opt-in**: it does nothing until the
+`OPENROUTER_API_KEY` secret is set on the protected **`live-calibration`** environment (Settings →
+Environments → live-calibration). Scope that environment's **deployment branches to `main`** so a manual
+dispatch at an attacker-controlled `--ref` cannot read the key (it never runs in PR/push CI). Manual
+inputs are validated: `reps` must be an integer in 1–10 (the baseline is 5; the cap stops a huge value
+from looping `run_live` out of memory) and `budget-usd` must be a plain number in `(0, 20]` — the `0`
+value is rejected because `run.py` treats `--budget-usd 0` as *no cap*. Spend is bounded per run by
+`--budget-usd 20`, checked before each panel, so a run can overshoot by at most one in-flight panel's
+cost (not a hard ceiling). Only a `--reps 5` run runs the baseline comparison; a manual run with any
+other `reps` still produces a report and artifact but **skips** `compare` (its per-model counts are not
+comparable to the 5-rep baseline). When it does compare, the two nonzero exits mean different things:
+**exit 1** is a regression — a detection-rate drop, a per-model true-positive drop, or an incomplete
+report (cost is **not** compared) — and **fails the job** so GitHub notifies; **exit 2** is a report
+integrity/comparison error (a sha256 digest mismatch on the baseline or new report, or bad comparison
+args), surfaced as an integrity error to investigate rather than a detection regression. The new report
+is uploaded as a build artifact (90-day retention) to inspect and, if it is a better baseline, commit in
+its place — update the `BASELINE` path in the workflow when you do.
+
 ## Scoring (`score.py`)
 
 `evals/score.py` grades a list of reviewer findings (a report's `findings` array) against a case's
