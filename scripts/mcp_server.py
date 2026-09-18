@@ -387,12 +387,12 @@ def _resolved_high_samples():
 
 def _panel_timeout():
     """Subprocess wrapper timeout for a reviewer-calling panel run. panel.py can spend up to
-    NINE AR_TIMEOUT_S request budgets on a single role before giving up: run_one_role makes two
+    SEVENTEEN AR_TIMEOUT_S request budgets on a single role before giving up: run_one_role makes two
     outer attempts and each call_reviewer may issue one corrective-JSON retry (2 × 2 = 4 requests);
-    a failed role is then substituted, which FIRST reloads the model catalog live — one /models
-    fetch, also bounded by AR_TIMEOUT_S whenever no cached --catalog-file was supplied (the MCP
-    path leaves it optional) — and THEN repeats the whole run_one_role sequence (4 more): 4 + 1 + 4
-    = 9. On top of that, multi-sample corroboration (E4-S3) resamples each flagged role up to
+    a failed role is then substituted across the eligible pool, which FIRST reloads the model
+    catalog live — one /models fetch, also bounded by AR_TIMEOUT_S whenever no cached
+    --catalog-file was supplied (the MCP path leaves it optional) — and THEN repeats the whole
+    run_one_role sequence (4 each) up to MAX_SUBSTITUTIONS (=3) candidates: 4 + 1 + 4·3 = 17. On top of that, multi-sample corroboration (E4-S3) resamples each flagged role up to
     AR_HIGH_SAMPLES times — (hs-1) extra samples, each a call plus one corrective retry (×2);
     resampling re-calls the SAME model and never substitutes, so it adds no further catalog fetch.
     Across up to 6 roles (SENSITIVE/CRITICAL) run sequentially that is (9 + 2·(hs-1)) × 6 request
@@ -411,7 +411,7 @@ def _panel_timeout():
     except (TypeError, ValueError):
         hs = 1
     hs = max(1, min(hs, 25))
-    return max(1800, req * (9 + 2 * (hs - 1)) * 6 + 600)
+    return max(1800, req * (17 + 2 * (hs - 1)) * 6 + 600)
 
 
 def _run_cli(module, argv, timeout=120):

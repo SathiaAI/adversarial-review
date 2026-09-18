@@ -208,6 +208,38 @@ def t_substitution_on_dead_provider():
     mock_router.STATE["fail_models"].clear()
 
 
+def t_failed_attempt_billed_usage_is_metered():
+    # CodeRabbit Major (PR #66): a substitute/primary attempt that is BILLED before it fails must be
+    # metered, or panel_cost() under-counts and the per-substitute cost gate can't hold the cap. Make
+    # only the security role's primary bill (reviewer_cost>0) then return a schema-invalid report so
+    # it fails and substitutes to a valid family: the run recovers, but the billed primary failure
+    # must be recorded as a status=failed meta and counted by panel_cost(). On the pre-fix code
+    # run_one_role discarded the exception's usage, so no failed meta exists and panel_cost omits it.
+    import panel as _panel
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.05
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        run = latest_run(repo)
+        target = read(run / "panel" / "plan.json")["roles"]["security"]["model"]
+        mock_router.STATE["response_provider"] = (
+            lambda md, _t=target: {"invalid": "shape"}
+            if (md["kind"] == "report" and md["model"] == _t) else None)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo)   # recovers via substitution
+        run = latest_run(repo)
+        assert (run / "panel" / "security.json").exists(), "security should recover via a substitute family"
+        failed = list((run / "panel" / "meta").glob("security.failed.*.json"))
+        assert failed, "the billed primary failure must persist a status=failed meta record"
+        rec = read(failed[0])
+        assert rec.get("status") == "failed" and rec.get("cost") and rec["cost"] > 0, rec
+        assert _panel.panel_cost(run) > 0, "panel_cost must include the billed failed-attempt spend"
+    finally:
+        mock_router.STATE["response_provider"] = None
+        mock_router.reset()
+
+
 def _complete_sensitive_repo():
     """Panel + rebuttal done, all required gates green. security-1 finding still open."""
     repo = fresh_repo()
@@ -5467,6 +5499,65 @@ def t_call_reviewer_exposes_usage_on_validation_failure():
         mock_router.reset()
 
 
+def t_call_reviewer_preserves_usage_when_corrective_retry_errors():
+    # E4-S2 (Codex #66 r2): a billed but schema-invalid first response triggers the corrective retry;
+    # if that retry then raises a transport/HTTP error, the first attempt's billed usage must STILL be
+    # attached to the propagated exception. Otherwise panel_cost()/the pre-call cost gate drop that
+    # spend and permit calls past AR_MAX_COST_USD. Pure unit test on call_reviewer: the first
+    # http_json bills $0.75 and returns an invalid report; the corrective retry raises.
+    import panel
+    calls = {"n": 0}
+    billed_first = {"prompt_tokens": 1000, "completion_tokens": 200, "cost": 0.75}
+
+    def fake_http_json(url, payload=None, key=None, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"choices": [{"message": {"content": json.dumps({"not": "a valid report"})}}],
+                    "usage": billed_first, "provider": "MockServe"}
+        raise RuntimeError("provider connection reset")   # transport error on the corrective retry
+
+    orig = panel.http_json
+    panel.http_json = fake_http_json
+    try:
+        body = {"model": "x/y", "messages": [{"role": "system", "content": "Your role: security"},
+                                             {"role": "user", "content": "go"}]}
+        try:
+            panel.call_reviewer("http://unused", "k", body, panel.REPORT_SCHEMA)
+            raise AssertionError("expected the corrective-retry transport error to propagate")
+        except RuntimeError as e:
+            assert calls["n"] == 2, ("expected exactly one corrective retry", calls["n"])
+            u = getattr(e, "usage", None)
+            assert u and abs((u.get("cost") or 0) - 0.75) < 1e-9, \
+                ("first attempt's billed usage must survive the retry error", u)
+    finally:
+        panel.http_json = orig
+
+
+def t_failed_meta_filename_is_bounded():
+    # E4-S2 (Codex #66 r2 + CodeRabbit r3): the billed-failure meta filename must (1) stay within the
+    # filesystem per-component limit (255) so a very long custom model ID never crashes run_one_role
+    # with OSError, and (2) be UNIQUE per attempt so panel_cost() never loses a billed failure to an
+    # overwrite. Uniqueness is keyed on the per-invocation boundary nonce: a substitute (its own
+    # run_one_role call), a retry, or a resumed invocation each get a distinct file, and two model IDs
+    # that sanitize to the same slug (vendor/a/b vs vendor/a_b) cannot collide within one invocation.
+    import panel
+    b = "abcd1234abcd1234"
+    long_id = "vendor/" + ("m" * 260)
+    n = panel.failed_meta_name("security", long_id, 1, b)
+    assert len(n) <= 255, len(n)
+    assert n.startswith("security.failed.") and n.endswith(".1.json"), n
+    assert b in n, "the per-invocation boundary must be in the filename so distinct calls don't collide"
+    # a different invocation (boundary) yields a distinct file even for the same model + attempt
+    assert panel.failed_meta_name("security", long_id, 1, "0000ffff0000ffff") != n
+    # model IDs that sanitize to the same slug map to distinct files when they run in distinct
+    # invocations (each substitute is its own run_one_role call with its own boundary)
+    assert panel.failed_meta_name("security", "vendor/a/b", 1, "1111") \
+        != panel.failed_meta_name("security", "vendor/a_b", 1, "2222")
+    # a normal short model ID keeps its readable slug
+    assert panel.failed_meta_name("security", "openai/gpt-5.6-sol", 2, b) \
+        == "security.failed.openai_gpt-5.6-sol.abcd1234abcd1234.2.json"
+
+
 def t_high_samples_rejects_invalid_values():
     # E4-S3: a non-integer / < 1 AR_HIGH_SAMPLES is rejected loudly (like the cost cap), so a typo
     # can never silently change the sampling count. Also validated at policy load.
@@ -7916,20 +8007,20 @@ def t_mcp_panel_timeout_scales_with_env():
     old_t = os.environ.get("AR_TIMEOUT_S")
     old_h = os.environ.get("AR_HIGH_SAMPLES")
     try:
-        os.environ.pop("AR_HIGH_SAMPLES", None)  # hs defaults to 1 -> base 9 request budgets/role
+        os.environ.pop("AR_HIGH_SAMPLES", None)  # hs defaults to 1 -> base 17 request budgets/role
         os.environ["AR_TIMEOUT_S"] = "240"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600) > 300
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 17 * 6 + 600) > 300
         os.environ["AR_TIMEOUT_S"] = "garbage"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600)  # bad value -> default
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 17 * 6 + 600)  # bad value -> default
         # Corroboration budget: hs samples add (hs-1) extra samples/role, each a call + retry (x2).
         os.environ["AR_TIMEOUT_S"] = "240"
         os.environ["AR_HIGH_SAMPLES"] = "25"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 24) * 6 + 600)
-        assert mcpsrv._panel_timeout() > max(1800, 240 * 9 * 6 + 600)  # strictly larger than base
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (17 + 2 * 24) * 6 + 600)
+        assert mcpsrv._panel_timeout() > max(1800, 240 * 17 * 6 + 600)  # strictly larger than base
         os.environ["AR_HIGH_SAMPLES"] = "1"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600)  # hs=1 == base
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 17 * 6 + 600)  # hs=1 == base
         os.environ["AR_HIGH_SAMPLES"] = "999"  # clamped to the 25 cap, never unbounded
-        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 24) * 6 + 600)
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (17 + 2 * 24) * 6 + 600)
     finally:
         for _k, _v in (("AR_TIMEOUT_S", old_t), ("AR_HIGH_SAMPLES", old_h)):
             if _v is None:
@@ -7952,10 +8043,10 @@ def t_mcp_panel_timeout_honors_policy_high_samples():
     try:
         os.environ["AR_TIMEOUT_S"] = "240"
         os.environ.pop("AR_HIGH_SAMPLES", None)           # env unset -> policy value must be honored
-        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 24) * 6 + 600), \
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (17 + 2 * 24) * 6 + 600), \
             mcpsrv._panel_timeout()
         os.environ["AR_HIGH_SAMPLES"] = "1"               # env set -> wins over the policy's 25
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600), mcpsrv._panel_timeout()
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 17 * 6 + 600), mcpsrv._panel_timeout()
     finally:
         os.chdir(cwd0)
         for _k, _v in (("AR_TIMEOUT_S", old_t), ("AR_HIGH_SAMPLES", old_h)):
@@ -7979,8 +8070,8 @@ def t_mcp_panel_timeout_reads_policy_racesafe():
     old_t = os.environ.get("AR_TIMEOUT_S")
     os.environ["AR_TIMEOUT_S"] = "240"
     cwd0 = os.getcwd()
-    MAXB = max(1800, 240 * (9 + 2 * 24) * 6 + 600)   # hs=25 (clamp max) budget
-    BASE = max(1800, 240 * 9 * 6 + 600)              # hs=1 budget
+    MAXB = max(1800, 240 * (17 + 2 * 24) * 6 + 600)   # hs=25 (clamp max) budget
+    BASE = max(1800, 240 * 17 * 6 + 600)              # hs=1 budget
     try:
         # (a) oversized REGULAR policy -> refused by size (fstat), budget the MAX (never read whole in-process)
         repo = Path(tempfile.mkdtemp(prefix="ar-pol-big-"))
@@ -8052,7 +8143,7 @@ def t_mcp_panel_timeout_reads_policy_racesafe():
         os.chdir(repo4)
         (repo4 / ".adversarial-review.yml").write_text("high_samples: 3\n", encoding="utf-8")
         assert int(mcpsrv._resolved_high_samples()) == 3, mcpsrv._resolved_high_samples()
-        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 2) * 6 + 600), mcpsrv._panel_timeout()
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (17 + 2 * 2) * 6 + 600), mcpsrv._panel_timeout()
         # ...and a policy with no high_samples -> default hs=1
         (repo4 / ".adversarial-review.yml").write_text("risk: NORMAL\n", encoding="utf-8")
         assert mcpsrv._panel_timeout() == BASE, mcpsrv._panel_timeout()
@@ -8068,13 +8159,13 @@ def t_mcp_panel_timeout_reads_policy_racesafe():
 
 
 def t_mcp_panel_timeout_budgets_the_substitution_catalog_fetch():
-    # The per-role worst case is NINE AR_TIMEOUT_S request budgets, not eight: run_one_role spends 4
+    # The per-role worst case is SEVENTEEN AR_TIMEOUT_S request budgets: run_one_role spends 4
     # (two attempts x one corrective retry), then substitution reloads the model catalog LIVE — one
     # /models fetch, bounded by AR_TIMEOUT_S when no --catalog-file is cached (panel.py load_catalog
-    # via http_json, whose timeout defaults to AR_TIMEOUT_S) — then run_one_role repeats (4 more):
-    # 4 + 1 + 4 = 9. Omitting the catalog fetch (budgeting 8) under-counts the outer deadline by one
+    # via http_json, whose timeout defaults to AR_TIMEOUT_S) — then run_one_role repeats (4 each) up
+    # to MAX_SUBSTITUTIONS(3): 4 + 1 + 4*3 = 17. Omitting the catalog fetch (budgeting 16) under-counts the outer deadline by one
     # request width PER ROLE, up to 6 roles, and can kill a legitimately slow but valid run mid-
-    # substitution. Assert the base budget is exactly 9 widths and STRICTLY exceeds an 8-width
+    # substitution. Assert the base budget is exactly 17 widths and STRICTLY exceeds a 16-width
     # (catalog-fetch-omitting) deadline. (Codex, bdccc64.)
     old_t = os.environ.get("AR_TIMEOUT_S")
     old_h = os.environ.get("AR_HIGH_SAMPLES")
@@ -8082,10 +8173,10 @@ def t_mcp_panel_timeout_budgets_the_substitution_catalog_fetch():
         os.environ["AR_TIMEOUT_S"] = "240"
         os.environ["AR_HIGH_SAMPLES"] = "1"               # no resampling -> pure base budget
         got = mcpsrv._panel_timeout()
-        assert got == max(1800, 240 * 9 * 6 + 600), got    # 9 widths/role x 6 roles + 600 headroom
-        assert got > max(1800, 240 * 8 * 6 + 600), got     # strictly more than the pre-fix 8-width budget
-        # The per-role width recovered from the deadline is 9 (4 primary + 1 catalog + 4 substitute).
-        assert (got - 600) // 6 // 240 == 9, got
+        assert got == max(1800, 240 * 17 * 6 + 600), got    # 17 widths/role x 6 roles + 600 headroom
+        assert got > max(1800, 240 * 16 * 6 + 600), got     # strictly more than a 16-width (catalog-omitting) budget
+        # The per-role width recovered from the deadline is 17 (4 primary + 1 catalog + 4*MAX_SUBSTITUTIONS(3)).
+        assert (got - 600) // 6 // 240 == 17, got
     finally:
         for _k, _v in (("AR_TIMEOUT_S", old_t), ("AR_HIGH_SAMPLES", old_h)):
             if _v is None:

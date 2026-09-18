@@ -42,6 +42,11 @@ TIER_ROLES = {
     "CRITICAL": ROLES,
 }
 
+# Cap on how many substitute families a failed role will try before giving up. Bounds the added
+# cost and runtime of the eligible-pool retry, and keeps it within mcp_server._panel_timeout, which
+# budgets per role as 4 primary + 1 catalog fetch + 4 * MAX_SUBSTITUTIONS request widths.
+MAX_SUBSTITUTIONS = 3
+
 # Family preference per role (post-exclusion, greedy, skip-used). Families, not slugs:
 # exact models are resolved from the live catalog at assign time, because router
 # catalogs churn and hardcoded slugs rot.
@@ -595,12 +600,29 @@ def FAMILY_OR_SELF(p):
 def call_reviewer(base, key, body, schema, corrective=None, prior_usage=None):
     """One HTTP attempt (+1 retry on malformed JSON). Returns (obj, raw, usage, provider).
     ``usage`` accumulates across the retry (``prior_usage``) so a malformed-JSON retry — which is
-    a second billed call — is fully counted against the cost cap, not just the final attempt."""
-    resp = http_json(f"{base}/chat/completions", payload=body, key=key)
-    if "error" in resp and "choices" not in resp:
-        raise RuntimeError(str(resp["error"]))
-    content = resp["choices"][0]["message"]["content"]
-    usage = merge_usage(prior_usage, resp.get("usage", {}))
+    a second billed call — is fully counted against the cost cap, not just the final attempt.
+    ANY failure carries the accumulated spend on ``err.usage`` — including a transport/HTTP error
+    raised by the corrective retry itself, which would otherwise drop the first (billed) attempt's
+    usage and let panel_cost()/the cost gate under-count and slip past AR_MAX_COST_USD."""
+    billed = prior_usage  # spend already billed on earlier attempts; grows once this response is in
+    try:
+        resp = http_json(f"{base}/chat/completions", payload=body, key=key)
+        if isinstance(resp, dict) and resp.get("usage"):
+            billed = merge_usage(prior_usage, resp.get("usage", {}))
+        if "error" in resp and "choices" not in resp:
+            raise RuntimeError(str(resp["error"]))
+        content = resp["choices"][0]["message"]["content"]
+        usage = merge_usage(prior_usage, resp.get("usage", {}))
+    except Exception as e:  # noqa: BLE001
+        # Attach the spend accrued so far (prior attempts + this response, if it billed) to any
+        # failure before we reach the validation branch below — a transport error, an error body,
+        # or a malformed envelope on the corrective retry must not silently discard billed usage.
+        if billed and getattr(e, "usage", None) is None:
+            try:
+                e.usage = billed
+            except Exception:  # a few exception types disallow attribute assignment
+                pass
+        raise
     provider = resp.get("provider")
     try:
         obj = extract_json(content)
@@ -619,6 +641,18 @@ def call_reviewer(base, key, body, schema, corrective=None, prior_usage=None):
         err.usage = usage  # expose billed usage so a failed-but-billed attempt can be cost-metered
         raise err
     return obj, content, usage, provider
+
+
+def failed_meta_name(role, model, attempt, boundary):
+    """Filename for a billed-but-failed reviewer attempt's meta record. Uniqueness comes from
+    ``boundary`` — the per-invocation nonce run_one_role already generates — so a distinct substitute
+    model (each substitute runs in its own run_one_role call), a retry, or a resumed invocation each
+    write a DISTINCT file; panel_cost() then never loses a billed failure to an overwrite, and two
+    model IDs that sanitize to the same slug (e.g. ``vendor/a/b`` and ``vendor/a_b``) can't collide.
+    The model slug is kept only for readability and truncated so a very long custom model ID can't
+    exceed the filesystem's per-component limit (commonly 255 bytes)."""
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", str(model))[:80]
+    return f"{role}.failed.{slug}.{boundary}.{attempt}.json"
 
 
 def run_one_role(run, meta, plan, role, context_text, base, key):
@@ -646,6 +680,20 @@ def run_one_role(run, meta, plan, role, context_text, base, key):
             return True
         except Exception as e:  # noqa: BLE001
             attempts.append(attempt)
+            # A failed attempt may still have been BILLED (call_reviewer attaches the usage it
+            # accrued before the failure to the exception). Persist it as a status=failed meta so
+            # panel_cost() counts spend that produced no report — without this the per-substitute
+            # cost gate under-counts and a run could exceed AR_MAX_COST_USD across the primary +
+            # substitution attempts. failed_meta_name() keys the filename on this invocation's
+            # boundary nonce, so a substitute, a retry, or a resume writes a distinct record instead
+            # of overwriting an earlier billed failure. Mirrors the corroboration-sample failure
+            # record (CodeRabbit #66).
+            failed_usage = getattr(e, "usage", None)
+            if failed_usage:
+                write_json(run / "panel" / "meta" / failed_meta_name(role, info["model"], attempt, boundary), {
+                    "model": info["model"], "family": info["family"], "status": "failed",
+                    "usage": failed_usage, "cost": failed_usage.get("cost"),
+                    "attempt": attempt, "completed_at": now_iso()})
             print(f"  {role}: attempt {attempt} on {info['model']} failed: {e}", file=sys.stderr)
     return False
 
@@ -890,19 +938,44 @@ def cmd_run(args):
         if run_one_role(run, meta, plan, role, context_text, base, key):
             produced_this_run.append(role)
             continue
-        # substitution: re-assign this role to an unused eligible family and retry once
+        # substitution: re-assign this role to an unused eligible family and retry. Previously a
+        # SINGLE substitute (the first priority family) was tried once; if that model was dead
+        # (e.g. a slug that 404s under the active privacy routing) or also returned an intermittent
+        # empty completion, the role failed even though other independent families were still
+        # available -- BLOCKing an otherwise-passing panel. Try substitutes across the eligible pool --
+        # priority families first, then any remaining eligible family, deterministically, up to
+        # MAX_SUBSTITUTIONS candidates -- stopping at the first that produces a report. The excluded
+        # set (every role's initially assigned family) and the dev-family exclusion are both applied
+        # on every candidate, so a substitute is always an independent, non-dev family and this never
+        # weakens panel independence.
         catalog = load_catalog(args.catalog_file)
-        used = {v["family"] for v in plan["roles"].values()}
         dev = set(plan["dev_families_excluded"])
         by_family = {}
         for m in catalog:
             by_family.setdefault(m["family"], []).append(m)
-        sub = None
-        for fam in ROLE_FAMILY_PRIORITY[role]:
-            if fam not in used and fam not in dev and fam in by_family:
-                sub = pick_model(by_family[fam])
+        rest = sorted(f for f in by_family if f not in ROLE_FAMILY_PRIORITY[role])
+        substituted = False
+        tried = 0
+        # Freeze the excluded families to the INITIAL assignment (every role's family, including
+        # this role's own original/pinned family). Recomputing this inside the loop would drop the
+        # role's original family the moment a substitute overwrites plan["roles"][role], so a later
+        # candidate — e.g. a pinned family sitting mid-priority — could re-select the family that
+        # already failed as primary and burn a substitution attempt on it (CodeRabbit #66).
+        used = {v["family"] for v in plan["roles"].values()}
+        for fam in list(ROLE_FAMILY_PRIORITY[role]) + rest:
+            if tried >= MAX_SUBSTITUTIONS:
                 break
-        if sub:
+            if fam in used or fam in dev or fam not in by_family:
+                continue
+            # Re-check the cost ceiling before every paid substitute, exactly as the primary path
+            # above: a pre-call gate, so at most one in-flight call can overshoot the cap.
+            if cap is not None:
+                spent = panel_cost(run)
+                if spent >= cap:
+                    _cost_abort(run, cap, spent, "panel",
+                                [r for r in plan["roles"] if not (run / "panel" / f"{r}.json").exists()])
+            tried += 1
+            sub = pick_model(by_family[fam])
             old = plan["roles"][role]["model"]
             sub_cap, sub_cap_src = capability_of(sub["slug"], sub, load_capabilities())
             plan["roles"][role] = {"model": sub["slug"], "family": sub["family"],
@@ -915,7 +988,10 @@ def cmd_run(args):
             print(f"  {role}: substituting {sub['slug']}")
             if run_one_role(run, meta, plan, role, context_text, base, key):
                 produced_this_run.append(role)
-                continue
+                substituted = True
+                break
+        if substituted:
+            continue
         failed.append(role)
 
     done = [r for r in plan["roles"] if (run / "panel" / f"{r}.json").exists()]
