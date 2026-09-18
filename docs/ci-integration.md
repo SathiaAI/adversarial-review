@@ -183,7 +183,14 @@ PyPI package on a full-semver `vX.Y.Z` tag — see "Version & tag scheme" below)
    `v0.x.y` release. After each release, move it and force-push:
 
    ```bash
-   git tag -f v0 v0.2.0      # point v0 at the latest 0.x release commit
+   # Point v0 at a commit that CONTAINS the narrowed release trigger — i.e. main AFTER the PR that
+   # narrows it merges, NOT the older v0.2.0 tag. A tag-push event runs the workflows present AT
+   # THE PUSHED REF: if v0 pointed at the pre-change v0.2.0 commit (still `tags: ["v*"]`), pushing
+   # v0 would start the OLD release workflow and fail its version guard (package 0.2.0 vs tag "0")
+   # — the exact red pipeline the narrowing removes. On a commit with the narrowed trigger, `v0`
+   # matches nothing, so the push fires no workflow.
+   git fetch origin
+   git tag -f v0 origin/main      # main HEAD (carries the narrowed full-semver trigger)
    git push -f origin v0
    ```
 
@@ -192,17 +199,20 @@ PyPI package on a full-semver `vX.Y.Z` tag — see "Version & tag scheme" below)
 
 ### Version & tag scheme
 
-This repo ships **two independently versioned products from one tree**, and they do **not** share a
-version number:
+This repo publishes the same release as **two distribution surfaces from one tree** — a GitHub
+Action and a PyPI package. They share one version line (the `pyproject` version); what differs is
+the **pinning form**, not an independent version number:
 
-| Product | How to pin | Meaning |
+| Surface | How to pin | Meaning |
 |---|---|---|
-| The **GitHub Action** | `@v0` (moving major) · `@v0.2.0` (immutable) · `@<full-sha>` (most secure) | Action **interface** compatibility. `@v0` auto-receives patch/minor fixes within 0.x; a full SHA is reproducible and the recommended default for security-sensitive consumers. |
-| The **PyPI package** `adversarial-review` | `adversarial-review==0.2.0` (or a range) | The installable CLI's own semver. |
+| The **GitHub Action** | `@<full-sha>` (immutable) · `@v0.2.0` (a specific release) · `@v0` (moving major) | Action **interface** compatibility. A **full commit SHA is the only inherently immutable pin** — the recommended default for security-sensitive consumers. `@v0.2.0` is a bare git tag: stable *only if* the tag-protection ruleset below is enforced (an unprotected tag can be force-moved or deleted). `@v0` is a moving alias that auto-receives patch/minor fixes within 0.x. |
+| The **PyPI package** `adversarial-review` | `adversarial-review==0.2.0` (or a range) | The same release, installed as a CLI. |
 
-The Action major tag tracks the **package major** for least surprise, but the two are separate git
-constructs: full `vX.Y.Z` tags are immutable and drive the PyPI release; `v0`/`v1` are **moving
-aliases** for Action consumers and are never attached to a PyPI publish. **Why the pin is real:**
+The Action major alias tracks the **package major**: Action compatibility is **not** advanced
+independently of the package release — both come from the same `vX.Y.Z` tag. What differs is only
+how each surface is pinned. Full `vX.Y.Z` tags drive the PyPI release (protect them as immutable —
+see below); `v0`/`v1` are **moving aliases** for Action consumers and are never attached to a PyPI
+publish. **Why the ref is the reproducibility boundary:**
 the composite action runs **its own** committed scripts via `${{ github.action_path }}/scripts` and
 never `pip install`s the package at run time, so `@v0.2.0` / `@<sha>` pins the *exact* code that
 executes — the Action ref, not a mutable PyPI "latest", is the reproducibility boundary.
