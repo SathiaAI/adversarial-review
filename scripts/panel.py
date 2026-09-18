@@ -42,6 +42,11 @@ TIER_ROLES = {
     "CRITICAL": ROLES,
 }
 
+# Cap on how many substitute families a failed role will try before giving up. Bounds the added
+# cost and runtime of the eligible-pool retry, and keeps it within mcp_server._panel_timeout, which
+# budgets per role as 4 primary + 1 catalog fetch + 4 * MAX_SUBSTITUTIONS request widths.
+MAX_SUBSTITUTIONS = 3
+
 # Family preference per role (post-exclusion, greedy, skip-used). Families, not slugs:
 # exact models are resolved from the live catalog at assign time, because router
 # catalogs churn and hardcoded slugs rot.
@@ -894,9 +899,10 @@ def cmd_run(args):
         # SINGLE substitute (the first priority family) was tried once; if that model was dead
         # (e.g. a slug that 404s under the active privacy routing) or also returned an intermittent
         # empty completion, the role failed even though other independent families were still
-        # available -- BLOCKing an otherwise-passing panel. Exhaust the eligible pool instead:
-        # priority families first, then any remaining eligible family, deterministically, stopping
-        # at the first substitute that produces a report. Family independence and dev-family
+        # available -- BLOCKing an otherwise-passing panel. Try substitutes across the eligible pool --
+        # priority families first, then any remaining eligible family, deterministically, up to
+        # MAX_SUBSTITUTIONS candidates -- stopping at the first that produces a report. Family
+        # independence and dev-family
         # exclusion are re-checked every step, so this never weakens panel independence.
         catalog = load_catalog(args.catalog_file)
         dev = set(plan["dev_families_excluded"])
@@ -905,10 +911,21 @@ def cmd_run(args):
             by_family.setdefault(m["family"], []).append(m)
         rest = sorted(f for f in by_family if f not in ROLE_FAMILY_PRIORITY[role])
         substituted = False
+        tried = 0
         for fam in list(ROLE_FAMILY_PRIORITY[role]) + rest:
+            if tried >= MAX_SUBSTITUTIONS:
+                break
             used = {v["family"] for v in plan["roles"].values()}
             if fam in used or fam in dev or fam not in by_family:
                 continue
+            # Re-check the cost ceiling before every paid substitute, exactly as the primary path
+            # above: a pre-call gate, so at most one in-flight call can overshoot the cap.
+            if cap is not None:
+                spent = panel_cost(run)
+                if spent >= cap:
+                    _cost_abort(run, cap, spent, "panel",
+                                [r for r in plan["roles"] if not (run / "panel" / f"{r}.json").exists()])
+            tried += 1
             sub = pick_model(by_family[fam])
             old = plan["roles"][role]["model"]
             sub_cap, sub_cap_src = capability_of(sub["slug"], sub, load_capabilities())

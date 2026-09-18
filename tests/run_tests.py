@@ -7911,20 +7911,20 @@ def t_mcp_panel_timeout_scales_with_env():
     old_t = os.environ.get("AR_TIMEOUT_S")
     old_h = os.environ.get("AR_HIGH_SAMPLES")
     try:
-        os.environ.pop("AR_HIGH_SAMPLES", None)  # hs defaults to 1 -> base 9 request budgets/role
+        os.environ.pop("AR_HIGH_SAMPLES", None)  # hs defaults to 1 -> base 17 request budgets/role
         os.environ["AR_TIMEOUT_S"] = "240"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600) > 300
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 17 * 6 + 600) > 300
         os.environ["AR_TIMEOUT_S"] = "garbage"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600)  # bad value -> default
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 17 * 6 + 600)  # bad value -> default
         # Corroboration budget: hs samples add (hs-1) extra samples/role, each a call + retry (x2).
         os.environ["AR_TIMEOUT_S"] = "240"
         os.environ["AR_HIGH_SAMPLES"] = "25"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 24) * 6 + 600)
-        assert mcpsrv._panel_timeout() > max(1800, 240 * 9 * 6 + 600)  # strictly larger than base
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (17 + 2 * 24) * 6 + 600)
+        assert mcpsrv._panel_timeout() > max(1800, 240 * 17 * 6 + 600)  # strictly larger than base
         os.environ["AR_HIGH_SAMPLES"] = "1"
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600)  # hs=1 == base
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 17 * 6 + 600)  # hs=1 == base
         os.environ["AR_HIGH_SAMPLES"] = "999"  # clamped to the 25 cap, never unbounded
-        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 24) * 6 + 600)
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (17 + 2 * 24) * 6 + 600)
     finally:
         for _k, _v in (("AR_TIMEOUT_S", old_t), ("AR_HIGH_SAMPLES", old_h)):
             if _v is None:
@@ -7947,10 +7947,10 @@ def t_mcp_panel_timeout_honors_policy_high_samples():
     try:
         os.environ["AR_TIMEOUT_S"] = "240"
         os.environ.pop("AR_HIGH_SAMPLES", None)           # env unset -> policy value must be honored
-        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 24) * 6 + 600), \
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (17 + 2 * 24) * 6 + 600), \
             mcpsrv._panel_timeout()
         os.environ["AR_HIGH_SAMPLES"] = "1"               # env set -> wins over the policy's 25
-        assert mcpsrv._panel_timeout() == max(1800, 240 * 9 * 6 + 600), mcpsrv._panel_timeout()
+        assert mcpsrv._panel_timeout() == max(1800, 240 * 17 * 6 + 600), mcpsrv._panel_timeout()
     finally:
         os.chdir(cwd0)
         for _k, _v in (("AR_TIMEOUT_S", old_t), ("AR_HIGH_SAMPLES", old_h)):
@@ -7974,8 +7974,8 @@ def t_mcp_panel_timeout_reads_policy_racesafe():
     old_t = os.environ.get("AR_TIMEOUT_S")
     os.environ["AR_TIMEOUT_S"] = "240"
     cwd0 = os.getcwd()
-    MAXB = max(1800, 240 * (9 + 2 * 24) * 6 + 600)   # hs=25 (clamp max) budget
-    BASE = max(1800, 240 * 9 * 6 + 600)              # hs=1 budget
+    MAXB = max(1800, 240 * (17 + 2 * 24) * 6 + 600)   # hs=25 (clamp max) budget
+    BASE = max(1800, 240 * 17 * 6 + 600)              # hs=1 budget
     try:
         # (a) oversized REGULAR policy -> refused by size (fstat), budget the MAX (never read whole in-process)
         repo = Path(tempfile.mkdtemp(prefix="ar-pol-big-"))
@@ -8063,13 +8063,13 @@ def t_mcp_panel_timeout_reads_policy_racesafe():
 
 
 def t_mcp_panel_timeout_budgets_the_substitution_catalog_fetch():
-    # The per-role worst case is NINE AR_TIMEOUT_S request budgets, not eight: run_one_role spends 4
+    # The per-role worst case is SEVENTEEN AR_TIMEOUT_S request budgets: run_one_role spends 4
     # (two attempts x one corrective retry), then substitution reloads the model catalog LIVE — one
     # /models fetch, bounded by AR_TIMEOUT_S when no --catalog-file is cached (panel.py load_catalog
-    # via http_json, whose timeout defaults to AR_TIMEOUT_S) — then run_one_role repeats (4 more):
-    # 4 + 1 + 4 = 9. Omitting the catalog fetch (budgeting 8) under-counts the outer deadline by one
+    # via http_json, whose timeout defaults to AR_TIMEOUT_S) — then run_one_role repeats (4 each) up
+    # to MAX_SUBSTITUTIONS(3): 4 + 1 + 4*3 = 17. Omitting the catalog fetch (budgeting 16) under-counts the outer deadline by one
     # request width PER ROLE, up to 6 roles, and can kill a legitimately slow but valid run mid-
-    # substitution. Assert the base budget is exactly 9 widths and STRICTLY exceeds an 8-width
+    # substitution. Assert the base budget is exactly 17 widths and STRICTLY exceeds a 16-width
     # (catalog-fetch-omitting) deadline. (Codex, bdccc64.)
     old_t = os.environ.get("AR_TIMEOUT_S")
     old_h = os.environ.get("AR_HIGH_SAMPLES")
@@ -8077,10 +8077,10 @@ def t_mcp_panel_timeout_budgets_the_substitution_catalog_fetch():
         os.environ["AR_TIMEOUT_S"] = "240"
         os.environ["AR_HIGH_SAMPLES"] = "1"               # no resampling -> pure base budget
         got = mcpsrv._panel_timeout()
-        assert got == max(1800, 240 * 9 * 6 + 600), got    # 9 widths/role x 6 roles + 600 headroom
-        assert got > max(1800, 240 * 8 * 6 + 600), got     # strictly more than the pre-fix 8-width budget
-        # The per-role width recovered from the deadline is 9 (4 primary + 1 catalog + 4 substitute).
-        assert (got - 600) // 6 // 240 == 9, got
+        assert got == max(1800, 240 * 17 * 6 + 600), got    # 17 widths/role x 6 roles + 600 headroom
+        assert got > max(1800, 240 * 16 * 6 + 600), got     # strictly more than a 16-width (catalog-omitting) budget
+        # The per-role width recovered from the deadline is 17 (4 primary + 1 catalog + 4*MAX_SUBSTITUTIONS(3)).
+        assert (got - 600) // 6 // 240 == 17, got
     finally:
         for _k, _v in (("AR_TIMEOUT_S", old_t), ("AR_HIGH_SAMPLES", old_h)):
             if _v is None:
