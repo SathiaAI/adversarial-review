@@ -48,6 +48,13 @@ order by `panel.py`; the first one that resolves wins unless overridden with
 Never paste API keys into chat transcripts or commit them. Never put keys in the run
 artifacts — the scripts don't, and you shouldn't either.
 
+**`scripts/jev_triage.py`** (the optional TypeSafe Jev finding-triage layer — see
+`references/jev.md`) reuses this exact same credential resolution (`panel.api_config()`:
+`OPENROUTER_API_KEY` / `AR_KEY_FILE` / `AR_BASE_URL`+`AR_API_KEY`) for its own calls to
+Jev's `/alpha/decisions` endpoint. Jev has no MCP/keyless transport, unlike the reviewer
+panel — with no key configured, `jev_triage.py` refuses to run rather than producing a
+partial or fabricated triage.
+
 ## Privacy tiers
 
 - NORMAL: default routing.
@@ -254,6 +261,9 @@ keyless `panel.py prepare` + `ingest` (MCP) transport does **not** take corrobor
 | `AR_SIGN_TIMEOUT` | `120` | Bounded timeout (seconds) for each signer/verifier subprocess; expiry converts to the tooling-error exit (3) |
 | `AR_COSIGN_IDENTITY` | — | Expected signer identity (SAN) for cosign keyless `--verify-signature` |
 | `AR_COSIGN_ISSUER` | — | Expected OIDC issuer for cosign keyless `--verify-signature` |
+| `AR_JEV_MODEL` | `typesafe/jev-1.13` | Model slug `jev_triage.py` calls at OpenRouter's `/alpha/decisions` endpoint (see `references/jev.md`) |
+| `AR_JEV_BASE_URL` | `https://openrouter.ai/api` | Base URL `jev_triage.py` appends `/alpha/decisions` to |
+| `AR_JEV_TIMEOUT_S` | `60` | Per-call timeout for `jev_triage.py`'s Jev calls (each call normally completes in well under a second; the default is a generous ceiling, not a tuned budget) |
 
 An empty env var counts as unset. Note one precedence fix shipped with the policy
 feature: `--pin` now beats `AR_PINS` for the same role (previously the env var

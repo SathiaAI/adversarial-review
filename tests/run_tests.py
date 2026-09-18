@@ -21,7 +21,8 @@ import mcp_server as mcpsrv  # noqa: E402
 
 PORT = 8811
 ENV = {**os.environ, "AR_BASE_URL": f"http://127.0.0.1:{PORT}/v1",
-       "AR_API_KEY": "test-key", "AR_TIMEOUT_S": "15", "AR_MAX_TOKENS": "2000"}
+       "AR_API_KEY": "test-key", "AR_TIMEOUT_S": "15", "AR_MAX_TOKENS": "2000",
+       "AR_JEV_BASE_URL": f"http://127.0.0.1:{PORT}", "AR_JEV_TIMEOUT_S": "15"}
 
 PASSED, FAILED = [], []
 
@@ -10556,6 +10557,300 @@ def t_ai_defects_invalid_diffref_never_empty_diff_pass():
     assert not (run / "changed_paths.txt").exists()
     r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=2)
     assert "cannot read diff file" in r.stdout and "empty-diff" not in r.stdout
+
+
+# ---------------------------------------------------------------- jev_triage.py (TypeSafe Jev)
+# Jev is a finding-triage LAYER, not an authority: these tests lock (1) the fail-closed
+# contract on every Jev error/malformed-response path, (2) that aggregate.py's verdict
+# semantics are unchanged when no jev_triage.py artifact exists (backward compatibility,
+# per CONTRIBUTING.md rule #2), and (3) that a recorded rebuttal/plan.json can only ever
+# narrow required rebuttal work, never remove Step 4 validation itself.
+
+def _jev_env(overrides=None):
+    env = dict(ENV)
+    if overrides:
+        env.update(overrides)
+    return env
+
+
+def _no_key_env():
+    """ENV with every Jev/reviewer credential blanked -- including OPENROUTER_API_KEY /
+    AR_KEY_FILE, in case the host environment happens to have one set -- for the
+    'no API key configured' fail-closed path."""
+    env = dict(ENV)
+    for k in ("AR_API_KEY", "OPENROUTER_API_KEY", "AR_KEY_FILE"):
+        env[k] = ""
+    return env
+
+
+def _panel_with_finding(risk="SENSITIVE"):
+    """One recorded high finding (security-1, mock_router._report) across a full panel."""
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", risk, "--dev-providers", "anthropic"], repo)
+    sh(["panel.py", "assign"], repo)
+    sh(["panel.py", "run", "--context-file", "context.md"], repo)
+    return repo, latest_run(repo)
+
+
+def t_jev_triage_requires_key():
+    repo, run = _panel_with_finding()
+    r = sh(["jev_triage.py", "triage", str(run)], repo, expect=2, env=_no_key_env())
+    assert "no API key configured for Jev" in r.stderr
+    assert not (run / "triage").exists() or not list((run / "triage").glob("*.json"))
+
+
+def t_jev_triage_writes_records_and_defaults_are_safe():
+    mock_router.reset()
+    try:
+        repo, run = _panel_with_finding()
+        r = sh(["jev_triage.py", "triage", str(run)], repo, env=_jev_env())
+        assert mock_router.STATE["jev_calls"] == 1, "one finding -> one Jev call"
+        rec = read(run / "triage" / "security-1.json")
+        assert rec["finding_id"] == "security-1" and rec["reviewer_severity"] == "high"
+        assert rec["jev"]["error"] is None
+        assert rec["jev"]["is_real"] == 0.1  # mock default (noul=0.1)
+        assert rec["jev"]["duplicate_of"]["choice"] == "none"
+        summ = read(run / "triage" / "_summary.json")
+        assert summ["findings"] == 1 and summ["errors"] == 0
+        assert "jev triage worklist" in r.stdout
+    finally:
+        mock_router.reset()
+
+
+def t_jev_triage_fails_closed_on_jev_error():
+    mock_router.reset()
+    mock_router.STATE["jev_fail"] = True
+    try:
+        repo, run = _panel_with_finding()
+        sh(["jev_triage.py", "triage", str(run)], repo, env=_jev_env())
+        j = read(run / "triage" / "security-1.json")["jev"]
+        assert j["error"], "a Jev transport failure must be recorded"
+        assert j["is_real"] == 1.0 and j["needs_human"] == 1.0 and j["fix_is_obvious"] == 0.0
+        assert j["duplicate_of"]["choice"] == "none"
+        summ = read(run / "triage" / "_summary.json")
+        assert summ["errors"] == 1
+    finally:
+        mock_router.reset()
+
+
+def t_jev_triage_duplicate_grouping_is_deterministic():
+    # Two findings in the same file: the SECOND call's duplicate_of choices must offer the
+    # first finding's id (and only it) as a candidate -- proving component grouping and
+    # processing order match what's documented (role-then-list-order).
+    mock_router.reset()
+    seen = []
+
+    def provider(body):
+        seen.append(sorted(body["questions"]["duplicate_of"]["criteria"]))
+        return None  # keep default answers
+
+    mock_router.STATE["jev_response_provider"] = provider
+    try:
+        repo, run = _panel_with_finding()
+        rep = read(run / "panel" / "security.json")
+        rep["findings"].append(dict(rep["findings"][0], id="security-2",
+                                    title="second issue in same file"))
+        write(run / "panel" / "security.json", rep)
+        sh(["jev_triage.py", "triage", str(run)], repo, env=_jev_env())
+        assert seen[0] == ["none"], "first finding in a file has no prior duplicate candidates"
+        assert seen[1] == ["none", "security-1"], \
+            "second finding in the same file must offer the first as a candidate"
+    finally:
+        mock_router.STATE["jev_response_provider"] = None
+        mock_router.reset()
+
+
+def t_jev_rebuttal_gate_skips_when_jev_says_no_contest():
+    mock_router.reset()  # defaults: noul=0.1 for both questions -> skip
+    try:
+        repo, run = _panel_with_finding()
+        r = sh(["jev_triage.py", "rebuttal-gate", str(run)], repo, env=_jev_env())
+        gate = read(run / "rebuttal" / "plan.json")
+        assert gate["required_finding_ids"] == []
+        assert gate["skipped_finding_ids"] == ["security-1"]
+        assert read(run / "rebuttal" / "digest.json") == []
+        assert "0/1 high/critical finding(s) need contest" in r.stdout
+    finally:
+        mock_router.reset()
+
+
+def t_jev_rebuttal_gate_requires_contest_when_jev_says_so():
+    mock_router.reset()
+
+    def provider(body):
+        if "contested" not in body.get("questions", {}):
+            return None
+        return {"contested": {"noul": 0.9}, "rebuttal_would_change_outcome": {"noul": 0.1}}
+
+    mock_router.STATE["jev_response_provider"] = provider
+    try:
+        repo, run = _panel_with_finding()
+        sh(["jev_triage.py", "rebuttal-gate", str(run)], repo, env=_jev_env())
+        gate = read(run / "rebuttal" / "plan.json")
+        assert gate["required_finding_ids"] == ["security-1"]
+        digest = read(run / "rebuttal" / "digest.json")
+        assert len(digest) == 1 and digest[0]["id"] == "security-1"
+    finally:
+        mock_router.STATE["jev_response_provider"] = None
+        mock_router.reset()
+
+
+def t_jev_rebuttal_gate_fails_closed_on_error():
+    mock_router.reset()
+    mock_router.STATE["jev_fail"] = True
+    try:
+        repo, run = _panel_with_finding()
+        sh(["jev_triage.py", "rebuttal-gate", str(run)], repo, env=_jev_env())
+        gate = read(run / "rebuttal" / "plan.json")
+        assert gate["required_finding_ids"] == ["security-1"], \
+            "a Jev error must keep the finding in the required (contest) set"
+    finally:
+        mock_router.reset()
+
+
+def t_jev_patch_check_resolves_and_flags_new_risk():
+    mock_router.reset()
+
+    def provider(body):
+        if "resolved_by_patch" not in body.get("questions", {}):
+            return None
+        return {"resolved_by_patch": {"noul": 0.9}, "patch_introduces_new_risk": {"noul": 0.7}}
+
+    mock_router.STATE["jev_response_provider"] = provider
+    try:
+        repo, run = _panel_with_finding()
+        write(run / "validation" / "idor.json", {
+            "finding_ids": ["security-1"], "classification": "confirmed",
+            "severity": "high", "evidence": "reproduced", "reproduced": True,
+            "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+        patch = run / "fix.patch"
+        patch.write_text("diff --git a/api/invoices.py b/api/invoices.py\n+fix\n")
+        r = sh(["jev_triage.py", "patch-check", str(run), str(patch)], repo, env=_jev_env())
+        rec = read(run / "patch_check" / "round-1.json")
+        assert len(rec["items"]) == 1
+        item = rec["items"][0]
+        assert item["resolved_by_patch"] == 0.9 and item["patch_introduces_new_risk"] == 0.7
+        assert "resolved, Claude confirms (1)" in r.stdout
+        assert "new risk introduced, back to panel (1)" in r.stdout
+    finally:
+        mock_router.STATE["jev_response_provider"] = None
+        mock_router.reset()
+
+
+def t_jev_patch_check_no_confirmed_findings_is_a_noop():
+    mock_router.reset()
+    try:
+        repo, run = _panel_with_finding()
+        patch = run / "fix.patch"
+        patch.write_text("diff --git a/x b/x\n+y\n")
+        r = sh(["jev_triage.py", "patch-check", str(run), str(patch)], repo, env=_jev_env())
+        assert mock_router.STATE["jev_calls"] == 0
+        assert "nothing to check" in r.stdout
+    finally:
+        mock_router.reset()
+
+
+def t_panel_rebuttal_digest_file_empty_writes_none_required():
+    repo, run = _panel_with_finding()
+    empty = run / "empty-digest.json"
+    write(empty, [])
+    sh(["panel.py", "rebuttal", "--digest-file", str(empty)], repo)
+    assert (run / "rebuttal" / "none-required.json").exists()
+    assert not (run / "rebuttal" / "security.json").exists(), \
+        "an explicitly empty --digest-file must not fall back to the full digest"
+
+
+def t_panel_rebuttal_digest_file_malformed_dies():
+    repo, run = _panel_with_finding()
+    bad = run / "bad-digest.json"
+    write(bad, [{"not": "a valid digest item"}])
+    r = sh(["panel.py", "rebuttal", "--digest-file", str(bad)], repo, expect=2)
+    assert "--digest-file must be" in r.stderr
+
+
+def t_panel_rebuttal_digest_file_subset_runs_normally():
+    repo, run = _panel_with_finding()
+    full = [{"id": "security-1", "title": "IDOR on invoice endpoint", "severity": "high",
+             "file": "api/invoices.py", "line": 42, "evidence": "x", "scenario": "y",
+             "author_role": "security"}]
+    df = run / "digest.json"
+    write(df, full)
+    sh(["panel.py", "rebuttal", "--digest-file", str(df)], repo)
+    for role in read(run / "panel" / "plan.json")["roles"]:
+        assert (run / "rebuttal" / f"{role}.json").exists()
+
+
+def t_check_rebuttal_backward_compatible_without_jev_gate():
+    import aggregate
+    repo, run = _panel_with_finding()
+    plan = read(run / "panel" / "plan.json")
+    meta = read(run / "run.json")
+    reports = aggregate.load_reports(run, plan)
+    fail, blocked, notes = [], [], []
+    rcov = aggregate.check_rebuttal(run, meta, plan, reports, blocked, notes)
+    assert "jev_gate" not in rcov
+    assert rcov["required"] is True, \
+        "pre-Jev behavior must be unchanged: any high/critical finding requires rebuttal"
+    assert any("rebuttal round required" in b for b in blocked)
+
+
+def t_check_rebuttal_honors_jev_gate_when_present():
+    import aggregate
+    repo, run = _panel_with_finding()
+    write(run / "rebuttal" / "plan.json", {
+        "generated_at": "x", "model": "typesafe/jev-1.13", "decisions": {},
+        "required_finding_ids": [], "skipped_finding_ids": ["security-1"]})
+    plan = read(run / "panel" / "plan.json")
+    meta = read(run / "run.json")
+    reports = aggregate.load_reports(run, plan)
+    fail, blocked, notes = [], [], []
+    rcov = aggregate.check_rebuttal(run, meta, plan, reports, blocked, notes)
+    assert rcov["required"] is False
+    assert not blocked, "a jev gate saying nothing needs contest must not BLOCK on rebuttal"
+    assert any("gated by jev triage" in n for n in notes)
+
+
+def t_check_rebuttal_malformed_jev_gate_falls_back_safely():
+    import aggregate
+    repo, run = _panel_with_finding()
+    write(run / "rebuttal" / "plan.json", {"required_finding_ids": "not-a-list"})
+    plan = read(run / "panel" / "plan.json")
+    meta = read(run / "run.json")
+    reports = aggregate.load_reports(run, plan)
+    fail, blocked, notes = [], [], []
+    rcov = aggregate.check_rebuttal(run, meta, plan, reports, blocked, notes)
+    assert rcov["required"] is True, \
+        "a malformed jev gate file must fall back to the safe (blanket) rule, never relax it"
+
+
+def t_verdict_md_shows_jev_priors():
+    mock_router.reset()
+    try:
+        repo = _complete_sensitive_repo()
+        run = latest_run(repo)
+        sh(["jev_triage.py", "triage", str(run)], repo, env=_jev_env())
+        write(run / "validation" / "idor.json", {
+            "finding_ids": ["security-1"], "classification": "confirmed",
+            "severity": "high", "evidence": "reproduced", "reproduced": True,
+            "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+        sh(["aggregate.py"], repo, expect=0)
+        md = (run / "verdict.md").read_text()
+        assert "## Jev triage priors" in md
+        assert "security-1" in md and "is_real=0.10" in md
+    finally:
+        mock_router.reset()
+
+
+def t_verdict_md_omits_jev_section_when_no_triage_ran():
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["aggregate.py"], repo, expect=0)
+    md = (run / "verdict.md").read_text()
+    assert "## Jev triage priors" not in md
 
 
 def main():

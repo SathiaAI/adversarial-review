@@ -1097,7 +1097,19 @@ def cmd_rebuttal(args):
     run = resolve_run(args.run)
     meta = read_json(run / "run.json")
     plan = read_json(run / "panel" / "plan.json")
-    digest = high_critical_digest(run, plan)
+    digest_file = getattr(args, "digest_file", None)
+    if digest_file:
+        # E.g. from `jev_triage.py rebuttal-gate`: a Jev-narrowed subset of the same
+        # high/critical digest this command would otherwise build itself — reduces the
+        # noise a rebuttal round contests without touching who may contest or how a
+        # dispute is settled (Step 4 reproduction, never Jev, never majority vote).
+        digest = read_json(digest_file)
+        if not isinstance(digest, list) or not all(
+                isinstance(d, dict) and "id" in d and "author_role" in d for d in digest):
+            die(f"--digest-file must be a JSON list of finding digest items (each an "
+                f"object with 'id' and 'author_role'), got: {digest_file}", 2)
+    else:
+        digest = high_critical_digest(run, plan)
     if not digest:
         write_json(run / "rebuttal" / "none-required.json",
                    {"reason": "no high/critical findings to contest", "at": now_iso()})
@@ -1256,6 +1268,10 @@ def main():
 
     p = sub.add_parser("rebuttal")
     p.add_argument("--run"); p.add_argument("--prepare", action="store_true")
+    p.add_argument("--digest-file",
+                   help="use this pre-filtered high/critical finding digest (e.g. from "
+                        "`jev_triage.py rebuttal-gate`) instead of contesting every "
+                        "high/critical finding in the panel reports")
     p.set_defaults(fn=cmd_rebuttal)
 
     p = sub.add_parser("concur")
