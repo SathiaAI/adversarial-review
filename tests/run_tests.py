@@ -8079,7 +8079,7 @@ def t_mcp_panel_timeout_reads_policy_racesafe():
         os.chdir(repo4)
         (repo4 / ".adversarial-review.yml").write_text("high_samples: 3\n", encoding="utf-8")
         assert int(mcpsrv._resolved_high_samples()) == 3, mcpsrv._resolved_high_samples()
-        assert mcpsrv._panel_timeout() == max(1800, 240 * (9 + 2 * 2) * 6 + 600), mcpsrv._panel_timeout()
+        assert mcpsrv._panel_timeout() == max(1800, 240 * (17 + 2 * 2) * 6 + 600), mcpsrv._panel_timeout()
         # ...and a policy with no high_samples -> default hs=1
         (repo4 / ".adversarial-review.yml").write_text("risk: NORMAL\n", encoding="utf-8")
         assert mcpsrv._panel_timeout() == BASE, mcpsrv._panel_timeout()
