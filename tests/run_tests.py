@@ -3391,13 +3391,18 @@ def _workflow_job_block(wf_text, job):
 
 
 def t_release_workflow_uses_trusted_publishing():
-    # The release workflow must publish on v* tags via OIDC Trusted Publishing with NO stored
-    # token, and the OIDC permission + pypi environment + publish step must live in the publish
-    # JOB — not merely somewhere in the file or in a comment. Substring-only checks would pass if
-    # a token were moved into a comment or an unrelated job, so this parses per-job structure and
-    # also guards the version==tag gate and the 3.9 wheel smoke (E2-S2).
+    # The release workflow must publish on full-semver vX.Y.Z tags via OIDC Trusted Publishing with
+    # NO stored token, and the OIDC permission + pypi environment + publish step must live in the
+    # publish JOB — not merely somewhere in the file or in a comment. Substring-only checks would
+    # pass if a token were moved into a comment or an unrelated job, so this parses per-job structure
+    # and also guards the version==tag gate and the 3.9 wheel smoke (E2-S2).
+    # The trigger is restricted to full semver (E2-S3): moving major aliases (v0/v1) must NOT match,
+    # so a maintainer can force-move them without re-triggering a PyPI publish.
     wf = (SKILL / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-    assert re.search(r'(?m)^\s*tags:\s*\[\s*"v\*"\s*\]', wf), "release.yml must trigger on v* tags"
+    assert re.search(r'(?m)^\s*tags:\s*\[\s*"v\[0-9\]\+\.\[0-9\]\+\.\[0-9\]\+"\s*\]', wf), \
+        "release.yml must trigger on full-semver vX.Y.Z tags only (moving v0/v1 aliases excluded)"
+    assert not re.search(r'(?m)^\s*tags:\s*\[\s*"v\*"\s*\]', wf), \
+        "release.yml must NOT use the broad v* trigger (it would fire on moving v0/v1 aliases)"
     assert "PYPI_API_TOKEN" not in wf and re.search(r'(?m)^\s*password:\s*\S', wf) is None, \
         "no stored PyPI token — Trusted Publishing only"
 

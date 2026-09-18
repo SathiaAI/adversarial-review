@@ -120,7 +120,7 @@ itself.
 pipeline so it gates the merge, not a human's optimism:
 
 ```yaml
-- uses: SathiaAI/adversarial-review@main
+- uses: SathiaAI/adversarial-review@v0   # moving major; pin @v0.2.0 for a specific release, or a full SHA — the only inherently immutable pin
   with:
     gates: |
       build=npm run build

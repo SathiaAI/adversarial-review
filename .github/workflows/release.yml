@@ -5,7 +5,14 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    # Full semver tags only (glob; `+` is GitHub's supported extension, not a regex). Moving
+    # major aliases (`v0`, `v1`) and any non-package tag are intentionally EXCLUDED so that
+    # force-moving them never re-triggers a PyPI publish. This workflow never creates or moves
+    # those aliases — a maintainer does that by hand after a green release (see
+    # docs/ci-integration.md "Version & tag scheme"). A full `vX.Y.Z` still matches, and the
+    # version guard below requires it to equal the pyproject version, so only a legitimately
+    # bumped release can publish.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
 
 permissions:
   contents: read
