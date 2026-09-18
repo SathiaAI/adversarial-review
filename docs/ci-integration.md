@@ -43,7 +43,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - uses: SathiaAI/adversarial-review@main   # early adopters use @main; switch to @v1 once the first major tag exists, or pin a full SHA
+      - uses: SathiaAI/adversarial-review@v0   # moving major (auto patch/minor); or pin @v0.2.0 / a full SHA for an immutable ref — see "Version & tag scheme" below
         with:
           risk: NORMAL              # or leave empty to resolve from .adversarial-review.yml
           dev-providers: anthropic  # families that wrote/advised the change — barred from the panel
@@ -147,7 +147,7 @@ repository-controlled code never runs in the same job as the reviewer key:
 | `openrouter-api-key` | `OPENROUTER_API_KEY` CI/CD variable (masked + protected) |
 | `diff-ref` | `AR_DIFF`, computed from GitLab's predefined variables (`CI_MERGE_REQUEST_DIFF_BASE_SHA` / `CI_DEFAULT_BRANCH`) |
 | `risk` / `dev-providers` | `AR_RISK` / `AR_DEV_PROVIDERS` (or, preferably, `.adversarial-review.yml`) |
-| _the action ref_ `@v1` / `@<sha>` | `AR_REF` (pin to a tag or full SHA) |
+| _the action ref_ `@v0` / `@<sha>` | `AR_REF` (pin to a tag or full SHA) |
 | `product` | recorded via the policy file / `run.json`; no separate variable in the template |
 
 > **Supported GitLab gate names.** The template runs exactly **`build`, `unit`, `deps`, `sast`, and
@@ -162,7 +162,7 @@ repository-controlled code never runs in the same job as the reviewer key:
 Listing the action on the GitHub Marketplace is a **manual action on github.com** — it involves
 branding, category choices, and the Marketplace Developer Agreement that only a repo maintainer
 can complete. It is **not** automated by this repository's release workflow (which publishes the
-PyPI package on a `v*` tag). The code side is already in place: `action.yml` declares
+PyPI package on a full-semver `vX.Y.Z` tag — see "Version & tag scheme" below). The code side is already in place: `action.yml` declares
 `name`, `description`, and `branding` (icon `shield`, color `red`). What remains for a maintainer:
 
 1. **Confirm the prerequisites.** The repo is public, `action.yml` sits at the repo root, its
@@ -174,22 +174,49 @@ PyPI package on a `v*` tag). The code side is already in place: `action.yml` dec
 4. **Choose categories.** Pick a primary category and an optional secondary one
    (e.g. *Continuous integration*, *Code quality*, *Code review*, or *Security*). The icon and
    color come from `action.yml`'s `branding`; the category is chosen here, in the UI.
-5. **Tag and publish.** Publish the release at a semver tag such as `v1.0.0`. The action then
-   appears on the Marketplace and is installable as `SathiaAI/adversarial-review@v1.0.0`.
-6. **Adopt a moving `v1` major tag.** So consumers can pin `@v1` and receive patch/minor updates,
-   maintain a `v1` tag that always points at the latest `v1.x.y` release. After each release,
-   move it and force-push:
+5. **Publish at the current release.** Publish the listing from the existing **`v0.2.0`** release
+   (it already exists). The action then appears on the Marketplace and is installable as
+   `SathiaAI/adversarial-review@v0.2.0`. There is **no need to cut a `v1.0.0`** to list on the
+   Marketplace — the listing publishes from any release tag.
+6. **Adopt a moving major tag now: `v0`.** So consumers can pin `@v0` and receive patch/minor
+   updates within the current 0.x line, maintain a `v0` tag that always points at the latest
+   `v0.x.y` release. After each release, move it and force-push:
 
    ```bash
-   git tag -f v1 v1.2.3      # point v1 at the new release commit
-   git push -f origin v1
+   git tag -f v0 v0.2.0      # point v0 at the latest 0.x release commit
+   git push -f origin v0
    ```
 
-   Document both options for consumers: **`@v1`** (moving major — auto-receives patches) or a
-   **full commit SHA** (immutable — reproducible, opt into updates deliberately). The examples in
-   this repo use `@main` for early adopters; switch them to `@v1` once the first major tag exists.
+   The moving alias is force-pushed **by a maintainer, by hand** — the release workflow never
+   creates or moves it (its trigger matches full `vX.Y.Z` only, so moving `v0`/`v1` fires nothing).
 
-Marketplace publication and the moving-tag discipline above are the only parts of this
+### Version & tag scheme
+
+This repo ships **two independently versioned products from one tree**, and they do **not** share a
+version number:
+
+| Product | How to pin | Meaning |
+|---|---|---|
+| The **GitHub Action** | `@v0` (moving major) · `@v0.2.0` (immutable) · `@<full-sha>` (most secure) | Action **interface** compatibility. `@v0` auto-receives patch/minor fixes within 0.x; a full SHA is reproducible and the recommended default for security-sensitive consumers. |
+| The **PyPI package** `adversarial-review` | `adversarial-review==0.2.0` (or a range) | The installable CLI's own semver. |
+
+The Action major tag tracks the **package major** for least surprise, but the two are separate git
+constructs: full `vX.Y.Z` tags are immutable and drive the PyPI release; `v0`/`v1` are **moving
+aliases** for Action consumers and are never attached to a PyPI publish. **Why the pin is real:**
+the composite action runs **its own** committed scripts via `${{ github.action_path }}/scripts` and
+never `pip install`s the package at run time, so `@v0.2.0` / `@<sha>` pins the *exact* code that
+executes — the Action ref, not a mutable PyPI "latest", is the reproducibility boundary.
+
+A `v1` moving tag is deliberately **not** cut yet: `v1.0.0` is reserved for the real 1.0 release
+(after the remaining PR-comment integration and signed-attestation work land), at which point that
+tag both drives the PyPI 1.0.0 publish and becomes the new moving `v1` for the Action. Cutting a
+`1.0.0` early would be a stability claim the project is not ready to make.
+
+**Tag hygiene (recommended repo ruleset):** protect `v[0-9]*.[0-9]*.[0-9]*` as immutable
+(no force-push, no delete); allow force-push on the `v0` alias only, for narrowly-scoped
+maintainers. This keeps the immutable release history honest while letting the major alias move.
+
+Marketplace publication and the moving-alias discipline above are the only parts of this
 integration a maintainer performs by hand; everything else — the template, the workflow, and the
 verdict wiring — is in the repository.
 

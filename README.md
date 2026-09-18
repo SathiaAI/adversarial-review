@@ -317,7 +317,7 @@ an OpenRouter key secret is provided, and fails the job exactly as
 written to the job summary:
 
 ```yaml
-- uses: SathiaAI/adversarial-review@main
+- uses: SathiaAI/adversarial-review@v0   # moving major (auto patch/minor); or pin @v0.2.0 / a full SHA
   with:
     gates: |
       build=npm run build
