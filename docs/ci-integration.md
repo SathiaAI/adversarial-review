@@ -180,7 +180,7 @@ PyPI package on a full-semver `vX.Y.Z` tag — see "Version & tag scheme" below)
    Marketplace — the listing publishes from any release tag.
 6. **Adopt a moving major tag now: `v0`.** So consumers can pin `@v0` and receive patch/minor
    updates within the current 0.x line, maintain a `v0` tag that always points at the latest
-   `v0.x.y` release. After each release, move it and force-push:
+   `v0.x.y` release. **Bootstrap it once**, onto a commit that carries the narrowed release trigger:
 
    ```bash
    # Point v0 at a commit that CONTAINS the narrowed release trigger — i.e. main AFTER the PR that
@@ -191,6 +191,16 @@ PyPI package on a full-semver `vX.Y.Z` tag — see "Version & tag scheme" below)
    # matches nothing, so the push fires no workflow.
    git fetch origin
    git tag -f v0 origin/main      # main HEAD (carries the narrowed full-semver trigger)
+   git push -f origin v0
+   ```
+
+   **After each subsequent release, move `v0` to that release's full-semver tag — not
+   `origin/main`, which may carry commits that were merged but not yet released** (pointing `v0`
+   at `origin/main` would expose that unreleased code through `@v0`):
+
+   ```bash
+   git fetch origin --tags
+   git tag -f v0 v0.3.0      # the tag of the release you just published (e.g. v0.3.0)
    git push -f origin v0
    ```
 
