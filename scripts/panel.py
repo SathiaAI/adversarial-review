@@ -651,6 +651,19 @@ def run_one_role(run, meta, plan, role, context_text, base, key):
             return True
         except Exception as e:  # noqa: BLE001
             attempts.append(attempt)
+            # A failed attempt may still have been BILLED (call_reviewer attaches the usage it
+            # accrued before the failure to the exception). Persist it as a status=failed meta so
+            # panel_cost() counts spend that produced no report — without this the per-substitute
+            # cost gate under-counts and a run could exceed AR_MAX_COST_USD across the primary +
+            # substitution attempts. Distinct filename per (model, attempt) so a later success meta
+            # never overwrites it. Mirrors the corroboration-sample failure record (CodeRabbit #66).
+            failed_usage = getattr(e, "usage", None)
+            if failed_usage:
+                slug = re.sub(r"[^A-Za-z0-9._-]", "_", str(info["model"]))
+                write_json(run / "panel" / "meta" / f"{role}.failed.{slug}.{attempt}.json", {
+                    "model": info["model"], "family": info["family"], "status": "failed",
+                    "usage": failed_usage, "cost": failed_usage.get("cost"),
+                    "attempt": attempt, "completed_at": now_iso()})
             print(f"  {role}: attempt {attempt} on {info['model']} failed: {e}", file=sys.stderr)
     return False
 

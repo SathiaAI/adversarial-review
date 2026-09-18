@@ -208,6 +208,38 @@ def t_substitution_on_dead_provider():
     mock_router.STATE["fail_models"].clear()
 
 
+def t_failed_attempt_billed_usage_is_metered():
+    # CodeRabbit Major (PR #66): a substitute/primary attempt that is BILLED before it fails must be
+    # metered, or panel_cost() under-counts and the per-substitute cost gate can't hold the cap. Make
+    # only the security role's primary bill (reviewer_cost>0) then return a schema-invalid report so
+    # it fails and substitutes to a valid family: the run recovers, but the billed primary failure
+    # must be recorded as a status=failed meta and counted by panel_cost(). On the pre-fix code
+    # run_one_role discarded the exception's usage, so no failed meta exists and panel_cost omits it.
+    import panel as _panel
+    mock_router.reset()
+    mock_router.STATE["reviewer_cost"] = 0.05
+    try:
+        repo = fresh_repo()
+        sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+        sh(["panel.py", "assign"], repo)
+        run = latest_run(repo)
+        target = read(run / "panel" / "plan.json")["roles"]["security"]["model"]
+        mock_router.STATE["response_provider"] = (
+            lambda md, _t=target: {"invalid": "shape"}
+            if (md["kind"] == "report" and md["model"] == _t) else None)
+        sh(["panel.py", "run", "--context-file", "context.md"], repo)   # recovers via substitution
+        run = latest_run(repo)
+        assert (run / "panel" / "security.json").exists(), "security should recover via a substitute family"
+        failed = list((run / "panel" / "meta").glob("security.failed.*.json"))
+        assert failed, "the billed primary failure must persist a status=failed meta record"
+        rec = read(failed[0])
+        assert rec.get("status") == "failed" and rec.get("cost") and rec["cost"] > 0, rec
+        assert _panel.panel_cost(run) > 0, "panel_cost must include the billed failed-attempt spend"
+    finally:
+        mock_router.STATE["response_provider"] = None
+        mock_router.reset()
+
+
 def _complete_sensitive_repo():
     """Panel + rebuttal done, all required gates green. security-1 finding still open."""
     repo = fresh_repo()
