@@ -15,6 +15,7 @@ Stdlib only. Exit codes: 0 ok, 1 error, 2 BLOCKED.
 """
 import argparse
 import difflib
+import hashlib
 import json
 import math
 import os
@@ -600,12 +601,29 @@ def FAMILY_OR_SELF(p):
 def call_reviewer(base, key, body, schema, corrective=None, prior_usage=None):
     """One HTTP attempt (+1 retry on malformed JSON). Returns (obj, raw, usage, provider).
     ``usage`` accumulates across the retry (``prior_usage``) so a malformed-JSON retry — which is
-    a second billed call — is fully counted against the cost cap, not just the final attempt."""
-    resp = http_json(f"{base}/chat/completions", payload=body, key=key)
-    if "error" in resp and "choices" not in resp:
-        raise RuntimeError(str(resp["error"]))
-    content = resp["choices"][0]["message"]["content"]
-    usage = merge_usage(prior_usage, resp.get("usage", {}))
+    a second billed call — is fully counted against the cost cap, not just the final attempt.
+    ANY failure carries the accumulated spend on ``err.usage`` — including a transport/HTTP error
+    raised by the corrective retry itself, which would otherwise drop the first (billed) attempt's
+    usage and let panel_cost()/the cost gate under-count and slip past AR_MAX_COST_USD."""
+    billed = prior_usage  # spend already billed on earlier attempts; grows once this response is in
+    try:
+        resp = http_json(f"{base}/chat/completions", payload=body, key=key)
+        if isinstance(resp, dict) and resp.get("usage"):
+            billed = merge_usage(prior_usage, resp.get("usage", {}))
+        if "error" in resp and "choices" not in resp:
+            raise RuntimeError(str(resp["error"]))
+        content = resp["choices"][0]["message"]["content"]
+        usage = merge_usage(prior_usage, resp.get("usage", {}))
+    except Exception as e:  # noqa: BLE001
+        # Attach the spend accrued so far (prior attempts + this response, if it billed) to any
+        # failure before we reach the validation branch below — a transport error, an error body,
+        # or a malformed envelope on the corrective retry must not silently discard billed usage.
+        if billed and getattr(e, "usage", None) is None:
+            try:
+                e.usage = billed
+            except Exception:  # a few exception types disallow attribute assignment
+                pass
+        raise
     provider = resp.get("provider")
     try:
         obj = extract_json(content)
@@ -624,6 +642,19 @@ def call_reviewer(base, key, body, schema, corrective=None, prior_usage=None):
         err.usage = usage  # expose billed usage so a failed-but-billed attempt can be cost-metered
         raise err
     return obj, content, usage, provider
+
+
+def failed_meta_name(role, model, attempt):
+    """Filename for a billed-but-failed reviewer attempt's meta record. A custom OpenAI-compatible
+    catalog can return very long model IDs; embedding the whole sanitized slug can exceed the
+    filesystem's per-component limit (commonly 255 bytes) and turn a recoverable reviewer failure
+    into an OSError crash in run_one_role. Keep a readable prefix and, when the slug is long, append
+    a short digest of the FULL model ID so two distinct long IDs sharing a prefix never collide."""
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", str(model))
+    if len(slug) > 80:
+        digest = hashlib.sha1(str(model).encode("utf-8")).hexdigest()[:12]
+        slug = slug[:64] + "." + digest
+    return f"{role}.failed.{slug}.{attempt}.json"
 
 
 def run_one_role(run, meta, plan, role, context_text, base, key):
@@ -659,8 +690,7 @@ def run_one_role(run, meta, plan, role, context_text, base, key):
             # never overwrites it. Mirrors the corroboration-sample failure record (CodeRabbit #66).
             failed_usage = getattr(e, "usage", None)
             if failed_usage:
-                slug = re.sub(r"[^A-Za-z0-9._-]", "_", str(info["model"]))
-                write_json(run / "panel" / "meta" / f"{role}.failed.{slug}.{attempt}.json", {
+                write_json(run / "panel" / "meta" / failed_meta_name(role, info["model"], attempt), {
                     "model": info["model"], "family": info["family"], "status": "failed",
                     "usage": failed_usage, "cost": failed_usage.get("cost"),
                     "attempt": attempt, "completed_at": now_iso()})

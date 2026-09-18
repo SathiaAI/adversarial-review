@@ -5494,6 +5494,58 @@ def t_call_reviewer_exposes_usage_on_validation_failure():
         mock_router.reset()
 
 
+def t_call_reviewer_preserves_usage_when_corrective_retry_errors():
+    # E4-S2 (Codex #66 r2): a billed but schema-invalid first response triggers the corrective retry;
+    # if that retry then raises a transport/HTTP error, the first attempt's billed usage must STILL be
+    # attached to the propagated exception. Otherwise panel_cost()/the pre-call cost gate drop that
+    # spend and permit calls past AR_MAX_COST_USD. Pure unit test on call_reviewer: the first
+    # http_json bills $0.75 and returns an invalid report; the corrective retry raises.
+    import panel
+    calls = {"n": 0}
+    billed_first = {"prompt_tokens": 1000, "completion_tokens": 200, "cost": 0.75}
+
+    def fake_http_json(url, payload=None, key=None, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"choices": [{"message": {"content": json.dumps({"not": "a valid report"})}}],
+                    "usage": billed_first, "provider": "MockServe"}
+        raise RuntimeError("provider connection reset")   # transport error on the corrective retry
+
+    orig = panel.http_json
+    panel.http_json = fake_http_json
+    try:
+        body = {"model": "x/y", "messages": [{"role": "system", "content": "Your role: security"},
+                                             {"role": "user", "content": "go"}]}
+        try:
+            panel.call_reviewer("http://unused", "k", body, panel.REPORT_SCHEMA)
+            raise AssertionError("expected the corrective-retry transport error to propagate")
+        except RuntimeError as e:
+            assert calls["n"] == 2, ("expected exactly one corrective retry", calls["n"])
+            u = getattr(e, "usage", None)
+            assert u and abs((u.get("cost") or 0) - 0.75) < 1e-9, \
+                ("first attempt's billed usage must survive the retry error", u)
+    finally:
+        panel.http_json = orig
+
+
+def t_failed_meta_filename_is_bounded():
+    # E4-S2 (Codex #66 r2): a custom OpenAI-compatible catalog can return a very long model ID; the
+    # billed-failure meta filename must stay within the filesystem per-component limit (255) so a
+    # recoverable reviewer failure never becomes an OSError crash in run_one_role. Two distinct long
+    # IDs sharing a prefix must still map to distinct filenames (digest of the FULL ID).
+    import panel
+    long_a = "vendor/" + ("m" * 260)
+    long_b = "vendor/" + ("m" * 258) + "zz"          # identical first 64 chars as long_a
+    na = panel.failed_meta_name("security", long_a, 1)
+    nb = panel.failed_meta_name("security", long_b, 1)
+    assert len(na) <= 255 and len(nb) <= 255, (len(na), len(nb))
+    assert na.startswith("security.failed.") and na.endswith(".1.json"), na
+    assert na != nb, "distinct long model IDs sharing a prefix must not collide"
+    # a normal short model ID keeps its readable slug unchanged (no digest suffix)
+    assert panel.failed_meta_name("security", "openai/gpt-5.6-sol", 2) \
+        == "security.failed.openai_gpt-5.6-sol.2.json"
+
+
 def t_high_samples_rejects_invalid_values():
     # E4-S3: a non-integer / < 1 AR_HIGH_SAMPLES is rejected loudly (like the cost cap), so a typo
     # can never silently change the sampling count. Also validated at policy load.
