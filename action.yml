@@ -1,8 +1,5 @@
-name: 'Adversarial Review'
-description: >-
-  Deterministic gate recording plus a machine-computed PASS/FAIL/BLOCKED release
-  verdict (aggregate.py exit 0/1/2). Optionally runs the independent multi-model
-  reviewer panel when an OpenRouter key is provided.
+name: 'Adversarial Review Gate'
+description: 'Machine-computed PASS/FAIL/BLOCKED release gate, with an optional independent multi-model reviewer panel.'
 author: 'Paul Poulose'
 branding:
   icon: 'shield'
