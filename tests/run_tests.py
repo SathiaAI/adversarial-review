@@ -11217,7 +11217,10 @@ def t_collect_jev_priors_rejects_unsafe_finding_id():
     run = Path(tempfile.mkdtemp())
     (run / "triage").mkdir()
     write(run / "outside.json", {"jev": {"is_real": 0.9, "error": None}})
-    write(run / "triage" / "_summary.json", {"generated_at": "x", "findings": 0})
+    # A dict-valued 'jev' field, not just any JSON object -- otherwise this fixture would
+    # still be skipped by collect_jev_priors' unrelated jev-shape check even if the
+    # reserved-name guard under test were removed, silently defeating the assertion below.
+    write(run / "triage" / "_summary.json", {"jev": {"is_real": 0.9, "error": None}})
     write(run / "triage" / "ok-1.json", {"jev": {"is_real": 0.5, "error": None}})
     reports = {"security": {"findings": [
         {"id": "../outside"},   # would escape triage/ into the run directory
