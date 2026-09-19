@@ -16,8 +16,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (die, load_policy, now_iso, read_json, resolve_run,
-                     resolve_waiver_clock, validate_gate_name,
+from _common import (die, load_attested_policy, load_policy, now_iso, read_json,
+                     resolve_run, resolve_waiver_clock, validate_gate_name,
                      validate_not_applicable_gate, validate_waived_gate, write_json)
 
 # Floors per tier: these cannot be silently omitted, only waived on the record with a
@@ -90,23 +90,26 @@ def cmd_plan(args):
     # for at-a-glance visibility.
     required = sorted(base_required)
     planned_at = now_iso()
-    # Fail fast at plan time using the EXACT SAME validator aggregate.py enforces, so an
-    # invalid waiver never even produces artifacts. Aggregate remains the authority (it
-    # re-validates from disk against the attested policy snapshot); this is the identical
-    # early check against the working-tree policy, so `plan` exits non-zero rather than
-    # writing a waiver that will only BLOCK later.
-    pol_data = pol["data"] if pol is not None else {}
-    clock_date, clock_err = resolve_waiver_clock()
-    if clock_err:
-        die(clock_err)
-    for w in waived:
-        rec = {"gate": w["name"], "status": "WAIVED",
-               "authorized_by": w["authorized_by"], "reason": w["reason"],
-               "expires": w["expires"], "tier": tier, "planned_at": planned_at}
-        verr = validate_waived_gate(w["name"], tier, rec, pol_data, clock_date,
-                                    manifest_planned_at=planned_at)
-        if verr:
-            die(f"cannot waive '{w['name']}': {verr}")
+    # Fail fast at plan time using the EXACT SAME validator AND the SAME policy source
+    # aggregate.py enforces — the policy attested at init (policy.snapshot.json), not the mutable
+    # working tree — so `plan` cannot accept a waiver aggregate would later reject (or vice
+    # versa). Aggregate remains the authority; this is the identical early check. Only touched
+    # when there is actually a waiver to validate (a plan with no waivers reads no policy).
+    if waived:
+        att_pol, att_err = load_attested_policy(run)
+        if att_err:
+            die(f"cannot validate waiver: {att_err}")
+        clock_date, clock_err = resolve_waiver_clock()
+        if clock_err:
+            die(clock_err)
+        for w in waived:
+            rec = {"gate": w["name"], "status": "WAIVED",
+                   "authorized_by": w["authorized_by"], "reason": w["reason"],
+                   "expires": w["expires"], "tier": tier, "planned_at": planned_at}
+            verr = validate_waived_gate(w["name"], tier, rec, att_pol, clock_date,
+                                        manifest_planned_at=planned_at)
+            if verr:
+                die(f"cannot waive '{w['name']}': {verr}")
     # Revoke any stale plan-written WAIVED record from a PRIOR plan of this run whose gate is
     # not waived this time — otherwise gates/<name>.json left behind would still read WAIVED
     # and be honored, silently reinstating a waiver the new plan dropped. Only records this
@@ -235,14 +238,15 @@ def cmd_record(args):
             die("NOT_APPLICABLE requires --summary explaining why the gate does not "
                 "apply to this stack")
         # Enforce the CRITICAL-tier N/A restrictions at record time too (fail fast), with the
-        # SAME validator aggregate applies: mutation on CRITICAL can never be N/A, and any
-        # CRITICAL N/A needs policy allow_critical_waivers. Aggregate remains the authority.
+        # SAME validator AND the SAME attested policy source aggregate applies: mutation on
+        # CRITICAL can never be N/A, and any CRITICAL N/A needs policy allow_critical_waivers.
         tier = read_json(run / "run.json").get("risk")
-        pol = load_policy()
-        pol_data = pol["data"] if pol is not None else {}
+        att_pol, att_err = load_attested_policy(run)
+        if att_err:
+            die(f"cannot validate NOT_APPLICABLE: {att_err}")
         nerr = validate_not_applicable_gate(
             args.name, tier, {"authorized_by": args.authorized_by, "summary": args.summary},
-            pol_data)
+            att_pol)
         if nerr:
             die(nerr)
     rec = {"gate": args.name, "command": args.command or "(external)",

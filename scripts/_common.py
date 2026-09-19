@@ -345,11 +345,12 @@ def validate_gate_name(name):
         return "gate name must be a string"
     if not name.strip():
         return "gate name is required"
-    # Match the RAW name (no strip): a name with surrounding whitespace passes a stripped
-    # check but the caller writes gates/<raw name>.json, so 'unit ' would be recorded as
-    # 'unit .json' while the required set looks for 'unit' — an accepted record that never
-    # satisfies the gate. Reject it here.
-    if not GATE_NAME_RE.match(name):
+    # Match the RAW name with fullmatch (NOT match): a name with surrounding whitespace passes
+    # a stripped check but the caller writes gates/<raw name>.json, so 'unit ' would be recorded
+    # as 'unit .json' while the required set looks for 'unit'. `re.match` also lets a trailing
+    # newline slip through ('unit\n' — the `$` anchor matches before the final \n), so fullmatch
+    # is required to reject the whole tampered string.
+    if not GATE_NAME_RE.fullmatch(name):
         return (f"gate name {name!r} is invalid — must match [a-z0-9][a-z0-9_-]{{0,63}} "
                 "(lowercase alphanumerics, '-' or '_', no leading underscore, no whitespace, "
                 "path separators, or dots); leading-underscore names such as '_required' are reserved")
@@ -630,11 +631,15 @@ def load_attested_policy(run):
                      working tree."""
     # The init-time provenance: run.json.policy.sha256 records whether a policy governed the
     # run at init. Read it first so a DELETED snapshot can be told apart from 'no policy'.
+    # Fail closed on unreadable/corrupt provenance — never treat it as 'no policy at init', or a
+    # damaged run.json could silently widen a waiver from an attested limit to the default.
     try:
         runjson = read_json(Path(run) / "run.json")
     except (ValueError, OSError):
-        runjson = None
-    init_pol = runjson.get("policy") if isinstance(runjson, dict) else None
+        return None, "run.json is unreadable — cannot determine the attested policy; run BLOCKED"
+    if not isinstance(runjson, dict):
+        return None, "run.json is not a JSON object — cannot determine the attested policy; run BLOCKED"
+    init_pol = runjson.get("policy")
     init_sha = init_pol.get("sha256") if isinstance(init_pol, dict) else None
     snap_path = Path(run) / "policy.snapshot.json"
     if not snap_path.is_file():

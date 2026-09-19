@@ -199,6 +199,7 @@ human-readable `verdict.md` is written alongside `verdict.json`.
    "rebuttal": {"policy": "contention", "required": false, "ran": false},
    "findings": {"raised": 0, "triaged": 0, "untriaged_release_blocking": 0},
    "cost_usd": 0.0, "cost_aborted": false, "cost_cap_usd": 20.0, "cost_cap_source": "default",
+   "policy_snapshot_sha256": "hex or null (sha256 of the policy attested at init whose waiver limits governed this verdict; null when the run had no policy file or the snapshot was rejected)",
    "areas_not_reviewed": ["union of reviewer attestations"]},
  "attestation": {"algorithm": "sha256-canonical-json-v2", "inputs": 0,
    "digest": "hex", "files": {"run.json": "hex", "gates/unit.json": "hex"}},

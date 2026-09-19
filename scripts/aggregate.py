@@ -70,24 +70,45 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
         return {}, gcov
     gplan = read_json(req_path)
     gcov["plan_recorded"] = True
-    gcov["required"] = list(gplan.get("required", []))
     manifest_planned_at = gplan.get("planned_at")
-    required_set = set(gplan.get("required", []))
+    # The manifest `required` must be a list of safe string gate names before it is turned into
+    # a list/set — a non-list ("required": 1) or an unhashable member ("required": [[]]) would
+    # otherwise raise a TypeError before a BLOCKED verdict is written. Malformed entries become
+    # blocking reasons; each surviving name is validated (so a tampered path/newline name is
+    # rejected here, not used to build a gates/<name>.json path later).
+    raw_required = gplan.get("required", [])
+    if not isinstance(raw_required, list):
+        blocked.append("gate plan 'required' is not a list — malformed or tampered manifest")
+        raw_required = []
+    required_names = []
+    for g in raw_required:
+        nerr = validate_gate_name(g) if isinstance(g, str) else "gate name must be a string"
+        if nerr:
+            blocked.append(f"gate plan has a malformed required entry {g!r}: {nerr}")
+            continue
+        required_names.append(g)
+    gcov["required"] = list(required_names)
+    required_set = set(required_names)
     # The manifest's `waived` list must be well-formed before anything is built from it — a
-    # non-list, or an entry that is not an object with a non-empty string `name` (an unhashable
-    # value such as {"name": []} would otherwise raise during set construction), is a
-    # malformed/tampered manifest that must BLOCK, never crash aggregation before the verdict.
+    # non-list, or an entry that is not an object with a safe string `name` (an unhashable value
+    # such as {"name": []}, or a newline/markdown name that could forge output, would otherwise
+    # raise or leak), is a malformed/tampered manifest that must BLOCK, never crash aggregation.
     raw_waived = gplan.get("waived", [])
     manifest_waived = {}   # gate name -> its manifest waiver entry (bound against the record)
     if not isinstance(raw_waived, list):
         blocked.append("gate plan 'waived' is not a list — malformed or tampered manifest")
         raw_waived = []
     for w in raw_waived:
-        if not (isinstance(w, dict) and isinstance(w.get("name"), str) and w["name"].strip()):
+        if not isinstance(w, dict):
             blocked.append(f"gate plan has a malformed waiver entry {w!r} — expected an object "
                            "with a string 'name'")
             continue
-        manifest_waived[w["name"]] = w
+        wn = w.get("name")
+        nerr = validate_gate_name(wn) if isinstance(wn, str) else "gate name must be a string"
+        if nerr:
+            blocked.append(f"gate plan has a malformed waiver entry {w!r}: {nerr}")
+            continue
+        manifest_waived[wn] = w
     manifest_waived_names = set(manifest_waived)
     # Legacy/tampered-plan guard: pre-M1 plans DROPPED a waived gate from `required` and
     # recorded it only in the manifest's `waived` list, so the loop below never checked it —
@@ -102,15 +123,7 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
                 "`gate.py plan` with the current version to migrate (waived gates now stay "
                 "required and are independently re-validated)")
     results = {}
-    for name in gplan.get("required", []):
-        # A required gate name becomes gates/<name>.json; reject an unsafe/reserved name from
-        # a tampered manifest BEFORE building that path (it could otherwise read _required.json
-        # or escape the gates dir).
-        nerr = validate_gate_name(name)
-        if nerr:
-            gcov["blocked"].append({"name": str(name), "reason": nerr})
-            blocked.append(f"required gate name rejected: {nerr}")
-            continue
+    for name in required_names:   # already validated as safe gate-name strings above
         p = run / "gates" / f"{name}.json"
         if not p.exists():
             gcov["missing"].append(name)
@@ -1408,6 +1421,11 @@ def _aggregate_cli():
 
         md = [f"# Release verdict: {verdict}", "",
               f"Run `{meta['run_id']}`, risk {meta['risk']}, computed {out['computed_at']}.", ""]
+        # fail/blocked reasons are already escaped where they interpolate untrusted text (reviewer
+        # strings via _snippet; tampered gate names are rejected by validate_gate_name, and a
+        # malformed manifest entry is shown via repr, which escapes newlines) — so they are NOT
+        # re-escaped here (that would double-escape, e.g. &lt; -> &amp;lt;). Notes are raw, so
+        # they are escaped at render.
         md += [f"- FAIL: {r}" for r in fail]
         md += [f"- BLOCKED: {r}" for r in blocked]
         md += [f"- note: {_oneline(n)}" for n in notes]
