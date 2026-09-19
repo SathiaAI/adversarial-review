@@ -73,6 +73,8 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
     gcov["required"] = list(gplan.get("required", []))
     manifest_planned_at = gplan.get("planned_at")
     required_set = set(gplan.get("required", []))
+    manifest_waived_names = {(w.get("name") if isinstance(w, dict) else w)
+                             for w in (gplan.get("waived") or [])}
     # Legacy/tampered-plan guard: pre-M1 plans DROPPED a waived gate from `required` and
     # recorded it only in the manifest's `waived` list, so the loop below never checked it —
     # a SENSITIVE run could pass with no mutation gate at all. Any waived entry whose gate is
@@ -108,6 +110,16 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
         # pass and not fail. Absent status falls back to the exit code (older records).
         status = rec.get("status")
         if status == "WAIVED":
+            # A WAIVED record must be authorized by the plan manifest's `waived` list. A record
+            # present without a matching manifest entry is an orphan — e.g. a stale record a
+            # concurrent replan failed to revoke, or one dropped from the final manifest — and
+            # honoring it would be a hollow-green result, so BLOCK.
+            if name not in manifest_waived_names:
+                reason = ("WAIVED record is not authorized by the plan manifest's waived list "
+                          "(orphaned or raced waiver) — re-run `gate.py plan`")
+                gcov["blocked"].append({"name": name, "reason": reason})
+                blocked.append(f"gate '{name}': {reason}")
+                continue
             # A waiver's expiry can only be judged against a trustworthy clock — if the
             # CI-provided clock itself could not be parsed, no waiver can be honestly
             # evaluated, so every waived gate is BLOCKED rather than silently guessing
@@ -1082,7 +1094,7 @@ def _snippet(s, n=80):
     return html.escape(s, quote=False)
 
 
-def next_steps(verdict, fail, blocked, gcov, fcov, counts):
+def next_steps(verdict, fail, blocked, gcov, fcov, counts, risk=None):
     """Plain-language 'what this means and what to do next', for someone who did not write
     the pipeline. DERIVED ONLY from the already-computed verdict and coverage — it reads
     them and never writes them, so it cannot change a gate, threshold, or verdict. Coverage
@@ -1102,12 +1114,19 @@ def next_steps(verdict, fail, blocked, gcov, fcov, counts):
     steps = []
     if verdict == "PASS":
         waived = [w for w in _list(gcov.get("waived")) if isinstance(w, dict)]
-        if waived:
-            names = ", ".join(str(w.get("name", "?")) for w in waived)
-            steps.append(f"Cleared, with accountable exception(s): every required check passed EXCEPT "
-                         f"{names}, which was time-boxed and authorized (a waiver, not a pass). "
-                         "Independent review ran with its blocking findings resolved. A human still "
-                         "owns the actual merge decision.")
+        na = [x for x in _list(gcov.get("not_applicable")) if isinstance(x, dict)]
+        if waived or na:
+            # Name BOTH kinds of exception — a waived gate and a not-applicable gate each did
+            # not "pass", so the guidance must not claim every remaining check passed.
+            parts = []
+            if waived:
+                parts.append("waived: " + ", ".join(str(w.get("name", "?")) for w in waived))
+            if na:
+                parts.append("not applicable: " + ", ".join(str(x.get("name", "?")) for x in na))
+            steps.append("Cleared, with accountable exception(s): every required check passed except "
+                         + "; ".join(parts) + " — each authorized and on record, not a pass or a "
+                         "silent skip. Independent review ran with its blocking findings resolved. "
+                         "A human still owns the actual merge decision.")
             for w in waived:
                 steps.append(f"Waived gate '{w.get('name', '?')}' — authorized by "
                              f"{_oneline(w.get('authorized_by', '?'))}, expires "
@@ -1150,8 +1169,15 @@ def next_steps(verdict, fail, blocked, gcov, fcov, counts):
         if g in seen:
             continue
         proves = GATE_HELP.get(g, ("a required check", ""))[0]
-        steps.append(f"The '{_oneline(g)}' check could not be verified. Passing it proves {proves}. It must "
-                     "run and pass (or be recorded as not-applicable, with a reason) before release.")
+        if risk == "CRITICAL" and g == "mutation":
+            # N/A (and waiving) is forbidden for mutation on CRITICAL — don't recommend an
+            # action the gate will reject; it must actually run and pass.
+            steps.append(f"The 'mutation' check could not be verified. Passing it proves {proves}. On "
+                         "CRITICAL tier it must actually run and pass — it cannot be waived or marked "
+                         "not-applicable — before release.")
+        else:
+            steps.append(f"The '{_oneline(g)}' check could not be verified. Passing it proves {proves}. It must "
+                         "run and pass (or be recorded as not-applicable, with a reason) before release.")
         seen.add(g)
     if counts.get("unresolved"):
         steps.append(f"{counts['unresolved']} serious (high/critical) finding(s) are unresolved. Each must be "
@@ -1280,6 +1306,9 @@ def _aggregate_cli():
                 attested_policy_sha = _snap["sha256"]
         if att_err:
             pol_data = {}
+            # The rejected snapshot did NOT govern the verdict (strict defaults did), so its
+            # sha must not be reported as the governing-policy provenance.
+            attested_policy_sha = None
             blocked.append(f"attested policy snapshot could not be trusted: {att_err}")
         # Resolved once per aggregate run: GITHUB_RUN_STARTED_AT's date if set (else today
         # UTC). A set-but-unparseable value is fail-closed — every waiver is BLOCKED rather
@@ -1340,7 +1369,7 @@ def _aggregate_cli():
         verdict = "FAIL" if fail else ("BLOCKED" if blocked else "PASS")
         # Plain-language next steps are derived from the verdict + coverage above; they are
         # read-only over that state and cannot change it (guidance, not gate).
-        steps = next_steps(verdict, fail, blocked, gcov, fcov, counts)
+        steps = next_steps(verdict, fail, blocked, gcov, fcov, counts, risk=meta["risk"])
         # Tamper-evident attestation over every recorded input, computed before the
         # verdict file exists so re-aggregating an untouched run reproduces it (#5).
         attestation = compute_attestation(run)

@@ -343,13 +343,16 @@ def validate_gate_name(name):
     can never escape the gates dir or overwrite the manifest."""
     if not isinstance(name, str):
         return "gate name must be a string"
-    n = name.strip()
-    if not n:
+    if not name.strip():
         return "gate name is required"
-    if not GATE_NAME_RE.match(n):
-        return (f"gate name {n!r} is invalid — must match [a-z0-9][a-z0-9_-]{{0,63}} "
-                "(lowercase alphanumerics, '-' or '_', no leading underscore, no path "
-                "separators or dots); leading-underscore names such as '_required' are reserved")
+    # Match the RAW name (no strip): a name with surrounding whitespace passes a stripped
+    # check but the caller writes gates/<raw name>.json, so 'unit ' would be recorded as
+    # 'unit .json' while the required set looks for 'unit' — an accepted record that never
+    # satisfies the gate. Reject it here.
+    if not GATE_NAME_RE.match(name):
+        return (f"gate name {name!r} is invalid — must match [a-z0-9][a-z0-9_-]{{0,63}} "
+                "(lowercase alphanumerics, '-' or '_', no leading underscore, no whitespace, "
+                "path separators, or dots); leading-underscore names such as '_required' are reserved")
     return None
 
 
@@ -473,19 +476,21 @@ def validate_waived_gate(gate_name, tier, rec, pol_data, clock_date, manifest_pl
     rec_planned = _date_from_iso(rec.get("planned_at"))
     if rec_planned is None:
         return "waiver record is missing a valid planned_at date — cannot verify the waiver-lifetime cap"
-    # Anchor the lifetime cap on the RUN's planning time (the _required.json manifest), never
-    # the record's own planned_at: editing just the record's planned_at must not move the
-    # window. Cross-check the record's planned_at against that anchor and the clock, and
-    # reject a tampered/implausible value (a small 1-day skew absorbs timezone/rounding).
-    anchor = _date_from_iso(manifest_planned_at) if manifest_planned_at is not None else rec_planned
-    if anchor is None:
+    man_planned = _date_from_iso(manifest_planned_at) if manifest_planned_at is not None else rec_planned
+    if man_planned is None:
         return "run plan is missing a valid planned_at date — cannot anchor the waiver-lifetime cap"
+    # A planning timestamp cannot be in the future — a run is not planned after 'now'. Reject a
+    # future record or manifest planned_at as tampered (1-day skew absorbs timezone/rounding).
     if rec_planned > clock_date + timedelta(days=1):
         return (f"waiver planned_at {rec_planned.isoformat()} is in the future "
                 f"(clock {clock_date.isoformat()}) — record tampered")
-    if rec_planned < anchor - timedelta(days=1):
-        return (f"waiver planned_at {rec_planned.isoformat()} predates the run's planning date "
-                f"{anchor.isoformat()} — record tampered")
+    if man_planned > clock_date + timedelta(days=1):
+        return (f"run plan planned_at {man_planned.isoformat()} is in the future "
+                f"(clock {clock_date.isoformat()}) — plan manifest tampered")
+    # Anchor the cap to the EARLIEST planning evidence of the two timestamps, so advancing
+    # EITHER the record's or the manifest's planned_at forward cannot widen the window (in the
+    # honest flow both are the same value gate.py wrote in one plan call).
+    anchor = min(rec_planned, man_planned)
     n = _policy_number(pol_data.get("max_waiver_days"))
     max_days = (int(n) if n is not None and 1 <= n <= MAX_WAIVER_DAYS_CAP
                 else DEFAULT_MAX_WAIVER_DAYS)
@@ -633,11 +638,25 @@ def load_attested_policy(run):
         return None, "policy.snapshot.json is not a JSON object"
     text = snap.get("text")
     sha = snap.get("sha256", "")
-    fname = snap.get("file", "") or ""
+    fname = snap.get("file", "")
+    if not isinstance(fname, str):
+        return None, "policy.snapshot.json 'file' field is not a string"
     if not isinstance(text, str):
         return None, "policy.snapshot.json has no captured policy text"
     if hashlib.sha256(text.encode("utf-8")).hexdigest() != sha:
         return None, "policy.snapshot.json text does not match its recorded sha256 — tampered"
+    # The snapshot's OWN sha256 is not tamper-proof (an attacker can rewrite text AND sha
+    # together). Cross-check it against the digest recorded in run.json at init — the
+    # authoritative init-time provenance — and BLOCK if the snapshot was swapped wholesale.
+    try:
+        runjson = read_json(Path(run) / "run.json")
+    except (ValueError, OSError):
+        runjson = None
+    init_pol = runjson.get("policy") if isinstance(runjson, dict) else None
+    init_sha = init_pol.get("sha256") if isinstance(init_pol, dict) else None
+    if init_sha != sha:
+        return None, ("policy.snapshot.json sha256 does not match the policy digest recorded in "
+                      "run.json at init — the snapshot was replaced")
     try:
         data = json.loads(text) if fname.endswith(".json") else _parse_policy_yaml(
             text, "policy.snapshot.json")

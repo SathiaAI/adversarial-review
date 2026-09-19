@@ -11013,6 +11013,135 @@ def t_gate_waiver_snapshot_nonobject_does_not_crash():
     assert "attested policy snapshot could not be trusted" in r.stdout, r.stdout
 
 
+def t_gate_waiver_snapshot_swap_blocks():
+    # The snapshot's own sha256 is not tamper-proof (text+sha can be rewritten together).
+    # Cross-checking against the digest recorded in run.json at init catches a wholesale swap,
+    # and the rejected snapshot's sha is NOT reported as governing provenance.
+    import hashlib
+    repo = _min_repo("SENSITIVE", policy="max_waiver_days: 7\n")
+    run = latest_run(repo)
+    swapped = "max_waiver_days: 30\n"
+    write(run / "policy.snapshot.json", {
+        "file": ".adversarial-review.yml",
+        "sha256": hashlib.sha256(swapped.encode("utf-8")).hexdigest(),
+        "captured_at": "x", "text": swapped})
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast", "mutation"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "does not match the policy digest recorded in run.json" in r.stdout, r.stdout
+    assert read(run / "verdict.json")["coverage"]["policy_snapshot_sha256"] is None
+
+
+def t_gate_waiver_snapshot_nonstring_file_blocks():
+    # A truthy non-string `file` field must fail closed, not raise before the verdict.
+    repo = _min_repo("SENSITIVE", policy="max_waiver_days: 7\n")
+    run = latest_run(repo)
+    snap = read(run / "policy.snapshot.json")
+    snap["file"] = 1
+    write(run / "policy.snapshot.json", snap)
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast", "mutation"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "'file' field is not a string" in r.stdout, r.stdout
+
+
+def t_gate_waiver_future_manifest_anchor_blocks():
+    # Advancing the manifest planned_at forward must not widen the cap: it anchors to the
+    # EARLIEST of the record/manifest planned_at.
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    rec_planned = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    man_planned = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(timespec="seconds")
+    expires = (date.today() + timedelta(days=15)).isoformat()   # > today + 14-day default cap
+    write(run / "gates" / "_required.json", {
+        "tier": "SENSITIVE",
+        "required": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested_source": "cli",
+        "waived": [{"name": "mutation", "authorized_by": "Paul",
+                    "reason": "mutation runner not wired into CI yet", "expires": expires}],
+        "planned_at": man_planned})
+    write(run / "gates" / "mutation.json", {
+        "gate": "mutation", "status": "WAIVED", "authorized_by": "Paul",
+        "reason": "mutation runner not wired into CI yet", "expires": expires,
+        "tier": "SENSITIVE", "planned_at": rec_planned, "source": "plan"})
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "capped at 14 days" in r.stdout, r.stdout
+
+
+def t_gate_waiver_orphan_record_blocks():
+    # A WAIVED record with no matching entry in the manifest's waived list is an orphan
+    # (e.g. a raced/stale waiver) and must BLOCK, not be honored.
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    future = (date.today() + timedelta(days=7)).isoformat()
+    planned = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    write(run / "gates" / "_required.json", {
+        "tier": "SENSITIVE",
+        "required": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested_source": "cli", "waived": [], "planned_at": planned})
+    write(run / "gates" / "mutation.json", {
+        "gate": "mutation", "status": "WAIVED", "authorized_by": "Paul",
+        "reason": "mutation runner not wired into CI yet", "expires": future,
+        "tier": "SENSITIVE", "planned_at": planned, "source": "plan"})
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "not authorized by the plan manifest" in r.stdout, r.stdout
+
+
+def t_gate_name_whitespace_rejected():
+    # A gate name with surrounding whitespace is rejected (it would be written to a file that
+    # never satisfies the stripped required name).
+    repo = _min_repo("SENSITIVE")
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    r = sh(["gate.py", "record", "--name", "unit ", "--exit-code", "0", "--summary", "ok"],
+           repo, expect=1)
+    assert "invalid" in r.stderr.lower(), r.stderr
+
+
+def t_gate_plan_tolerates_nonobject_record():
+    # A pre-existing gate file containing a non-object must not crash the stale-waiver scan.
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    write(run / "gates" / "junk.json", [])
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    assert (run / "gates" / "_required.json").exists()
+
+
+def t_next_steps_pass_names_na_exception():
+    # A PASS with BOTH a waiver and an N/A gate names both as accountable exceptions.
+    repo = _complete_sensitive_repo()   # waives mutation
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+        "evidence": "fixed", "reproduced": True, "regression_test": "t::x",
+        "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["gate.py", "record", "--name", "sast", "--status", "NOT_APPLICABLE",
+        "--authorized-by", "Paul", "--summary", "config-only repo, no source for SAST"], repo)
+    sh(["aggregate.py"], repo, expect=0)
+    blob = " ".join(read(run / "verdict.json")["next_steps"])
+    assert "not applicable: sast" in blob and "waived: mutation" in blob, blob
+
+
+def t_next_steps_critical_mutation_not_na_guidance():
+    # For a missing mutation gate on CRITICAL, the guidance must not recommend N/A (which the
+    # gate rejects) — it must say the gate has to run and pass.
+    repo = _min_repo("CRITICAL")
+    run = latest_run(repo)
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    blob = " ".join(read(run / "verdict.json")["next_steps"])
+    assert "cannot be waived or marked not-applicable" in blob, blob
+
+
 def t_mcp_gate_plan_waive_requires_reason_and_expires():
     repo = fresh_repo()
     res = _mcp_call(repo, "ar_init", {"risk": "SENSITIVE", "dev_providers": ["anthropic"]})

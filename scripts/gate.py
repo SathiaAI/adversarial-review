@@ -121,8 +121,10 @@ def cmd_plan(args):
                 old = read_json(gp)
             except (ValueError, OSError):
                 continue
-            if (old.get("status") == "WAIVED" and old.get("source") == "plan"
-                    and old.get("gate") not in waived_names):
+            # A gate file may contain a non-object (e.g. []) — .get would raise; only a dict
+            # WAIVED record written by a prior plan is a stale-waiver candidate.
+            if (isinstance(old, dict) and old.get("status") == "WAIVED"
+                    and old.get("source") == "plan" and old.get("gate") not in waived_names):
                 gp.unlink()
     write_json(run / "gates" / "_required.json",
                {"tier": tier, "required": required, "requested": requested,
