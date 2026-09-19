@@ -32,7 +32,10 @@ from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import family_of, meta_cost, now_iso, read_json, resolve_run, write_json
+from _common import (family_of, load_attested_policy, meta_cost, now_iso, read_json,
+                     resolve_run, resolve_waiver_clock, validate_gate_name,
+                     validate_not_applicable_gate, validate_waived_gate, write_json,
+                     _policy_bool)
 
 HIGH = ("critical", "high")
 
@@ -46,9 +49,19 @@ def load_reports(run, plan):
     return reports
 
 
-def check_gates(run, tier, fail, blocked, notes):
+def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, None)):
     """Returns (results, gates_coverage). Coverage is derived from the same records
-    the verdict uses — an unrecorded fact stays invisible in both."""
+    the verdict uses — an unrecorded fact stays invisible in both.
+
+    A waived gate stays a member of `required` (it is never dropped from the set this
+    checks) and is represented as its own gates/<name>.json record with status WAIVED,
+    exactly like a NOT_APPLICABLE record — so both are independently re-validated here
+    from what is actually on disk (expiry, cap, authorizer, reason, CRITICAL rules),
+    never trusted just because gate.py's own plan-time checks passed. `pol_data` is the
+    loaded repo policy's data mapping (or {} when there is none); `clock` is the
+    (clock_date, error) pair from resolve_waiver_clock, resolved once by the caller."""
+    pol_data = pol_data or {}
+    clock_date, clock_err = clock
     gcov = {"plan_recorded": False, "required": [], "recorded": [], "passed": [],
             "failed": [], "blocked": [], "not_applicable": [], "missing": [],
             "waived": []}
@@ -58,15 +71,60 @@ def check_gates(run, tier, fail, blocked, notes):
         return {}, gcov
     gplan = read_json(req_path)
     gcov["plan_recorded"] = True
-    gcov["required"] = list(gplan.get("required", []))
-    for w in gplan.get("waived", []):
-        gcov["waived"].append({"name": w.get("name"), "authorized_by": w.get("authorized_by")})
-        if not w.get("authorized_by"):
-            blocked.append(f"gate '{w['name']}' waived without an authorizer")
-        else:
-            notes.append(f"gate '{w['name']}' waived by {w['authorized_by']}")
+    manifest_planned_at = gplan.get("planned_at")
+    # The manifest `required` must be a list of safe string gate names before it is turned into
+    # a list/set — a non-list ("required": 1) or an unhashable member ("required": [[]]) would
+    # otherwise raise a TypeError before a BLOCKED verdict is written. Malformed entries become
+    # blocking reasons; each surviving name is validated (so a tampered path/newline name is
+    # rejected here, not used to build a gates/<name>.json path later).
+    raw_required = gplan.get("required", [])
+    if not isinstance(raw_required, list):
+        blocked.append("gate plan 'required' is not a list — malformed or tampered manifest")
+        raw_required = []
+    required_names = []
+    for g in raw_required:
+        nerr = validate_gate_name(g) if isinstance(g, str) else "gate name must be a string"
+        if nerr:
+            blocked.append(f"gate plan has a malformed required entry {g!r}: {nerr}")
+            continue
+        required_names.append(g)
+    gcov["required"] = list(required_names)
+    required_set = set(required_names)
+    # The manifest's `waived` list must be well-formed before anything is built from it — a
+    # non-list, or an entry that is not an object with a safe string `name` (an unhashable value
+    # such as {"name": []}, or a newline/markdown name that could forge output, would otherwise
+    # raise or leak), is a malformed/tampered manifest that must BLOCK, never crash aggregation.
+    raw_waived = gplan.get("waived", [])
+    manifest_waived = {}   # gate name -> its manifest waiver entry (bound against the record)
+    if not isinstance(raw_waived, list):
+        blocked.append("gate plan 'waived' is not a list — malformed or tampered manifest")
+        raw_waived = []
+    for w in raw_waived:
+        if not isinstance(w, dict):
+            blocked.append(f"gate plan has a malformed waiver entry {w!r} — expected an object "
+                           "with a string 'name'")
+            continue
+        wn = w.get("name")
+        nerr = validate_gate_name(wn) if isinstance(wn, str) else "gate name must be a string"
+        if nerr:
+            blocked.append(f"gate plan has a malformed waiver entry {w!r}: {nerr}")
+            continue
+        manifest_waived[wn] = w
+    manifest_waived_names = set(manifest_waived)
+    # Legacy/tampered-plan guard: pre-M1 plans DROPPED a waived gate from `required` and
+    # recorded it only in the manifest's `waived` list, so the loop below never checked it —
+    # a SENSITIVE run could pass with no mutation gate at all. Any waived entry whose gate is
+    # absent from `required` means the manifest predates the waiver-hardening (or was edited
+    # to drop a gate); BLOCK and require re-planning rather than honoring it.
+    for wname in manifest_waived_names:
+        if wname not in required_set:
+            blocked.append(
+                f"legacy or tampered gate plan: gate '{wname}' is waived but missing from the "
+                "required set — pre-M1 waivers that drop the gate are not honored; re-run "
+                "`gate.py plan` with the current version to migrate (waived gates now stay "
+                "required and are independently re-validated)")
     results = {}
-    for name in gplan.get("required", []):
+    for name in required_names:   # already validated as safe gate-name strings above
         p = run / "gates" / f"{name}.json"
         if not p.exists():
             gcov["missing"].append(name)
@@ -78,29 +136,69 @@ def check_gates(run, tier, fail, blocked, notes):
         # Tri-state: BLOCKED means the check could not be run/verified — unknown, not
         # pass and not fail. Absent status falls back to the exit code (older records).
         status = rec.get("status")
-        if status == "BLOCKED":
+        if status == "WAIVED":
+            # A WAIVED record must be authorized by the plan manifest's `waived` list. A record
+            # present without a matching manifest entry is an orphan — e.g. a stale record a
+            # concurrent replan failed to revoke, or one dropped from the final manifest — and
+            # honoring it would be a hollow-green result, so BLOCK.
+            if name not in manifest_waived_names:
+                reason = ("WAIVED record is not authorized by the plan manifest's waived list "
+                          "(orphaned or raced waiver) — re-run `gate.py plan`")
+                gcov["blocked"].append({"name": name, "reason": reason})
+                blocked.append(f"gate '{name}': {reason}")
+                continue
+            # Bind the record to the manifest entry's METADATA, not just the name: gate.py writes
+            # the manifest and the record separately, so a concurrent replan could pair a short
+            # manifest entry with a longer stale record. Its authorizer/reason/expiry must match
+            # what the final manifest authorized, or the record is raced/tampered → BLOCK.
+            m = manifest_waived.get(name, {})
+            if (rec.get("expires") != m.get("expires")
+                    or rec.get("authorized_by") != m.get("authorized_by")
+                    or rec.get("reason") != m.get("reason")):
+                reason = ("WAIVED record does not match the plan manifest's waiver entry "
+                          "(authorizer/reason/expiry mismatch — raced or tampered) — "
+                          "re-run `gate.py plan`")
+                gcov["blocked"].append({"name": name, "reason": reason})
+                blocked.append(f"gate '{name}': {reason}")
+                continue
+            # A waiver's expiry can only be judged against a trustworthy clock — if the
+            # CI-provided clock itself could not be parsed, no waiver can be honestly
+            # evaluated, so every waived gate is BLOCKED rather than silently guessing
+            # 'today' (fail closed; see resolve_waiver_clock).
+            err = (f"cannot verify waiver expiry: {clock_err}" if clock_date is None
+                   else validate_waived_gate(name, tier, rec, pol_data, clock_date,
+                                             manifest_planned_at=manifest_planned_at))
+            if err:
+                gcov["blocked"].append({"name": name, "reason": err})
+                blocked.append(f"gate '{name}': {err}")
+            else:
+                who = rec.get("authorized_by").strip()
+                reason = rec.get("reason").strip()
+                expires = rec.get("expires")
+                gcov["waived"].append({"name": name, "authorized_by": who, "reason": reason,
+                                       "expires": expires, "tier": tier})
+                notes.append(f"gate '{name}' waived by {who} until {expires}: {reason}")
+        elif status == "BLOCKED":
             reason = rec.get("summary", "could not verify")
             gcov["blocked"].append({"name": name, "reason": reason})
             blocked.append(f"gate '{name}' blocked: {reason}")
         elif status == "NOT_APPLICABLE":
             # A gate that genuinely does not apply to this stack does NOT restrict the
-            # verdict — but it is an accountable, on-record determination, so an N/A
-            # without a named authorizer and a reason is itself a BLOCK (unaccountable
-            # skips are exactly what this pipeline exists to prevent).
-            # Guard against non-string values (JSON null, numbers, objects): a
-            # `null` authorizer must read as absent, not as the string "None". Only a
-            # non-empty *string* counts as accountable.
-            who = rec.get("authorized_by")
-            reason = rec.get("summary")
-            who = who.strip() if isinstance(who, str) else ""
-            reason = reason.strip() if isinstance(reason, str) else ""
-            if not who or not reason:
-                gcov["blocked"].append(
-                    {"name": name, "reason": "NOT_APPLICABLE without an authorizer and reason"})
-                blocked.append(f"gate '{name}' marked NOT_APPLICABLE without a named "
-                               "authorizer and reason — an inapplicable gate must still "
-                               "be accountable")
+            # verdict — but it is an accountable, on-record determination, so an invalid
+            # N/A record (missing authorizer/reason, or one of the CRITICAL restrictions)
+            # is itself a BLOCK (unaccountable skips are exactly what this pipeline exists
+            # to prevent).
+            err = validate_not_applicable_gate(name, tier, rec, pol_data)
+            if err:
+                gcov["blocked"].append({"name": name, "reason": err})
+                blocked.append(f"gate '{name}': {err}")
             else:
+                # Guard against non-string values (JSON null, numbers, objects): a `null`
+                # authorizer must read as absent, not as the string "None" — already
+                # enforced by validate_not_applicable_gate, re-derived here only to build
+                # the coverage entry from the same (now known-good) strings.
+                who = rec.get("authorized_by").strip()
+                reason = rec.get("summary").strip()
                 gcov["not_applicable"].append(
                     {"name": name, "authorized_by": who, "reason": reason})
                 notes.append(f"gate '{name}' not applicable (authorized by {who}): {reason}")
@@ -1037,13 +1135,16 @@ def _snippet(s, n=80):
     return html.escape(s, quote=False)
 
 
-def next_steps(verdict, fail, blocked, gcov, fcov, counts):
+def next_steps(verdict, fail, blocked, gcov, fcov, counts, risk=None, allow_critical_waivers=False):
     """Plain-language 'what this means and what to do next', for someone who did not write
     the pipeline. DERIVED ONLY from the already-computed verdict and coverage — it reads
     them and never writes them, so it cannot change a gate, threshold, or verdict. Coverage
     shapes are normalized defensively so malformed/None input degrades rather than crashing
     (the verdict file must still be written), and every fail/blocked reason not rephrased as
-    a specific gate line is passed through verbatim (one-lined) so a blocker is never hidden."""
+    a specific gate line is passed through verbatim (one-lined) so a blocker is never hidden.
+    `allow_critical_waivers` mirrors the SAME attested-policy flag _common.py's
+    _validate_gate_exception_common() enforces — it must never be sourced from anywhere
+    else, or this guidance could recommend an action the gate will actually reject."""
     fail = [r for r in (fail or []) if isinstance(r, str)]
     blocked = [r for r in (blocked or []) if isinstance(r, str)]
     # Normalize by TYPE, not truthiness: a truthy-but-wrong-typed shape (gcov a list, or a
@@ -1056,8 +1157,28 @@ def next_steps(verdict, fail, blocked, gcov, fcov, counts):
         return x if isinstance(x, list) else []
     steps = []
     if verdict == "PASS":
-        steps.append("Cleared: every required check passed and independent review ran with its blocking "
-                     "findings resolved. A human still owns the actual merge decision.")
+        waived = [w for w in _list(gcov.get("waived")) if isinstance(w, dict)]
+        na = [x for x in _list(gcov.get("not_applicable")) if isinstance(x, dict)]
+        if waived or na:
+            # Name BOTH kinds of exception — a waived gate and a not-applicable gate each did
+            # not "pass", so the guidance must not claim every remaining check passed.
+            parts = []
+            if waived:
+                parts.append("waived: " + ", ".join(str(w.get("name", "?")) for w in waived))
+            if na:
+                parts.append("not applicable: " + ", ".join(str(x.get("name", "?")) for x in na))
+            steps.append("Cleared, with accountable exception(s): every required check passed except "
+                         + "; ".join(parts) + " — each authorized and on record, not a pass or a "
+                         "silent skip. Independent review ran with its blocking findings resolved. "
+                         "A human still owns the actual merge decision.")
+            for w in waived:
+                steps.append(f"Waived gate '{w.get('name', '?')}' — authorized by "
+                             f"{_oneline(w.get('authorized_by', '?'))}, expires "
+                             f"{_oneline(w.get('expires', '?'))}: {_oneline(w.get('reason', ''))}. "
+                             "It expires; do not treat it as permanently green.")
+        else:
+            steps.append("Cleared: every required check passed and independent review ran with its blocking "
+                         "findings resolved. A human still owns the actual merge decision.")
         if counts.get("confirmed"):
             steps.append(f"{counts['confirmed']} issue(s) were caught during review and already fixed before "
                          "this passed — see the Findings section of the report for what changed.")
@@ -1092,8 +1213,23 @@ def next_steps(verdict, fail, blocked, gcov, fcov, counts):
         if g in seen:
             continue
         proves = GATE_HELP.get(g, ("a required check", ""))[0]
-        steps.append(f"The '{_oneline(g)}' check could not be verified. Passing it proves {proves}. It must "
-                     "run and pass (or be recorded as not-applicable, with a reason) before release.")
+        if risk == "CRITICAL" and g == "mutation":
+            # N/A (and waiving) is forbidden for mutation on CRITICAL regardless of policy —
+            # don't recommend an action the gate will reject; it must actually run and pass.
+            steps.append(f"The 'mutation' check could not be verified. Passing it proves {proves}. On "
+                         "CRITICAL tier it must actually run and pass — it cannot be waived or marked "
+                         "not-applicable — before release.")
+        elif risk == "CRITICAL" and not allow_critical_waivers:
+            # Every OTHER gate on CRITICAL is waivable/N-A-able only when policy opts in
+            # (allow_critical_waivers: true); the default is false, so by default the gate
+            # will reject a NOT_APPLICABLE record here too — the guidance must not suggest it.
+            steps.append(f"The '{_oneline(g)}' check could not be verified. Passing it proves {proves}. On "
+                         "CRITICAL tier, with this policy, it must actually run and pass — waiving or "
+                         "marking it not-applicable requires policy allow_critical_waivers: true "
+                         "(currently not set) before release.")
+        else:
+            steps.append(f"The '{_oneline(g)}' check could not be verified. Passing it proves {proves}. It must "
+                         "run and pass (or be recorded as not-applicable, with a reason) before release.")
         seen.add(g)
     if counts.get("unresolved"):
         steps.append(f"{counts['unresolved']} serious (high/critical) finding(s) are unresolved. Each must be "
@@ -1202,7 +1338,38 @@ def _aggregate_cli():
         counts = {"gates": 0, "reviewers": 0, "findings_high_critical": 0,
                   "findings_medium_low": 0, "confirmed": 0, "unresolved": 0}
 
-        gates, gcov = check_gates(run, meta["risk"], fail, blocked, notes)
+        # Waiver limits (max_waiver_days, allow_critical_waivers) come ONLY from the policy
+        # attested at init (policy.snapshot.json), NEVER the mutable working-tree policy — a
+        # post-init edit must not be able to widen a waiver that is absent from the audit
+        # record. A snapshot that is present but untrustworthy (unreadable / sha-mismatched /
+        # no longer valid) fails closed to strict built-in defaults AND blocks the run.
+        pol_data, att_err = load_attested_policy(run)
+        attested_policy_sha = None
+        snap_p = run / "policy.snapshot.json"
+        if snap_p.is_file():
+            try:
+                _snap = read_json(snap_p)
+            except (ValueError, OSError):
+                _snap = None
+            # A non-object snapshot (array/string/number) has no .get — guard so the sha
+            # re-read cannot raise AttributeError before the verdict is written. The
+            # untrustworthy snapshot is already caught (and BLOCKED) by load_attested_policy.
+            if isinstance(_snap, dict) and isinstance(_snap.get("sha256"), str):
+                attested_policy_sha = _snap["sha256"]
+        if att_err:
+            pol_data = {}
+            # The rejected snapshot did NOT govern the verdict (strict defaults did), so its
+            # sha must not be reported as the governing-policy provenance.
+            attested_policy_sha = None
+            blocked.append(f"attested policy snapshot could not be trusted: {att_err}")
+        # Resolved once per aggregate run: GITHUB_RUN_STARTED_AT's date if set (else today
+        # UTC). A set-but-unparseable value is fail-closed — every waiver is BLOCKED rather
+        # than silently falling back to today (see check_gates/resolve_waiver_clock).
+        clock = resolve_waiver_clock()
+        if clock[1]:
+            blocked.append(clock[1])
+
+        gates, gcov = check_gates(run, meta["risk"], fail, blocked, notes, pol_data, clock)
         counts["gates"] = len(gates)
 
         plan_path = run / "panel" / "plan.json"
@@ -1245,12 +1412,20 @@ def _aggregate_cli():
                     "rebuttal": rcov, "findings": fcov,
                     "cost_usd": round(panel_cost_usd, 6), "cost_aborted": bool(cost_abort),
                     "cost_cap_usd": cpol.get("cap_usd"), "cost_cap_source": cpol.get("source"),
+                    # The sha256 of the policy attested at init, whose waiver limits governed
+                    # this verdict — so the audit shows exactly which policy the waiver checks
+                    # ran against (null when the run had no policy file).
+                    "policy_snapshot_sha256": attested_policy_sha,
                     "areas_not_reviewed": sorted(areas)}
 
         verdict = "FAIL" if fail else ("BLOCKED" if blocked else "PASS")
         # Plain-language next steps are derived from the verdict + coverage above; they are
-        # read-only over that state and cannot change it (guidance, not gate).
-        steps = next_steps(verdict, fail, blocked, gcov, fcov, counts)
+        # read-only over that state and cannot change it (guidance, not gate). The
+        # allow_critical_waivers flag comes from the SAME attested pol_data the gates
+        # themselves were just checked against (never the mutable working-tree policy),
+        # so the guidance can never suggest an action the gate above it already rejected.
+        steps = next_steps(verdict, fail, blocked, gcov, fcov, counts, risk=meta["risk"],
+                           allow_critical_waivers=_policy_bool(pol_data.get("allow_critical_waivers")) or False)
         # Tamper-evident attestation over every recorded input, computed before the
         # verdict file exists so re-aggregating an untouched run reproduces it (#5).
         attestation = compute_attestation(run)
@@ -1262,9 +1437,14 @@ def _aggregate_cli():
 
         md = [f"# Release verdict: {verdict}", "",
               f"Run `{meta['run_id']}`, risk {meta['risk']}, computed {out['computed_at']}.", ""]
+        # fail/blocked reasons are already escaped where they interpolate untrusted text (reviewer
+        # strings via _snippet; tampered gate names are rejected by validate_gate_name, and a
+        # malformed manifest entry is shown via repr, which escapes newlines) — so they are NOT
+        # re-escaped here (that would double-escape, e.g. &lt; -> &amp;lt;). Notes are raw, so
+        # they are escaped at render.
         md += [f"- FAIL: {r}" for r in fail]
         md += [f"- BLOCKED: {r}" for r in blocked]
-        md += [f"- note: {n}" for n in notes]
+        md += [f"- note: {_oneline(n)}" for n in notes]
         # Plain-language guidance up top, where a non-expert will actually read it — before
         # the technical counts/coverage that follow.
         md += ["", "## Next steps", ""]
@@ -1281,8 +1461,16 @@ def _aggregate_cli():
                f"{len(coverage['areas_not_reviewed'])} reviewer-attested unreviewed areas"]
         # Surface every not-applicable determination and its authorizer distinctly — a
         # skipped gate must never be silent, even when it does not restrict the verdict.
+        # Authorizer/reason/expiry are operator-supplied — HTML-escape (via _oneline) before
+        # interpolating into verdict.md so a crafted value cannot forge markup in the report.
         md += [f"- not applicable: gate '{na['name']}' (authorized by "
-               f"{na['authorized_by']}): {na['reason']}" for na in gcov["not_applicable"]]
+               f"{_oneline(na['authorized_by'])}): {_oneline(na['reason'])}"
+               for na in gcov["not_applicable"]]
+        # Surface every active waiver and its authorizer/expiry distinctly too — a waived
+        # gate must never be silent, even though (like N/A) it does not restrict the verdict.
+        md += [f"- waived: gate '{w['name']}' (authorized by {_oneline(w['authorized_by'])}, "
+               f"expires {_oneline(w['expires'])}): {_oneline(w['reason'])}"
+               for w in gcov["waived"]]
         md += ["", f"Attestation: sha256 {attestation['digest']} over "
                f"{attestation['inputs']} recorded artifacts "
                "(verify with `aggregate.py --check-digest`)"]

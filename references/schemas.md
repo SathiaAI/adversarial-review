@@ -100,19 +100,50 @@ this file.
 
 ```json
 {"gate": "unit", "command": "npm test", "exit_code": 0,
- "status": "PASS|FAIL|BLOCKED|NOT_APPLICABLE",
+ "status": "PASS|FAIL|BLOCKED|NOT_APPLICABLE|WAIVED",
  "summary": "312 passed", "output_tail": "...", "recorded_at": "ISO-8601",
- "source": "run|record", "authorized_by": "name (NOT_APPLICABLE only)"}
+ "source": "run|record|plan", "authorized_by": "name (NOT_APPLICABLE/WAIVED only)"}
 ```
 
 `status` BLOCKED marks required coverage that could not be run or verified (`exit_code`
 may be null there). `status` NOT_APPLICABLE marks a required gate that genuinely does not
 apply to this stack (e.g. a config-only repo with no build or unit gate); unlike BLOCKED
 it does **not** restrict the verdict, but it is an accountable determination — the
-aggregator requires a named `authorized_by` and a non-empty `summary`, and an N/A record
-missing either is itself BLOCKED. Every N/A gate is listed distinctly (with its
+aggregator requires a named `authorized_by` and a non-empty `summary` (stripped), and an
+N/A record missing either is itself BLOCKED. The stricter waiver-reason rule (>=16 chars,
+no placeholder) applies to WAIVED `reason`s only, **not** to N/A `summary`s. Every N/A gate
+is listed distinctly (with its
 authorizer) in `verdict.json` coverage (`gates.not_applicable`) and in `verdict.md`, so a
 skipped gate is never silent. Absent `status` falls back to the exit code.
+
+`status` WAIVED (written by `gate.py plan --waive`, `source: "plan"`) is the third
+accountable, non-restricting exception: `{"gate": "mutation", "status": "WAIVED",
+"authorized_by": "name", "reason": "why (>=16 chars, not a placeholder)",
+"expires": "YYYY-MM-DD", "tier": "SENSITIVE", "planned_at": "ISO-8601",
+"source": "plan"}`. Unlike the pre-M1 waiver, the waived gate is **never removed from
+`required`** — this record is what the aggregator checks for it, and it is
+**independently re-validated at every aggregate run** (never trusted just because
+`gate.py plan` wrote it — and `gate.py plan` now runs the **same** validator, so an invalid
+waiver is rejected at plan time and never produces an artifact): a named `authorized_by`, a
+`reason` (>=16 chars, not a placeholder); `expires` must be a strict `YYYY-MM-DD` strictly
+after the run's clock date — the **later** of today UTC and the date part of
+`GITHUB_RUN_STARTED_AT` when that's set (a stale/backdated run-start timestamp can never
+un-expire a waiver; a forward-dated one is still honored — a set-but-unparseable value
+BLOCKS the run rather than guessing); and `expires` must be no more than `max_waiver_days`
+after the run's planning time, anchored to the **earlier** of the record's own `planned_at`
+and the run plan's `planned_at` in `gates/_required.json` (so editing either one forward
+alone cannot slide the window — an honest run always has both equal, since `gate.py plan`
+writes them together). A `planned_at` in the future relative to the run's clock — on either
+the record or the manifest — is rejected as tampered; there is no lower bound requiring the
+record's `planned_at` to be no earlier than the manifest's. `max_waiver_days` (default 14) is bounded to 1–365 at policy
+load, and the limits (`max_waiver_days`, `allow_critical_waivers`) are read from the policy
+**attested at init** (`policy.snapshot.json`), never a post-init working-tree edit. On
+CRITICAL tier, waiving (or marking NOT_APPLICABLE)
+any gate is refused unless policy sets `allow_critical_waivers: true`; `mutation` on
+CRITICAL is refused regardless of that setting — it stays BLOCKED until real CRITICAL
+mutation coverage ships (M4). Every waived gate is listed distinctly (with its
+authorizer, reason, and expiry) in `verdict.json` coverage (`gates.waived`) and in
+`verdict.md`.
 
 ## Validation record — `validation/<slug>.json` (one per deduped issue)
 
@@ -165,12 +196,14 @@ human-readable `verdict.md` is written alongside `verdict.json`.
  "coverage": {"risk": "TIER",
    "gates": {"plan_recorded": true, "required": [], "recorded": [], "passed": [],
              "failed": [], "blocked": [{"name": "", "reason": ""}], "missing": [],
-             "waived": [{"name": "", "authorized_by": ""}]},
+             "waived": [{"name": "", "authorized_by": "", "reason": "",
+                         "expires": "YYYY-MM-DD", "tier": ""}]},
    "panel": {"roles_required": [], "roles_filled": [], "substitutions": 0,
              "degraded": null, "dev_families_excluded": []},
    "rebuttal": {"policy": "contention", "required": false, "ran": false},
    "findings": {"raised": 0, "triaged": 0, "untriaged_release_blocking": 0},
    "cost_usd": 0.0, "cost_aborted": false, "cost_cap_usd": 20.0, "cost_cap_source": "default",
+   "policy_snapshot_sha256": "hex or null (sha256 of the policy attested at init whose waiver limits governed this verdict; null when the run had no policy file or the snapshot was rejected)",
    "areas_not_reviewed": ["union of reviewer attestations"]},
  "attestation": {"algorithm": "sha256-canonical-json-v2", "inputs": 0,
    "digest": "hex", "files": {"run.json": "hex", "gates/unit.json": "hex"}},

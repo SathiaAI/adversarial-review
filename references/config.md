@@ -95,6 +95,13 @@ silent. `scope` is `changed`/`all`; `max_mutants`/`concurrency`/`timeout_s` are 
 integers; `sample_pct`/`threshold` are numbers in `[0, 100]`; `exclude_files`/
 `exclude_tests` are lists of path/glob strings.
 
+Two more keys govern `gate.py plan --waive` (see `references/gates.md`, *Waivers*):
+`allow_critical_waivers` (`true`/`false`, default `false`) opts a repo in to waiving or
+marking NOT_APPLICABLE any gate on CRITICAL tier — refused by default. `max_waiver_days`
+(positive integer, default `14`) caps how far past its `planned_at` date a waiver's
+`--waive-expires` may be set. Neither key can make `mutation` waivable/NOT_APPLICABLE on
+CRITICAL: that one restriction is not policy-configurable.
+
 Precedence, everywhere: **CLI flag > env var > policy file > built-in default** —
 explicit beats ambient. The resolution is recorded in the run's artifacts so the
 audit trail shows where every setting came from: `run.json` gets a `sources` block

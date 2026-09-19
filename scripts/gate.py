@@ -16,10 +16,18 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import die, load_policy, now_iso, read_json, resolve_run, write_json
+from _common import (die, load_attested_policy, load_policy, now_iso, read_json,
+                     resolve_run, resolve_waiver_clock, validate_gate_name,
+                     validate_not_applicable_gate, validate_waived_gate, write_json)
 
 # Floors per tier: these cannot be silently omitted, only waived on the record with a
-# named authorizer (surfaced in the verdict reasons and the report).
+# named authorizer (surfaced in the verdict reasons and the report). A waived floor gate
+# stays in the required set — its gates/<name>.json record (status WAIVED) is what
+# aggregate.py independently re-validates (expiry, cap, authorizer, reason, CRITICAL
+# rules); waiving it here never removes it from `required`. NOTE: CRITICAL's `mutation`
+# can never be waived or marked NOT_APPLICABLE (see aggregate.py/_common.py) — real
+# CRITICAL mutation coverage is a later milestone (M4), so until then a CRITICAL run
+# with no genuine mutation gate result stays BLOCKED, by design.
 MINIMUM_GATES = {
     "NORMAL": ["build", "unit", "secrets", "deps", "sast"],
     "SENSITIVE": ["build", "unit", "secrets", "deps", "sast", "mutation"],
@@ -44,22 +52,98 @@ def cmd_plan(args):
         die(f"required gates unresolved for tier {tier}: pass --require, set "
             f"AR_REQUIRE, or add required_gates.{tier} to .adversarial-review.yml")
     requested = [g.strip() for g in requested if g.strip()]
+    # Every gate identifier becomes gates/<name>.json, so validate it BEFORE it is ever used
+    # to build a path — a name like '_required', '../x' or 'a/b' would overwrite the run
+    # manifest or escape the gates dir, blanking the required set into a silent all-pass.
+    for g in requested:
+        gerr = validate_gate_name(g)
+        if gerr:
+            die(f"invalid required gate (via {req_src}): {gerr}")
+    # The gates that are required BEFORE any waiver is applied: this is the set a --waive
+    # is allowed to name. Waiving a name outside it is rejected (gate-name smuggling) —
+    # otherwise a typo'd or invented gate name could be "waived" while the real required
+    # gate it was meant to stand in for goes completely unaddressed, with nothing to show
+    # for it but a plausible-looking (but meaningless) waiver in the audit trail.
+    base_required = set(requested) | set(MINIMUM_GATES[tier])
     waived = []
     for w in args.waive or []:
+        gerr = validate_gate_name(w)
+        if gerr:
+            die(f"cannot waive {w!r}: {gerr}")
+        if w not in base_required:
+            die(f"cannot waive '{w}': not among this tier's requested/floor gates "
+                f"({', '.join(sorted(base_required))}) — waiving a gate name that was "
+                "never required does nothing and is rejected (gate-name smuggling)")
         if not args.authorized_by:
             die(f"waiving gate '{w}' requires --authorized-by '<user>'")
-        waived.append({"name": w, "authorized_by": args.authorized_by})
+        if not args.waive_reason.strip():
+            die(f"waiving gate '{w}' requires --waive-reason '<a real justification, "
+                "at least 16 characters, not a placeholder>'")
+        if not args.waive_expires.strip():
+            die(f"waiving gate '{w}' requires --waive-expires 'YYYY-MM-DD' — a waiver is "
+                "time-boxed, never permanent")
+        waived.append({"name": w, "authorized_by": args.authorized_by,
+                       "reason": args.waive_reason, "expires": args.waive_expires})
+    # A waived gate stays in `required` — it no longer disappears from the set aggregate.py
+    # checks. Its own gates/<name>.json record (status WAIVED, written below) is what
+    # aggregate.py independently re-validates; this manifest's `waived` list is kept only
+    # for at-a-glance visibility.
+    required = sorted(base_required)
+    planned_at = now_iso()
+    # Fail fast at plan time using the EXACT SAME validator AND the SAME policy source
+    # aggregate.py enforces — the policy attested at init (policy.snapshot.json), not the mutable
+    # working tree — so `plan` cannot accept a waiver aggregate would later reject (or vice
+    # versa). Aggregate remains the authority; this is the identical early check. Only touched
+    # when there is actually a waiver to validate (a plan with no waivers reads no policy).
+    if waived:
+        att_pol, att_err = load_attested_policy(run)
+        if att_err:
+            die(f"cannot validate waiver: {att_err}")
+        clock_date, clock_err = resolve_waiver_clock()
+        if clock_err:
+            die(clock_err)
+        for w in waived:
+            rec = {"gate": w["name"], "status": "WAIVED",
+                   "authorized_by": w["authorized_by"], "reason": w["reason"],
+                   "expires": w["expires"], "tier": tier, "planned_at": planned_at}
+            verr = validate_waived_gate(w["name"], tier, rec, att_pol, clock_date,
+                                        manifest_planned_at=planned_at)
+            if verr:
+                die(f"cannot waive '{w['name']}': {verr}")
+    # Revoke any stale plan-written WAIVED record from a PRIOR plan of this run whose gate is
+    # not waived this time — otherwise gates/<name>.json left behind would still read WAIVED
+    # and be honored, silently reinstating a waiver the new plan dropped. Only records this
+    # tool wrote (source == "plan") are removed; recorded gate results are never touched.
     waived_names = {w["name"] for w in waived}
-    required = sorted(set(requested) | {g for g in MINIMUM_GATES[tier]
-                                        if g not in waived_names})
+    gates_dir = run / "gates"
+    if gates_dir.is_dir():
+        for gp in sorted(gates_dir.glob("*.json")):
+            if gp.name == "_required.json":
+                continue
+            try:
+                old = read_json(gp)
+            except (ValueError, OSError):
+                continue
+            # A gate file may contain a non-object (e.g. []) — .get would raise; only a dict
+            # WAIVED record written by a prior plan is a stale-waiver candidate.
+            if (isinstance(old, dict) and old.get("status") == "WAIVED"
+                    and old.get("source") == "plan" and old.get("gate") not in waived_names):
+                gp.unlink()
     write_json(run / "gates" / "_required.json",
                {"tier": tier, "required": required, "requested": requested,
                 "requested_source": req_src, "waived": waived,
-                "planned_at": now_iso()})
+                "planned_at": planned_at})
+    for w in waived:
+        write_json(run / "gates" / f"{w['name']}.json", {
+            "gate": w["name"], "status": "WAIVED",
+            "authorized_by": w["authorized_by"], "reason": w["reason"],
+            "expires": w["expires"], "tier": tier, "planned_at": planned_at,
+            "source": "plan"})
     print(f"required gates ({tier}): {', '.join(required)}  "
           f"[requested via {req_src}]")
     for w in waived:
-        print(f"  WAIVED: {w['name']} (authorized by {w['authorized_by']})")
+        print(f"  WAIVED: {w['name']} (authorized by {w['authorized_by']}, "
+              f"expires {w['expires']})")
 
 
 def _parse_exit_map(spec):
@@ -93,6 +177,9 @@ def _parse_exit_map(spec):
 
 def cmd_run(args):
     run = resolve_run(args.run)
+    nerr = validate_gate_name(args.name)
+    if nerr:
+        die(nerr)
     cmd = args.command
     if not cmd:
         die("no command given after --")
@@ -125,6 +212,9 @@ def cmd_run(args):
 
 def cmd_record(args):
     run = resolve_run(args.run)
+    nerr = validate_gate_name(args.name)
+    if nerr:
+        die(nerr)
     # Status states, none of which may be inferred silently:
     #   PASS/FAIL    derive from the exit code by default.
     #   BLOCKED      required coverage that could not be run or verified (unknown).
@@ -147,6 +237,18 @@ def cmd_record(args):
         if not args.summary.strip():
             die("NOT_APPLICABLE requires --summary explaining why the gate does not "
                 "apply to this stack")
+        # Enforce the CRITICAL-tier N/A restrictions at record time too (fail fast), with the
+        # SAME validator AND the SAME attested policy source aggregate applies: mutation on
+        # CRITICAL can never be N/A, and any CRITICAL N/A needs policy allow_critical_waivers.
+        tier = read_json(run / "run.json").get("risk")
+        att_pol, att_err = load_attested_policy(run)
+        if att_err:
+            die(f"cannot validate NOT_APPLICABLE: {att_err}")
+        nerr = validate_not_applicable_gate(
+            args.name, tier, {"authorized_by": args.authorized_by, "summary": args.summary},
+            att_pol)
+        if nerr:
+            die(nerr)
     rec = {"gate": args.name, "command": args.command or "(external)",
            "exit_code": args.exit_code, "status": status, "summary": args.summary,
            "output_tail": "", "recorded_at": now_iso(), "source": "record"}
@@ -169,6 +271,14 @@ def main():
                    help="comma list of gates (required unless AR_REQUIRE or the "
                         "repo policy file's required_gates provides this tier)")
     p.add_argument("--waive", action="append")
+    p.add_argument("--waive-reason", default="",
+                   help="required when waiving a gate: a real justification (>=16 chars, "
+                        "not a placeholder like 'tbd'); independently re-validated at "
+                        "aggregate time")
+    p.add_argument("--waive-expires", default="",
+                   help="required when waiving a gate: 'YYYY-MM-DD', strictly after the "
+                        "aggregate run's clock date and within policy max_waiver_days "
+                        "(default 14) of when it was planned")
     p.add_argument("--authorized-by", default="")
     p.set_defaults(fn=cmd_plan)
 

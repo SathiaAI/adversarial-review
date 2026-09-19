@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -248,7 +249,9 @@ def _complete_sensitive_repo():
     sh(["panel.py", "run", "--context-file", "context.md"], repo)
     sh(["panel.py", "rebuttal"], repo)  # contention policy: required once findings exist
     sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
-        "--waive", "mutation", "--authorized-by", "Paul"], repo)
+        "--waive", "mutation", "--authorized-by", "Paul",
+        "--waive-reason", "mutation runner not wired into CI for this repo yet",
+        "--waive-expires", (date.today() + timedelta(days=7)).isoformat()], repo)
     for g in ["build", "unit", "secrets", "deps", "sast"]:
         sh(["gate.py", "record", "--name", g, "--exit-code", "0",
             "--summary", "ok"], repo)
@@ -305,14 +308,17 @@ def t_next_steps_pass_guidance():
     sh(["aggregate.py"], repo, expect=0)
     md = (run / "verdict.md").read_text()
     assert "## Next steps" in md, md
-    assert "Cleared:" in md and "owns the actual merge" in md, md
+    assert "Cleared" in md and "owns the actual merge" in md, md
+    # This fixture waives mutation, so PASS guidance must name the accountable exception
+    # instead of claiming every required check passed unqualified (M1 #9).
+    assert "accountable exception" in md and "Waived gate 'mutation'" in md, md
     v = read(run / "verdict.json")
     assert isinstance(v["next_steps"], list) and v["next_steps"], v
     assert v["verdict"] == "PASS" and all("next_steps" not in r for r in v["reasons"])
     # fix 2 (Codex review): a PASS does not claim the reviewers "signed off" on the released
     # state — findings can be fixed by operator + gate reruns without reviewer re-review.
     assert "signed off" not in md, md
-    assert "independent review ran with its blocking findings resolved" in md, md
+    assert "review ran with its blocking findings resolved" in md, md
     # fix 6 (Codex review): PASS guidance carries the pre-merge push-integrity check (AGENTS.md)
     passblob = " ".join(v["next_steps"])
     assert "Before you merge" in passblob and "pushed bytes match" in passblob, passblob
@@ -547,7 +553,9 @@ def t_coverage_block_on_pass():
     assert cov["findings"]["raised"] >= 1 and cov["findings"]["triaged"] >= 1
     assert cov["findings"]["untriaged_release_blocking"] == 0
     assert isinstance(cov["areas_not_reviewed"], list)
-    assert "Coverage: gates 5/5 passed" in (run / "verdict.md").read_text()
+    # 5/6, not 5/5: the waived `mutation` gate stays in `required` (M1 waiver hardening),
+    # so it counts toward the denominator without counting as "passed".
+    assert "Coverage: gates 5/6 passed" in (run / "verdict.md").read_text()
 
 
 def t_coverage_block_on_blocked():
@@ -634,7 +642,9 @@ def t_attestation_reproducible():
     # test_quality-2).
     strip = lambda v: {k: x for k, x in v.items() if k not in ("computed_at",)}
     assert strip(v1) == strip(v2), "verdict fields drifted across re-aggregation"
-    assert v1["verdict"] == "PASS" and "coverage" in v1 and v1["counts"]["gates"] == 5
+    # 6, not 5: the waived `mutation` gate stays in `required` (M1 waiver hardening) and
+    # now has its own recorded (WAIVED) gate result, so it counts too.
+    assert v1["verdict"] == "PASS" and "coverage" in v1 and v1["counts"]["gates"] == 6
     r = sh(["aggregate.py", "--check-digest"], repo, expect=0)
     assert "attestation OK" in r.stdout
     # Reformat one artifact without changing content: canonical JSON must not drift.
@@ -1958,7 +1968,9 @@ def t_rebuttal_policy_matrix():
     sh(["panel.py", "assign"], repo)
     sh(["panel.py", "run", "--context-file", "context.md"], repo)
     sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
-        "--waive", "mutation", "--authorized-by", "Paul"], repo)
+        "--waive", "mutation", "--authorized-by", "Paul",
+        "--waive-reason", "mutation runner not wired into CI for this repo yet",
+        "--waive-expires", (date.today() + timedelta(days=7)).isoformat()], repo)
     for g in ["build", "unit", "secrets", "deps", "sast"]:
         sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
     run = latest_run(repo)
@@ -1975,7 +1987,9 @@ def t_rebuttal_policy_matrix():
     sh(["panel.py", "assign"], repo2)
     sh(["panel.py", "run", "--context-file", "context.md"], repo2)
     sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
-        "--waive", "mutation", "--authorized-by", "Paul"], repo2)
+        "--waive", "mutation", "--authorized-by", "Paul",
+        "--waive-reason", "mutation runner not wired into CI for this repo yet",
+        "--waive-expires", (date.today() + timedelta(days=7)).isoformat()], repo2)
     for g in ["build", "unit", "secrets", "deps", "sast"]:
         sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo2)
     run2 = latest_run(repo2)
@@ -2033,9 +2047,11 @@ def t_critical_requires_rebuttal():
     sh(["panel.py", "init", "--risk", "CRITICAL", "--dev-providers", "anthropic"], repo)
     sh(["panel.py", "assign"], repo)
     sh(["panel.py", "run", "--context-file", "context.md"], repo)
-    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
-        "--waive", "mutation", "--authorized-by", "Paul"], repo)
-    for g in ["build", "unit", "secrets", "deps", "sast"]:
+    # CRITICAL's mutation gate can never be waived (see t_gate_mutation_critical_*_blocks),
+    # so it is recorded for real here (simulating a run that actually passed) rather than
+    # waived — a waiver would itself BLOCK the run and mask what this test is checking.
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast"], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast", "mutation"]:
         sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
     run = latest_run(repo)
     write(run / "validation" / "idor.json", {
@@ -10556,6 +10572,797 @@ def t_ai_defects_invalid_diffref_never_empty_diff_pass():
     assert not (run / "changed_paths.txt").exists()
     r = _aidef_wrap(run, _aidef_env(_aidef_fix("exit0_clean.py")), expect=2)
     assert "cannot read diff file" in r.stdout and "empty-diff" not in r.stdout
+
+
+def _min_repo(tier, dev="anthropic", policy=None):
+    """A repo with just `panel.py init` done — enough for `gate.py plan`/`record` and
+    `aggregate.py` to run, without the panel/rebuttal/validation machinery a full PASS
+    needs. Gate-waiver tests only need the gates to be checked, so this keeps them fast
+    and focused; other BLOCKED reasons (missing panel, etc.) may also appear in stdout,
+    which is fine since these tests only assert their own gate-specific substring.
+
+    `policy`, when given, is written to .adversarial-review.yml BEFORE init, so it is
+    captured in the attested policy.snapshot.json — the only policy aggregate honors for
+    waiver limits. (A policy written AFTER init is deliberately ignored at aggregate time;
+    see t_gate_waiver_post_init_policy_drift_ignored.)"""
+    repo = fresh_repo()
+    if policy is not None:
+        (repo / ".adversarial-review.yml").write_text(policy)
+    sh(["panel.py", "init", "--risk", tier, "--dev-providers", dev], repo)
+    return repo
+
+
+def t_gate_plan_waive_requires_reason_and_expires():
+    repo = _min_repo("SENSITIVE")
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul"], repo, expect=1)
+    assert "waive-reason" in r.stderr, r.stderr
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI yet"], repo, expect=1)
+    assert "waive-expires" in r.stderr, r.stderr
+
+
+def t_gate_waiver_smuggled_name_rejected():
+    # Waiving a gate name that isn't actually part of this tier's requested/floor gates
+    # is rejected outright at plan time, never silently accepted as a no-op waiver.
+    repo = _min_repo("SENSITIVE")
+    future = (date.today() + timedelta(days=7)).isoformat()
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "totally-not-a-real-gate", "--authorized-by", "Paul",
+            "--waive-reason", "trying to sneak an unrelated waiver in",
+            "--waive-expires", future], repo, expect=1)
+    assert "gate-name smuggling" in r.stderr, r.stderr
+
+
+def t_gate_waiver_valid_sensitive_passes_with_note():
+    # A well-formed SENSITIVE waiver stays in `required`, is written as its own WAIVED
+    # gate record, and the run still reaches PASS with the waiver surfaced as a note
+    # and distinctly in coverage/verdict.md (issue: M1 waiver hardening).
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced then fixed", "reproduced": True,
+        "regression_test": "tests/test_invoices.py::t_x",
+        "resolution": {"fixed": True, "gates_rerun": ["unit", "sast"]}})
+    rec = read(run / "gates" / "mutation.json")
+    assert rec["status"] == "WAIVED" and rec["authorized_by"] == "Paul", rec
+    r = sh(["aggregate.py"], repo, expect=0)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
+    assert "waived by Paul" in r.stdout, r.stdout
+    v = read(run / "verdict.json")
+    w = v["coverage"]["gates"]["waived"]
+    assert [x["name"] for x in w] == ["mutation"], w
+    assert w[0]["authorized_by"] == "Paul" and w[0]["reason"] and w[0]["expires"], w
+    assert "mutation" not in v["coverage"]["gates"]["passed"], v
+    md = (run / "verdict.md").read_text()
+    assert "waived: gate 'mutation'" in md, md
+
+
+def t_gate_waiver_reason_placeholder_blocks():
+    # plan now runs the SAME validator aggregate enforces, so an invalid waiver is rejected
+    # at plan time (exit 1) — no bad artifact is ever written.
+    repo = _min_repo("SENSITIVE")
+    future = (date.today() + timedelta(days=7)).isoformat()
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "tbd", "--waive-expires", future], repo, expect=1)
+    assert "placeholder" in r.stderr, r.stderr
+
+
+def t_gate_waiver_reason_too_short_blocks():
+    repo = _min_repo("SENSITIVE")
+    future = (date.today() + timedelta(days=7)).isoformat()
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "short", "--waive-expires", future], repo, expect=1)
+    assert "at least 16 characters" in r.stderr, r.stderr
+
+
+def t_gate_waiver_malformed_date_blocks():
+    repo = _min_repo("SENSITIVE")
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI yet",
+            "--waive-expires", "2026-13-40"], repo, expect=1)
+    assert "not a valid YYYY-MM-DD date" in r.stderr, r.stderr
+
+
+def t_gate_waiver_expired_blocks():
+    repo = _min_repo("SENSITIVE")
+    past = (date.today() - timedelta(days=1)).isoformat()
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI yet",
+            "--waive-expires", past], repo, expect=1)
+    assert "waiver expired" in r.stderr, r.stderr
+
+
+def t_gate_waiver_expires_today_is_not_strictly_future_blocks():
+    # expires == the clock date is NOT "strictly later" — must BLOCK, not pass.
+    # Use the UTC date, matching resolve_waiver_clock's fallback
+    # (datetime.now(timezone.utc).date()) when GITHUB_RUN_STARTED_AT is unset —
+    # a local date() would drift a day off UTC in some timezones and turn this
+    # exact-boundary case into a false-pass.
+    repo = _min_repo("SENSITIVE")
+    today = datetime.now(timezone.utc).date().isoformat()
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI yet",
+            "--waive-expires", today], repo, expect=1)
+    assert "waiver expired" in r.stderr, r.stderr
+
+
+def t_gate_waiver_over_cap_blocks():
+    repo = _min_repo("SENSITIVE")
+    far = (date.today() + timedelta(days=30)).isoformat()  # > default 14-day cap
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI yet",
+            "--waive-expires", far], repo, expect=1)
+    assert "capped at 14 days" in r.stderr, r.stderr
+
+
+def t_gate_waiver_custom_cap_from_policy():
+    # A policy max_waiver_days raises (or could lower) the cap; 20 days here is over the
+    # built-in default (14) but within the configured policy cap, so it passes cleanly.
+    # The policy is attested at init (so aggregate honors it) AND is in the working tree
+    # (so the plan-time check honors it too).
+    repo = _min_repo("SENSITIVE", policy="max_waiver_days: 20\n")
+    within_custom_cap = (date.today() + timedelta(days=18)).isoformat()
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+        "--waive", "mutation", "--authorized-by", "Paul",
+        "--waive-reason", "mutation runner not wired into CI yet",
+        "--waive-expires", within_custom_cap], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)  # still BLOCKED (no panel/rebuttal/etc in _min_repo)
+    assert "capped at" not in r.stdout, r.stdout
+    assert "waiver expired" not in r.stdout, r.stdout
+
+
+def t_gate_waiver_unauthorized_critical_blocks():
+    # CRITICAL-tier waivers (for a NON-mutation gate) are refused by default, without an
+    # explicit policy opt-in — rejected at plan time by the unified validator.
+    repo = _min_repo("CRITICAL")
+    future = (date.today() + timedelta(days=7)).isoformat()
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,mutation",
+            "--waive", "sast", "--authorized-by", "Paul",
+            "--waive-reason", "static analyzer unavailable for this legacy module",
+            "--waive-expires", future], repo, expect=1)
+    assert "allow_critical_waivers" in r.stderr, r.stderr
+
+
+def t_gate_waiver_critical_allowed_when_policy_opts_in():
+    # With allow_critical_waivers: true (attested at init), a NON-mutation CRITICAL gate CAN
+    # be waived — plan accepts it and aggregate honors it from the snapshot.
+    repo = _min_repo("CRITICAL", policy="allow_critical_waivers: true\n")
+    future = (date.today() + timedelta(days=7)).isoformat()
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,mutation",
+        "--waive", "sast", "--authorized-by", "Paul",
+        "--waive-reason", "static analyzer unavailable for this legacy module",
+        "--waive-expires", future], repo)
+    for g in ["build", "unit", "secrets", "deps", "mutation"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)  # still BLOCKED (no panel in _min_repo)
+    assert "allow_critical_waivers" not in r.stdout, r.stdout
+    assert "sast' waived by Paul" in r.stdout, r.stdout
+
+
+def t_gate_mutation_critical_waiver_always_blocks():
+    # mutation on CRITICAL can NEVER be waived, even with allow_critical_waivers: true —
+    # that one restriction is not policy-configurable, and plan rejects it outright.
+    repo = _min_repo("CRITICAL", policy="allow_critical_waivers: true\nmax_waiver_days: 30\n")
+    future = (date.today() + timedelta(days=7)).isoformat()
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not implemented for CRITICAL yet",
+            "--waive-expires", future], repo, expect=1)
+    assert "mutation cannot be waived" in r.stderr, r.stderr
+
+
+def t_gate_mutation_critical_not_applicable_blocks():
+    # Same restriction applies to the other representation: NOT_APPLICABLE on CRITICAL
+    # mutation is rejected at record time (fail fast) AND, if a record is written directly,
+    # BLOCKED by aggregate (the authority) — uniformly with the waiver case.
+    repo = _min_repo("CRITICAL")
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast"], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["gate.py", "record", "--name", "mutation", "--status", "NOT_APPLICABLE",
+            "--authorized-by", "Paul",
+            "--summary", "mutation runner is not implemented for this stack yet"], repo, expect=1)
+    assert "mutation cannot be waived or marked NOT_APPLICABLE" in r.stderr, r.stderr
+    run = latest_run(repo)
+    write(run / "gates" / "mutation.json", {
+        "gate": "mutation", "command": "(external)", "exit_code": None,
+        "status": "NOT_APPLICABLE", "summary": "written directly, bypassing record",
+        "authorized_by": "Paul", "recorded_at": "x", "source": "record"})
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "mutation cannot be waived or marked NOT_APPLICABLE" in r.stdout, r.stdout
+
+
+def t_gate_waiver_malformed_run_started_at_blocks():
+    # A malformed GITHUB_RUN_STARTED_AT BLOCKS the whole run, fail-closed — never a
+    # silent fall-back to "today" — even for an otherwise-fully-valid waiver/run.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced then fixed", "reproduced": True,
+        "regression_test": "t::x", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    env = {**ENV, "GITHUB_RUN_STARTED_AT": "not-a-real-timestamp"}
+    r = sh(["aggregate.py"], repo, expect=2, env=env)
+    assert "GITHUB_RUN_STARTED_AT" in r.stdout and "could not be parsed" in r.stdout, r.stdout
+
+
+def t_gate_waiver_run_started_at_shifts_clock():
+    # GITHUB_RUN_STARTED_AT genuinely drives the 'now' used for expiry: a waiver that is
+    # NOT expired against real today can still be judged expired when the injected clock
+    # is moved past its expiry date.
+    repo = _min_repo("SENSITIVE")
+    expires = (date.today() + timedelta(days=2)).isoformat()
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+        "--waive", "mutation", "--authorized-by", "Paul",
+        "--waive-reason", "mutation runner not wired into CI yet",
+        "--waive-expires", expires], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    future_clock = (date.today() + timedelta(days=5)).isoformat() + "T00:00:00Z"
+    env = {**ENV, "GITHUB_RUN_STARTED_AT": future_clock}
+    r = sh(["aggregate.py"], repo, expect=2, env=env)
+    assert "waiver expired" in r.stdout, r.stdout
+
+
+def t_gate_waiver_tampered_record_blocks():
+    # aggregate.py re-validates the on-disk WAIVED record independently: a valid waiver
+    # gate.py wrote, then hand-tampered afterward, is caught exactly like a fresh bad one.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced then fixed", "reproduced": True,
+        "regression_test": "t::x", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    rec = read(run / "gates" / "mutation.json")
+    assert rec["status"] == "WAIVED"  # sanity: gate.py really did write a valid waiver
+    rec["reason"] = "tbd"             # tamper: swap the real reason for a placeholder
+    write(run / "gates" / "mutation.json", rec)
+    # keep the manifest's waiver entry consistent with the record so the record<->manifest
+    # binding passes and the independent REASON re-validation (placeholder) is what fires
+    man = read(run / "gates" / "_required.json")
+    for w in man["waived"]:
+        if w["name"] == "mutation":
+            w["reason"] = "tbd"
+    write(run / "gates" / "_required.json", man)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "placeholder" in r.stdout, r.stdout
+
+
+def t_gate_waiver_reserved_gate_name_rejected():
+    # A gate identifier becomes gates/<name>.json. A reserved/leading-underscore name
+    # ('_required' is the run manifest) or a path-escaping name is rejected at plan time,
+    # before any path is built — closing the manifest-overwrite / silent all-pass hole.
+    repo = _min_repo("SENSITIVE")
+    r = sh(["gate.py", "plan",
+            "--require", "build,unit,secrets,deps,sast,_required"], repo, expect=1)
+    assert "reserved" in r.stderr, r.stderr
+    r = sh(["gate.py", "plan",
+            "--require", "build,unit,secrets,deps,sast,../evil"], repo, expect=1)
+    assert "invalid required gate" in r.stderr, r.stderr
+
+
+def t_gate_waiver_legacy_dropped_gate_blocks():
+    # Pre-M1 plans DROPPED a waived gate from `required` (recording it only in the manifest's
+    # `waived` list), so the aggregator never checked it — a SENSITIVE run could pass with no
+    # mutation gate at all. Such a legacy/tampered manifest must now BLOCK with migration
+    # guidance rather than be honored.
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    future = (date.today() + timedelta(days=7)).isoformat()
+    planned = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    write(run / "gates" / "_required.json", {
+        "tier": "SENSITIVE", "required": ["build", "unit", "secrets", "deps", "sast"],
+        "requested": ["build", "unit", "secrets", "deps", "sast"], "requested_source": "cli",
+        "waived": [{"name": "mutation", "authorized_by": "Paul",
+                    "reason": "legacy waiver that dropped the gate from required",
+                    "expires": future}],
+        "planned_at": planned})
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "waived but missing from the required set" in r.stdout, r.stdout
+
+
+def t_gate_waiver_post_init_policy_drift_ignored():
+    # A max_waiver_days written AFTER init is NOT in the attested snapshot, so aggregate
+    # ignores it and enforces the built-in 14-day cap — a post-init policy edit cannot widen
+    # a waiver that isn't in the audit record. (Mirror of t_gate_waiver_custom_cap_from_policy,
+    # where the policy IS attested at init and therefore honored.)
+    repo = _min_repo("SENSITIVE")  # no policy at init -> attested snapshot carries the default cap
+    within_20 = (date.today() + timedelta(days=18)).isoformat()
+    (repo / ".adversarial-review.yml").write_text("max_waiver_days: 20\n")  # post-init drift
+    # plan now validates against the ATTESTED policy too (not the mutable working tree), so the
+    # post-init 20-day cap is ignored and the 18-day waiver is rejected at plan time (14-day default).
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI yet",
+            "--waive-expires", within_20], repo, expect=1)
+    assert "capped at 14 days" in r.stderr, r.stderr
+
+
+def t_gate_waiver_tampered_planned_at_blocks():
+    # The lifetime cap is anchored to the RUN's planning time (the manifest), not the
+    # record's own planned_at. Moving only the record's planned_at forward to stretch the
+    # window is caught: aggregate cross-checks it against the clock/manifest and BLOCKS.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "fixed", "reproduced": True,
+        "regression_test": "t::x", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    rec = read(run / "gates" / "mutation.json")
+    rec["planned_at"] = (datetime.now(timezone.utc) + timedelta(days=40)).isoformat(timespec="seconds")
+    write(run / "gates" / "mutation.json", rec)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "record tampered" in r.stdout, r.stdout
+
+
+def t_gate_not_applicable_short_summary_reaches_pass():
+    # N/A keeps its original contract: a non-empty summary is enough (it is not a time-boxed
+    # waiver, so the >=16-char / no-placeholder waiver-reason rule must not apply). A short but
+    # real justification is accepted; a whitespace-only one is still rejected.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "fixed", "reproduced": True,
+        "regression_test": "t::x", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["gate.py", "record", "--name", "sast", "--status", "NOT_APPLICABLE",
+        "--authorized-by", "Paul", "--summary", "no source"], repo)  # <16 chars, real
+    r = sh(["aggregate.py"], repo, expect=0)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
+    write(run / "gates" / "sast.json", {
+        "gate": "sast", "command": "(external)", "exit_code": None,
+        "status": "NOT_APPLICABLE", "summary": "   ", "authorized_by": "Paul",
+        "recorded_at": "x", "source": "record"})
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "requires a non-empty summary" in r.stdout, r.stdout
+
+
+def t_policy_max_waiver_days_bounded():
+    # An absurd max_waiver_days is rejected at policy load (bounded 1..365), so it can never
+    # reach timedelta(days=...) and raise OverflowError, leaving a run with no verdict.
+    repo = fresh_repo()
+    (repo / ".adversarial-review.yml").write_text("max_waiver_days: 100000000000\n")
+    r = sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
+           repo, expect=1)
+    assert "max_waiver_days must be an integer from 1 to 365" in r.stderr, r.stderr
+
+
+def t_gate_waiver_replan_revokes_stale_waiver():
+    # Re-running `gate.py plan` WITHOUT a previously granted waiver must revoke the stale
+    # WAIVED record — otherwise gates/<name>.json left behind would still read WAIVED and be
+    # honored, silently reinstating a waiver the new plan dropped.
+    repo = _min_repo("SENSITIVE")
+    future = (date.today() + timedelta(days=7)).isoformat()
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+        "--waive", "mutation", "--authorized-by", "Paul",
+        "--waive-reason", "mutation runner not wired into CI yet",
+        "--waive-expires", future], repo)
+    run = latest_run(repo)
+    assert read(run / "gates" / "mutation.json")["status"] == "WAIVED"
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    assert not (run / "gates" / "mutation.json").exists(), "stale waiver record must be revoked"
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "no recorded result" in r.stdout, r.stdout
+
+
+def t_gate_waiver_clock_rollback_cannot_unexpire():
+    # A rolled-back run clock (a stale/forged GITHUB_RUN_STARTED_AT set to the past) must not
+    # un-expire a genuinely expired waiver: the clock is the LATER of real UTC and the env date.
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    expired = (date.today() - timedelta(days=20)).isoformat()          # already expired
+    planned = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(timespec="seconds")
+    write(run / "gates" / "_required.json", {
+        "tier": "SENSITIVE",
+        "required": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested_source": "cli",
+        "waived": [{"name": "mutation", "authorized_by": "Paul",
+                    "reason": "mutation runner not wired into CI yet", "expires": expired}],
+        "planned_at": planned})
+    write(run / "gates" / "mutation.json", {
+        "gate": "mutation", "status": "WAIVED", "authorized_by": "Paul",
+        "reason": "mutation runner not wired into CI yet", "expires": expired,
+        "tier": "SENSITIVE", "planned_at": planned, "source": "plan"})
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    # roll the clock back to a date when the waiver would still have been valid
+    rollback = (date.today() - timedelta(days=25)).isoformat() + "T00:00:00Z"
+    env = {**ENV, "GITHUB_RUN_STARTED_AT": rollback}
+    r = sh(["aggregate.py"], repo, expect=2, env=env)
+    assert "waiver expired" in r.stdout, r.stdout
+
+
+def t_gate_waiver_metadata_escaped_in_markdown():
+    # Operator-supplied waiver reason is HTML-escaped in verdict.md so a crafted value cannot
+    # forge markup in the rendered report.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "fixed", "reproduced": True,
+        "regression_test": "t::x", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    crafted = "needs <script> & rework, tracked under bug-123 until fixed"
+    rec = read(run / "gates" / "mutation.json")
+    rec["reason"] = crafted
+    write(run / "gates" / "mutation.json", rec)
+    # the record<->manifest binding requires the manifest's waiver reason to match, so set the
+    # crafted reason in both; it stays a valid (>=16-char, non-placeholder) reason, so the run
+    # still PASSes and the reason is exercised through the verdict.md escaping path
+    man = read(run / "gates" / "_required.json")
+    for w in man["waived"]:
+        if w["name"] == "mutation":
+            w["reason"] = crafted
+    write(run / "gates" / "_required.json", man)
+    r = sh(["aggregate.py"], repo, expect=0)
+    md = (run / "verdict.md").read_text()
+    assert "&lt;script&gt;" in md and "&amp;" in md, md
+    assert "<script>" not in md, md
+
+
+def t_gate_waiver_snapshot_nonobject_does_not_crash():
+    # A non-object policy.snapshot.json must fail closed (BLOCKED), never crash the
+    # aggregator with AttributeError before it can write a verdict.
+    repo = _min_repo("SENSITIVE", policy="max_waiver_days: 20\n")
+    run = latest_run(repo)
+    (run / "policy.snapshot.json").write_text("[]", encoding="utf-8")
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast", "mutation"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "attested policy snapshot could not be trusted" in r.stdout, r.stdout
+
+
+def t_gate_waiver_snapshot_swap_blocks():
+    # The snapshot's own sha256 is not tamper-proof (text+sha can be rewritten together).
+    # Cross-checking against the digest recorded in run.json at init catches a wholesale swap,
+    # and the rejected snapshot's sha is NOT reported as governing provenance.
+    import hashlib
+    repo = _min_repo("SENSITIVE", policy="max_waiver_days: 7\n")
+    run = latest_run(repo)
+    swapped = "max_waiver_days: 30\n"
+    write(run / "policy.snapshot.json", {
+        "file": ".adversarial-review.yml",
+        "sha256": hashlib.sha256(swapped.encode("utf-8")).hexdigest(),
+        "captured_at": "x", "text": swapped})
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast", "mutation"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "does not match the policy digest recorded in run.json" in r.stdout, r.stdout
+    assert read(run / "verdict.json")["coverage"]["policy_snapshot_sha256"] is None
+
+
+def t_gate_waiver_snapshot_nonstring_file_blocks():
+    # A truthy non-string `file` field must fail closed, not raise before the verdict.
+    repo = _min_repo("SENSITIVE", policy="max_waiver_days: 7\n")
+    run = latest_run(repo)
+    snap = read(run / "policy.snapshot.json")
+    snap["file"] = 1
+    write(run / "policy.snapshot.json", snap)
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast", "mutation"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "'file' field is not a string" in r.stdout, r.stdout
+
+
+def t_gate_waiver_manifest_anchor_uses_earliest():
+    # The cap anchors to the EARLIEST of the record/manifest planned_at, so a LATER manifest
+    # planned_at cannot widen the window. Both timestamps are in the past (so the future-date
+    # guard does not fire); the manifest is 3 days after the record.
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    utc_today = datetime.now(timezone.utc).date()
+    rec_planned = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat(timespec="seconds")
+    man_planned = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat(timespec="seconds")
+    # Use the UTC date for expires so the cap boundary is compared consistently with the UTC
+    # planned_at (a local date() could drift a day and flip this exact boundary case).
+    expires = (utc_today + timedelta(days=10)).isoformat()   # > (utc_today-5) + 14 = utc_today+9
+    write(run / "gates" / "_required.json", {
+        "tier": "SENSITIVE",
+        "required": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested_source": "cli",
+        "waived": [{"name": "mutation", "authorized_by": "Paul",
+                    "reason": "mutation runner not wired into CI yet", "expires": expires}],
+        "planned_at": man_planned})
+    write(run / "gates" / "mutation.json", {
+        "gate": "mutation", "status": "WAIVED", "authorized_by": "Paul",
+        "reason": "mutation runner not wired into CI yet", "expires": expires,
+        "tier": "SENSITIVE", "planned_at": rec_planned, "source": "plan"})
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "capped at 14 days" in r.stdout, r.stdout
+
+
+def t_gate_waiver_future_planned_at_rejected():
+    # Advancing BOTH the record and manifest planned_at to tomorrow must be rejected — a run is
+    # not planned in the future — so it cannot defeat the min() anchor (no one-day slack).
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    tomorrow_ts = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(timespec="seconds")
+    expires = (date.today() + timedelta(days=15)).isoformat()
+    write(run / "gates" / "_required.json", {
+        "tier": "SENSITIVE",
+        "required": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested_source": "cli",
+        "waived": [{"name": "mutation", "authorized_by": "Paul",
+                    "reason": "mutation runner not wired into CI yet", "expires": expires}],
+        "planned_at": tomorrow_ts})
+    write(run / "gates" / "mutation.json", {
+        "gate": "mutation", "status": "WAIVED", "authorized_by": "Paul",
+        "reason": "mutation runner not wired into CI yet", "expires": expires,
+        "tier": "SENSITIVE", "planned_at": tomorrow_ts, "source": "plan"})
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "in the future" in r.stdout and "tampered" in r.stdout, r.stdout
+
+
+def t_gate_waiver_snapshot_missing_blocks():
+    # A policy governed the run at init but the attested snapshot was deleted: falling back to
+    # built-in defaults could accept a waiver the attested policy would reject, so BLOCK.
+    repo = _min_repo("SENSITIVE", policy="max_waiver_days: 7\n")
+    run = latest_run(repo)
+    (run / "policy.snapshot.json").unlink()
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast", "mutation"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "policy.snapshot.json is missing" in r.stdout, r.stdout
+
+
+def t_gate_waiver_record_manifest_mismatch_blocks():
+    # A WAIVED record whose metadata (here, expiry) does not match the manifest's waiver entry
+    # is raced/tampered and must BLOCK, even though the gate name matches.
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    planned = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    short = (date.today() + timedelta(days=3)).isoformat()
+    long = (date.today() + timedelta(days=13)).isoformat()
+    write(run / "gates" / "_required.json", {
+        "tier": "SENSITIVE",
+        "required": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested_source": "cli",
+        "waived": [{"name": "mutation", "authorized_by": "Paul",
+                    "reason": "mutation runner not wired into CI yet", "expires": short}],
+        "planned_at": planned})
+    write(run / "gates" / "mutation.json", {   # record authorizes a LONGER expiry than the manifest
+        "gate": "mutation", "status": "WAIVED", "authorized_by": "Paul",
+        "reason": "mutation runner not wired into CI yet", "expires": long,
+        "tier": "SENSITIVE", "planned_at": planned, "source": "plan"})
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "does not match the plan manifest's waiver entry" in r.stdout, r.stdout
+
+
+def t_gate_waiver_manifest_waived_malformed_blocks():
+    # A malformed `waived` (non-list, or an entry with an unhashable/non-string name) must
+    # BLOCK, never crash aggregation before it writes a verdict.
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    planned = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    base = {"tier": "SENSITIVE",
+            "required": ["build", "unit", "secrets", "deps", "sast"],
+            "requested": ["build", "unit", "secrets", "deps", "sast"],
+            "requested_source": "cli", "planned_at": planned}
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    # waived is not a list
+    write(run / "gates" / "_required.json", {**base, "waived": 1})
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "'waived' is not a list" in r.stdout, r.stdout
+    # a waived entry with an unhashable (list) name
+    write(run / "gates" / "_required.json", {**base, "waived": [{"name": []}]})
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "malformed waiver entry" in r.stdout, r.stdout
+
+
+def t_gate_waiver_orphan_record_blocks():
+    # A WAIVED record with no matching entry in the manifest's waived list is an orphan
+    # (e.g. a raced/stale waiver) and must BLOCK, not be honored.
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    future = (date.today() + timedelta(days=7)).isoformat()
+    planned = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    write(run / "gates" / "_required.json", {
+        "tier": "SENSITIVE",
+        "required": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested_source": "cli", "waived": [], "planned_at": planned})
+    write(run / "gates" / "mutation.json", {
+        "gate": "mutation", "status": "WAIVED", "authorized_by": "Paul",
+        "reason": "mutation runner not wired into CI yet", "expires": future,
+        "tier": "SENSITIVE", "planned_at": planned, "source": "plan"})
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "not authorized by the plan manifest" in r.stdout, r.stdout
+
+
+def t_gate_name_whitespace_rejected():
+    # A gate name with surrounding whitespace is rejected (it would be written to a file that
+    # never satisfies the stripped required name).
+    repo = _min_repo("SENSITIVE")
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    r = sh(["gate.py", "record", "--name", "unit ", "--exit-code", "0", "--summary", "ok"],
+           repo, expect=1)
+    assert "invalid" in r.stderr.lower(), r.stderr
+
+
+def t_gate_plan_tolerates_nonobject_record():
+    # A pre-existing gate file containing a non-object must not crash the stale-waiver scan.
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    write(run / "gates" / "junk.json", [])
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    assert (run / "gates" / "_required.json").exists()
+
+
+def t_next_steps_pass_names_na_exception():
+    # A PASS with BOTH a waiver and an N/A gate names both as accountable exceptions.
+    repo = _complete_sensitive_repo()   # waives mutation
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed", "severity": "high",
+        "evidence": "fixed", "reproduced": True, "regression_test": "t::x",
+        "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    sh(["gate.py", "record", "--name", "sast", "--status", "NOT_APPLICABLE",
+        "--authorized-by", "Paul", "--summary", "config-only repo, no source for SAST"], repo)
+    sh(["aggregate.py"], repo, expect=0)
+    blob = " ".join(read(run / "verdict.json")["next_steps"])
+    assert "not applicable: sast" in blob and "waived: mutation" in blob, blob
+
+
+def t_next_steps_critical_mutation_not_na_guidance():
+    # For a missing mutation gate on CRITICAL, the guidance must not recommend N/A (which the
+    # gate rejects) — it must say the gate has to run and pass.
+    repo = _min_repo("CRITICAL")
+    run = latest_run(repo)
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    blob = " ".join(read(run / "verdict.json")["next_steps"])
+    assert "cannot be waived or marked not-applicable" in blob, blob
+
+
+def t_next_steps_critical_gate_na_blocked_without_policy_opt_in():
+    # Round-7 P2 follow-up: for a missing NON-mutation gate on CRITICAL under the default
+    # policy (no allow_critical_waivers), the guidance previously always offered "recorded
+    # as not-applicable" — but _validate_gate_exception_common() rejects NOT_APPLICABLE for
+    # ANY CRITICAL gate (not just mutation) unless policy allow_critical_waivers is true, so
+    # the guidance must not recommend an action the gate itself will reject.
+    repo = _min_repo("CRITICAL")
+    run = latest_run(repo)
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    for g in ["build", "unit", "secrets", "deps", "mutation"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    sh(["aggregate.py"], repo, expect=2)
+    steps = read(run / "verdict.json")["next_steps"]
+    sast_line = next(s for s in steps if "'sast'" in s)
+    assert "allow_critical_waivers: true" in sast_line and "currently not set" in sast_line, sast_line
+    assert "recorded as not-applicable" not in sast_line, sast_line
+
+
+def t_next_steps_critical_gate_na_allowed_when_policy_opts_in():
+    # Same missing-gate shape as above, but with allow_critical_waivers=True (mirroring an
+    # attested policy that opts in) — the guidance reverts to the generic N/A-allowed
+    # wording, since the gate itself would accept a NOT_APPLICABLE record under this policy.
+    import aggregate
+    gcov = {"failed": [], "blocked": [], "missing": ["sast"]}
+    steps = aggregate.next_steps("BLOCKED", [], ["gate plan missing"], gcov, {}, {},
+                                 risk="CRITICAL", allow_critical_waivers=True)
+    sast_line = next(s for s in steps if "'sast'" in s)
+    assert "recorded as not-applicable, with a reason) before release" in sast_line, sast_line
+    assert "allow_critical_waivers" not in sast_line, sast_line
+
+
+def t_load_attested_policy_fails_closed_on_unreadable_runjson():
+    # Unreadable/corrupt provenance must fail closed, never be treated as 'no policy at init'
+    # (which would silently widen a waiver to the default cap).
+    import _common
+    d = Path(tempfile.mkdtemp())
+    (d / "run.json").write_text("this is not json {", encoding="utf-8")
+    data, err = _common.load_attested_policy(d)
+    assert data is None and err and "run.json is unreadable" in err, (data, err)
+    (d / "run.json").write_text("[]", encoding="utf-8")   # valid JSON but not an object
+    data, err = _common.load_attested_policy(d)
+    assert data is None and "not a JSON object" in (err or ""), (data, err)
+
+
+def t_gate_required_malformed_blocks():
+    # A malformed `required` (non-list, or an unhashable member) must BLOCK, never crash
+    # aggregation with TypeError before the verdict is written — same contract as `waived`.
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    planned = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    write(run / "gates" / "_required.json", {"tier": "SENSITIVE", "required": 1,
+        "requested": [], "requested_source": "cli", "waived": [], "planned_at": planned})
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "'required' is not a list" in r.stdout, r.stdout
+    write(run / "gates" / "_required.json", {"tier": "SENSITIVE", "required": [[]],
+        "requested": [], "requested_source": "cli", "waived": [], "planned_at": planned})
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "malformed required entry" in r.stdout, r.stdout
+
+
+def t_gate_name_newline_rejected():
+    # A trailing newline in a gate name must be rejected — re.match + $ would accept it, so
+    # validation uses fullmatch. Otherwise 'unit\n' records gates/'unit\n'.json.
+    repo = _min_repo("SENSITIVE")
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    r = sh(["gate.py", "record", "--name", "unit\n", "--exit-code", "0", "--summary", "ok"],
+           repo, expect=1)
+    assert "invalid" in r.stderr.lower(), r.stderr
+
+
+def t_gate_waiver_malformed_name_no_forged_heading():
+    # A tampered manifest waiver name containing a newline + markdown must be rejected as
+    # malformed AND must not forge a heading in verdict.md (reason lines are escaped).
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    planned = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    write(run / "gates" / "_required.json", {"tier": "SENSITIVE",
+        "required": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested_source": "cli",
+        "waived": [{"name": "evil\n# Forged release heading", "authorized_by": "Paul",
+                    "reason": "attempt to forge output via a newline name",
+                    "expires": (date.today() + timedelta(days=3)).isoformat()}],
+        "planned_at": planned})
+    for g in ["build", "unit", "secrets", "deps", "sast", "mutation"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "malformed waiver entry" in r.stdout, r.stdout
+    md = (run / "verdict.md").read_text()
+    assert not any(ln.strip().startswith("# Forged release heading") for ln in md.splitlines()), md
+
+
+def t_mcp_gate_plan_waive_requires_reason_and_expires():
+    repo = fresh_repo()
+    res = _mcp_call(repo, "ar_init", {"risk": "SENSITIVE", "dev_providers": ["anthropic"]})
+    assert not res.get("isError"), res
+    res = _mcp_call(repo, "ar_gate_plan",
+                    {"require": ["build", "unit", "secrets", "deps", "sast"],
+                     "waive": ["mutation"], "authorized_by": "Paul"})
+    assert res.get("isError") and "waive_reason" in res["content"][0]["text"], res
+    res = _mcp_call(repo, "ar_gate_plan",
+                    {"require": ["build", "unit", "secrets", "deps", "sast"],
+                     "waive": ["mutation"], "authorized_by": "Paul",
+                     "waive_reason": "mutation runner not wired into CI yet"})
+    assert res.get("isError") and "waive_expires" in res["content"][0]["text"], res
+    future = (date.today() + timedelta(days=7)).isoformat()
+    res = _mcp_call(repo, "ar_gate_plan",
+                    {"require": ["build", "unit", "secrets", "deps", "sast"],
+                     "waive": ["mutation"], "authorized_by": "Paul",
+                     "waive_reason": "mutation runner not wired into CI yet",
+                     "waive_expires": future})
+    assert not res.get("isError"), res
+    run = latest_run(repo)
+    rec = read(run / "gates" / "mutation.json")
+    assert rec["status"] == "WAIVED" and rec["expires"] == future, rec
+    assert "mutation" in read(run / "gates" / "_required.json")["required"], "waiver dropped from required"
 
 
 def main():

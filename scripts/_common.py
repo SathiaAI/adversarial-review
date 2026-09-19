@@ -3,8 +3,9 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 RUN_ROOT = Path(os.environ.get("AR_RUN_DIR", ".adversarial-review"))
@@ -80,7 +81,8 @@ def family_of(slug):
 
 POLICY_BASENAMES = (".adversarial-review.yml", ".adversarial-review.json")
 POLICY_KEYS = ("risk", "dev_providers", "rebuttal_policy", "required_gates", "pins",
-               "mutation", "max_cost_usd", "high_samples")
+               "mutation", "max_cost_usd", "high_samples",
+               "allow_critical_waivers", "max_waiver_days")
 VALID_RISKS = ("NORMAL", "SENSITIVE", "CRITICAL")
 VALID_REBUTTAL = ("critical", "contention", "any")
 MAX_HIGH_SAMPLES = 25  # practical upper bound on corroboration samples (E4-S3): bounds the
@@ -304,6 +306,216 @@ def _validate_mutation(v, name):
                 die(f"{name}: mutation.{k} must be a list of non-empty path/glob strings")
 
 
+def _policy_bool(v):
+    """A policy boolean: a real bool (JSON), or the literal string 'true'/'false' (the YAML
+    subset never coerces scalars). Anything else is not a usable boolean here."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+        return v.strip().lower() == "true"
+    return None
+
+
+# --------------------------------------------------------------- gate waivers (M1)
+# A waiver is a time-boxed, accountable exception, never a permanent hole: it must name an
+# authorizer, give a real reason, and expire — and it is independently re-validated from the
+# gates/<name>.json record itself at aggregate time, never trusted just because gate.py wrote
+# it (a hand-edited/tampered record is caught exactly like a fresh one). See references/gates.md.
+WAIVER_REASON_PLACEHOLDERS = {"tbd", "n/a", "na", "temp", "fixme", "todo", "none", ""}
+WAIVER_REASON_MIN_LEN = 16
+DEFAULT_MAX_WAIVER_DAYS = 14
+# Hard ceiling on any configured waiver lifetime. Bounds max_waiver_days at policy-load
+# time so an absurd value (a typo, or a deliberate 10**12) can neither pass validation nor
+# reach timedelta(days=...) and raise OverflowError, which would leave a run with no verdict.
+MAX_WAIVER_DAYS_CAP = 365
+
+# A gate identifier becomes a filename: gates/<name>.json. It must therefore be a strict,
+# path-safe slug with NO leading underscore — gates/_required.json is the run manifest, and
+# waiving or requiring a name like '_required' (or '../x', 'a/b', 'x.json') would overwrite
+# the manifest or escape the gates dir, blanking the required set into a silent all-pass.
+GATE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def validate_gate_name(name):
+    """Return an error string, or None when `name` is a safe gate identifier. Rejects
+    leading-underscore/reserved names (gates/_required.json is the manifest), path
+    separators, dots, and anything outside a strict lowercase slug — so gates/<name>.json
+    can never escape the gates dir or overwrite the manifest."""
+    if not isinstance(name, str):
+        return "gate name must be a string"
+    if not name.strip():
+        return "gate name is required"
+    # Match the RAW name with fullmatch (NOT match): a name with surrounding whitespace passes
+    # a stripped check but the caller writes gates/<raw name>.json, so 'unit ' would be recorded
+    # as 'unit .json' while the required set looks for 'unit'. `re.match` also lets a trailing
+    # newline slip through ('unit\n' — the `$` anchor matches before the final \n), so fullmatch
+    # is required to reject the whole tampered string.
+    if not GATE_NAME_RE.fullmatch(name):
+        return (f"gate name {name!r} is invalid — must match [a-z0-9][a-z0-9_-]{{0,63}} "
+                "(lowercase alphanumerics, '-' or '_', no leading underscore, no whitespace, "
+                "path separators, or dots); leading-underscore names such as '_required' are reserved")
+    return None
+
+
+def validate_waiver_reason(reason):
+    """Return an error string, or None when `reason` is an acceptable justification: a
+    non-empty string, long enough to be a real explanation, and not a placeholder."""
+    if not isinstance(reason, str):
+        return "reason must be a string"
+    r = reason.strip()
+    if not r:
+        return "reason is required"
+    if r.lower() in WAIVER_REASON_PLACEHOLDERS:
+        return f"reason {r!r} is a placeholder, not a real justification"
+    if len(r) < WAIVER_REASON_MIN_LEN:
+        return f"reason must be at least {WAIVER_REASON_MIN_LEN} characters, got {len(r)}"
+    return None
+
+
+def parse_waiver_expiry(expires):
+    """Strict YYYY-MM-DD only (no datetimes, no other separators) — returns a `date`, or
+    None when `expires` is missing, malformed, or not that exact shape."""
+    if not isinstance(expires, str):
+        return None
+    s = expires.strip()
+    if len(s) != 10 or s[4] != "-" or s[7] != "-":
+        return None
+    y, m, d = s[0:4], s[5:7], s[8:10]
+    if not (y.isdigit() and m.isdigit() and d.isdigit()):
+        return None
+    try:
+        return date(int(y), int(m), int(d))
+    except ValueError:
+        return None
+
+
+def _date_from_iso(value):
+    """The date part of an ISO-8601 datetime (or bare date) string, or None if `value`
+    is not a string or is not parseable."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    s = value.strip()
+    if s[-1:] in ("Z", "z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s).date()
+    except ValueError:
+        return None
+
+
+def resolve_waiver_clock():
+    """The 'now' date waiver expiries are compared against: the LATER of today in UTC and the
+    date part of GITHUB_RUN_STARTED_AT (when that env var is set). Returns (clock_date, error).
+    When the env var is set but cannot be parsed, returns (None, <message>) — fail closed:
+    callers must BLOCK rather than fall back to today, since silently guessing the clock would
+    defeat the whole expiry check. Taking the later of the two means a run clock rolled BACKWARD
+    (a stale/forged GITHUB_RUN_STARTED_AT) cannot un-expire a waiver — real UTC still applies —
+    while a forward run clock is still honored."""
+    today = datetime.now(timezone.utc).date()
+    raw = os.environ.get("GITHUB_RUN_STARTED_AT", "")
+    if not raw.strip():
+        return today, None
+    d = _date_from_iso(raw)
+    if d is None:
+        return None, (f"GITHUB_RUN_STARTED_AT={raw!r} could not be parsed as a date/time — "
+                       "the run is BLOCKED rather than guessing the current date")
+    return max(d, today), None
+
+
+def _validate_gate_exception_common(kind, gate_name, tier, authorized_by, reason, pol_data,
+                                    strict_reason=True):
+    """Checks shared by a WAIVED and a NOT_APPLICABLE gate record: the CRITICAL-tier
+    restrictions, a named authorizer, and a justification. `kind` is 'WAIVED' or
+    'NOT_APPLICABLE', used only for messages. `strict_reason` selects the justification
+    contract: True (WAIVED) applies the full waiver-reason rule (>=16 chars, not a
+    placeholder); False (NOT_APPLICABLE) only requires a non-empty summary — its original
+    contract, which the shared 16-char rule had inadvertently tightened. Returns an error
+    string, or None."""
+    # Mutation on CRITICAL can NEVER be waived or marked not-applicable, regardless of policy:
+    # CRITICAL mutation coverage stays BLOCKED by design until the mutation-runner milestone
+    # (M4) implements it for real — a green verdict must never be reachable by waiving/N-A'ing
+    # the one gate meant to catch that gap.
+    if tier == "CRITICAL" and gate_name == "mutation":
+        return ("mutation cannot be waived or marked NOT_APPLICABLE on CRITICAL tier — "
+                "CRITICAL mutation coverage stays BLOCKED by design until the mutation-runner "
+                "milestone (M4); run and record the real gate instead")
+    if tier == "CRITICAL" and not (_policy_bool(pol_data.get("allow_critical_waivers")) or False):
+        return (f"{kind} of a CRITICAL-tier gate requires policy allow_critical_waivers: true "
+                "(default false) — CRITICAL waivers/NOT_APPLICABLE are disabled by default")
+    who = authorized_by.strip() if isinstance(authorized_by, str) else ""
+    if not who:
+        return f"{kind} without a named authorizer"
+    if strict_reason:
+        err = validate_waiver_reason(reason)
+        if err:
+            return f"{kind} with an invalid reason: {err}"
+    elif not (isinstance(reason, str) and reason.strip()):
+        return f"{kind} requires a non-empty summary"
+    return None
+
+
+def validate_waived_gate(gate_name, tier, rec, pol_data, clock_date, manifest_planned_at=None):
+    """Independently re-validate a gates/<name>.json record with status WAIVED (never
+    trusting that gate.py's own plan-time checks ran, or ran correctly): named authorizer,
+    real reason, CRITICAL restrictions, a strict future YYYY-MM-DD expiry, and the
+    max_waiver_days cap measured from the RUN's planning time. `tier` is the run's ACTUAL
+    current tier (never the record's own claim); `clock_date` is the resolved 'now' from
+    resolve_waiver_clock (the caller must already have handled its error case);
+    `manifest_planned_at` is the authoritative planning timestamp from the run's
+    gates/_required.json manifest — the cap is anchored to it, not to the record's own
+    planned_at, so editing only the record's planned_at cannot slide the whole window
+    forward. Returns an error string, or None when the waiver is valid."""
+    err = _validate_gate_exception_common("WAIVED", gate_name, tier,
+                                          rec.get("authorized_by"), rec.get("reason"), pol_data)
+    if err:
+        return err
+    expires = parse_waiver_expiry(rec.get("expires"))
+    if expires is None:
+        return f"expires {rec.get('expires')!r} is missing or not a valid YYYY-MM-DD date"
+    if not (expires > clock_date):
+        return f"waiver expired {expires.isoformat()} (as of {clock_date.isoformat()})"
+    rec_planned = _date_from_iso(rec.get("planned_at"))
+    if rec_planned is None:
+        return "waiver record is missing a valid planned_at date — cannot verify the waiver-lifetime cap"
+    man_planned = _date_from_iso(manifest_planned_at) if manifest_planned_at is not None else rec_planned
+    if man_planned is None:
+        return "run plan is missing a valid planned_at date — cannot anchor the waiver-lifetime cap"
+    # A planning timestamp cannot be after the effective clock — a run is not planned in the
+    # future. Reject ANY future record or manifest planned_at as tampered (no day of slack:
+    # advancing both timestamps by a day together would otherwise defeat the min() anchor).
+    if rec_planned > clock_date:
+        return (f"waiver planned_at {rec_planned.isoformat()} is in the future "
+                f"(clock {clock_date.isoformat()}) — record tampered")
+    if man_planned > clock_date:
+        return (f"run plan planned_at {man_planned.isoformat()} is in the future "
+                f"(clock {clock_date.isoformat()}) — plan manifest tampered")
+    # Anchor the cap to the EARLIEST planning evidence of the two timestamps, so advancing
+    # EITHER the record's or the manifest's planned_at forward cannot widen the window (in the
+    # honest flow both are the same value gate.py wrote in one plan call).
+    anchor = min(rec_planned, man_planned)
+    n = _policy_number(pol_data.get("max_waiver_days"))
+    max_days = (int(n) if n is not None and 1 <= n <= MAX_WAIVER_DAYS_CAP
+                else DEFAULT_MAX_WAIVER_DAYS)
+    try:
+        deadline = anchor + timedelta(days=max_days)
+    except (OverflowError, ValueError):
+        return "waiver-lifetime cap is too large to evaluate — run BLOCKED"
+    if expires > deadline:
+        return (f"waiver expires {expires.isoformat()}, more than {max_days} days after the "
+                f"run was planned ({anchor.isoformat()}) — waivers are capped at {max_days} days")
+    return None
+
+
+def validate_not_applicable_gate(gate_name, tier, rec, pol_data):
+    """Independently re-validate a gates/<name>.json record with status NOT_APPLICABLE:
+    named authorizer, a non-empty summary, and the CRITICAL restrictions. N/A keeps its
+    original non-empty-summary contract (it is not a time-boxed waiver, so the >=16-char /
+    no-placeholder waiver-reason rule does not apply). Returns an error string, or None."""
+    return _validate_gate_exception_common("NOT_APPLICABLE", gate_name, tier,
+                                           rec.get("authorized_by"), rec.get("summary"), pol_data,
+                                           strict_reason=False)
+
+
 def _validate_policy(data, name):
     if not isinstance(data, dict):
         die(f"{name}: top level must be a mapping of settings")
@@ -342,6 +554,16 @@ def _validate_policy(data, name):
                     f"got {slug!r}")
     if "mutation" in data:
         _validate_mutation(data["mutation"], name)
+    if "allow_critical_waivers" in data:
+        if _policy_bool(data["allow_critical_waivers"]) is None:
+            die(f"{name}: allow_critical_waivers must be true or false, got "
+                f"{data['allow_critical_waivers']!r}")
+    if "max_waiver_days" in data:
+        v = data["max_waiver_days"]
+        n = _policy_number(v)
+        if n is None or n < 1 or n > MAX_WAIVER_DAYS_CAP or n != int(n):
+            die(f"{name}: max_waiver_days must be an integer from 1 to "
+                f"{MAX_WAIVER_DAYS_CAP}, got {v!r}")
     if "max_cost_usd" in data:
         v = data["max_cost_usd"]
         # A documented disable token, or a finite non-negative number. Reject at load so a bare
@@ -394,6 +616,70 @@ def load_policy(root=None):
     return {"data": data, "path": path,
             "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             "text": text}
+
+
+def load_attested_policy(run):
+    """Return (pol_data, error) from the run's attested policy.snapshot.json — the exact
+    policy text captured at init — NEVER the mutable working-tree policy, so a post-init edit
+    cannot widen a waiver that is absent from the audit record (#3).
+
+      ({}, None)     no policy at init (no snapshot) → strict built-in defaults apply.
+      (data, None)   snapshot present, its text matches its recorded sha256, and it parses
+                     and validates against the current schema.
+      (None, msg)    snapshot present but unreadable, sha-mismatched (tampered), or no longer
+                     valid — the caller must BLOCK (fail closed), never fall back to the
+                     working tree."""
+    # The init-time provenance: run.json.policy.sha256 records whether a policy governed the
+    # run at init. Read it first so a DELETED snapshot can be told apart from 'no policy'.
+    # Fail closed on unreadable/corrupt provenance — never treat it as 'no policy at init', or a
+    # damaged run.json could silently widen a waiver from an attested limit to the default.
+    try:
+        runjson = read_json(Path(run) / "run.json")
+    except (ValueError, OSError):
+        return None, "run.json is unreadable — cannot determine the attested policy; run BLOCKED"
+    if not isinstance(runjson, dict):
+        return None, "run.json is not a JSON object — cannot determine the attested policy; run BLOCKED"
+    init_pol = runjson.get("policy")
+    init_sha = init_pol.get("sha256") if isinstance(init_pol, dict) else None
+    snap_path = Path(run) / "policy.snapshot.json"
+    if not snap_path.is_file():
+        if init_sha:
+            # A policy governed the run at init but its attested snapshot is gone — falling back
+            # to built-in defaults could accept a waiver the attested policy would have rejected.
+            return None, ("run.json records a policy at init but policy.snapshot.json is missing "
+                          "— the attested policy cannot be recovered; run BLOCKED")
+        return {}, None
+    try:
+        snap = read_json(snap_path)
+    except (ValueError, OSError) as e:
+        return None, f"policy.snapshot.json is unreadable/corrupt: {e}"
+    if not isinstance(snap, dict):
+        return None, "policy.snapshot.json is not a JSON object"
+    text = snap.get("text")
+    sha = snap.get("sha256", "")
+    fname = snap.get("file", "")
+    if not isinstance(fname, str):
+        return None, "policy.snapshot.json 'file' field is not a string"
+    if not isinstance(text, str):
+        return None, "policy.snapshot.json has no captured policy text"
+    if hashlib.sha256(text.encode("utf-8")).hexdigest() != sha:
+        return None, "policy.snapshot.json text does not match its recorded sha256 — tampered"
+    # The snapshot's OWN sha256 is not tamper-proof (an attacker can rewrite text AND sha
+    # together). Cross-check it against the digest recorded in run.json at init — the
+    # authoritative init-time provenance — and BLOCK if the snapshot was swapped wholesale.
+    # (A run.json edit too is caught by the run's attestation digest / signature layer.)
+    if init_sha != sha:
+        return None, ("policy.snapshot.json sha256 does not match the policy digest recorded in "
+                      "run.json at init — the snapshot was replaced")
+    try:
+        data = json.loads(text) if fname.endswith(".json") else _parse_policy_yaml(
+            text, "policy.snapshot.json")
+        _validate_policy(data, "policy.snapshot.json")
+    except (ValueError, SystemExit):
+        return None, "policy.snapshot.json failed to parse/validate against the current schema"
+    if not isinstance(data, dict):
+        return None, "policy.snapshot.json did not parse to a mapping"
+    return data, None
 
 
 def resolve_setting(cli_value, env_var, pol, key, default=None):
