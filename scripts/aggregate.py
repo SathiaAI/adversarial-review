@@ -33,7 +33,8 @@ from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import family_of, meta_cost, now_iso, read_json, resolve_run, write_json
+from _common import (canonical_finding_digest, family_of, meta_cost, now_iso, read_json,
+                     resolve_run, write_json)
 
 HIGH = ("critical", "high")
 
@@ -214,21 +215,25 @@ def _rebuttal_jev_gate(run, reports):
     present, well-formed, AND covering every real high/critical finding in this run's own
     panel reports -- else None, which means "fall back to the pre-Jev blanket rule"
     exactly (see check_rebuttal). Jev's own numbers never reach here: this reads only the
-    CLI-recorded 'required_finding_ids'/'skipped_finding_ids' lists, and that recording is
-    itself fail-closed (any Jev error -> the finding lands in required_finding_ids) — so a
-    malformed or tampered file can only ever make MORE rebuttal required, never less, once
-    it fails validation and is treated as absent.
+    CLI-recorded 'required_finding_ids'/'skipped_finding_ids' lists (plus their digest
+    counterparts, see below), and that recording is itself fail-closed (any Jev error ->
+    the finding lands in required_finding_ids) — so a malformed or tampered file can only
+    ever make MORE rebuttal required, never less, once it fails validation and is treated
+    as absent.
 
-    The coverage check closes a real bypass: `required_finding_ids=[]` alone passes the
-    shape check above regardless of whether it reflects anything Jev actually decided --
-    without cross-checking against the run's OWN real high/critical finding ids, a
-    fabricated or stale rebuttal/plan.json claiming "nothing needs contest" would suppress
-    a required rebuttal round entirely, with no Jev call ever having evaluated the
-    findings it silently waves through. Requiring every real high/critical id to appear in
-    required_finding_ids or skipped_finding_ids (a plain coverage check, no signature or
-    hash needed -- the file already has to name every finding to "win" either way) closes
-    that: an incomplete or fabricated list simply fails validation and falls back to the
-    blanket rule, same as a malformed one always has."""
+    Coverage is bound to a canonical CONTENT digest per finding
+    (_common.canonical_finding_digest: title/file/line/severity/evidence/scenario/
+    author_role, normalized) — not to the finding's 'id' alone. Ids are reviewer-model
+    output, not guaranteed stable or unique across a `panel.py run --force` re-run of the
+    SAME run directory: an id-only coverage check let a stale rebuttal/plan.json from an
+    earlier invocation "cover" a completely different finding that happened to reuse the
+    same conventional id (e.g. 'security-1'), with no Jev call ever having evaluated the
+    new content. A plan.json written before this digest binding existed (missing
+    required_finding_digests/skipped_finding_digests, or a digest list whose length
+    doesn't match its id list) cannot be verified this way and is treated as absent —
+    fall back to the pre-Jev blanket rule, same as any other malformed/incomplete gate
+    file. The id lists are still returned (rcov reads them for the audit trail) but the
+    coverage DECISION below is made on digests alone."""
     path = run / "rebuttal" / "plan.json"
     if not path.exists():
         return None
@@ -244,13 +249,23 @@ def _rebuttal_jev_gate(run, reports):
     skipped = g.get("skipped_finding_ids")
     if not isinstance(skipped, list) or not all(isinstance(x, str) for x in skipped):
         skipped = []
-    real_hc_ids = {f["id"] for rep in reports.values()
-                   for f in (rep.get("findings") or []) if isinstance(f, dict)
-                   and f.get("severity") in HIGH and isinstance(f.get("id"), str)}
-    covered = set(ids) | set(skipped)
-    if not real_hc_ids <= covered:
-        return None  # gate doesn't account for every real high/critical finding -- absent
-    return {"required_finding_ids": ids, "skipped_finding_ids": skipped}
+    req_digests = g.get("required_finding_digests")
+    if not isinstance(req_digests, list) or not all(isinstance(x, str) for x in req_digests) \
+            or len(req_digests) != len(ids):
+        return None
+    skip_digests = g.get("skipped_finding_digests")
+    if not isinstance(skip_digests, list) or not all(isinstance(x, str) for x in skip_digests) \
+            or len(skip_digests) != len(skipped):
+        return None
+    real_hc = [dict(f, author_role=role) for role, rep in reports.items()
+               for f in (rep.get("findings") or []) if isinstance(f, dict)
+               and f.get("severity") in HIGH and isinstance(f.get("id"), str)]
+    real_digests = {canonical_finding_digest(f) for f in real_hc}
+    covered = set(req_digests) | set(skip_digests)
+    if not real_digests <= covered:
+        return None  # gate doesn't account, by content, for every real high/critical finding
+    return {"required_finding_ids": ids, "skipped_finding_ids": skipped,
+            "required_finding_digests": req_digests, "skipped_finding_digests": skip_digests}
 
 
 def check_rebuttal(run, meta, plan, reports, blocked, notes):

@@ -1146,6 +1146,29 @@ def cmd_rebuttal(args):
     else:
         digest = high_critical_digest(run, plan)
     if not digest:
+        # An empty `digest` here means two very different things depending on how we got
+        # here, and conflating them into one "no high/critical findings" message is
+        # itself misleading: with --digest-file (typically `jev_triage.py rebuttal-gate`'s
+        # output), an empty file means Jev's gate decided NONE of the run's real
+        # high/critical findings needed a rebuttal round -- those findings still exist
+        # and Step 4 validation is still mandatory for every one of them; only the
+        # rebuttal CONTEST step was gated off. Without --digest-file, an empty digest
+        # means what it always meant: this run genuinely raised no high/critical finding.
+        if digest_file:
+            real_now = list(real_by_id.values())
+            if real_now:
+                write_json(run / "rebuttal" / "none-required.json",
+                           {"reason": "jev rebuttal-gate: all real high/critical findings "
+                                      "were skipped -- none required a rebuttal round, "
+                                      "but Step 4 validation is still required for all of "
+                                      "them",
+                            "high_critical_finding_ids": sorted(d["id"] for d in real_now),
+                            "at": now_iso()})
+                print(f"jev rebuttal-gate skipped all {len(real_now)} high/critical "
+                      f"finding(s) in this run -- none required a rebuttal round, but "
+                      f"Step 4 validation is still required for every one of them; "
+                      f"marker written")
+                return
         write_json(run / "rebuttal" / "none-required.json",
                    {"reason": "no high/critical findings to contest", "at": now_iso()})
         print("no high/critical findings — rebuttal round not required, marker written")

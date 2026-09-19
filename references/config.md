@@ -49,11 +49,71 @@ Never paste API keys into chat transcripts or commit them. Never put keys in the
 artifacts — the scripts don't, and you shouldn't either.
 
 **`scripts/jev_triage.py`** (the optional TypeSafe Jev finding-triage layer — see
-`references/jev.md`) reuses this exact same credential resolution (`panel.api_config()`:
-`OPENROUTER_API_KEY` / `AR_KEY_FILE` / `AR_BASE_URL`+`AR_API_KEY`) for its own calls to
-Jev's `/alpha/decisions` endpoint. Jev has no MCP/keyless transport, unlike the reviewer
-panel — with no key configured, `jev_triage.py` refuses to run rather than producing a
-partial or fabricated triage.
+`references/jev.md`) resolves its own credentials for calls to Jev's `/alpha/decisions`
+endpoint through a three-tier chain — deliberately NOT a straight reuse of the reviewer
+panel's setup, since adversarial-review is a portable OSS skill and not every adopter
+with a working panel key wants (or can safely allow) that key reused against a separate,
+third-party decisions endpoint:
+
+1. **Dedicated Jev key** — `AR_JEV_API_KEY`, or `AR_JEV_KEY_FILE` pointing at a file
+   containing only the key. Works against any host Jev is configured to call.
+2. **Panel-key fallback** — with no dedicated key, `jev_triage.py` reuses the reviewer
+   panel's own key (`panel.api_config()`), but ONLY when Jev's resolved endpoint has the
+   SAME ORIGIN — scheme + hostname + port, not hostname alone — as the panel's own
+   `AR_BASE_URL`. A key configured for `https://proxy:443` is never sent to
+   `http://proxy:8080` just because the hostname matches; if the origins differ (or the
+   panel itself has no key), fallback is refused outright and Jev is simply unavailable.
+3. **Unavailable** — neither tier resolves, or `AR_JEV_DISABLE=1` is set. This is not an
+   error: every command here, and the pipeline as a whole, works completely without Jev
+   (SKILL.md: skip Jev, do Step 4 by hand). Jev is a pure cost/time optimization layer
+   over the mandatory human/Claude validation step, never a dependency of it.
+
+Jev has no MCP/keyless transport, unlike the reviewer panel — with no key configured at
+all (tier 3), `jev_triage.py` refuses to run up front rather than producing a partial or
+fabricated triage; if a key IS configured (tier 1 or 2) but an individual call still
+fails, that one call fails closed (see `references/jev.md`) instead of aborting the run.
+
+**Failure semantics, per command.** "Fails closed" means a specific, hard-coded worst
+case, not a generic error — and it applies to the WHOLE record the moment any one
+answer in that call is malformed (wrong type, out of range, or a legend that doesn't
+match the criteria list), never per-field:
+- `triage`: the finding is treated as real, unscored, needing human review, and not an
+  obvious fix (`is_real=1.0`, `severity=None`, `needs_human=1.0`, `fix_obvious=0.0`) —
+  it lands in the manual-review pile, never auto-dismissed.
+- `rebuttal-gate`: the finding is treated as contested and would-change-the-verdict
+  (`contested=1.0`, `would_change=1.0`) — it stays in the required-rebuttal set.
+- `patch-check`: the patch is treated as unresolved and newly risky (`resolved=0.0`,
+  `new_risk=1.0`) — it does not get marked fixed on Jev's say-so.
+A timeout, HTTP error, or connection failure from the `/alpha/decisions` endpoint itself
+is caught the same way as a malformed answer and produces the same per-command default
+above; `jev_triage.py` never lets a call it cannot complete or parse resolve to a
+passing/benign outcome. Jev's opinion is also never the last word regardless of how it
+answers: `aggregate.py` computes PASS/FAIL/BLOCKED from the reviewer panel's own reports
+and gate checks, and nothing in `jev_triage.py`'s output can flip that verdict directly.
+
+**What is actually sent to Jev.** Each call's `state` carries only the fields the
+question is about — never the full run directory or diff — and, since round 4, every
+free-text field that originates from a reviewer finding, a diff excerpt, or a human/
+Claude resolution note (title, evidence, scenario, diff excerpt, patch text, and every
+string under a `resolution` block) is wrapped in a random per-call boundary marker
+(`<<<{boundary}>>> ... <<<END-{boundary}>>>`) plus an explicit `untrusted_content_rules`
+instruction telling Jev that text inside those markers is quoted data to evaluate, never
+an instruction to follow — the same isolation principle the reviewer panel already
+applies to chat messages, adapted to Jev's structured `state`/`questions` transport
+(which has no message-role channel to isolate untrusted content into). This narrows
+prompt-injection risk but does not provably eliminate it for a call to an external
+model; the regression tests added alongside this (see `tests/run_tests.py`) verify the
+wrapping and rules are present on every call, not that a live Jev model resists any
+particular injected instruction, since that would require a live-model adversarial eval
+that is out of scope for this offline suite.
+
+**Audit trail.** Jev is never the sole record of a decision: every triage, rebuttal-gate,
+and patch-check run writes its full input/output to the run directory as ordinary JSON
+(`triage/`, `rebuttal/plan.json`, `patch-check/` — see `references/jev.md` for exact
+paths), so a human can always re-derive what Jev was asked and what it answered without
+re-running it. `rebuttal/plan.json` additionally records a `canonical_finding_digest`
+(content hash, not just id) per finding it covers, so a later `--force` re-run can't
+silently satisfy stale coverage with a finding that only shares an id, not substance.
 
 ## Privacy tiers
 
@@ -263,6 +323,10 @@ keyless `panel.py prepare` + `ingest` (MCP) transport does **not** take corrobor
 | `AR_COSIGN_ISSUER` | — | Expected OIDC issuer for cosign keyless `--verify-signature` |
 | `AR_JEV_MODEL` | `typesafe/jev-1.13` | Model slug `jev_triage.py` calls at OpenRouter's `/alpha/decisions` endpoint (see `references/jev.md`) |
 | `AR_JEV_BASE_URL` | `https://openrouter.ai/api` | Base URL `jev_triage.py` appends `/alpha/decisions` to |
+| `AR_JEV_API_KEY` | — | Dedicated Jev credential (tier 1, see above); works against any host |
+| `AR_JEV_KEY_FILE` | — | Path to a file containing only the dedicated Jev key (tier 1 alternative to `AR_JEV_API_KEY`) |
+| `AR_JEV_ENDPOINT` | — | Full-URL override for a decisions-capable relay that doesn't follow OpenRouter's base+path convention (e.g. TypeSafe's own direct API) |
+| `AR_JEV_DISABLE` | off | `1`/`true`/`yes`/`on` turns Jev off outright (tier 3), even if a key would otherwise resolve |
 | `AR_JEV_TIMEOUT_S` | `60` | Per-call timeout for `jev_triage.py`'s Jev calls (each call normally completes in well under a second; the default is a generous ceiling, not a tuned budget) |
 
 An empty env var counts as unset. Note one precedence fix shipped with the policy

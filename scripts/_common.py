@@ -72,6 +72,46 @@ def family_of(slug):
     return FAMILY_ALIASES.get(prefix, prefix)
 
 
+def canonical_finding_digest(finding):
+    """A content-derived identity for a reviewer finding, independent of its 'id' field.
+    Reviewer-assigned ids are convenient labels, not stable or unique across separate
+    `panel.py run --force` re-runs of the same run directory -- a re-run can reuse a
+    conventional id (e.g. 'security-1') for what is, in substance, a completely different
+    finding. Anything that binds coverage/trust to an id alone (see aggregate.py's
+    check_rebuttal / _rebuttal_jev_gate) can then be satisfied by a stale record that
+    never actually evaluated the new content. This hashes the fields that describe WHAT
+    the finding actually claims -- title, file, line, severity, evidence, scenario, and
+    the reporting role -- after normalizing line endings (CRLF/CR -> LF) and trimming, so
+    the same substantive text produces the same digest regardless of how it was
+    transcribed, and joins the fields with an ASCII record-separator byte (0x1E) that
+    cannot appear in ordinary text, so two different field-boundary splits can never
+    collide onto the same joined string. The 'file' field is additionally normalized to
+    forward-slash separators (Windows backslash paths and POSIX forward-slash paths for
+    the same file must hash identically) -- this only rewrites the separator character,
+    it does not touch case or resolve '.'/'..' segments, since doing so could silently
+    fold two genuinely different paths on a case-sensitive filesystem into one digest."""
+    def norm(v):
+        if not isinstance(v, str):
+            return ""
+        return v.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    def norm_path(v):
+        return norm(v).replace("\\", "/")
+
+    line = finding.get("line")
+    parts = [
+        norm(finding.get("title")),
+        norm_path(finding.get("file")),
+        str(line) if isinstance(line, int) and not isinstance(line, bool) else "",
+        norm(finding.get("severity")),
+        norm(finding.get("evidence")),
+        norm(finding.get("scenario")),
+        norm(finding.get("author_role")),
+    ]
+    canonical = "\x1e".join(parts)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 # ------------------------------------------------------------------- policy as code
 # Repo-versioned defaults (issue #6): `.adversarial-review.yml` (strict minimal YAML
 # subset) or `.adversarial-review.json` at the reviewed repo's root. Precedence
