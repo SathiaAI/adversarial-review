@@ -10764,14 +10764,21 @@ def t_gate_mutation_critical_waiver_always_blocks():
 
 def t_gate_mutation_critical_not_applicable_blocks():
     # Same restriction applies to the other representation: NOT_APPLICABLE on CRITICAL
-    # mutation is blocked too, uniformly with the waiver case.
+    # mutation is rejected at record time (fail fast) AND, if a record is written directly,
+    # BLOCKED by aggregate (the authority) — uniformly with the waiver case.
     repo = _min_repo("CRITICAL")
     sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast"], repo)
     for g in ["build", "unit", "secrets", "deps", "sast"]:
         sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
-    sh(["gate.py", "record", "--name", "mutation", "--status", "NOT_APPLICABLE",
-        "--authorized-by", "Paul",
-        "--summary", "mutation runner is not implemented for this stack yet"], repo)
+    r = sh(["gate.py", "record", "--name", "mutation", "--status", "NOT_APPLICABLE",
+            "--authorized-by", "Paul",
+            "--summary", "mutation runner is not implemented for this stack yet"], repo, expect=1)
+    assert "mutation cannot be waived or marked NOT_APPLICABLE" in r.stderr, r.stderr
+    run = latest_run(repo)
+    write(run / "gates" / "mutation.json", {
+        "gate": "mutation", "command": "(external)", "exit_code": None,
+        "status": "NOT_APPLICABLE", "summary": "written directly, bypassing record",
+        "authorized_by": "Paul", "recorded_at": "x", "source": "record"})
     r = sh(["aggregate.py"], repo, expect=2)
     assert "mutation cannot be waived or marked NOT_APPLICABLE" in r.stdout, r.stdout
 
@@ -10925,6 +10932,72 @@ def t_policy_max_waiver_days_bounded():
     r = sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
            repo, expect=1)
     assert "max_waiver_days must be an integer from 1 to 365" in r.stderr, r.stderr
+
+
+def t_gate_waiver_replan_revokes_stale_waiver():
+    # Re-running `gate.py plan` WITHOUT a previously granted waiver must revoke the stale
+    # WAIVED record — otherwise gates/<name>.json left behind would still read WAIVED and be
+    # honored, silently reinstating a waiver the new plan dropped.
+    repo = _min_repo("SENSITIVE")
+    future = (date.today() + timedelta(days=7)).isoformat()
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+        "--waive", "mutation", "--authorized-by", "Paul",
+        "--waive-reason", "mutation runner not wired into CI yet",
+        "--waive-expires", future], repo)
+    run = latest_run(repo)
+    assert read(run / "gates" / "mutation.json")["status"] == "WAIVED"
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    assert not (run / "gates" / "mutation.json").exists(), "stale waiver record must be revoked"
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "no recorded result" in r.stdout, r.stdout
+
+
+def t_gate_waiver_clock_rollback_cannot_unexpire():
+    # A rolled-back run clock (a stale/forged GITHUB_RUN_STARTED_AT set to the past) must not
+    # un-expire a genuinely expired waiver: the clock is the LATER of real UTC and the env date.
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    expired = (date.today() - timedelta(days=20)).isoformat()          # already expired
+    planned = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(timespec="seconds")
+    write(run / "gates" / "_required.json", {
+        "tier": "SENSITIVE",
+        "required": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested": ["build", "unit", "secrets", "deps", "sast", "mutation"],
+        "requested_source": "cli",
+        "waived": [{"name": "mutation", "authorized_by": "Paul",
+                    "reason": "mutation runner not wired into CI yet", "expires": expired}],
+        "planned_at": planned})
+    write(run / "gates" / "mutation.json", {
+        "gate": "mutation", "status": "WAIVED", "authorized_by": "Paul",
+        "reason": "mutation runner not wired into CI yet", "expires": expired,
+        "tier": "SENSITIVE", "planned_at": planned, "source": "plan"})
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    # roll the clock back to a date when the waiver would still have been valid
+    rollback = (date.today() - timedelta(days=25)).isoformat() + "T00:00:00Z"
+    env = {**ENV, "GITHUB_RUN_STARTED_AT": rollback}
+    r = sh(["aggregate.py"], repo, expect=2, env=env)
+    assert "waiver expired" in r.stdout, r.stdout
+
+
+def t_gate_waiver_metadata_escaped_in_markdown():
+    # Operator-supplied waiver reason is HTML-escaped in verdict.md so a crafted value cannot
+    # forge markup in the rendered report.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "fixed", "reproduced": True,
+        "regression_test": "t::x", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    rec = read(run / "gates" / "mutation.json")
+    rec["reason"] = "needs <script> & rework, tracked under bug-123 until fixed"
+    write(run / "gates" / "mutation.json", rec)
+    r = sh(["aggregate.py"], repo, expect=0)
+    md = (run / "verdict.md").read_text()
+    assert "&lt;script&gt;" in md and "&amp;" in md, md
+    assert "<script>" not in md, md
 
 
 def t_mcp_gate_plan_waive_requires_reason_and_expires():

@@ -400,19 +400,22 @@ def _date_from_iso(value):
 
 
 def resolve_waiver_clock():
-    """The 'now' date waiver expiries are compared against: the date part of
-    GITHUB_RUN_STARTED_AT when that env var is set, else today in UTC. Returns
-    (clock_date, error). When the env var is set but cannot be parsed, returns
-    (None, <message>) — fail closed: callers must BLOCK rather than fall back to
-    today, since silently guessing the clock would defeat the whole expiry check."""
+    """The 'now' date waiver expiries are compared against: the LATER of today in UTC and the
+    date part of GITHUB_RUN_STARTED_AT (when that env var is set). Returns (clock_date, error).
+    When the env var is set but cannot be parsed, returns (None, <message>) — fail closed:
+    callers must BLOCK rather than fall back to today, since silently guessing the clock would
+    defeat the whole expiry check. Taking the later of the two means a run clock rolled BACKWARD
+    (a stale/forged GITHUB_RUN_STARTED_AT) cannot un-expire a waiver — real UTC still applies —
+    while a forward run clock is still honored."""
+    today = datetime.now(timezone.utc).date()
     raw = os.environ.get("GITHUB_RUN_STARTED_AT", "")
     if not raw.strip():
-        return datetime.now(timezone.utc).date(), None
+        return today, None
     d = _date_from_iso(raw)
     if d is None:
         return None, (f"GITHUB_RUN_STARTED_AT={raw!r} could not be parsed as a date/time — "
                        "the run is BLOCKED rather than guessing the current date")
-    return d, None
+    return max(d, today), None
 
 
 def _validate_gate_exception_common(kind, gate_name, tier, authorized_by, reason, pol_data,

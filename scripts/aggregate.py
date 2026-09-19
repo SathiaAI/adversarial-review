@@ -1110,8 +1110,9 @@ def next_steps(verdict, fail, blocked, gcov, fcov, counts):
                          "owns the actual merge decision.")
             for w in waived:
                 steps.append(f"Waived gate '{w.get('name', '?')}' — authorized by "
-                             f"{w.get('authorized_by', '?')}, expires {w.get('expires', '?')}: "
-                             f"{w.get('reason', '')}. It expires; do not treat it as permanently green.")
+                             f"{_oneline(w.get('authorized_by', '?'))}, expires "
+                             f"{_oneline(w.get('expires', '?'))}: {_oneline(w.get('reason', ''))}. "
+                             "It expires; do not treat it as permanently green.")
         else:
             steps.append("Cleared: every required check passed and independent review ran with its blocking "
                          "findings resolved. A human still owns the actual merge decision.")
@@ -1348,7 +1349,7 @@ def _aggregate_cli():
               f"Run `{meta['run_id']}`, risk {meta['risk']}, computed {out['computed_at']}.", ""]
         md += [f"- FAIL: {r}" for r in fail]
         md += [f"- BLOCKED: {r}" for r in blocked]
-        md += [f"- note: {n}" for n in notes]
+        md += [f"- note: {_oneline(n)}" for n in notes]
         # Plain-language guidance up top, where a non-expert will actually read it — before
         # the technical counts/coverage that follow.
         md += ["", "## Next steps", ""]
@@ -1365,12 +1366,16 @@ def _aggregate_cli():
                f"{len(coverage['areas_not_reviewed'])} reviewer-attested unreviewed areas"]
         # Surface every not-applicable determination and its authorizer distinctly — a
         # skipped gate must never be silent, even when it does not restrict the verdict.
+        # Authorizer/reason/expiry are operator-supplied — HTML-escape (via _oneline) before
+        # interpolating into verdict.md so a crafted value cannot forge markup in the report.
         md += [f"- not applicable: gate '{na['name']}' (authorized by "
-               f"{na['authorized_by']}): {na['reason']}" for na in gcov["not_applicable"]]
+               f"{_oneline(na['authorized_by'])}): {_oneline(na['reason'])}"
+               for na in gcov["not_applicable"]]
         # Surface every active waiver and its authorizer/expiry distinctly too — a waived
         # gate must never be silent, even though (like N/A) it does not restrict the verdict.
-        md += [f"- waived: gate '{w['name']}' (authorized by {w['authorized_by']}, "
-               f"expires {w['expires']}): {w['reason']}" for w in gcov["waived"]]
+        md += [f"- waived: gate '{w['name']}' (authorized by {_oneline(w['authorized_by'])}, "
+               f"expires {_oneline(w['expires'])}): {_oneline(w['reason'])}"
+               for w in gcov["waived"]]
         md += ["", f"Attestation: sha256 {attestation['digest']} over "
                f"{attestation['inputs']} recorded artifacts "
                "(verify with `aggregate.py --check-digest`)"]

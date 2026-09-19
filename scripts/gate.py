@@ -17,8 +17,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (die, load_policy, now_iso, read_json, resolve_run,
-                     resolve_waiver_clock, validate_gate_name, validate_waived_gate,
-                     write_json)
+                     resolve_waiver_clock, validate_gate_name,
+                     validate_not_applicable_gate, validate_waived_gate, write_json)
 
 # Floors per tier: these cannot be silently omitted, only waived on the record with a
 # named authorizer (surfaced in the verdict reasons and the report). A waived floor gate
@@ -107,6 +107,23 @@ def cmd_plan(args):
                                     manifest_planned_at=planned_at)
         if verr:
             die(f"cannot waive '{w['name']}': {verr}")
+    # Revoke any stale plan-written WAIVED record from a PRIOR plan of this run whose gate is
+    # not waived this time — otherwise gates/<name>.json left behind would still read WAIVED
+    # and be honored, silently reinstating a waiver the new plan dropped. Only records this
+    # tool wrote (source == "plan") are removed; recorded gate results are never touched.
+    waived_names = {w["name"] for w in waived}
+    gates_dir = run / "gates"
+    if gates_dir.is_dir():
+        for gp in sorted(gates_dir.glob("*.json")):
+            if gp.name == "_required.json":
+                continue
+            try:
+                old = read_json(gp)
+            except (ValueError, OSError):
+                continue
+            if (old.get("status") == "WAIVED" and old.get("source") == "plan"
+                    and old.get("gate") not in waived_names):
+                gp.unlink()
     write_json(run / "gates" / "_required.json",
                {"tier": tier, "required": required, "requested": requested,
                 "requested_source": req_src, "waived": waived,
@@ -155,6 +172,9 @@ def _parse_exit_map(spec):
 
 def cmd_run(args):
     run = resolve_run(args.run)
+    nerr = validate_gate_name(args.name)
+    if nerr:
+        die(nerr)
     cmd = args.command
     if not cmd:
         die("no command given after --")
@@ -187,6 +207,9 @@ def cmd_run(args):
 
 def cmd_record(args):
     run = resolve_run(args.run)
+    nerr = validate_gate_name(args.name)
+    if nerr:
+        die(nerr)
     # Status states, none of which may be inferred silently:
     #   PASS/FAIL    derive from the exit code by default.
     #   BLOCKED      required coverage that could not be run or verified (unknown).
@@ -209,6 +232,17 @@ def cmd_record(args):
         if not args.summary.strip():
             die("NOT_APPLICABLE requires --summary explaining why the gate does not "
                 "apply to this stack")
+        # Enforce the CRITICAL-tier N/A restrictions at record time too (fail fast), with the
+        # SAME validator aggregate applies: mutation on CRITICAL can never be N/A, and any
+        # CRITICAL N/A needs policy allow_critical_waivers. Aggregate remains the authority.
+        tier = read_json(run / "run.json").get("risk")
+        pol = load_policy()
+        pol_data = pol["data"] if pol is not None else {}
+        nerr = validate_not_applicable_gate(
+            args.name, tier, {"authorized_by": args.authorized_by, "summary": args.summary},
+            pol_data)
+        if nerr:
+            die(nerr)
     rec = {"gate": args.name, "command": args.command or "(external)",
            "exit_code": args.exit_code, "status": status, "summary": args.summary,
            "output_tail": "", "recorded_at": now_iso(), "source": "record"}
