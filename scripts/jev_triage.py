@@ -238,11 +238,18 @@ def call_jev(state, questions, model=None, base=None, timeout=None, endpoint=Non
 
 def _noul(answers, name, default):
     """A 'noul' (0..1) answer. Returns (value, ok); on any shape problem, value is the
-    caller's fail-closed default and ok is False."""
+    caller's fail-closed default and ok is False. Only a real JSON number counts -- a bool
+    is rejected even though Python's `float()` would silently accept it as 0.0/1.0
+    (`bool` is an `int` subclass), and a numeric string ("0.5") is rejected rather than
+    parsed, so malformed provider output can't quietly pass as a valid low-probability
+    answer and skip the fail-closed default (checklist: reject boolean likelihoods)."""
     try:
-        v = float(answers[name]["noul"])
-    except (KeyError, TypeError, ValueError):
+        v = answers[name]["noul"]
+    except (KeyError, TypeError):
         return default, False
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return default, False
+    v = float(v)
     if not (0.0 <= v <= 1.0):
         return default, False
     return v, True
@@ -720,7 +727,7 @@ def cmd_patch_check(args):
             if isinstance(cost, (int, float)):
                 jev_cost_total += cost
         if resolved >= 0.8:
-            status = "resolved (Claude must confirm)"
+            status = "resolved (operator must confirm)"
         elif resolved < 0.4:
             status = "still open"
         else:
@@ -742,7 +749,7 @@ def cmd_patch_check(args):
 
     print(f"\njev patch-check round {round_n}: {len(results)} confirmed finding(s) checked "
           f"against {patch_path.name} (sha256 {patch_sha256[:16]}...)")
-    print(f"  resolved, Claude confirms ({len(resolved_items)}):")
+    print(f"  resolved, operator confirms ({len(resolved_items)}):")
     for r in resolved_items:
         print(f"    OK    {r['slug']}  resolved={r['resolved_by_patch']:.2f}")
     print(f"  still open ({len(open_items)}):")

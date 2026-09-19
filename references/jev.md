@@ -221,20 +221,23 @@ recomputing and comparing, instead of trusting the round file on faith:
   "items": [
     {"slug": "security-1", "finding_ids": ["security-1"],
      "resolved_by_patch": 0.91, "patch_introduces_new_risk": 0.1,
-     "status": "resolved (Claude must confirm)", "error": null,
+     "status": "resolved (operator must confirm)", "error": null,
      "validation_sha256": "…"}
   ]
 }
 ```
 
 `status` buckets `resolved_by_patch` for the human-readable summary:
-`≥ 0.8` → *"resolved (Claude must confirm)"* — a **proposal**, not a closed finding; `< 0.4`
-→ *"still open"*; in between → *"still open (ambiguous — verify by hand)"*.
+`≥ 0.8` → *"resolved (operator must confirm)"* — a **proposal**, not a closed finding; `< 0.4`
+→ *"still open"*; in between → *"still open (ambiguous — verify by hand)"*. The label says
+"operator", not "Claude" specifically, because this skill is portable across supported
+agents (Codex, Cursor, Copilot, etc. — see the credentials section above); whichever agent
+is running the skill is the one that must confirm.
 `patch_introduces_new_risk ≥ 0.5` flags an item for the panel regardless of its resolution
 status.
 
 Prints a one-screen round summary a non-coder can read: how many findings Jev proposes as
-resolved (Claude still confirms each and still updates its `validation/<slug>.json`), how
+resolved (the operator still confirms each and still updates its `validation/<slug>.json`), how
 many are still open (with the one-line reason), and how many carry a new-risk flag that
 should go back to the panel. No confirmed findings on record → prints "nothing to check"
 and writes an empty round record; no Jev calls made.

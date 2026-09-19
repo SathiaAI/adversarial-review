@@ -10730,7 +10730,7 @@ def t_jev_patch_check_resolves_and_flags_new_risk():
         assert len(rec["items"]) == 1
         item = rec["items"][0]
         assert item["resolved_by_patch"] == 0.9 and item["patch_introduces_new_risk"] == 0.7
-        assert "resolved, Claude confirms (1)" in r.stdout
+        assert "resolved, operator confirms (1)" in r.stdout
         assert "new risk introduced, back to panel (1)" in r.stdout
     finally:
         mock_router.STATE["jev_response_provider"] = None
@@ -10908,6 +10908,43 @@ def t_jev_triage_nonfinite_score_fails_closed_not_crash():
         rec = read(run / "triage" / "security-1.json")
         assert rec["jev"]["severity"] is None, "non-finite score must fail closed, not crash"
         assert rec["jev"]["error"], "a non-finite/malformed answer must be recorded as an error"
+    finally:
+        mock_router.STATE["jev_response_provider"] = None
+        mock_router.reset()
+
+
+def t_jev_triage_rejects_boolean_and_string_noul_answers():
+    """A malformed 'noul' answer -- a JSON boolean or a numeric string instead of a real
+    number -- must fall back to the fail-closed default, not silently coerce. `float(False)`
+    is a legal Python conversion (bool is an int subclass) that would otherwise turn a
+    malformed boolean into a confident (and wrong) 0.0/1.0 answer instead of the safe
+    default; a numeric string would otherwise `float()`-parse into a value that never
+    should have been trusted as a real JSON number in the first place."""
+    mock_router.reset()
+
+    def provider(body):
+        if "severity" not in body.get("questions", {}):
+            return None
+        return {
+            "is_real": {"noul": False},
+            "severity": {"score": 0.0, "legend": {"0": "low", "1": "medium",
+                                                   "2": "high", "3": "critical"}},
+            "duplicate_of": {"choice": "none", "confidence": 0.9,
+                             "probabilities": {"none": 1.0}},
+            "needs_human": {"noul": "0.1"},
+            "fix_is_obvious": {"noul": 0.1},
+        }
+
+    mock_router.STATE["jev_response_provider"] = provider
+    try:
+        repo, run = _panel_with_finding()
+        sh(["jev_triage.py", "triage", str(run)], repo, env=_jev_env())
+        rec = read(run / "triage" / "security-1.json")
+        assert rec["jev"]["is_real"] == 1.0, \
+            "boolean noul must fail closed to the default, not float(False) == 0.0"
+        assert rec["jev"]["needs_human"] == 1.0, \
+            "numeric-string noul must fail closed, not be silently parsed"
+        assert rec["jev"]["error"], "a malformed noul answer must be recorded as an error"
     finally:
         mock_router.STATE["jev_response_provider"] = None
         mock_router.reset()

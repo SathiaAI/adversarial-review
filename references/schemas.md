@@ -211,7 +211,7 @@ skipped for a policy/tier that requires it.
   "model": "typesafe/jev-1.13|null", "jev_cost_usd": 0.0,
   "items": [{"slug": "security-1", "finding_ids": ["security-1"],
              "resolved_by_patch": 0.0, "patch_introduces_new_risk": 0.0,
-             "status": "resolved (Claude must confirm)|still open|still open (ambiguous -- verify by hand)",
+             "status": "resolved (operator must confirm)|still open|still open (ambiguous -- verify by hand)",
              "error": "string|null", "validation_sha256": "hex"}]
 }
 ```
