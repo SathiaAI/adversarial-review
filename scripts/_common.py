@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -323,6 +324,33 @@ def _policy_bool(v):
 WAIVER_REASON_PLACEHOLDERS = {"tbd", "n/a", "na", "temp", "fixme", "todo", "none", ""}
 WAIVER_REASON_MIN_LEN = 16
 DEFAULT_MAX_WAIVER_DAYS = 14
+# Hard ceiling on any configured waiver lifetime. Bounds max_waiver_days at policy-load
+# time so an absurd value (a typo, or a deliberate 10**12) can neither pass validation nor
+# reach timedelta(days=...) and raise OverflowError, which would leave a run with no verdict.
+MAX_WAIVER_DAYS_CAP = 365
+
+# A gate identifier becomes a filename: gates/<name>.json. It must therefore be a strict,
+# path-safe slug with NO leading underscore — gates/_required.json is the run manifest, and
+# waiving or requiring a name like '_required' (or '../x', 'a/b', 'x.json') would overwrite
+# the manifest or escape the gates dir, blanking the required set into a silent all-pass.
+GATE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def validate_gate_name(name):
+    """Return an error string, or None when `name` is a safe gate identifier. Rejects
+    leading-underscore/reserved names (gates/_required.json is the manifest), path
+    separators, dots, and anything outside a strict lowercase slug — so gates/<name>.json
+    can never escape the gates dir or overwrite the manifest."""
+    if not isinstance(name, str):
+        return "gate name must be a string"
+    n = name.strip()
+    if not n:
+        return "gate name is required"
+    if not GATE_NAME_RE.match(n):
+        return (f"gate name {n!r} is invalid — must match [a-z0-9][a-z0-9_-]{{0,63}} "
+                "(lowercase alphanumerics, '-' or '_', no leading underscore, no path "
+                "separators or dots); leading-underscore names such as '_required' are reserved")
+    return None
 
 
 def validate_waiver_reason(reason):
@@ -387,10 +415,15 @@ def resolve_waiver_clock():
     return d, None
 
 
-def _validate_gate_exception_common(kind, gate_name, tier, authorized_by, reason, pol_data):
+def _validate_gate_exception_common(kind, gate_name, tier, authorized_by, reason, pol_data,
+                                    strict_reason=True):
     """Checks shared by a WAIVED and a NOT_APPLICABLE gate record: the CRITICAL-tier
-    restrictions, a named authorizer, and a real reason. `kind` is 'WAIVED' or
-    'NOT_APPLICABLE', used only for messages. Returns an error string, or None."""
+    restrictions, a named authorizer, and a justification. `kind` is 'WAIVED' or
+    'NOT_APPLICABLE', used only for messages. `strict_reason` selects the justification
+    contract: True (WAIVED) applies the full waiver-reason rule (>=16 chars, not a
+    placeholder); False (NOT_APPLICABLE) only requires a non-empty summary — its original
+    contract, which the shared 16-char rule had inadvertently tightened. Returns an error
+    string, or None."""
     # Mutation on CRITICAL can NEVER be waived or marked not-applicable, regardless of policy:
     # CRITICAL mutation coverage stays BLOCKED by design until the mutation-runner milestone
     # (M4) implements it for real — a green verdict must never be reachable by waiving/N-A'ing
@@ -405,20 +438,26 @@ def _validate_gate_exception_common(kind, gate_name, tier, authorized_by, reason
     who = authorized_by.strip() if isinstance(authorized_by, str) else ""
     if not who:
         return f"{kind} without a named authorizer"
-    err = validate_waiver_reason(reason)
-    if err:
-        return f"{kind} with an invalid reason: {err}"
+    if strict_reason:
+        err = validate_waiver_reason(reason)
+        if err:
+            return f"{kind} with an invalid reason: {err}"
+    elif not (isinstance(reason, str) and reason.strip()):
+        return f"{kind} requires a non-empty summary"
     return None
 
 
-def validate_waived_gate(gate_name, tier, rec, pol_data, clock_date):
+def validate_waived_gate(gate_name, tier, rec, pol_data, clock_date, manifest_planned_at=None):
     """Independently re-validate a gates/<name>.json record with status WAIVED (never
     trusting that gate.py's own plan-time checks ran, or ran correctly): named authorizer,
     real reason, CRITICAL restrictions, a strict future YYYY-MM-DD expiry, and the
-    max_waiver_days cap measured from the record's own planned_at. `tier` is the run's
-    ACTUAL current tier (never the record's own claim), and `clock_date` is the resolved
-    'now' from resolve_waiver_clock (the caller must already have handled its error case).
-    Returns an error string, or None when the waiver is valid."""
+    max_waiver_days cap measured from the RUN's planning time. `tier` is the run's ACTUAL
+    current tier (never the record's own claim); `clock_date` is the resolved 'now' from
+    resolve_waiver_clock (the caller must already have handled its error case);
+    `manifest_planned_at` is the authoritative planning timestamp from the run's
+    gates/_required.json manifest — the cap is anchored to it, not to the record's own
+    planned_at, so editing only the record's planned_at cannot slide the whole window
+    forward. Returns an error string, or None when the waiver is valid."""
     err = _validate_gate_exception_common("WAIVED", gate_name, tier,
                                           rec.get("authorized_by"), rec.get("reason"), pol_data)
     if err:
@@ -428,23 +467,43 @@ def validate_waived_gate(gate_name, tier, rec, pol_data, clock_date):
         return f"expires {rec.get('expires')!r} is missing or not a valid YYYY-MM-DD date"
     if not (expires > clock_date):
         return f"waiver expired {expires.isoformat()} (as of {clock_date.isoformat()})"
-    planned_ref = _date_from_iso(rec.get("planned_at"))
-    if planned_ref is None:
+    rec_planned = _date_from_iso(rec.get("planned_at"))
+    if rec_planned is None:
         return "waiver record is missing a valid planned_at date — cannot verify the waiver-lifetime cap"
+    # Anchor the lifetime cap on the RUN's planning time (the _required.json manifest), never
+    # the record's own planned_at: editing just the record's planned_at must not move the
+    # window. Cross-check the record's planned_at against that anchor and the clock, and
+    # reject a tampered/implausible value (a small 1-day skew absorbs timezone/rounding).
+    anchor = _date_from_iso(manifest_planned_at) if manifest_planned_at is not None else rec_planned
+    if anchor is None:
+        return "run plan is missing a valid planned_at date — cannot anchor the waiver-lifetime cap"
+    if rec_planned > clock_date + timedelta(days=1):
+        return (f"waiver planned_at {rec_planned.isoformat()} is in the future "
+                f"(clock {clock_date.isoformat()}) — record tampered")
+    if rec_planned < anchor - timedelta(days=1):
+        return (f"waiver planned_at {rec_planned.isoformat()} predates the run's planning date "
+                f"{anchor.isoformat()} — record tampered")
     n = _policy_number(pol_data.get("max_waiver_days"))
-    max_days = int(n) if n is not None and n >= 1 else DEFAULT_MAX_WAIVER_DAYS
-    if expires > planned_ref + timedelta(days=max_days):
-        return (f"waiver expires {expires.isoformat()}, more than {max_days} days after it was "
-                f"planned ({planned_ref.isoformat()}) — waivers are capped at {max_days} days")
+    max_days = (int(n) if n is not None and 1 <= n <= MAX_WAIVER_DAYS_CAP
+                else DEFAULT_MAX_WAIVER_DAYS)
+    try:
+        deadline = anchor + timedelta(days=max_days)
+    except (OverflowError, ValueError):
+        return "waiver-lifetime cap is too large to evaluate — run BLOCKED"
+    if expires > deadline:
+        return (f"waiver expires {expires.isoformat()}, more than {max_days} days after the "
+                f"run was planned ({anchor.isoformat()}) — waivers are capped at {max_days} days")
     return None
 
 
 def validate_not_applicable_gate(gate_name, tier, rec, pol_data):
     """Independently re-validate a gates/<name>.json record with status NOT_APPLICABLE:
-    named authorizer, real reason, and the CRITICAL restrictions. Returns an error string,
-    or None when the record is valid."""
+    named authorizer, a non-empty summary, and the CRITICAL restrictions. N/A keeps its
+    original non-empty-summary contract (it is not a time-boxed waiver, so the >=16-char /
+    no-placeholder waiver-reason rule does not apply). Returns an error string, or None."""
     return _validate_gate_exception_common("NOT_APPLICABLE", gate_name, tier,
-                                           rec.get("authorized_by"), rec.get("summary"), pol_data)
+                                           rec.get("authorized_by"), rec.get("summary"), pol_data,
+                                           strict_reason=False)
 
 
 def _validate_policy(data, name):
@@ -492,8 +551,9 @@ def _validate_policy(data, name):
     if "max_waiver_days" in data:
         v = data["max_waiver_days"]
         n = _policy_number(v)
-        if n is None or n < 1 or n >= 2 ** 53 or n != int(n):
-            die(f"{name}: max_waiver_days must be a positive integer, got {v!r}")
+        if n is None or n < 1 or n > MAX_WAIVER_DAYS_CAP or n != int(n):
+            die(f"{name}: max_waiver_days must be an integer from 1 to "
+                f"{MAX_WAIVER_DAYS_CAP}, got {v!r}")
     if "max_cost_usd" in data:
         v = data["max_cost_usd"]
         # A documented disable token, or a finite non-negative number. Reject at load so a bare
@@ -546,6 +606,44 @@ def load_policy(root=None):
     return {"data": data, "path": path,
             "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             "text": text}
+
+
+def load_attested_policy(run):
+    """Return (pol_data, error) from the run's attested policy.snapshot.json — the exact
+    policy text captured at init — NEVER the mutable working-tree policy, so a post-init edit
+    cannot widen a waiver that is absent from the audit record (#3).
+
+      ({}, None)     no policy at init (no snapshot) → strict built-in defaults apply.
+      (data, None)   snapshot present, its text matches its recorded sha256, and it parses
+                     and validates against the current schema.
+      (None, msg)    snapshot present but unreadable, sha-mismatched (tampered), or no longer
+                     valid — the caller must BLOCK (fail closed), never fall back to the
+                     working tree."""
+    snap_path = Path(run) / "policy.snapshot.json"
+    if not snap_path.is_file():
+        return {}, None
+    try:
+        snap = read_json(snap_path)
+    except (ValueError, OSError) as e:
+        return None, f"policy.snapshot.json is unreadable/corrupt: {e}"
+    if not isinstance(snap, dict):
+        return None, "policy.snapshot.json is not a JSON object"
+    text = snap.get("text")
+    sha = snap.get("sha256", "")
+    fname = snap.get("file", "") or ""
+    if not isinstance(text, str):
+        return None, "policy.snapshot.json has no captured policy text"
+    if hashlib.sha256(text.encode("utf-8")).hexdigest() != sha:
+        return None, "policy.snapshot.json text does not match its recorded sha256 — tampered"
+    try:
+        data = json.loads(text) if fname.endswith(".json") else _parse_policy_yaml(
+            text, "policy.snapshot.json")
+        _validate_policy(data, "policy.snapshot.json")
+    except (ValueError, SystemExit):
+        return None, "policy.snapshot.json failed to parse/validate against the current schema"
+    if not isinstance(data, dict):
+        return None, "policy.snapshot.json did not parse to a mapping"
+    return data, None
 
 
 def resolve_setting(cli_value, env_var, pol, key, default=None):

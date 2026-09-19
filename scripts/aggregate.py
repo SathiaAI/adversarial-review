@@ -32,9 +32,9 @@ from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (family_of, load_policy, meta_cost, now_iso, read_json, resolve_run,
-                     resolve_waiver_clock, validate_not_applicable_gate, validate_waived_gate,
-                     write_json)
+from _common import (family_of, load_attested_policy, meta_cost, now_iso, read_json,
+                     resolve_run, resolve_waiver_clock, validate_gate_name,
+                     validate_not_applicable_gate, validate_waived_gate, write_json)
 
 HIGH = ("critical", "high")
 
@@ -71,8 +71,31 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
     gplan = read_json(req_path)
     gcov["plan_recorded"] = True
     gcov["required"] = list(gplan.get("required", []))
+    manifest_planned_at = gplan.get("planned_at")
+    required_set = set(gplan.get("required", []))
+    # Legacy/tampered-plan guard: pre-M1 plans DROPPED a waived gate from `required` and
+    # recorded it only in the manifest's `waived` list, so the loop below never checked it —
+    # a SENSITIVE run could pass with no mutation gate at all. Any waived entry whose gate is
+    # absent from `required` means the manifest predates the waiver-hardening (or was edited
+    # to drop a gate); BLOCK and require re-planning rather than honoring it.
+    for w in (gplan.get("waived") or []):
+        wname = w.get("name") if isinstance(w, dict) else w
+        if wname not in required_set:
+            blocked.append(
+                f"legacy or tampered gate plan: gate '{wname}' is waived but missing from the "
+                "required set — pre-M1 waivers that drop the gate are not honored; re-run "
+                "`gate.py plan` with the current version to migrate (waived gates now stay "
+                "required and are independently re-validated)")
     results = {}
     for name in gplan.get("required", []):
+        # A required gate name becomes gates/<name>.json; reject an unsafe/reserved name from
+        # a tampered manifest BEFORE building that path (it could otherwise read _required.json
+        # or escape the gates dir).
+        nerr = validate_gate_name(name)
+        if nerr:
+            gcov["blocked"].append({"name": str(name), "reason": nerr})
+            blocked.append(f"required gate name rejected: {nerr}")
+            continue
         p = run / "gates" / f"{name}.json"
         if not p.exists():
             gcov["missing"].append(name)
@@ -90,7 +113,8 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
             # evaluated, so every waived gate is BLOCKED rather than silently guessing
             # 'today' (fail closed; see resolve_waiver_clock).
             err = (f"cannot verify waiver expiry: {clock_err}" if clock_date is None
-                   else validate_waived_gate(name, tier, rec, pol_data, clock_date))
+                   else validate_waived_gate(name, tier, rec, pol_data, clock_date,
+                                             manifest_planned_at=manifest_planned_at))
             if err:
                 gcov["blocked"].append({"name": name, "reason": err})
                 blocked.append(f"gate '{name}': {err}")
@@ -1077,8 +1101,20 @@ def next_steps(verdict, fail, blocked, gcov, fcov, counts):
         return x if isinstance(x, list) else []
     steps = []
     if verdict == "PASS":
-        steps.append("Cleared: every required check passed and independent review ran with its blocking "
-                     "findings resolved. A human still owns the actual merge decision.")
+        waived = [w for w in _list(gcov.get("waived")) if isinstance(w, dict)]
+        if waived:
+            names = ", ".join(str(w.get("name", "?")) for w in waived)
+            steps.append(f"Cleared, with accountable exception(s): every required check passed EXCEPT "
+                         f"{names}, which was time-boxed and authorized (a waiver, not a pass). "
+                         "Independent review ran with its blocking findings resolved. A human still "
+                         "owns the actual merge decision.")
+            for w in waived:
+                steps.append(f"Waived gate '{w.get('name', '?')}' — authorized by "
+                             f"{w.get('authorized_by', '?')}, expires {w.get('expires', '?')}: "
+                             f"{w.get('reason', '')}. It expires; do not treat it as permanently green.")
+        else:
+            steps.append("Cleared: every required check passed and independent review ran with its blocking "
+                         "findings resolved. A human still owns the actual merge decision.")
         if counts.get("confirmed"):
             steps.append(f"{counts['confirmed']} issue(s) were caught during review and already fixed before "
                          "this passed — see the Findings section of the report for what changed.")
@@ -1223,8 +1259,22 @@ def _aggregate_cli():
         counts = {"gates": 0, "reviewers": 0, "findings_high_critical": 0,
                   "findings_medium_low": 0, "confirmed": 0, "unresolved": 0}
 
-        pol = load_policy()  # malformed policy dies here too — never silently ignored
-        pol_data = pol["data"] if pol is not None else {}
+        # Waiver limits (max_waiver_days, allow_critical_waivers) come ONLY from the policy
+        # attested at init (policy.snapshot.json), NEVER the mutable working-tree policy — a
+        # post-init edit must not be able to widen a waiver that is absent from the audit
+        # record. A snapshot that is present but untrustworthy (unreadable / sha-mismatched /
+        # no longer valid) fails closed to strict built-in defaults AND blocks the run.
+        pol_data, att_err = load_attested_policy(run)
+        attested_policy_sha = None
+        snap_p = run / "policy.snapshot.json"
+        if snap_p.is_file():
+            try:
+                attested_policy_sha = read_json(snap_p).get("sha256")
+            except (ValueError, OSError):
+                attested_policy_sha = None
+        if att_err:
+            pol_data = {}
+            blocked.append(f"attested policy snapshot could not be trusted: {att_err}")
         # Resolved once per aggregate run: GITHUB_RUN_STARTED_AT's date if set (else today
         # UTC). A set-but-unparseable value is fail-closed — every waiver is BLOCKED rather
         # than silently falling back to today (see check_gates/resolve_waiver_clock).
@@ -1275,6 +1325,10 @@ def _aggregate_cli():
                     "rebuttal": rcov, "findings": fcov,
                     "cost_usd": round(panel_cost_usd, 6), "cost_aborted": bool(cost_abort),
                     "cost_cap_usd": cpol.get("cap_usd"), "cost_cap_source": cpol.get("source"),
+                    # The sha256 of the policy attested at init, whose waiver limits governed
+                    # this verdict — so the audit shows exactly which policy the waiver checks
+                    # ran against (null when the run had no policy file).
+                    "policy_snapshot_sha256": attested_policy_sha,
                     "areas_not_reviewed": sorted(areas)}
 
         verdict = "FAIL" if fail else ("BLOCKED" if blocked else "PASS")

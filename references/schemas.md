@@ -109,8 +109,10 @@ this file.
 may be null there). `status` NOT_APPLICABLE marks a required gate that genuinely does not
 apply to this stack (e.g. a config-only repo with no build or unit gate); unlike BLOCKED
 it does **not** restrict the verdict, but it is an accountable determination — the
-aggregator requires a named `authorized_by` and a non-empty `summary`, and an N/A record
-missing either is itself BLOCKED. Every N/A gate is listed distinctly (with its
+aggregator requires a named `authorized_by` and a non-empty `summary` (stripped), and an
+N/A record missing either is itself BLOCKED. The stricter waiver-reason rule (>=16 chars,
+no placeholder) applies to WAIVED `reason`s only, **not** to N/A `summary`s. Every N/A gate
+is listed distinctly (with its
 authorizer) in `verdict.json` coverage (`gates.not_applicable`) and in `verdict.md`, so a
 skipped gate is never silent. Absent `status` falls back to the exit code.
 
@@ -121,11 +123,18 @@ accountable, non-restricting exception: `{"gate": "mutation", "status": "WAIVED"
 "source": "plan"}`. Unlike the pre-M1 waiver, the waived gate is **never removed from
 `required`** — this record is what the aggregator checks for it, and it is
 **independently re-validated at every aggregate run** (never trusted just because
-`gate.py plan` wrote it): `authorized_by` and `reason` as for NOT_APPLICABLE; `expires`
-must be a strict `YYYY-MM-DD` strictly after the run's clock date (today UTC, or the date
-part of `GITHUB_RUN_STARTED_AT` when set — a set-but-unparseable value BLOCKS the run
-rather than guessing); and `expires` must be no more than policy `max_waiver_days`
-(default 14) after `planned_at`. On CRITICAL tier, waiving (or marking NOT_APPLICABLE)
+`gate.py plan` wrote it — and `gate.py plan` now runs the **same** validator, so an invalid
+waiver is rejected at plan time and never produces an artifact): a named `authorized_by`, a
+`reason` (>=16 chars, not a placeholder); `expires` must be a strict `YYYY-MM-DD` strictly
+after the run's clock date (today UTC, or the date part of `GITHUB_RUN_STARTED_AT` when set
+— a set-but-unparseable value BLOCKS the run rather than guessing); and `expires` must be no
+more than `max_waiver_days` after the **run's** planning time — the `planned_at` in
+`gates/_required.json`, not the record's own, so editing only the record's `planned_at`
+cannot slide the window (a record `planned_at` in the future, or before the run's planning
+date, is rejected as tampered). `max_waiver_days` (default 14) is bounded to 1–365 at policy
+load, and the limits (`max_waiver_days`, `allow_critical_waivers`) are read from the policy
+**attested at init** (`policy.snapshot.json`), never a post-init working-tree edit. On
+CRITICAL tier, waiving (or marking NOT_APPLICABLE)
 any gate is refused unless policy sets `allow_critical_waivers: true`; `mutation` on
 CRITICAL is refused regardless of that setting — it stays BLOCKED until real CRITICAL
 mutation coverage ships (M4). Every waived gate is listed distinctly (with its

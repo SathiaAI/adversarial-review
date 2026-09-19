@@ -16,7 +16,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import die, load_policy, now_iso, read_json, resolve_run, write_json
+from _common import (die, load_policy, now_iso, read_json, resolve_run,
+                     resolve_waiver_clock, validate_gate_name, validate_waived_gate,
+                     write_json)
 
 # Floors per tier: these cannot be silently omitted, only waived on the record with a
 # named authorizer (surfaced in the verdict reasons and the report). A waived floor gate
@@ -50,6 +52,13 @@ def cmd_plan(args):
         die(f"required gates unresolved for tier {tier}: pass --require, set "
             f"AR_REQUIRE, or add required_gates.{tier} to .adversarial-review.yml")
     requested = [g.strip() for g in requested if g.strip()]
+    # Every gate identifier becomes gates/<name>.json, so validate it BEFORE it is ever used
+    # to build a path — a name like '_required', '../x' or 'a/b' would overwrite the run
+    # manifest or escape the gates dir, blanking the required set into a silent all-pass.
+    for g in requested:
+        gerr = validate_gate_name(g)
+        if gerr:
+            die(f"invalid required gate (via {req_src}): {gerr}")
     # The gates that are required BEFORE any waiver is applied: this is the set a --waive
     # is allowed to name. Waiving a name outside it is rejected (gate-name smuggling) —
     # otherwise a typo'd or invented gate name could be "waived" while the real required
@@ -58,6 +67,9 @@ def cmd_plan(args):
     base_required = set(requested) | set(MINIMUM_GATES[tier])
     waived = []
     for w in args.waive or []:
+        gerr = validate_gate_name(w)
+        if gerr:
+            die(f"cannot waive {w!r}: {gerr}")
         if w not in base_required:
             die(f"cannot waive '{w}': not among this tier's requested/floor gates "
                 f"({', '.join(sorted(base_required))}) — waiving a gate name that was "
@@ -78,6 +90,23 @@ def cmd_plan(args):
     # for at-a-glance visibility.
     required = sorted(base_required)
     planned_at = now_iso()
+    # Fail fast at plan time using the EXACT SAME validator aggregate.py enforces, so an
+    # invalid waiver never even produces artifacts. Aggregate remains the authority (it
+    # re-validates from disk against the attested policy snapshot); this is the identical
+    # early check against the working-tree policy, so `plan` exits non-zero rather than
+    # writing a waiver that will only BLOCK later.
+    pol_data = pol["data"] if pol is not None else {}
+    clock_date, clock_err = resolve_waiver_clock()
+    if clock_err:
+        die(clock_err)
+    for w in waived:
+        rec = {"gate": w["name"], "status": "WAIVED",
+               "authorized_by": w["authorized_by"], "reason": w["reason"],
+               "expires": w["expires"], "tier": tier, "planned_at": planned_at}
+        verr = validate_waived_gate(w["name"], tier, rec, pol_data, clock_date,
+                                    manifest_planned_at=planned_at)
+        if verr:
+            die(f"cannot waive '{w['name']}': {verr}")
     write_json(run / "gates" / "_required.json",
                {"tier": tier, "required": required, "requested": requested,
                 "requested_source": req_src, "waived": waived,
