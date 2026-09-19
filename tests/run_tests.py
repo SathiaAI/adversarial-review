@@ -6853,12 +6853,16 @@ def t_mcp_http_keepalive_reuse_releases_work_permit():
                 s.settimeout(5)
                 data = b""
                 while b"\r\n\r\n" not in data:
-                    data += s.recv(4096)
+                    chunk = s.recv(4096)
+                    assert chunk, "connection closed before a response header arrived"
+                    data += chunk
                 head, _sep, rest = data.partition(b"\r\n\r\n")
-                clen = int([l.split(b":", 1)[1].strip() for l in head.split(b"\r\n")
-                            if l.lower().startswith(b"content-length")][0])
+                clen = next(int(ln.split(b":", 1)[1].strip()) for ln in head.split(b"\r\n")
+                            if ln.lower().startswith(b"content-length"))
                 while len(rest) < clen:
-                    rest += s.recv(4096)
+                    chunk = s.recv(4096)
+                    assert chunk, "connection closed before the body was complete"
+                    rest += chunk
                 assert head.split(b" ")[1] == b"200", head[:80]
         finally:
             s.close()
