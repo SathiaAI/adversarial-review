@@ -2048,6 +2048,13 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         return s[:max(0, limit - len(marker))] + marker  # reserve suffix space so `limit` is a true bound
 
     def do_POST(self):
+        # No HTTP keep-alive on this transport: close the connection after every POST response. An idle
+        # kept-alive connection holds an _accept_sem permit WITHOUT a work permit, so control_reserve idle
+        # connections could fill the accept cap and starve a DELETE at the accept layer before its verb is
+        # even known (Codex P1, PR #71) -- reproducing the very teardown starvation SAT-1109 fixes. This is
+        # a localhost / low-volume control surface, so per-request TCP setup is a negligible cost for
+        # removing that starvation class. GET (stream end) and DELETE already close their connections.
+        self.close_connection = True
         # (1) DNS-rebinding defense first: reject a disallowed browser Origin before touching the body.
         if not self._origin_ok():
             return
@@ -2248,6 +2255,7 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             # A notification (or any message handle() declines to answer) -> 202 Accepted, no body.
             self.send_response(202)
             self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")   # no keep-alive (see do_POST); connection closes
             self.end_headers()
             return
         # (7) On a SUCCESSFUL `initialize`, mint and return a session id (rotatable: a fresh id per
@@ -2264,6 +2272,7 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")   # no keep-alive (see do_POST); connection closes
         if pv is not None:
             self.send_header("MCP-Protocol-Version", pv)  # echo the negotiated version
         if session_id is not None:
@@ -2606,10 +2615,13 @@ class HttpTransport:
         # for the accept cap and used as the DELETE control lane. Keep it a hard 1..4 so it can never be
         # turned into a second unbounded pool that defeats the accept cap, and so at least one permit
         # always exists for a session teardown.
-        if not (1 <= self.control_reserve <= 4):
+        if not isinstance(self.control_reserve, int) or not (1 <= self.control_reserve <= 4):
             raise ValueError(
-                "control_reserve (%r) must be between 1 and 4: it is a small fixed headroom for the "
-                "control-plane (DELETE) lane, not a general pool." % (self.control_reserve,))
+                "control_reserve (%r) must be an INTEGER between 1 and 4: it is a small fixed headroom for "
+                "the control-plane (DELETE) lane, not a general pool. A fractional capacity is rejected "
+                "because threading.BoundedSemaphore only blocks at exactly 0, so a value like 1.5 (going "
+                "1.5 -> 0.5 -> -0.5) would never block acquire() -- leaving the control lane and the accept "
+                "cap effectively unbounded (Codex, PR #71)." % (self.control_reserve,))
         # Pick the address family from the host so an IPv6 loopback (::1) actually binds — the default
         # ThreadingHTTPServer is AF_INET, which cannot bind an IPv6 address. Defer bind/activate so the
         # family can be set first, and clean up the socket if the bind itself fails.

@@ -66,8 +66,9 @@ every request must authenticate**, on every host including loopback.
   remote request flooding, remain residual risks even behind TLS; the bounded pools cap the flooding blast
   radius. Terminating TLS in-process is a possible future hardening, deliberately out of this PR.
 - **Sub-timeout slow-loris.** The per-recv read timeout bounds an *idle* connection; a client dribbling a byte
-  just under the timeout can still hold a worker. The **bounded worker pool caps the blast radius** (a flood
-  can hold at most `MAX_WORKERS` connections, beyond which new connections are fast-closed). A true absolute
+  just under the timeout can still hold a worker. The **bounded pool caps the blast radius** (a flood can hold
+  at most `AR_MCP_HTTP_MAX_WORKERS + HTTP_CONTROL_RESERVE` concurrent connections — the accept cap — beyond
+  which new connections are fast-closed). A true absolute
   wall-clock read deadline is a follow-up (S2d hardening), kept out of the SENSITIVE auth PR to avoid a fragile
   stdlib `http.server` read-path override.
 - **Serialized dispatch.** `_HTTP_DISPATCH_LOCK` serializes tool dispatch (the handlers are stateful/one-at-a-
@@ -84,10 +85,15 @@ every request must authenticate**, on every host including loopback.
   (`control_reserve`, DELETE). A saturated data-plane request is shed with the same **no-body close** as the
   accept cap — never a 503 body (the stream-count cap's retryable 503 is a distinct, cooperative backpressure
   and is unchanged). Auth is unchanged: a DELETE still 401s without a token and consumes no control permit — the
-  lane isolates *scheduling*, never *authorization*. **Residual:** the lane isolates DELETE from data-plane
-  *work*, not from a pure **connection** flood — a flood of half-open requests can still occupy the accept slots
-  until the per-recv `AR_MCP_HTTP_READ_TIMEOUT` reaps them, so control-plane admission is bounded by that
-  timeout, not unconditional. Preemptive cancellation of an already-running tool remains out of scope (below).
+  lane isolates *scheduling*, never *authorization*. **HTTP keep-alive is disabled** on this transport (every
+  POST response closes the connection, as GET/DELETE already did): an idle kept-alive connection would
+  otherwise hold an accept permit **without** a work permit, and `control_reserve` such idle connections could
+  fill the accept cap and starve a DELETE at the accept layer before its verb is known (Codex, PR #71).
+  **Residual:** with keep-alive off, only sockets *actively* being flooded — each parked in its initial header
+  read, before its verb is known — can still occupy the accept slots, bounded by the per-recv
+  `AR_MCP_HTTP_READ_TIMEOUT` that reaps them. So control-plane admission is isolated from ordinary data-plane
+  load and from idle connections, but remains bounded (not immune) under an active new-connection flood.
+  Preemptive cancellation of an already-running tool remains out of scope (below).
 - **Cancellation is best-effort, not forced.** SSE client-disconnect frees the stream slot promptly and a
   DELETE wakes streams (both tested). A client that disconnects mid-POST does **not** abort the running
   subprocess — it completes and its result is discarded. Preemptive "kill-means-kill" cancellation of an

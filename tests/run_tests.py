@@ -6685,7 +6685,9 @@ def t_mcp_http_control_reserve_bounds():
     # SAT-1109: control_reserve is a fixed small headroom; bind() enforces 1 <= it <= 4 so it can never
     # become a second unbounded pool that defeats the accept cap. Default (2) binds and sizes the three
     # pools: work == max_workers, control == control_reserve (accept cap == their sum).
-    for bad in (0, 5, -1):
+    # 1.5 / 2.5 are IN the 1..4 range but fractional: BoundedSemaphore(1.5) never blocks (only blocks at
+    # exactly 0), so a float capacity leaves the lane unbounded -- bind() must reject it (Codex, PR #71).
+    for bad in (0, 5, -1, 1.5, 2.5):
         tr = mcpsrv.HttpTransport(host="127.0.0.1", port=0, max_workers=8, max_streams=4,
                                   control_reserve=bad)
         try:
@@ -6835,42 +6837,46 @@ def t_mcp_http_control_lane_exhaustion_sheds_without_body():
         t.shutdown()
 
 
-def t_mcp_http_keepalive_reuse_releases_work_permit():
-    # SAT-1109: work/control permits are per-REQUEST (released between requests), so HTTP/1.1 keep-alive
-    # reuse on ONE connection must not leak a permit. Two sequential POSTs on one socket both succeed and
-    # leave the work pool fully restored.
+def t_mcp_http_no_keepalive_closes_and_releases_work_permit():
+    # SAT-1109 (Codex P1, PR #71): HTTP keep-alive is disabled -- every POST response closes the
+    # connection so no idle kept-alive connection pins an accept permit and starves the control lane.
+    # Verify the server closes after each POST (Connection: close, then EOF) AND that the per-request
+    # work permit is released with no leak across sequential connections.
     import socket as _sock, time as _time
     t, port = _http_transport(max_workers=2, max_streams=1)
     try:
-        before = t.httpd._work_sem._value
-        s = _sock.create_connection(("127.0.0.1", port), timeout=5)
-        try:
-            body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover"}).encode("utf-8")
-            for _ in range(2):
-                req = (b"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: "
-                       + str(len(body)).encode() + b"\r\n\r\n" + body)   # keep-alive (no Connection: close)
+        before_work = t.httpd._work_sem._value
+        before_accept = t.httpd._accept_sem._value
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover"}).encode("utf-8")
+        req = (b"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: "
+               + str(len(body)).encode() + b"\r\n\r\n" + body)   # no Connection header -> HTTP/1.1 default
+        for _ in range(2):
+            s = _sock.create_connection(("127.0.0.1", port), timeout=5)
+            try:
                 s.sendall(req)
                 s.settimeout(5)
                 data = b""
-                while b"\r\n\r\n" not in data:
+                while True:
                     chunk = s.recv(4096)
-                    assert chunk, "connection closed before a response header arrived"
+                    if not chunk:
+                        break   # server closed the connection (no keep-alive) -> clean EOF, no spin
                     data += chunk
-                head, _sep, rest = data.partition(b"\r\n\r\n")
-                clen = next(int(ln.split(b":", 1)[1].strip()) for ln in head.split(b"\r\n")
-                            if ln.lower().startswith(b"content-length"))
-                while len(rest) < clen:
-                    chunk = s.recv(4096)
-                    assert chunk, "connection closed before the body was complete"
-                    rest += chunk
-                assert head.split(b" ")[1] == b"200", head[:80]
-        finally:
-            s.close()
+            finally:
+                s.close()
+            head = data.split(b"\r\n\r\n", 1)[0]
+            assert head.split(b" ")[1] == b"200", head[:80]
+            assert b"connection: close" in head.lower(), "POST response must close the connection (no keep-alive)"
+        # Both permits fully restored: the work permit is released per request, AND the connection closes
+        # so its ACCEPT permit is released too -- a completed POST cannot linger idle holding an accept
+        # slot (the Codex P1 starvation vector). Poll (the finally-release runs just after the response).
         deadline = _time.time() + 3
-        while t.httpd._work_sem._value != before and _time.time() < deadline:
+        while (t.httpd._work_sem._value != before_work
+               or t.httpd._accept_sem._value != before_accept) and _time.time() < deadline:
             _time.sleep(0.02)
-        assert t.httpd._work_sem._value == before, "work permit leaked across keep-alive reuse (%r != %r)" % (
-            t.httpd._work_sem._value, before)
+        assert t.httpd._work_sem._value == before_work, "work permit leaked (%r != %r)" % (
+            t.httpd._work_sem._value, before_work)
+        assert t.httpd._accept_sem._value == before_accept, "accept permit leaked -- POST connection stayed idle (%r != %r)" % (
+            t.httpd._accept_sem._value, before_accept)
     finally:
         t.shutdown()
 
