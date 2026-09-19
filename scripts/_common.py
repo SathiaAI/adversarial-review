@@ -479,12 +479,13 @@ def validate_waived_gate(gate_name, tier, rec, pol_data, clock_date, manifest_pl
     man_planned = _date_from_iso(manifest_planned_at) if manifest_planned_at is not None else rec_planned
     if man_planned is None:
         return "run plan is missing a valid planned_at date — cannot anchor the waiver-lifetime cap"
-    # A planning timestamp cannot be in the future — a run is not planned after 'now'. Reject a
-    # future record or manifest planned_at as tampered (1-day skew absorbs timezone/rounding).
-    if rec_planned > clock_date + timedelta(days=1):
+    # A planning timestamp cannot be after the effective clock — a run is not planned in the
+    # future. Reject ANY future record or manifest planned_at as tampered (no day of slack:
+    # advancing both timestamps by a day together would otherwise defeat the min() anchor).
+    if rec_planned > clock_date:
         return (f"waiver planned_at {rec_planned.isoformat()} is in the future "
                 f"(clock {clock_date.isoformat()}) — record tampered")
-    if man_planned > clock_date + timedelta(days=1):
+    if man_planned > clock_date:
         return (f"run plan planned_at {man_planned.isoformat()} is in the future "
                 f"(clock {clock_date.isoformat()}) — plan manifest tampered")
     # Anchor the cap to the EARLIEST planning evidence of the two timestamps, so advancing
@@ -627,8 +628,21 @@ def load_attested_policy(run):
       (None, msg)    snapshot present but unreadable, sha-mismatched (tampered), or no longer
                      valid — the caller must BLOCK (fail closed), never fall back to the
                      working tree."""
+    # The init-time provenance: run.json.policy.sha256 records whether a policy governed the
+    # run at init. Read it first so a DELETED snapshot can be told apart from 'no policy'.
+    try:
+        runjson = read_json(Path(run) / "run.json")
+    except (ValueError, OSError):
+        runjson = None
+    init_pol = runjson.get("policy") if isinstance(runjson, dict) else None
+    init_sha = init_pol.get("sha256") if isinstance(init_pol, dict) else None
     snap_path = Path(run) / "policy.snapshot.json"
     if not snap_path.is_file():
+        if init_sha:
+            # A policy governed the run at init but its attested snapshot is gone — falling back
+            # to built-in defaults could accept a waiver the attested policy would have rejected.
+            return None, ("run.json records a policy at init but policy.snapshot.json is missing "
+                          "— the attested policy cannot be recovered; run BLOCKED")
         return {}, None
     try:
         snap = read_json(snap_path)
@@ -648,12 +662,7 @@ def load_attested_policy(run):
     # The snapshot's OWN sha256 is not tamper-proof (an attacker can rewrite text AND sha
     # together). Cross-check it against the digest recorded in run.json at init — the
     # authoritative init-time provenance — and BLOCK if the snapshot was swapped wholesale.
-    try:
-        runjson = read_json(Path(run) / "run.json")
-    except (ValueError, OSError):
-        runjson = None
-    init_pol = runjson.get("policy") if isinstance(runjson, dict) else None
-    init_sha = init_pol.get("sha256") if isinstance(init_pol, dict) else None
+    # (A run.json edit too is caught by the run's attestation digest / signature layer.)
     if init_sha != sha:
         return None, ("policy.snapshot.json sha256 does not match the policy digest recorded in "
                       "run.json at init — the snapshot was replaced")

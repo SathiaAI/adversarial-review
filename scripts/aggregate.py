@@ -73,15 +73,28 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
     gcov["required"] = list(gplan.get("required", []))
     manifest_planned_at = gplan.get("planned_at")
     required_set = set(gplan.get("required", []))
-    manifest_waived_names = {(w.get("name") if isinstance(w, dict) else w)
-                             for w in (gplan.get("waived") or [])}
+    # The manifest's `waived` list must be well-formed before anything is built from it — a
+    # non-list, or an entry that is not an object with a non-empty string `name` (an unhashable
+    # value such as {"name": []} would otherwise raise during set construction), is a
+    # malformed/tampered manifest that must BLOCK, never crash aggregation before the verdict.
+    raw_waived = gplan.get("waived", [])
+    manifest_waived = {}   # gate name -> its manifest waiver entry (bound against the record)
+    if not isinstance(raw_waived, list):
+        blocked.append("gate plan 'waived' is not a list — malformed or tampered manifest")
+        raw_waived = []
+    for w in raw_waived:
+        if not (isinstance(w, dict) and isinstance(w.get("name"), str) and w["name"].strip()):
+            blocked.append(f"gate plan has a malformed waiver entry {w!r} — expected an object "
+                           "with a string 'name'")
+            continue
+        manifest_waived[w["name"]] = w
+    manifest_waived_names = set(manifest_waived)
     # Legacy/tampered-plan guard: pre-M1 plans DROPPED a waived gate from `required` and
     # recorded it only in the manifest's `waived` list, so the loop below never checked it —
     # a SENSITIVE run could pass with no mutation gate at all. Any waived entry whose gate is
     # absent from `required` means the manifest predates the waiver-hardening (or was edited
     # to drop a gate); BLOCK and require re-planning rather than honoring it.
-    for w in (gplan.get("waived") or []):
-        wname = w.get("name") if isinstance(w, dict) else w
+    for wname in manifest_waived_names:
         if wname not in required_set:
             blocked.append(
                 f"legacy or tampered gate plan: gate '{wname}' is waived but missing from the "
@@ -117,6 +130,20 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
             if name not in manifest_waived_names:
                 reason = ("WAIVED record is not authorized by the plan manifest's waived list "
                           "(orphaned or raced waiver) — re-run `gate.py plan`")
+                gcov["blocked"].append({"name": name, "reason": reason})
+                blocked.append(f"gate '{name}': {reason}")
+                continue
+            # Bind the record to the manifest entry's METADATA, not just the name: gate.py writes
+            # the manifest and the record separately, so a concurrent replan could pair a short
+            # manifest entry with a longer stale record. Its authorizer/reason/expiry must match
+            # what the final manifest authorized, or the record is raced/tampered → BLOCK.
+            m = manifest_waived.get(name, {})
+            if (rec.get("expires") != m.get("expires")
+                    or rec.get("authorized_by") != m.get("authorized_by")
+                    or rec.get("reason") != m.get("reason")):
+                reason = ("WAIVED record does not match the plan manifest's waiver entry "
+                          "(authorizer/reason/expiry mismatch — raced or tampered) — "
+                          "re-run `gate.py plan`")
                 gcov["blocked"].append({"name": name, "reason": reason})
                 blocked.append(f"gate '{name}': {reason}")
                 continue
