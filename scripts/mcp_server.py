@@ -1593,6 +1593,11 @@ HTTP_DEFAULT_MAX_WORKERS = 128      # bounded worker/connection pool (E3-S2c): s
                                     # one thread per connection, unbounded — a connection flood would exhaust
                                     # threads/fds. Cap it. MUST exceed MAX_STREAMS (an SSE GET holds its worker for
                                     # the stream's whole life), else streams starve POST dispatch; bind() enforces it.
+HTTP_CONTROL_RESERVE = 2            # dedicated control-plane (DELETE) admission permits, isolated from the general
+                                    # worker pool (SAT-1109). A session teardown rides these, never the data-plane
+                                    # pool, so it is admitted even under full data-plane saturation. Small FIXED
+                                    # constant (not an operator knob); the accept cap is max_workers + this, and
+                                    # bind() requires 1 <= it <= 4 so the reserve cannot itself become a second pool.
 HTTP_DEFAULT_READ_TIMEOUT = 30      # per-recv socket read timeout, seconds (E3-S2c): bounds an idle slow-loris on
                                     # the request read + a stalled response write. Dispatch does no socket IO, so it
                                     # never interrupts a running tool. (A sub-timeout dribble still holds a worker —
@@ -1960,6 +1965,16 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
     do_PATCH = _not_allowed
     do_OPTIONS = _not_allowed
 
+    def _overloaded_close(self, kind):
+        # SAT-1109 admission shed. A request that cannot get its lane's permit (general work pool for
+        # POST/GET, control pool for DELETE) is dropped the SAME way the accept-level flood cap drops an
+        # over-cap connection: close with NO HTTP response body. 'Writing a body to a flood is the work
+        # the flood wants' (PR #54/#58), so there is no 503 and no Retry-After here. Setting
+        # close_connection ends BaseHTTPRequestHandler's keep-alive loop and the base closes the socket
+        # with nothing written. `kind` ("work"/"control") drives a rate-limited operator log.
+        self.close_connection = True
+        self.server.note_denial(kind)
+
     def _origin_ok(self):
         # DNS-rebinding defense, shared by every verb: a present browser Origin must be allow-listed
         # (reject -> closed 403); an absent Origin (curl / a programmatic MCP host) is allowed.
@@ -2033,6 +2048,13 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         return s[:max(0, limit - len(marker))] + marker  # reserve suffix space so `limit` is a true bound
 
     def do_POST(self):
+        # No HTTP keep-alive on this transport: close the connection after every POST response. An idle
+        # kept-alive connection holds an _accept_sem permit WITHOUT a work permit, so control_reserve idle
+        # connections could fill the accept cap and starve a DELETE at the accept layer before its verb is
+        # even known (Codex P1, PR #71) -- reproducing the very teardown starvation SAT-1109 fixes. This is
+        # a localhost / low-volume control surface, so per-request TCP setup is a negligible cost for
+        # removing that starvation class. GET (stream end) and DELETE already close their connections.
+        self.close_connection = True
         # (1) DNS-rebinding defense first: reject a disallowed browser Origin before touching the body.
         if not self._origin_ok():
             return
@@ -2046,6 +2068,20 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         #     pinned version before touching the body.
         if not self._protocol_ok():
             return
+        # (4) SAT-1109 data-plane admission: take a general WORK permit AFTER the cheap boundary checks
+        #     (a rejected/unauthenticated request consumes none) and BEFORE any body read or dispatch, so
+        #     the read-work and serve_message() run only under a permit. On saturation, shed with a
+        #     NO-BODY close (never a 503 body), exactly as the accept-level flood cap does. DELETE rides
+        #     its own control lane (see do_DELETE) and is never blocked by this pool.
+        if not self.server._work_sem.acquire(blocking=False):
+            self._overloaded_close("work")
+            return
+        try:
+            self._serve_post()
+        finally:
+            self.server._work_sem.release()
+
+    def _serve_post(self):
         pv = self.headers.get("MCP-Protocol-Version")
         # (3) Frame strictly by Content-Length: reject any Transfer-Encoding (chunked et al.), even when
         #     combined with Content-Length. We do not decode a chunked body, so it would sit unread on a
@@ -2219,6 +2255,7 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             # A notification (or any message handle() declines to answer) -> 202 Accepted, no body.
             self.send_response(202)
             self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")   # no keep-alive (see do_POST); connection closes
             self.end_headers()
             return
         # (7) On a SUCCESSFUL `initialize`, mint and return a session id (rotatable: a fresh id per
@@ -2235,6 +2272,7 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")   # no keep-alive (see do_POST); connection closes
         if pv is not None:
             self.send_header("MCP-Protocol-Version", pv)  # echo the negotiated version
         if session_id is not None:
@@ -2286,7 +2324,17 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
         # session-store bound limits session COUNT, not stream count (N GETs on one valid id = N threads).
         # A global BoundedSemaphore caps live streams; past the cap the GET is refused with a retryable
         # 503, and the slot is released when the stream ends (below).
+        # SAT-1109: a GET (SSE) is data-plane and holds a general WORK permit for the stream's whole life
+        # (a stream occupies a worker -- this is why bind() keeps max_workers > max_streams). Take it
+        # BEFORE the stream slot; on data-plane saturation shed with a NO-BODY close (not a 503). It is
+        # released alongside the stream slot in the finally below.
+        if not self.server._work_sem.acquire(blocking=False):
+            self._overloaded_close("work")
+            return
         if not self.server.sse_streams.acquire(blocking=False):
+            self.server._work_sem.release()   # release the work permit taken just above before bailing out
+            # Stream-count backpressure (E3-S2b): a retryable 503 to an already-authenticated client
+            # opening one more stream is cooperative signalling, distinct from anonymous flood shedding.
             self._json(503, {"error": "too many concurrent event streams"}, {"Retry-After": "1"})
             return
         wake = None
@@ -2369,6 +2417,7 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             if wake is not None:
                 self.server.sessions.unregister_wake(sid, wake)
             self.server.sse_streams.release()
+            self.server._work_sem.release()   # release the data-plane work permit held for the stream life
 
     def do_DELETE(self):
         # DELETE terminates a LEGACY session (MCP revisions through 2025-11-25). The stateless 2026-07-28
@@ -2382,10 +2431,34 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
             return
         if not self._protocol_ok():
             return
+        # SAT-1109 control-plane admission: take a permit from the dedicated control lane -- one the data
+        # plane can NEVER consume -- AFTER auth (an unauthenticated DELETE already 401'd above and must
+        # not take a control permit) and covering the modern-era 405 path too, so a teardown-shaped
+        # method is never queued behind or denied by data-plane saturation. If the small control lane is
+        # itself exhausted, shed with a NO-BODY close (flood shed), never a 503.
+        if not self.server._control_sem.acquire(blocking=False):
+            self._overloaded_close("control")
+            return
+        try:
+            self._serve_delete()
+        finally:
+            self.server._control_sem.release()
+
+    def _serve_delete(self):
         pv = self.headers.get("MCP-Protocol-Version")
         if pv in MODERN_PROTOCOLS:
             self._json(405, {"error": "no session to terminate; MCP " + ", ".join(MODERN_PROTOCOLS)
                              + " is stateless (no Mcp-Session-Id)"}, {"Allow": "POST"})
+            return
+        # SAT-1109: a DELETE carries no body and this handler never reads one; refuse an oversized
+        # declared body so a trickled upload cannot pin the control permit (the socket read_timeout
+        # already bounds a slow header read; the connection is closed after the response either way).
+        try:
+            _dlen = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            _dlen = -1
+        if _dlen < 0 or _dlen > self.server.max_bytes:
+            self._json(413, {"error": "request body too large"})
             return
         sid = self.headers.get(SESSION_HEADER)
         if sid is None:
@@ -2415,21 +2488,50 @@ class _MCPHTTPHandler(http.server.BaseHTTPRequestHandler):
 
 
 class _BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
-    """ThreadingHTTPServer with a bounded worker/connection pool (E3-S2c). stdlib ThreadingMixIn spawns one
-    (daemon) thread per accepted connection, UNBOUNDED — a connection flood would exhaust threads/fds. A
-    BoundedSemaphore caps concurrent worker threads: acquired before the worker thread is spawned
-    (process_request) and released exactly once when it ends (process_request_thread's finally) OR if the
-    spawn itself raises. Past the cap a new connection is closed immediately (shutdown_request), not framed
-    with a 503 body — writing a body to a flood is the work the flood wants. max_workers MUST exceed the SSE
-    stream cap (an SSE GET holds its worker for the stream's whole life); HttpTransport.bind() enforces that."""
+    """ThreadingHTTPServer with a THREE-TIER bounded admission model (E3-S2c + SAT-1109). stdlib
+    ThreadingMixIn spawns one (daemon) thread per accepted connection, UNBOUNDED — a connection flood
+    would exhaust threads/fds. Three BoundedSemaphores bound admission:
 
-    def __init__(self, *args, max_workers=HTTP_DEFAULT_MAX_WORKERS, **kwargs):
-        self._worker_sem = threading.BoundedSemaphore(max_workers)
+      * _accept_sem (max_workers + control_reserve): the total connection/thread cap. Acquired at
+        connection-accept in process_request — BEFORE the HTTP verb is known — and released exactly once
+        when the worker thread ends (process_request_thread's finally) OR if the spawn itself raises. Past
+        the cap a new connection is closed immediately (shutdown_request), NOT framed with a 503 body —
+        writing a body to a flood is the work the flood wants. This is the anti-flood cap.
+      * _work_sem (max_workers): the general DATA-PLANE work permit, acquired in the handler (do_POST /
+        do_GET) once the verb is known and released per request. A POST holds it across body-read +
+        dispatch; a GET holds it for the SSE stream's whole life (so bind() keeps max_workers >
+        max_streams). On saturation the handler sheds with a NO-BODY close (_overloaded_close), same
+        anti-flood contract as the accept cap.
+      * _control_sem (control_reserve): the dedicated CONTROL-PLANE (DELETE) permit the data plane can
+        NEVER consume, acquired in do_DELETE after auth. Because _accept_sem == max_workers +
+        control_reserve, control_reserve accept slots (and control permits) always remain for a teardown
+        even when every data-plane work permit is held — so a session DELETE is admitted under full
+        data-plane saturation (SAT-1109). The residual: a pure connection flood of half-open requests can
+        still occupy the accept slots until read_timeout; documented in docs/mcp-http-threat-model.md."""
+
+    def __init__(self, *args, max_workers=HTTP_DEFAULT_MAX_WORKERS, control_reserve=HTTP_CONTROL_RESERVE,
+                 **kwargs):
+        self._accept_sem = threading.BoundedSemaphore(max_workers + control_reserve)
+        self._work_sem = threading.BoundedSemaphore(max_workers)
+        self._control_sem = threading.BoundedSemaphore(control_reserve)
+        # Rate-limited operator visibility for silent admission sheds (per lane). A flood must not turn
+        # denial logging into its own amplification, so log the first shed and then every 500th.
+        self._denial_lock = threading.Lock()
+        self._denial_count = {}
         super().__init__(*args, **kwargs)
 
+    def note_denial(self, kind):
+        with self._denial_lock:
+            n = self._denial_count.get(kind, 0) + 1
+            self._denial_count[kind] = n
+            emit = (n == 1 or n % 500 == 0)
+        if emit:
+            log("WARNING: ar-mcp admission shed a %s-lane request (pool saturated); %d total on this lane"
+                % (kind, n))
+
     def process_request(self, request, client_address):
-        if not self._worker_sem.acquire(blocking=False):
-            # pool full: refuse fast, without spawning a worker or writing a response body
+        if not self._accept_sem.acquire(blocking=False):
+            # total pool full: refuse fast, without spawning a worker or writing a response body
             self.shutdown_request(request)
             return
         try:
@@ -2437,14 +2539,14 @@ class _BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
         except BaseException:
             # thread spawn failed AFTER acquire (e.g. RuntimeError: can't start new thread) — the worker
             # will never run its finally, so release the permit here so the pool does not leak a slot.
-            self._worker_sem.release()
+            self._accept_sem.release()
             raise
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._worker_sem.release()
+            self._accept_sem.release()
 
 
 class HttpTransport:
@@ -2460,7 +2562,7 @@ class HttpTransport:
 
     def __init__(self, host=None, port=None, origins=None, max_bytes=None,
                  max_sessions=None, require_session=None, max_streams=None,
-                 token=None, max_workers=None, read_timeout=None):
+                 token=None, max_workers=None, read_timeout=None, control_reserve=None):
         h, p, o, m = http_config()
         self.host = h if host is None else host
         self.port = p if port is None else port
@@ -2472,6 +2574,10 @@ class HttpTransport:
                             if max_streams is None else max_streams)
         self.max_workers = (_http_int_env("AR_MCP_HTTP_MAX_WORKERS", HTTP_DEFAULT_MAX_WORKERS, minimum=1)
                             if max_workers is None else max_workers)
+        # SAT-1109 control-plane reserve: a FIXED constant (deliberately NOT env-driven — no new operator
+        # knob), injectable only so tests can exercise a tiny lane; bind() enforces 1 <= it <= 4 so the
+        # reserve can never balloon into a second worker pool that defeats the total cap.
+        self.control_reserve = HTTP_CONTROL_RESERVE if control_reserve is None else control_reserve
         self.read_timeout = (_http_int_env("AR_MCP_HTTP_READ_TIMEOUT", HTTP_DEFAULT_READ_TIMEOUT, minimum=1)
                              if read_timeout is None else read_timeout)
         self.require_session = (_http_bool_env("AR_MCP_HTTP_REQUIRE_SESSION")
@@ -2505,11 +2611,23 @@ class HttpTransport:
                 "AR_MCP_HTTP_MAX_WORKERS (%d) must exceed AR_MCP_HTTP_MAX_STREAMS (%d): an SSE GET holds a "
                 "worker for the stream's whole life, so a worker pool no larger than the stream cap lets "
                 "held-open streams starve POST dispatch." % (self.max_workers, self.max_streams))
+        # SAT-1109: the control reserve is a small FIXED headroom (default 2) added on TOP of max_workers
+        # for the accept cap and used as the DELETE control lane. Keep it a hard 1..4 so it can never be
+        # turned into a second unbounded pool that defeats the accept cap, and so at least one permit
+        # always exists for a session teardown.
+        if not isinstance(self.control_reserve, int) or not (1 <= self.control_reserve <= 4):
+            raise ValueError(
+                "control_reserve (%r) must be an INTEGER between 1 and 4: it is a small fixed headroom for "
+                "the control-plane (DELETE) lane, not a general pool. A fractional capacity is rejected "
+                "because threading.BoundedSemaphore only blocks at exactly 0, so a value like 1.5 (going "
+                "1.5 -> 0.5 -> -0.5) would never block acquire() -- leaving the control lane and the accept "
+                "cap effectively unbounded (Codex, PR #71)." % (self.control_reserve,))
         # Pick the address family from the host so an IPv6 loopback (::1) actually binds — the default
         # ThreadingHTTPServer is AF_INET, which cannot bind an IPv6 address. Defer bind/activate so the
         # family can be set first, and clean up the socket if the bind itself fails.
         httpd = _BoundedThreadingHTTPServer((self.host, self.port), _MCPHTTPHandler,
-                                            bind_and_activate=False, max_workers=self.max_workers)
+                                            bind_and_activate=False, max_workers=self.max_workers,
+                                            control_reserve=self.control_reserve)
         httpd.address_family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
         httpd.daemon_threads = True
         httpd.allowed_origins = self.origins
@@ -2539,7 +2657,8 @@ class HttpTransport:
         addr = self.httpd.server_address
         _auth = "bearer-auth ON" if self.token is not None else "NO auth (loopback-only)"
         log(f"http transport ready on {addr[0]}:{addr[1]} "
-            f"({_auth}; sessions E3-S2b; bounded pool {self.max_workers}w/{self.max_streams}s)")
+            f"({_auth}; sessions E3-S2b; bounded pool {self.max_workers}w/{self.max_streams}s"
+            f" + {self.control_reserve} control-lane)")
         try:
             self.httpd.serve_forever()
         finally:
