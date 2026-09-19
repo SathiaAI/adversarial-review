@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -10681,8 +10681,12 @@ def t_gate_waiver_expired_blocks():
 
 def t_gate_waiver_expires_today_is_not_strictly_future_blocks():
     # expires == the clock date is NOT "strictly later" — must BLOCK, not pass.
+    # Use the UTC date, matching resolve_waiver_clock's fallback
+    # (datetime.now(timezone.utc).date()) when GITHUB_RUN_STARTED_AT is unset —
+    # a local date() would drift a day off UTC in some timezones and turn this
+    # exact-boundary case into a false-pass.
     repo = _min_repo("SENSITIVE")
-    today = date.today().isoformat()
+    today = datetime.now(timezone.utc).date().isoformat()
     sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
         "--waive", "mutation", "--authorized-by", "Paul",
         "--waive-reason", "mutation runner not wired into CI yet",
