@@ -11000,6 +11000,19 @@ def t_gate_waiver_metadata_escaped_in_markdown():
     assert "<script>" not in md, md
 
 
+def t_gate_waiver_snapshot_nonobject_does_not_crash():
+    # A non-object policy.snapshot.json must fail closed (BLOCKED), never crash the
+    # aggregator with AttributeError before it can write a verdict.
+    repo = _min_repo("SENSITIVE", policy="max_waiver_days: 20\n")
+    run = latest_run(repo)
+    (run / "policy.snapshot.json").write_text("[]", encoding="utf-8")
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast", "mutation"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "attested policy snapshot could not be trusted" in r.stdout, r.stdout
+
+
 def t_mcp_gate_plan_waive_requires_reason_and_expires():
     repo = fresh_repo()
     res = _mcp_call(repo, "ar_init", {"risk": "SENSITIVE", "dev_providers": ["anthropic"]})

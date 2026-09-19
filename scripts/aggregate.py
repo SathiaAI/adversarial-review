@@ -1270,9 +1270,14 @@ def _aggregate_cli():
         snap_p = run / "policy.snapshot.json"
         if snap_p.is_file():
             try:
-                attested_policy_sha = read_json(snap_p).get("sha256")
+                _snap = read_json(snap_p)
             except (ValueError, OSError):
-                attested_policy_sha = None
+                _snap = None
+            # A non-object snapshot (array/string/number) has no .get — guard so the sha
+            # re-read cannot raise AttributeError before the verdict is written. The
+            # untrustworthy snapshot is already caught (and BLOCKED) by load_attested_policy.
+            if isinstance(_snap, dict) and isinstance(_snap.get("sha256"), str):
+                attested_policy_sha = _snap["sha256"]
         if att_err:
             pol_data = {}
             blocked.append(f"attested policy snapshot could not be trusted: {att_err}")
