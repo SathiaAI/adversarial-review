@@ -155,6 +155,76 @@ validation record at any severity — untriaged flagged findings are BLOCKED. Th
 which tiers require the rebuttal round when high/critical findings exist. A
 human-readable `verdict.md` is written alongside `verdict.json`.
 
+## Jev triage artifacts — `triage/`, `rebuttal/plan.json`, `rebuttal/digest.json`, `patch_check/round-N.json`
+
+Written by the optional `scripts/jev_triage.py` layer (`references/jev.md`). Advisory only
+— `aggregate.py` never computes PASS/FAIL/BLOCKED from these; `verdict.md` displays
+`triage/` records purely for the operator, and `rebuttal/plan.json` narrows *which* findings
+`check_rebuttal()` treats as needing contest but never whether the rebuttal round itself is
+skipped for a policy/tier that requires it.
+
+```json
+// triage/<finding-id>.json — one per finding, from `jev_triage.py triage`
+{
+  "finding_id": "security-1", "role": "security", "component": "api/invoices.py",
+  "reviewer_severity": "high", "title": "string", "release_blocking": true,
+  "jev": {"model": "typesafe/jev-1.13", "called_at": "ISO-8601", "error": "string|null",
+          "cost": 0.00003, "is_real": 0.0,
+          "severity": {"score": 0.0, "label": "low|medium|high|critical", "legend": {}},
+          "duplicate_of": {"choice": "none|<earlier-finding-id>", "confidence": 0.0,
+                            "probabilities": {}},
+          "needs_human": 0.0, "fix_is_obvious": 0.0}
+}
+```
+
+`jev.error` non-null means every `jev.*` value above it is a fail-closed default
+(`is_real`/`needs_human=1.0`, `fix_is_obvious=0.0`), not a real Jev answer — see
+*Fail-closed* in `references/jev.md`.
+
+```json
+// rebuttal/plan.json — from `jev_triage.py rebuttal-gate`; read by aggregate.py's
+// _rebuttal_jev_gate(). Absent, malformed (not an object, or required_finding_ids/
+// skipped_finding_ids not a list of strings), or not covering every real high/critical
+// finding id in this run's own panel/<role>.json reports (required ∪ skipped must be a
+// superset) is treated identically to a run that never ran rebuttal-gate.
+{
+  "generated_at": "ISO-8601", "model": "typesafe/jev-1.13|null",
+  "decisions": {"<finding-id>": {"contested": 0.0, "would_change": 0.0, "error": "string|null",
+                                  "decision": "run|skip"}},
+  "required_finding_ids": ["security-1"], "skipped_finding_ids": [],
+  "jev_cost_usd": 0.0
+}
+```
+
+```json
+// rebuttal/digest.json — same item shape as panel.high_critical_digest(), filtered to
+// required_finding_ids. Pass to `panel.py rebuttal --digest-file <path>`.
+[{"id": "security-1", "title": "string", "severity": "high|critical", "file": "path",
+  "line": 0, "evidence": "string", "scenario": "string", "author_role": "security"}]
+```
+
+```json
+// patch_check/round-N.json — one per `jev_triage.py patch-check` invocation, N auto-
+// incrementing per run directory
+{
+  "generated_at": "ISO-8601", "round": 1, "patch": "path", "patch_sha256": "hex",
+  "model": "typesafe/jev-1.13|null", "jev_cost_usd": 0.0,
+  "items": [{"slug": "security-1", "finding_ids": ["security-1"],
+             "resolved_by_patch": 0.0, "patch_introduces_new_risk": 0.0,
+             "status": "resolved (operator must confirm)|still open|still open (ambiguous -- verify by hand)",
+             "error": "string|null", "validation_sha256": "hex"}]
+}
+```
+
+`patch_sha256` is the sha256 of the patch file as read; each item's `validation_sha256` is
+the sha256 of that `validation/<slug>.json` record as it stood at check time — nothing
+reads these back automatically, they let a later comparison detect drift instead of
+trusting the round file on faith.
+
+A `resolved_by_patch ≥ 0.8` item is a **proposal**, not a closed finding — the operator
+still inspects the patch and still updates `validation/<slug>.json` by hand; nothing in
+`patch_check/` closes a finding on its own.
+
 ## Verdict — `verdict.json` (written by aggregate.py only)
 
 ```json
