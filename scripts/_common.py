@@ -4,6 +4,9 @@ import json
 import math
 import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -40,6 +43,150 @@ def write_json(path, obj):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
         f.write("\n")
+
+
+# ---------------------------------------------------------------- signing (shared)
+# Generic out-of-process signing/verification primitives, shared by aggregate.py's
+# verdict signature (`--sign`/`--verify-signature`, E6-S1) and panel.py's opportunistic
+# policy-snapshot signature at init (PR70 provenance-binding fix, Option B: sign only
+# waiver/N-A runs). Nothing here is specific to WHAT is being signed — callers pass
+# their own message/signature paths — so the identity-pinning rules (panel finding
+# security-1: never verify cosign keyless without BOTH AR_COSIGN_IDENTITY and
+# AR_COSIGN_ISSUER pinned; never let filesystem state pick the minisign key) live in
+# exactly one place for every caller, instead of drifting between two copies.
+POLICY_SIG_FILENAME = "policy.snapshot.sig"
+
+
+def sign_fail(msg):
+    """Loud, non-zero failure for the signing/verifying TOOLING path (no signer
+    configured, a malformed command template, or the external tool could not start /
+    timed out / errored). Exit 3 keeps it distinct from the verdict codes (0 PASS /
+    1 FAIL / 2 BLOCKED) and from a verify mismatch (1). Never a silent skip."""
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(3)
+
+
+def sign_timeout():
+    """Bounded subprocess timeout (seconds) for signer/verifier calls; AR_SIGN_TIMEOUT
+    overrides. A non-positive or non-numeric override falls back to the default rather
+    than crashing the gate."""
+    raw = os.environ.get("AR_SIGN_TIMEOUT", "120").strip()
+    try:
+        t = int(raw)
+    except ValueError:
+        return 120
+    return t if t > 0 else 120
+
+
+def resolve_signing_tool(env_cmd, builders):
+    """Resolve a signing/verifying command as an argv TEMPLATE carrying `{msg}`/`{sig}`
+    tokens. Precedence: an explicit env override (`env_cmd`, e.g. AR_SIGNER_CMD) wins;
+    otherwise the first auto-detected tool whose builder returns a non-None argv
+    (cosign keyless primary, minisign fallback). Returns (argv, kind) or (None, None)
+    when nothing resolves. The command is only ever executed via subprocess — nothing
+    here imports the signer."""
+    cmd = os.environ.get(env_cmd, "").strip()
+    if cmd:
+        try:
+            return shlex.split(cmd), "custom"
+        except ValueError as e:
+            sign_fail(f"{env_cmd} is not a valid command template ({e}): {cmd!r}")
+    for kind, build in builders:
+        argv = build()
+        if argv is not None:
+            return argv, kind
+    return None, None
+
+
+def cosign_sign_argv():
+    # Primary: sigstore/cosign KEYLESS. An ephemeral Fulcio certificate (from an ambient
+    # OIDC identity) plus a Rekor transparency-log entry; no long-lived private key.
+    # `--yes` suppresses the confirmation prompt; `--bundle` packs signature +
+    # certificate + log proof into ONE self-contained sidecar an outside verifier
+    # consumes with `verify-blob --bundle`.
+    if not shutil.which("cosign"):
+        return None
+    return ["cosign", "sign-blob", "--yes", "--bundle", "{sig}", "{msg}"]
+
+
+def minisign_sign_argv():
+    # Fallback: minisign (Ed25519). Requires a configured secret key (AR_MINISIGN_KEY);
+    # `-x` writes the detached signature to the given path. Use a password-less key for
+    # non-interactive runs.
+    key = os.environ.get("AR_MINISIGN_KEY", "").strip()
+    if not (shutil.which("minisign") and key):
+        return None
+    return ["minisign", "-S", "-s", key, "-m", "{msg}", "-x", "{sig}"]
+
+
+def cosign_verify_argv():
+    # Keyless verification is only meaningful against an expected signer identity +
+    # issuer: `cosign verify-blob` WITHOUT --certificate-identity/--certificate-oidc-issuer
+    # accepts ANY valid Fulcio certificate, so it must not be auto-selected as the
+    # verifier unless BOTH are set. When they are missing we return None and fall
+    # through (to minisign, or to a loud "no verifier available" naming
+    # AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER) rather than silently verifying against an
+    # unconstrained identity (panel finding security-1).
+    if not shutil.which("cosign"):
+        return None
+    ident = os.environ.get("AR_COSIGN_IDENTITY", "").strip()
+    issuer = os.environ.get("AR_COSIGN_ISSUER", "").strip()
+    if not (ident and issuer):
+        return None
+    return ["cosign", "verify-blob", "--bundle", "{sig}",
+            "--certificate-identity", ident, "--certificate-oidc-issuer", issuer, "{msg}"]
+
+
+def minisign_verify_argv():
+    # AR_MINISIGN_PUBKEY_FILE names a public-key FILE (minisign `-p`); AR_MINISIGN_PUBKEY
+    # carries an INLINE key value (minisign `-P`). They are SEPARATE vars by design:
+    # choosing `-p` vs `-P` by whether the value happens to name an existing file (an
+    # earlier os.path.exists heuristic) let an attacker who can drop a file into the
+    # verifier's working directory — named exactly the operator's PUBLIC inline key —
+    # make minisign read an attacker-chosen key file, so a verdict signed with the
+    # attacker's key would verify (panel finding security-1). Filesystem state must
+    # never select the verification key. An explicit key file wins when both are set.
+    if not shutil.which("minisign"):
+        return None
+    keyfile = os.environ.get("AR_MINISIGN_PUBKEY_FILE", "").strip()
+    if keyfile:
+        return ["minisign", "-V", "-p", keyfile, "-m", "{msg}", "-x", "{sig}"]
+    inline = os.environ.get("AR_MINISIGN_PUBKEY", "").strip()
+    if inline:
+        return ["minisign", "-V", "-P", inline, "-m", "{msg}", "-x", "{sig}"]
+    return None
+
+
+def run_signing_tool(argv_tmpl, msg_path, sig_path, *, fatal=True):
+    """Substitute `{msg}`/`{sig}` in the argv template and run the external
+    signer/verifier. Always returns (proc, error) — `proc` is the CompletedProcess on a
+    successful invocation (regardless of its exit code; a nonzero exit is the CALLER's
+    failure to interpret, not a tooling failure) and `error` is a short message when the
+    tool could not even be started or timed out.
+
+    fatal=True (the default — matches the existing opt-in aggregate.py --sign /
+    --verify-signature contract): a tooling failure calls sign_fail() (loud, exit 3)
+    and this never returns with `error` set.
+    fatal=False (a best-effort caller, e.g. panel.py's opportunistic policy-snapshot
+    signature at init): a tooling failure is returned instead of exiting, so the caller
+    can warn and continue rather than aborting a command that has nothing else to do
+    with signing."""
+    argv = [a.replace("{msg}", str(msg_path)).replace("{sig}", str(sig_path)) for a in argv_tmpl]
+    if not any("{msg}" in a for a in argv_tmpl):
+        argv.append(str(msg_path))
+    try:
+        return subprocess.run(argv, capture_output=True, timeout=sign_timeout()), None
+    except OSError as e:
+        msg = f"could not start signer/verifier {argv[0]!r}: {e}"
+        if fatal:
+            sign_fail(msg)
+        return None, msg
+    except subprocess.TimeoutExpired:
+        msg = (f"signer/verifier {argv[0]!r} timed out after {sign_timeout()}s "
+               "(set AR_SIGN_TIMEOUT to adjust)")
+        if fatal:
+            sign_fail(msg)
+        return None, msg
 
 
 def die(msg, code=1):

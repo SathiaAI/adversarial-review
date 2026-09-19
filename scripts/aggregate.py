@@ -23,19 +23,23 @@ import hashlib
 import html
 import json
 import os
-import shlex
-import shutil
-import subprocess
 import sys
 import tempfile
 from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (family_of, load_attested_policy, meta_cost, now_iso, read_json,
-                     resolve_run, resolve_waiver_clock, validate_gate_name,
-                     validate_not_applicable_gate, validate_waived_gate, write_json,
-                     _policy_bool)
+from _common import (POLICY_SIG_FILENAME, _policy_bool,
+                     cosign_sign_argv as _cosign_sign_argv,
+                     cosign_verify_argv as _cosign_verify_argv, family_of,
+                     load_attested_policy, meta_cost,
+                     minisign_sign_argv as _minisign_sign_argv,
+                     minisign_verify_argv as _minisign_verify_argv, now_iso, read_json,
+                     resolve_run, resolve_signing_tool as _resolve_tool,
+                     resolve_waiver_clock, run_signing_tool as _run_tool,
+                     sign_fail as _sign_fail, sign_timeout as _sign_timeout,
+                     validate_gate_name, validate_not_applicable_gate,
+                     validate_waived_gate, write_json)
 
 HIGH = ("critical", "high")
 
@@ -561,99 +565,15 @@ def check_digest(run):
 # state; the verdict never depends on whether a signature exists.
 SIG_FILENAME = "attestation.sig"
 
-
-def _sign_fail(msg):
-    """Loud, non-zero failure for the signing/verifying TOOLING path (no signer configured, a
-    malformed command template, or the external tool could not start / timed out / errored). Exit 3
-    keeps it distinct from the verdict codes (0 PASS / 1 FAIL / 2 BLOCKED) and from a verify mismatch
-    (1). Never a silent skip."""
-    print(f"ERROR: {msg}", file=sys.stderr)
-    sys.exit(3)
-
-
-def _sign_timeout():
-    """Bounded subprocess timeout (seconds) for signer/verifier calls; AR_SIGN_TIMEOUT overrides.
-    A non-positive or non-numeric override falls back to the default rather than crashing the gate."""
-    raw = os.environ.get("AR_SIGN_TIMEOUT", "120").strip()
-    try:
-        t = int(raw)
-    except ValueError:
-        return 120
-    return t if t > 0 else 120
-
-
-def _resolve_tool(env_cmd, builders):
-    """Resolve a signing/verifying command as an argv TEMPLATE carrying `{msg}`/`{sig}` tokens.
-    Precedence: an explicit env override (`env_cmd`, e.g. AR_SIGNER_CMD) wins; otherwise the first
-    auto-detected tool whose builder returns a non-None argv (cosign keyless primary, minisign
-    fallback). Returns (argv, kind) or (None, None) when nothing resolves. The command is only ever
-    executed via subprocess — nothing here imports the signer."""
-    cmd = os.environ.get(env_cmd, "").strip()
-    if cmd:
-        try:
-            return shlex.split(cmd), "custom"
-        except ValueError as e:
-            _sign_fail(f"{env_cmd} is not a valid command template ({e}): {cmd!r}")
-    for kind, build in builders:
-        argv = build()
-        if argv is not None:
-            return argv, kind
-    return None, None
-
-
-def _cosign_sign_argv():
-    # Primary: sigstore/cosign KEYLESS. An ephemeral Fulcio certificate (from an ambient OIDC
-    # identity) plus a Rekor transparency-log entry; no long-lived private key. `--yes` suppresses
-    # the confirmation prompt; `--bundle` packs signature + certificate + log proof into ONE
-    # self-contained sidecar an outside verifier consumes with `verify-blob --bundle`.
-    if not shutil.which("cosign"):
-        return None
-    return ["cosign", "sign-blob", "--yes", "--bundle", "{sig}", "{msg}"]
-
-
-def _minisign_sign_argv():
-    # Fallback: minisign (Ed25519). Requires a configured secret key (AR_MINISIGN_KEY); `-x` writes
-    # the detached signature to the given path. Use a password-less key for non-interactive runs.
-    key = os.environ.get("AR_MINISIGN_KEY", "").strip()
-    if not (shutil.which("minisign") and key):
-        return None
-    return ["minisign", "-S", "-s", key, "-m", "{msg}", "-x", "{sig}"]
-
-
-def _cosign_verify_argv():
-    # Keyless verification is only meaningful against an expected signer identity + issuer:
-    # `cosign verify-blob` WITHOUT --certificate-identity/--certificate-oidc-issuer accepts ANY
-    # valid Fulcio certificate, so it must not be auto-selected as the verifier unless BOTH are
-    # set. When they are missing we return None and fall through (to minisign, or to a loud
-    # "no verifier available" naming AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER) rather than silently
-    # verifying against an unconstrained identity (panel finding security-1).
-    if not shutil.which("cosign"):
-        return None
-    ident = os.environ.get("AR_COSIGN_IDENTITY", "").strip()
-    issuer = os.environ.get("AR_COSIGN_ISSUER", "").strip()
-    if not (ident and issuer):
-        return None
-    return ["cosign", "verify-blob", "--bundle", "{sig}",
-            "--certificate-identity", ident, "--certificate-oidc-issuer", issuer, "{msg}"]
-
-
-def _minisign_verify_argv():
-    # AR_MINISIGN_PUBKEY_FILE names a public-key FILE (minisign `-p`); AR_MINISIGN_PUBKEY carries an
-    # INLINE key value (minisign `-P`). They are SEPARATE vars by design: choosing `-p` vs `-P` by
-    # whether the value happens to name an existing file (an earlier os.path.exists heuristic) let an
-    # attacker who can drop a file into the verifier's working directory — named exactly the operator's
-    # PUBLIC inline key — make minisign read an attacker-chosen key file, so a verdict signed with the
-    # attacker's key would verify (panel finding security-1). Filesystem state must never select the
-    # verification key. An explicit key file wins when both are set.
-    if not shutil.which("minisign"):
-        return None
-    keyfile = os.environ.get("AR_MINISIGN_PUBKEY_FILE", "").strip()
-    if keyfile:
-        return ["minisign", "-V", "-p", keyfile, "-m", "{msg}", "-x", "{sig}"]
-    inline = os.environ.get("AR_MINISIGN_PUBKEY", "").strip()
-    if inline:
-        return ["minisign", "-V", "-P", inline, "-m", "{msg}", "-x", "{sig}"]
-    return None
+# _sign_fail, _sign_timeout, _resolve_tool, _cosign_sign_argv, _minisign_sign_argv,
+# _cosign_verify_argv, _minisign_verify_argv, and _run_tool (below) are the generic
+# out-of-process signing/verification primitives — nothing in them is specific to
+# verdict.json. They now live in _common.py (as sign_fail / sign_timeout /
+# resolve_signing_tool / cosign_sign_argv / minisign_sign_argv / cosign_verify_argv /
+# minisign_verify_argv / run_signing_tool) so panel.py's opportunistic policy-snapshot
+# signature at init (PR70 provenance-binding fix, Option B) reuses the exact same
+# identity-pinning logic instead of a second, potentially-drifting copy. Imported above
+# under their original underscore names so every call site below is unchanged.
 
 
 def _load_verdict(run):
@@ -679,23 +599,6 @@ def _canonical_verdict_bytes(verdict):
     core = {k: v for k, v in verdict.items() if k != "computed_at"}
     return json.dumps(core, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False).encode("utf-8")
-
-
-def _run_tool(argv_tmpl, msg_path, sig_path):
-    """Substitute `{msg}`/`{sig}` in the argv template and run the external tool. When the template
-    references `{msg}` the canonical verdict.json (the signed bytes) is substituted there, else it is
-    appended as the final arg.
-    Returns the completed process; exits 3 (loud) if the tool cannot even be started."""
-    argv = [a.replace("{msg}", str(msg_path)).replace("{sig}", str(sig_path)) for a in argv_tmpl]
-    if not any("{msg}" in a for a in argv_tmpl):
-        argv.append(str(msg_path))
-    try:
-        return subprocess.run(argv, capture_output=True, timeout=_sign_timeout())
-    except OSError as e:
-        _sign_fail(f"could not start signer/verifier {argv[0]!r}: {e}")
-    except subprocess.TimeoutExpired:
-        _sign_fail(f"signer/verifier {argv[0]!r} timed out after {_sign_timeout()}s "
-                   "(set AR_SIGN_TIMEOUT to adjust)")
 
 
 def sign_attestation(run):
@@ -738,7 +641,8 @@ def sign_attestation(run):
         msg = Path(td) / "verdict.canonical.json"
         msg.write_bytes(_canonical_verdict_bytes(verdict))
         sig_tmp = Path(td) / "sig.out"
-        proc = _run_tool(argv_tmpl, msg, sig_tmp)
+        proc, _err = _run_tool(argv_tmpl, msg, sig_tmp)  # fatal=True default: a tooling
+        # failure already exited via sign_fail(), so proc is never None here.
         if proc.returncode != 0:
             _sign_fail(f"signer '{kind}' exited {proc.returncode}: "
                        + (proc.stderr or b"").decode("utf-8", "replace").strip()[-500:])
@@ -798,7 +702,8 @@ def verify_signature(run):
     with tempfile.TemporaryDirectory() as td:
         msg = Path(td) / "verdict.canonical.json"
         msg.write_bytes(_canonical_verdict_bytes(verdict))
-        proc = _run_tool(argv_tmpl, msg, sigpath)
+        proc, _err = _run_tool(argv_tmpl, msg, sigpath)  # fatal=True: never returns with
+        # an error unresolved, so proc is never None here.
     if proc.returncode == 0:
         print(f"signature OK: {SIG_FILENAME} verifies the verdict.json of run "
               f"{verdict.get('run_id')} (attestation sha256 {digest}, verifier: {kind})")
@@ -810,6 +715,58 @@ def verify_signature(run):
     if err:
         print("  " + err[-500:])
     sys.exit(1)
+
+
+def _verify_policy_snapshot_signature(run, snap_p, run_id):
+    """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
+    Paul's decision, frontier-gate run pr70-provenance, 2026-09-19).
+
+    The bug: load_attested_policy() cross-checks policy.snapshot.json's own sha256
+    against run.json's policy.sha256 — but BOTH files live in the same mutable run
+    directory, so an actor with write access there can edit both together and widen
+    waiver policy (e.g. flip allow_critical_waivers to true) undetected. The frontier
+    panel also caught that the pipeline's EXISTING opt-in signature (--sign) does not
+    close this: it signs verdict.json, produced AFTER aggregation already trusted the
+    (possibly tampered) policy snapshot — the attack happens before that signature
+    exists. So this checks a DIFFERENT, EARLIER artifact: POLICY_SIG_FILENAME
+    (policy.snapshot.sig), written by panel.py at init over run_id + policy.snapshot.json
+    (see _policy_attest_bytes in panel.py) — the one moment before the run directory can
+    become attacker-writable. A later coordinated edit to policy.snapshot.json + run.json
+    cannot forge a matching signature without the signing key/identity, and a signature
+    minted for a DIFFERENT run cannot be replayed onto this one, because run_id is part
+    of what was signed (panel checklist items 2 and 12: bind to run context; test replay).
+
+    Scope: the caller only invokes this when the run contains a WAIVED or
+    NOT_APPLICABLE gate record — the common no-exception aggregation path stays
+    completely infrastructure-free, exactly as decided. Returns None when the
+    signature verifies, else a short error string for the BLOCKED reason list — this
+    never raises and never calls sys.exit; a signing-tool problem here is an ordinary
+    BLOCK reason like any other missing prerequisite, not a process abort (mirroring
+    every other check in this function)."""
+    sig_p = run / POLICY_SIG_FILENAME
+    if not sig_p.is_file():
+        return (f"no {POLICY_SIG_FILENAME} — the policy snapshot was not signed at init. "
+                "Configure a signer (AR_SIGNER_CMD, or install cosign / minisign with "
+                "AR_MINISIGN_KEY) before `panel.py init` so any run that later records a "
+                "waiver or not-applicable gate can be trusted")
+    argv_tmpl, kind = _resolve_tool(
+        "AR_VERIFIER_CMD",
+        [("cosign-keyless", _cosign_verify_argv), ("minisign", _minisign_verify_argv)])
+    if argv_tmpl is None:
+        return ("no verifier available: set AR_VERIFIER_CMD, or install cosign (with "
+                "AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned) or minisign (with "
+                "AR_MINISIGN_PUBKEY or AR_MINISIGN_PUBKEY_FILE)")
+    with tempfile.TemporaryDirectory() as td:
+        msg_tmp = Path(td) / "policy.snapshot.attest"
+        msg_tmp.write_bytes(run_id.encode("utf-8") + b"\n" + snap_p.read_bytes())
+        proc, err = _run_tool(argv_tmpl, msg_tmp, sig_p, fatal=False)
+    if err:
+        return f"verifier '{kind}' could not run: {err}"
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()[-300:]
+        detail = f" — {stderr}" if stderr else ""
+        return f"signature did not verify (verifier: {kind}, exit {proc.returncode}){detail}"
+    return None
 
 
 def author_families(finding_ids, plan):
@@ -1371,6 +1328,22 @@ def _aggregate_cli():
 
         gates, gcov = check_gates(run, meta["risk"], fail, blocked, notes, pol_data, clock)
         counts["gates"] = len(gates)
+
+        # PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only,
+        # Paul's decision): the no-exception path above stays infrastructure-free, but
+        # the moment this run recorded a WAIVED or NOT_APPLICABLE gate, the attested
+        # policy snapshot that governed it must carry a verified init-time signature —
+        # see _verify_policy_snapshot_signature for the full rationale. Gated on
+        # `snap_p.is_file() and not att_err` so this never fires for a run with no
+        # policy configured at all (waivers there are governed by strict built-in
+        # defaults, not a mutable file, so there is nothing to tamper) or one whose
+        # snapshot is already untrustworthy (already BLOCKED above by that reason).
+        if (gcov["waived"] or gcov["not_applicable"]) and snap_p.is_file() and not att_err:
+            sig_err = _verify_policy_snapshot_signature(run, snap_p, meta["run_id"])
+            if sig_err:
+                blocked.append(
+                    "run recorded a waived or not-applicable gate but its attested "
+                    f"policy snapshot is not verifiably signed: {sig_err}")
 
         plan_path = run / "panel" / "plan.json"
         plan = read_json(plan_path) if plan_path.exists() else {}

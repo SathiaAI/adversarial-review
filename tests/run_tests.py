@@ -1235,11 +1235,17 @@ def t_sign_cosign_verify_requires_identity():
     # --certificate-oidc-issuer accepts ANY valid Fulcio certificate, so _cosign_verify_argv must NOT
     # auto-select cosign unless BOTH identity and issuer are set; otherwise it returns None so verify
     # falls through to minisign / a loud "no verifier available".
+    # cosign_verify_argv now lives in _common.py (shared with panel.py's opportunistic
+    # policy-snapshot signature, PR70 provenance-binding fix) and is re-exported into
+    # aggregate.py's namespace as _cosign_verify_argv; its `shutil.which` lookup resolves
+    # against _common's module globals, so the monkeypatch targets _common.shutil, not
+    # aggregate.shutil (aggregate no longer imports shutil directly at all).
     import importlib
     import aggregate
+    import _common
     importlib.reload(aggregate)
-    orig_which = aggregate.shutil.which
-    aggregate.shutil.which = lambda name: "/usr/bin/cosign" if name == "cosign" else orig_which(name)
+    orig_which = _common.shutil.which
+    _common.shutil.which = lambda name: "/usr/bin/cosign" if name == "cosign" else orig_which(name)
     saved = {k: os.environ.get(k) for k in ("AR_COSIGN_IDENTITY", "AR_COSIGN_ISSUER")}
     try:
         for k in ("AR_COSIGN_IDENTITY", "AR_COSIGN_ISSUER"):
@@ -1251,7 +1257,7 @@ def t_sign_cosign_verify_requires_identity():
         argv = aggregate._cosign_verify_argv()
         assert argv and "--certificate-identity" in argv and "--certificate-oidc-issuer" in argv, argv
     finally:
-        aggregate.shutil.which = orig_which
+        _common.shutil.which = orig_which
         for _k, _v in saved.items():
             os.environ.pop(_k, None) if _v is None else os.environ.__setitem__(_k, _v)
 
@@ -1378,13 +1384,16 @@ def t_minisign_verify_flag_inline_vs_file():
     # Regression: an inline value that happens to equal an existing filename in CWD must STILL verify
     # with `-P`, so an attacker who plants a file named like the operator's PUBLIC inline key cannot
     # swap in an attacker-chosen verification key.
+    # See t_sign_cosign_verify_requires_identity: the shutil lookup this monkeypatches now
+    # lives in _common.py, shared with panel.py's opportunistic policy-snapshot signature.
     import importlib
     import aggregate
+    import _common
     importlib.reload(aggregate)
     _saved_pub = os.environ.get("AR_MINISIGN_PUBKEY")
     _saved_file = os.environ.get("AR_MINISIGN_PUBKEY_FILE")
-    orig_which = aggregate.shutil.which
-    aggregate.shutil.which = lambda name: "/usr/bin/minisign" if name == "minisign" else orig_which(name)
+    orig_which = _common.shutil.which
+    _common.shutil.which = lambda name: "/usr/bin/minisign" if name == "minisign" else orig_which(name)
     tmpd = Path(tempfile.mkdtemp(prefix="ar-minipub-"))
     keyfile = tmpd / "ar.pub"
     keyfile.write_text("RWQexampleexamplekey\n")
@@ -1409,9 +1418,206 @@ def t_minisign_verify_flag_inline_vs_file():
         assert argv and "-p" in argv and str(keyfile) in argv and "-P" not in argv, argv
     finally:
         os.chdir(_cwd)
-        aggregate.shutil.which = orig_which
+        _common.shutil.which = orig_which
         for _var, _saved in (("AR_MINISIGN_PUBKEY", _saved_pub), ("AR_MINISIGN_PUBKEY_FILE", _saved_file)):
             os.environ.pop(_var, None) if _saved is None else os.environ.__setitem__(_var, _saved)
+
+
+# ------------------------------------------------------ PR70 provenance-binding fix
+# (Option B / require_signing_for_exceptions_only, Paul's decision, frontier-gate run
+# pr70-provenance 2026-09-19). The bug: load_attested_policy() cross-checks
+# policy.snapshot.json's own sha256 against run.json's policy.sha256 recorded at init —
+# but both files live in the same mutable run directory, so a coordinated edit to BOTH
+# (e.g. widening allow_critical_waivers) passes that cross-check undetected. The fix
+# adds an EARLIER, independent artifact — policy.snapshot.sig, signed by panel.py at
+# init before the run directory can become attacker-writable — that aggregate.py
+# requires and verifies ONLY when the run records a WAIVED or NOT_APPLICABLE gate; a
+# clean run needs no signer configured at all.
+
+def _no_signer_env():
+    """Deterministically force 'no signer available', regardless of what happens to be
+    installed on the test host (mirrors t_sign_no_signer_fails_loudly)."""
+    empty = Path(tempfile.mkdtemp(prefix="ar-nopath-"))
+    return {**ENV, "PATH": str(empty), "AR_SIGNER_CMD": "", "AR_MINISIGN_KEY": ""}
+
+
+def _sensitive_repo_with_policy(env=None, waive=True):
+    """Like _complete_sensitive_repo, but with a REAL policy file configured, so
+    panel.py init captures (and, given a signer env, opportunistically signs)
+    policy.snapshot.json. `waive=False` gives a clean run with no exception at all."""
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
+    e = env or ENV
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo, env=e)
+    sh(["panel.py", "assign"], repo, env=e)
+    sh(["panel.py", "run", "--context-file", "context.md"], repo, env=e)
+    sh(["panel.py", "rebuttal"], repo, env=e)
+    if waive:
+        sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI for this repo yet",
+            "--waive-expires", (date.today() + timedelta(days=7)).isoformat()], repo, env=e)
+    else:
+        sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo, env=e)
+        sh(["gate.py", "record", "--name", "mutation", "--exit-code", "0", "--summary", "ok"],
+           repo, env=e)
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo, env=e)
+    return repo
+
+
+def _resolve_open_finding(run):
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+
+
+def t_policy_sig_signed_at_init_when_signer_configured():
+    # panel.py init signs policy.snapshot.json opportunistically when a signer is
+    # configured — the sidecar exists immediately, before any gate/waiver is recorded.
+    env = _stub_signer_env()
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
+    r = sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
+           repo, env=env)
+    run = latest_run(repo)
+    assert "signed:" in r.stdout and "policy.snapshot.sig" in r.stdout, r.stdout
+    sig = (run / "policy.snapshot.sig").read_bytes()
+    # signed bytes are run_id + "\n" + policy.snapshot.json (bound to this run — see
+    # panel.py's _policy_attest_bytes — so the signature cannot be replayed onto another)
+    msg = run.name.encode("utf-8") + b"\n" + (run / "policy.snapshot.json").read_bytes()
+    assert sig == b"STUBSIG-v1:" + hashlib.sha256(msg).hexdigest().encode(), sig
+
+
+def t_policy_sig_no_signer_is_a_note_not_a_failure():
+    # The common no-exception path stays infrastructure-free: with no signer configured,
+    # init still succeeds (never dies), prints a note (not an error), and a CLEAN run
+    # (no waiver, no not-applicable) still reaches PASS unsigned.
+    env = _no_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=False)
+    run = latest_run(repo)
+    assert not (run / "policy.snapshot.sig").exists()
+    assert (run / "policy.snapshot.json").exists()
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0, env=env)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
+
+
+def t_policy_sig_no_policy_at_all_is_exempt():
+    # A run with NO policy file at all is governed by strict built-in defaults, not a
+    # mutable attested artifact — there is nothing to sign, and the fix must not demand
+    # a signature that could never exist. _complete_sensitive_repo (no policy file) has
+    # a genuine WAIVED gate (mutation) and must still reach PASS unsigned.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    assert not (run / "policy.snapshot.json").exists()
+    assert not (run / "policy.snapshot.sig").exists()
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
+
+
+def t_policy_sig_missing_blocks_waiver_run():
+    # A policy IS configured, the run DOES record a waiver, but policy.snapshot.json was
+    # never signed (no signer at init) -> BLOCK, never a silent pass, even though the
+    # waiver record itself is perfectly valid and load_attested_policy sees no tamper.
+    env = _no_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.json").exists()
+    assert not (run / "policy.snapshot.sig").exists()
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=2, env=env)
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "no policy.snapshot.sig" in r.stdout, r.stdout
+
+
+def t_policy_sig_valid_signature_allows_waiver_run_to_pass():
+    # The intended happy path for Option B: signer configured at init -> waiver run
+    # verifies and reaches PASS, naming the accountable waiver exactly as before.
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.sig").exists()
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0, env=env)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
+    v = read(run / "verdict.json")
+    assert v["verdict"] == "PASS"
+    assert any(w["name"] == "mutation" for w in v["coverage"]["gates"]["waived"]), v["coverage"]
+
+
+def t_policy_sig_coordinated_two_file_tamper_still_blocks():
+    # THE core regression: an actor with write access to the run directory edits
+    # policy.snapshot.json AND run.json's policy.sha256 together (self-consistently,
+    # widening the policy — e.g. turning on allow_critical_waivers) to try to smuggle a
+    # wider waiver policy past load_attested_policy's own cross-check. Prove (a) that
+    # cross-check is genuinely fooled — this IS the PR70 bug — and (b) the NEW signature
+    # check catches it anyway, because the signature was computed over the ORIGINAL
+    # bytes and does not cover the tampered replacement.
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    # sanity: unmodified run verifies and passes
+    sh(["aggregate.py"], repo, expect=0, env=env)
+
+    widened_text = json.dumps({"max_waiver_days": 3650, "allow_critical_waivers": True})
+    widened_sha = hashlib.sha256(widened_text.encode("utf-8")).hexdigest()
+    snap = read(run / "policy.snapshot.json")
+    snap["text"] = widened_text
+    snap["sha256"] = widened_sha
+    write(run / "policy.snapshot.json", snap)
+    rj = read(run / "run.json")
+    rj["policy"]["sha256"] = widened_sha          # the SAME coordinated edit, kept consistent
+    write(run / "run.json", rj)
+
+    r = sh(["aggregate.py"], repo, expect=2, env=env)
+    # (a) load_attested_policy's own cross-check is fooled -- this is the bug being fixed
+    assert "attested policy snapshot could not be trusted" not in r.stdout, r.stdout
+    # (b) the signature check catches it anyway
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "did not verify" in r.stdout, r.stdout
+
+
+def t_policy_sig_replay_from_another_run_blocks():
+    # panel checklist item 12 (signature replay): a validly-signed policy.snapshot.sig
+    # from one run must NOT verify when copied onto a DIFFERENT run's identically-
+    # configured policy — the signature is bound to run_id (_policy_attest_bytes), not
+    # just the snapshot text, so it cannot be transplanted between runs.
+    env = _stub_signer_env()
+    repo_a = _sensitive_repo_with_policy(env=env, waive=True)
+    run_a = latest_run(repo_a)
+    repo_b = _sensitive_repo_with_policy(env=env, waive=True)
+    run_b = latest_run(repo_b)
+    _resolve_open_finding(run_b)
+    # sanity: run_b verifies fine with its OWN signature before the swap
+    sh(["aggregate.py"], repo_b, expect=0, env=env)
+    # replay: paste run_a's signature (minted for run_a's run_id) onto run_b
+    (run_b / "policy.snapshot.sig").write_bytes((run_a / "policy.snapshot.sig").read_bytes())
+    r = sh(["aggregate.py"], repo_b, expect=2, env=env)
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "did not verify" in r.stdout, r.stdout
+
+
+def t_policy_sig_verifier_unavailable_blocks_not_crashes():
+    # A waiver run WITH a valid sidecar, but no verifier configured/available at
+    # aggregate time, must BLOCK (exit 2) like any other missing prerequisite -- never
+    # crash the whole command (exit 3 is reserved for the opt-in --sign/--verify-signature
+    # standalone commands; this check runs inside ordinary `aggregate.py` and must always
+    # leave a verdict on disk).
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.sig").exists()
+    _resolve_open_finding(run)
+    no_verifier_env = {**_no_signer_env(), "AR_VERIFIER_CMD": ""}
+    r = sh(["aggregate.py"], repo, expect=2, env=no_verifier_env)
+    assert "no verifier available" in r.stdout, r.stdout
+    assert (run / "verdict.json").exists(), "a verdict must still be written"
+    v = read(run / "verdict.json")
+    assert v["verdict"] == "BLOCKED"
 
 
 def t_gate_blocked_status_yields_blocked_not_fail():

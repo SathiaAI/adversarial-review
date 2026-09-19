@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -29,9 +30,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (MAX_HIGH_SAMPLES, RUN_ROOT, VALID_REBUTTAL, VALID_RISKS, capability_of, die,
-                     family_of, load_capabilities, load_policy, merge_usage, meta_cost,
-                     now_iso, read_json, resolve_run, resolve_setting, write_json)
+from _common import (MAX_HIGH_SAMPLES, POLICY_SIG_FILENAME, RUN_ROOT, VALID_REBUTTAL,
+                     VALID_RISKS, capability_of, cosign_sign_argv, die, family_of,
+                     load_capabilities, load_policy, merge_usage, meta_cost,
+                     minisign_sign_argv, now_iso, read_json, resolve_run,
+                     resolve_setting, resolve_signing_tool, run_signing_tool, write_json)
 
 DEFAULT_BASE = "https://openrouter.ai/api/v1"
 
@@ -537,6 +540,72 @@ def validate_obj(obj, schema, path="$"):
 
 # ---------------------------------------------------------------- subcommands
 
+def _policy_attest_bytes(run_id, snap_path):
+    """The exact bytes signed/verified for the policy-snapshot signature: the run_id
+    PREPENDED to policy.snapshot.json's raw bytes. Binding to run_id (not just the
+    snapshot content) stops a signature minted for one run from being replayed onto a
+    different run's policy.snapshot.json — e.g. an old run that once legitimately
+    carried a looser policy cannot have its valid signature copied onto a new run to
+    smuggle that looser policy in (frontier-gate panel checklist items 2 and 12:
+    verify against run context; test signature replay)."""
+    return run_id.encode("utf-8") + b"\n" + Path(snap_path).read_bytes()
+
+
+def _sign_policy_snapshot_if_possible(run, run_id, snap_path):
+    """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
+    Paul's decision, frontier-gate run pr70-provenance, 2026-09-19): opportunistically
+    sign policy.snapshot.json (bound to this run's run_id) right after it is written —
+    the one moment before the run directory can become attacker-writable — so a LATER
+    coordinated edit to policy.snapshot.json + run.json's policy.sha256 (widening
+    waiver policy, e.g. flipping allow_critical_waivers) cannot produce a snapshot that
+    still verifies, and a signature from a DIFFERENT run cannot be replayed onto this
+    one.
+
+    Deliberately BEST-EFFORT and never fatal to `init`: the common no-exception
+    aggregation path must stay completely infrastructure-free, so an unconfigured or
+    misbehaving signer here is a printed note, not a die(). aggregate.py enforces this
+    signature — hard BLOCK on failure — ONLY when the run ends up recording a WAIVED or
+    NOT_APPLICABLE gate (see aggregate.py's _verify_policy_snapshot_signature); a run
+    that never waives anything never needs this signature to exist at all."""
+    note = ("this run will BLOCK at aggregate time if any gate is later waived or "
+            "marked not-applicable")
+    argv_tmpl, kind = resolve_signing_tool(
+        "AR_SIGNER_CMD", [("cosign-keyless", cosign_sign_argv), ("minisign", minisign_sign_argv)])
+    if argv_tmpl is None:
+        print(f"note: no signer configured (AR_SIGNER_CMD, or install cosign / minisign "
+              f"with AR_MINISIGN_KEY) — policy.snapshot.json is unsigned; {note}")
+        return
+    want_sig_out = any("{sig}" in a for a in argv_tmpl)
+    with tempfile.TemporaryDirectory() as td:
+        msg_tmp = Path(td) / "policy.snapshot.attest"
+        msg_tmp.write_bytes(_policy_attest_bytes(run_id, snap_path))
+        sig_tmp = Path(td) / "sig.out"
+        proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_tmp, fatal=False)
+        if err:
+            print(f"note: policy-snapshot signer '{kind}' could not run ({err}) — "
+                  f"policy.snapshot.json is unsigned; {note}")
+            return
+        if proc.returncode != 0:
+            stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()[-500:]
+            print(f"note: policy-snapshot signer '{kind}' exited {proc.returncode}: "
+                  f"{stderr} — policy.snapshot.json is unsigned; {note}")
+            return
+        if want_sig_out:
+            if not sig_tmp.exists():
+                print(f"note: policy-snapshot signer '{kind}' exited 0 but wrote no "
+                      f"signature file — policy.snapshot.json is unsigned; {note}")
+                return
+            sig = sig_tmp.read_bytes()
+        else:
+            sig = proc.stdout or b""
+    if not sig:
+        print(f"note: policy-snapshot signer '{kind}' produced an empty signature — "
+              f"policy.snapshot.json is unsigned; {note}")
+        return
+    (run / POLICY_SIG_FILENAME).write_bytes(sig)
+    print(f"signed: {run / POLICY_SIG_FILENAME} attests policy.snapshot.json (signer: {kind})")
+
+
 def cmd_init(args):
     pol = load_policy()  # malformed policy dies here — never silently ignored
     risk, risk_src = resolve_setting(args.risk, "AR_RISK", pol, "risk")
@@ -576,6 +645,7 @@ def cmd_init(args):
         write_json(run / "policy.snapshot.json", {
             "file": pol["path"].name, "sha256": pol["sha256"],
             "captured_at": now_iso(), "text": pol["text"]})
+        _sign_policy_snapshot_if_possible(run, run_id, run / "policy.snapshot.json")
     write_json(run / "run.json", {
         "run_id": run_id, "product": args.product or "", "risk": risk,
         "dev_providers": dev, "diff_ref": args.diff_ref or "",
