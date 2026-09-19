@@ -126,12 +126,16 @@ accountable, non-restricting exception: `{"gate": "mutation", "status": "WAIVED"
 `gate.py plan` wrote it — and `gate.py plan` now runs the **same** validator, so an invalid
 waiver is rejected at plan time and never produces an artifact): a named `authorized_by`, a
 `reason` (>=16 chars, not a placeholder); `expires` must be a strict `YYYY-MM-DD` strictly
-after the run's clock date (today UTC, or the date part of `GITHUB_RUN_STARTED_AT` when set
-— a set-but-unparseable value BLOCKS the run rather than guessing); and `expires` must be no
-more than `max_waiver_days` after the **run's** planning time — the `planned_at` in
-`gates/_required.json`, not the record's own, so editing only the record's `planned_at`
-cannot slide the window (a record `planned_at` in the future, or before the run's planning
-date, is rejected as tampered). `max_waiver_days` (default 14) is bounded to 1–365 at policy
+after the run's clock date — the **later** of today UTC and the date part of
+`GITHUB_RUN_STARTED_AT` when that's set (a stale/backdated run-start timestamp can never
+un-expire a waiver; a forward-dated one is still honored — a set-but-unparseable value
+BLOCKS the run rather than guessing); and `expires` must be no more than `max_waiver_days`
+after the run's planning time, anchored to the **earlier** of the record's own `planned_at`
+and the run plan's `planned_at` in `gates/_required.json` (so editing either one forward
+alone cannot slide the window — an honest run always has both equal, since `gate.py plan`
+writes them together). A `planned_at` in the future relative to the run's clock — on either
+the record or the manifest — is rejected as tampered; there is no lower bound requiring the
+record's `planned_at` to be no earlier than the manifest's. `max_waiver_days` (default 14) is bounded to 1–365 at policy
 load, and the limits (`max_waiver_days`, `allow_critical_waivers`) are read from the policy
 **attested at init** (`policy.snapshot.json`), never a post-init working-tree edit. On
 CRITICAL tier, waiving (or marking NOT_APPLICABLE)

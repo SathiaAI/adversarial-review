@@ -34,7 +34,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (family_of, load_attested_policy, meta_cost, now_iso, read_json,
                      resolve_run, resolve_waiver_clock, validate_gate_name,
-                     validate_not_applicable_gate, validate_waived_gate, write_json)
+                     validate_not_applicable_gate, validate_waived_gate, write_json,
+                     _policy_bool)
 
 HIGH = ("critical", "high")
 
@@ -1134,13 +1135,16 @@ def _snippet(s, n=80):
     return html.escape(s, quote=False)
 
 
-def next_steps(verdict, fail, blocked, gcov, fcov, counts, risk=None):
+def next_steps(verdict, fail, blocked, gcov, fcov, counts, risk=None, allow_critical_waivers=False):
     """Plain-language 'what this means and what to do next', for someone who did not write
     the pipeline. DERIVED ONLY from the already-computed verdict and coverage — it reads
     them and never writes them, so it cannot change a gate, threshold, or verdict. Coverage
     shapes are normalized defensively so malformed/None input degrades rather than crashing
     (the verdict file must still be written), and every fail/blocked reason not rephrased as
-    a specific gate line is passed through verbatim (one-lined) so a blocker is never hidden."""
+    a specific gate line is passed through verbatim (one-lined) so a blocker is never hidden.
+    `allow_critical_waivers` mirrors the SAME attested-policy flag _common.py's
+    _validate_gate_exception_common() enforces — it must never be sourced from anywhere
+    else, or this guidance could recommend an action the gate will actually reject."""
     fail = [r for r in (fail or []) if isinstance(r, str)]
     blocked = [r for r in (blocked or []) if isinstance(r, str)]
     # Normalize by TYPE, not truthiness: a truthy-but-wrong-typed shape (gcov a list, or a
@@ -1210,11 +1214,19 @@ def next_steps(verdict, fail, blocked, gcov, fcov, counts, risk=None):
             continue
         proves = GATE_HELP.get(g, ("a required check", ""))[0]
         if risk == "CRITICAL" and g == "mutation":
-            # N/A (and waiving) is forbidden for mutation on CRITICAL — don't recommend an
-            # action the gate will reject; it must actually run and pass.
+            # N/A (and waiving) is forbidden for mutation on CRITICAL regardless of policy —
+            # don't recommend an action the gate will reject; it must actually run and pass.
             steps.append(f"The 'mutation' check could not be verified. Passing it proves {proves}. On "
                          "CRITICAL tier it must actually run and pass — it cannot be waived or marked "
                          "not-applicable — before release.")
+        elif risk == "CRITICAL" and not allow_critical_waivers:
+            # Every OTHER gate on CRITICAL is waivable/N-A-able only when policy opts in
+            # (allow_critical_waivers: true); the default is false, so by default the gate
+            # will reject a NOT_APPLICABLE record here too — the guidance must not suggest it.
+            steps.append(f"The '{_oneline(g)}' check could not be verified. Passing it proves {proves}. On "
+                         "CRITICAL tier, with this policy, it must actually run and pass — waiving or "
+                         "marking it not-applicable requires policy allow_critical_waivers: true "
+                         "(currently not set) before release.")
         else:
             steps.append(f"The '{_oneline(g)}' check could not be verified. Passing it proves {proves}. It must "
                          "run and pass (or be recorded as not-applicable, with a reason) before release.")
@@ -1408,8 +1420,12 @@ def _aggregate_cli():
 
         verdict = "FAIL" if fail else ("BLOCKED" if blocked else "PASS")
         # Plain-language next steps are derived from the verdict + coverage above; they are
-        # read-only over that state and cannot change it (guidance, not gate).
-        steps = next_steps(verdict, fail, blocked, gcov, fcov, counts, risk=meta["risk"])
+        # read-only over that state and cannot change it (guidance, not gate). The
+        # allow_critical_waivers flag comes from the SAME attested pol_data the gates
+        # themselves were just checked against (never the mutable working-tree policy),
+        # so the guidance can never suggest an action the gate above it already rejected.
+        steps = next_steps(verdict, fail, blocked, gcov, fcov, counts, risk=meta["risk"],
+                           allow_critical_waivers=_policy_bool(pol_data.get("allow_critical_waivers")) or False)
         # Tamper-evident attestation over every recorded input, computed before the
         # verdict file exists so re-aggregating an untouched run reproduces it (#5).
         attestation = compute_attestation(run)

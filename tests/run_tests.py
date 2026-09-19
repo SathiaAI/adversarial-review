@@ -11247,6 +11247,37 @@ def t_next_steps_critical_mutation_not_na_guidance():
     assert "cannot be waived or marked not-applicable" in blob, blob
 
 
+def t_next_steps_critical_gate_na_blocked_without_policy_opt_in():
+    # Round-7 P2 follow-up: for a missing NON-mutation gate on CRITICAL under the default
+    # policy (no allow_critical_waivers), the guidance previously always offered "recorded
+    # as not-applicable" — but _validate_gate_exception_common() rejects NOT_APPLICABLE for
+    # ANY CRITICAL gate (not just mutation) unless policy allow_critical_waivers is true, so
+    # the guidance must not recommend an action the gate itself will reject.
+    repo = _min_repo("CRITICAL")
+    run = latest_run(repo)
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo)
+    for g in ["build", "unit", "secrets", "deps", "mutation"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    sh(["aggregate.py"], repo, expect=2)
+    steps = read(run / "verdict.json")["next_steps"]
+    sast_line = next(s for s in steps if "'sast'" in s)
+    assert "allow_critical_waivers: true" in sast_line and "currently not set" in sast_line, sast_line
+    assert "recorded as not-applicable" not in sast_line, sast_line
+
+
+def t_next_steps_critical_gate_na_allowed_when_policy_opts_in():
+    # Same missing-gate shape as above, but with allow_critical_waivers=True (mirroring an
+    # attested policy that opts in) — the guidance reverts to the generic N/A-allowed
+    # wording, since the gate itself would accept a NOT_APPLICABLE record under this policy.
+    import aggregate
+    gcov = {"failed": [], "blocked": [], "missing": ["sast"]}
+    steps = aggregate.next_steps("BLOCKED", [], ["gate plan missing"], gcov, {}, {},
+                                 risk="CRITICAL", allow_critical_waivers=True)
+    sast_line = next(s for s in steps if "'sast'" in s)
+    assert "recorded as not-applicable, with a reason) before release" in sast_line, sast_line
+    assert "allow_critical_waivers" not in sast_line, sast_line
+
+
 def t_load_attested_policy_fails_closed_on_unreadable_runjson():
     # Unreadable/corrupt provenance must fail closed, never be treated as 'no policy at init'
     # (which would silently widen a waiver to the default cap).
