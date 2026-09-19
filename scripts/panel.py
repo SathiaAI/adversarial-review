@@ -1108,6 +1108,37 @@ def cmd_rebuttal(args):
                 isinstance(d, dict) and "id" in d and "author_role" in d for d in digest):
             die(f"--digest-file must be a JSON list of finding digest items (each an "
                 f"object with 'id' and 'author_role'), got: {digest_file}", 2)
+        # Never trust the FILE's content -- only use it to select which findings to
+        # contest. Cross-check every entry against this run's own current high/critical
+        # digest, freshly recomputed from panel/<role>.json (never from the file), and use
+        # the real content in every case. This closes both directions of staleness: a
+        # digest-file naming a finding id that isn't (or is no longer) a real high/critical
+        # finding, and one whose title/evidence/etc. has drifted from what the panel
+        # actually reported (a stale copy from an earlier round, or a hand/tool edit) —
+        # either dies loudly rather than silently contesting a fabricated finding or
+        # substituting altered content into the rebuttal round.
+        real_by_id = {d["id"]: d for d in high_critical_digest(run, plan)}
+        content_keys = ("id", "title", "severity", "file", "line", "evidence", "scenario",
+                        "author_role")
+        seen_ids, verified = set(), []
+        for item in digest:
+            fid = item.get("id")
+            if fid in seen_ids:
+                die(f"--digest-file lists finding id {fid!r} more than once", 2)
+            seen_ids.add(fid)
+            real = real_by_id.get(fid)
+            if real is None:
+                die(f"--digest-file references finding id {fid!r}, which is not a "
+                    f"current high/critical finding in this run's panel reports — "
+                    f"stale or fabricated digest file (re-run `jev_triage.py "
+                    f"rebuttal-gate` or `panel.py rebuttal` without --digest-file)", 2)
+            if any(item.get(k) != real.get(k) for k in content_keys):
+                die(f"--digest-file entry for {fid!r} does not match this run's current "
+                    f"panel/{real['author_role']}.json content — stale or tampered "
+                    f"digest file (re-run `jev_triage.py rebuttal-gate` or `panel.py "
+                    f"rebuttal` without --digest-file)", 2)
+            verified.append(real)
+        digest = verified
     else:
         digest = high_critical_digest(run, plan)
     if not digest:

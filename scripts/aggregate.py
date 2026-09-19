@@ -167,8 +167,22 @@ def collect_jev_priors(run, reports):
                 rec = read_json(p)
             except (OSError, ValueError):
                 continue
-            if isinstance(rec, dict) and isinstance(rec.get("jev"), dict):
-                out[fid] = rec
+            if not (isinstance(rec, dict) and isinstance(rec.get("jev"), dict)):
+                continue
+            jv = rec["jev"]
+            # A triage/<id>.json file is on-disk data, not this process's own recent
+            # output (it could be from an older schema, hand-edited, or corrupted) -- the
+            # verdict.md renderer below indexes into severity/duplicate_of as dicts, so
+            # validate that shape here rather than let a malformed field crash aggregate.py
+            # entirely (this function's own contract is "malformed records are simply
+            # absent from the result").
+            if jv.get("severity") is not None and not isinstance(jv["severity"], dict):
+                continue
+            if jv.get("duplicate_of") is not None and not isinstance(jv["duplicate_of"], dict):
+                continue
+            if jv.get("is_real") is not None and not isinstance(jv["is_real"], (int, float)):
+                continue
+            out[fid] = rec
     return out
 
 
@@ -179,15 +193,26 @@ REBUTTAL_SCOPE = {
 }
 
 
-def _rebuttal_jev_gate(run):
+def _rebuttal_jev_gate(run, reports):
     """The recorded decision from `jev_triage.py rebuttal-gate` (rebuttal/plan.json), if
-    present and well-formed -- else None, which means "fall back to the pre-Jev blanket
-    rule" exactly (see check_rebuttal). Jev's own numbers never reach here: this reads
-    only the CLI-recorded 'required_finding_ids'/'skipped_finding_ids' lists, and that
-    recording is itself fail-closed (any Jev error -> the finding lands in
-    required_finding_ids) — so a malformed or tampered file can only ever make MORE
-    rebuttal required, never less, once it fails this shape check and is treated as
-    absent."""
+    present, well-formed, AND covering every real high/critical finding in this run's own
+    panel reports -- else None, which means "fall back to the pre-Jev blanket rule"
+    exactly (see check_rebuttal). Jev's own numbers never reach here: this reads only the
+    CLI-recorded 'required_finding_ids'/'skipped_finding_ids' lists, and that recording is
+    itself fail-closed (any Jev error -> the finding lands in required_finding_ids) — so a
+    malformed or tampered file can only ever make MORE rebuttal required, never less, once
+    it fails validation and is treated as absent.
+
+    The coverage check closes a real bypass: `required_finding_ids=[]` alone passes the
+    shape check above regardless of whether it reflects anything Jev actually decided --
+    without cross-checking against the run's OWN real high/critical finding ids, a
+    fabricated or stale rebuttal/plan.json claiming "nothing needs contest" would suppress
+    a required rebuttal round entirely, with no Jev call ever having evaluated the
+    findings it silently waves through. Requiring every real high/critical id to appear in
+    required_finding_ids or skipped_finding_ids (a plain coverage check, no signature or
+    hash needed -- the file already has to name every finding to "win" either way) closes
+    that: an incomplete or fabricated list simply fails validation and falls back to the
+    blanket rule, same as a malformed one always has."""
     path = run / "rebuttal" / "plan.json"
     if not path.exists():
         return None
@@ -201,8 +226,14 @@ def _rebuttal_jev_gate(run):
     if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
         return None
     skipped = g.get("skipped_finding_ids")
-    if not isinstance(skipped, list):
+    if not isinstance(skipped, list) or not all(isinstance(x, str) for x in skipped):
         skipped = []
+    real_hc_ids = {f["id"] for rep in reports.values()
+                   for f in (rep.get("findings") or []) if isinstance(f, dict)
+                   and f.get("severity") in HIGH and isinstance(f.get("id"), str)}
+    covered = set(ids) | set(skipped)
+    if not real_hc_ids <= covered:
+        return None  # gate doesn't account for every real high/critical finding -- absent
     return {"required_finding_ids": ids, "skipped_finding_ids": skipped}
 
 
@@ -222,7 +253,7 @@ def check_rebuttal(run, meta, plan, reports, blocked, notes):
     scope = REBUTTAL_SCOPE.get(policy, REBUTTAL_SCOPE["contention"])
     any_high_critical = any(f["severity"] in HIGH
                             for rep in reports.values() for f in rep.get("findings", []))
-    gate = _rebuttal_jev_gate(run)
+    gate = _rebuttal_jev_gate(run, reports)
     contested = bool(gate["required_finding_ids"]) if gate is not None else any_high_critical
     required = meta["risk"] in scope and contested
     ran = bool(plan.get("roles")) and all(
@@ -1363,8 +1394,10 @@ def _aggregate_cli():
             md += ["", f"## Jev triage priors ({len(jev_priors)}/{counts.get('findings_high_critical', 0) + counts.get('findings_medium_low', 0)} finding(s) triaged)", ""]
             for fid in sorted(jev_priors):
                 jv = jev_priors[fid]["jev"]
-                sev = (jv.get("severity") or {}).get("label")
-                dup = (jv.get("duplicate_of") or {}).get("choice")
+                sev_obj = jv.get("severity")
+                dup_obj = jv.get("duplicate_of")
+                sev = sev_obj.get("label") if isinstance(sev_obj, dict) else None
+                dup = dup_obj.get("choice") if isinstance(dup_obj, dict) else None
                 bits = [f"is_real={jv.get('is_real'):.2f}" if isinstance(jv.get("is_real"), (int, float)) else "is_real=?"]
                 if sev:
                     bits.append(f"jev_severity={sev}")

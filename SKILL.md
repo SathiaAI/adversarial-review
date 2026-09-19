@@ -184,13 +184,14 @@ downstream is identical. See `references/config.md` for privacy limits of this p
 python <skill>/scripts/jev_triage.py triage --context-file context.md
 ```
 
-If a Jev key is configured (`references/jev.md`; same credentials as the panel), one fast
-cheap call per finding prioritizes Step 4's worklist — high/critical findings Jev thinks
-are real first, possible duplicates grouped, candidate false positives flagged last —
-without deciding anything. `aggregate.py` never reads Jev's numbers to compute the verdict;
-`verdict.md` only displays them next to each finding for your reference. Skip this command
-entirely and go straight to Step 4 by hand if no Jev key is configured — nothing else in
-the pipeline depends on it.
+If Jev is available (`references/jev.md` — `AR_JEV_API_KEY` for a dedicated key, or it
+falls back to the panel's own key when their endpoints share a host; `AR_JEV_DISABLE=1` to
+turn it off outright), one fast cheap call per finding prioritizes Step 4's worklist —
+high/critical findings Jev thinks are real first, possible duplicates grouped, candidate
+false positives flagged last — without deciding anything. `aggregate.py` never reads Jev's
+numbers to compute the verdict; `verdict.md` only displays them next to each finding for
+your reference. Skip this command entirely and go straight to Step 4 by hand if Jev isn't
+available — nothing else in the pipeline depends on it.
 
 **Rebuttal round — when high/critical findings exist:**
 

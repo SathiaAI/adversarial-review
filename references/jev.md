@@ -33,9 +33,42 @@ Three independent guarantees make this true regardless of what Jev says:
    `patch-check` (so the finding stays open and is flagged risky). A broken or unreachable
    Jev degrades every command to "do the old, more thorough thing" — never to a silent pass.
 
-Jev has no MCP/keyless transport (unlike the reviewer panel's `prepare`/`ingest` path — see
-`references/config.md`). With no key configured, all three commands refuse outright rather
-than run a partial triage: `require_jev_key()` exits 2 before any Jev call or file write.
+## Credentials — independently configurable, and fully optional
+
+adversarial-review is a portable OSS skill, not built only around one operator's
+OpenRouter account — not every adopter has (or wants) an OpenRouter key, so Jev's
+credentials are resolved independently of the reviewer panel's, with three tiers
+(`jev_available()`/`_jev_credentials()` in `jev_triage.py`):
+
+1. **`AR_JEV_API_KEY`** (or **`AR_JEV_KEY_FILE`**, read the same way `AR_KEY_FILE` is for
+   the panel) — a dedicated Jev key, valid against whatever `AR_JEV_BASE_URL` /
+   `AR_JEV_ENDPOINT` points at.
+2. **No dedicated key**: fall back to the reviewer panel's own key
+   (`panel.api_config()`) — but **only** when Jev's resolved endpoint is the **same host**
+   the panel itself is configured against (`AR_BASE_URL`). A key an operator configured
+   for one host (default OpenRouter, or a private/self-hosted proxy) is never silently
+   forwarded to a different host just because Jev's own base URL happens to differ or was
+   left at its default. When this tier is used, a one-line notice is printed to stderr
+   (once per process) so it's never silent.
+3. **Neither applies** (including `AR_JEV_DISABLE=1`, an explicit off switch): Jev is
+   simply **unavailable** — this is not an error. Every command here refuses cleanly
+   (`require_jev_key()` exits 2, no partial triage, no Jev call, no file write), and
+   nothing else in the pipeline requires Jev at all — `SKILL.md` documents Jev triage as
+   optional, skippable by going straight to Step 4 by hand.
+
+`jev_available()` is the mandatory, side-effect-free (no network) preflight: it returns
+`{"available": bool, "mode": "dedicated"|"panel_fallback"|"disabled"|"unavailable",
+"reason": str|None}` and never carries a key, so it's safe to call, print, or log before
+deciding whether to run any Jev command at all.
+
+**Endpoint.** `AR_JEV_BASE_URL` (default OpenRouter, `https://openrouter.ai/api`) selects
+the endpoint by the same base+`/alpha/decisions`-path convention the credential tiers
+above assume. `AR_JEV_ENDPOINT` is a full-URL override for a decisions-capable relay that
+doesn't follow that convention — for example TypeSafe's own direct API
+(`https://api.typesafe.ai/v1/systemone`, `docs.typesafe.ai/api`), a separate product from
+OpenRouter's beta integration of Jev, with its own (currently waitlisted, batch-issued, no
+published free tier) signup — set both `AR_JEV_API_KEY` and `AR_JEV_ENDPOINT` to use it;
+`AR_JEV_BASE_URL` is ignored whenever `AR_JEV_ENDPOINT` is set.
 
 State sent to Jev is capped at roughly 25k tokens (approximated in characters, at a
 deliberately low chars-per-token estimate so the char cap stays conservative even when the
@@ -126,17 +159,36 @@ as before.
 **This is the piece `aggregate.py`'s `check_rebuttal()` actually reads** (via
 `_rebuttal_jev_gate()`, which loads `rebuttal/plan.json` and validates its shape):
 
-- No `rebuttal/plan.json`, or one that isn't a well-formed object with a list-of-strings
-  `required_finding_ids` → **treated as absent** → `check_rebuttal()` falls back to the
-  pre-Jev rule (rebuttal required whenever *any* high/critical finding exists) — byte-
+- No `rebuttal/plan.json`, one that isn't a well-formed object with list-of-strings
+  `required_finding_ids`/`skipped_finding_ids`, **or one whose `required_finding_ids` ∪
+  `skipped_finding_ids` doesn't name every real high/critical finding id in this run's own
+  `panel/<role>.json` reports** → **treated as absent** → `check_rebuttal()` falls back to
+  the pre-Jev rule (rebuttal required whenever *any* high/critical finding exists) — byte-
   identical behavior to a run that never used Jev triage at all.
-- A present, well-formed `rebuttal/plan.json` → rebuttal is required only when
-  `required_finding_ids` is non-empty.
+- A present, well-formed, fully-covering `rebuttal/plan.json` → rebuttal is required only
+  when `required_finding_ids` is non-empty.
 
-Because a malformed or missing gate file falls back to the *strictly more demanding*
-blanket rule, and because `rebuttal-gate` itself only ever adds findings to
-`required_finding_ids` on error, a corrupted or adversarial gate file can only ever require
-**more** verification, never less.
+The coverage check closes a real bypass: `required_finding_ids=[]` alone used to satisfy
+the shape check regardless of whether it reflected anything Jev actually decided — a
+fabricated or stale `rebuttal/plan.json` claiming "nothing needs contest" could otherwise
+suppress a required rebuttal round entirely, with no Jev call ever having evaluated the
+findings it silently waived. Requiring every real high/critical id to appear in one of the
+two lists closes that without any signature or hash — the file already has to name every
+finding to "win" either way. Because a malformed, missing, or incomplete gate file falls
+back to the *strictly more demanding* blanket rule, and because `rebuttal-gate` itself only
+ever adds findings to `required_finding_ids` on error, a corrupted or adversarial gate file
+can only ever require **more** verification, never less.
+
+**`panel.py rebuttal --digest-file` never trusts the file's content, only its selection.**
+Every entry is cross-checked against this run's own current `panel.high_critical_digest()`
+(freshly recomputed from `panel/<role>.json`, not from the file): an id that isn't a real
+current high/critical finding, a duplicate id, or an entry whose `title`/`severity`/`file`/
+`line`/`evidence`/`scenario`/`author_role` doesn't match the real finding's own content
+dies loudly (`--digest-file references finding id ... not a current high/critical
+finding`, or `... does not match this run's current panel/<role>.json content`) rather than
+silently contesting a fabricated finding or substituting altered content into the rebuttal
+round. A legitimate `rebuttal/digest.json` — the one `rebuttal-gate` itself writes — is
+always a straight subset of the real digest, so this never rejects normal use.
 
 If there are no high/critical findings at all, `rebuttal-gate` writes an empty plan/digest
 and makes no Jev calls — nothing to gate.
@@ -152,16 +204,25 @@ against that record's `evidence`/`resolution`. Jev answers:
 - **`patch_introduces_new_risk`** (noul) — this patch introduces a new defect/risk not
   present before.
 
-Writes `patch_check/round-N.json` (`N` auto-increments per run directory):
+Writes `patch_check/round-N.json` (`N` auto-increments per run directory), bound to the
+exact bytes checked: `patch_sha256` is the sha256 of the patch file as read, and each
+item's `validation_sha256` is the sha256 of that `validation/<slug>.json` record as it
+stood at check time. Nothing in the pipeline reads these back automatically today
+(`patch_check/` is informational, read by a human/Claude, same as `triage/` and
+`rebuttal/plan.json`) — but they let a later "does this round still describe the patch I'm
+about to apply / the validation record as it stands now" question be answered by
+recomputing and comparing, instead of trusting the round file on faith:
 
 ```json
 {
-  "generated_at": "ISO-8601", "round": 1, "patch": "fix.diff", "model": "typesafe/jev-1.13",
+  "generated_at": "ISO-8601", "round": 1, "patch": "fix.diff",
+  "patch_sha256": "…", "model": "typesafe/jev-1.13",
   "jev_cost_usd": 0.00003,
   "items": [
     {"slug": "security-1", "finding_ids": ["security-1"],
      "resolved_by_patch": 0.91, "patch_introduces_new_risk": 0.1,
-     "status": "resolved (Claude must confirm)", "error": null}
+     "status": "resolved (Claude must confirm)", "error": null,
+     "validation_sha256": "…"}
   ]
 }
 ```
@@ -214,3 +275,14 @@ fails **closed**.
   a fraction of a cent. This is separate from, and far smaller than, the reviewer panel's
   cost cap (`AR_MAX_COST_USD`, `references/config.md`) — Jev calls are not currently metered
   against that cap.
+- **Privacy/ZDR parity with the reviewer panel.** Every Jev call for a SENSITIVE/CRITICAL
+  run sends the same `provider` data-handling preferences (`data_collection: deny`, plus
+  `zdr: true` for CRITICAL) the reviewer panel sends for its own calls
+  (`panel.privacy_provider_prefs`) — the run's risk tier is never a lower-privacy path just
+  because it went through Jev instead of the panel.
+- **Finding ids are sanitized before touching the filesystem.** A finding's `id` comes from
+  reviewer-model output, not trusted input, and `triage` writes one file per finding named
+  after it — `_safe_finding_id()` rejects anything outside a conservative charset, any
+  reserved name (`_summary`), and any id already used this run, falling back to a
+  disambiguated `<role>-unnamed-N` name instead. The finding's own record still stores the
+  literal, unsanitized id in `finding_id` — only the filename is constrained.

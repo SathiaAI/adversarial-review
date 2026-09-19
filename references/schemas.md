@@ -183,8 +183,10 @@ skipped for a policy/tier that requires it.
 
 ```json
 // rebuttal/plan.json — from `jev_triage.py rebuttal-gate`; read by aggregate.py's
-// _rebuttal_jev_gate(). Absent or malformed (not an object, or required_finding_ids not a
-// list of strings) is treated identically to a run that never ran rebuttal-gate.
+// _rebuttal_jev_gate(). Absent, malformed (not an object, or required_finding_ids/
+// skipped_finding_ids not a list of strings), or not covering every real high/critical
+// finding id in this run's own panel/<role>.json reports (required ∪ skipped must be a
+// superset) is treated identically to a run that never ran rebuttal-gate.
 {
   "generated_at": "ISO-8601", "model": "typesafe/jev-1.13|null",
   "decisions": {"<finding-id>": {"contested": 0.0, "would_change": 0.0, "error": "string|null",
@@ -205,14 +207,19 @@ skipped for a policy/tier that requires it.
 // patch_check/round-N.json — one per `jev_triage.py patch-check` invocation, N auto-
 // incrementing per run directory
 {
-  "generated_at": "ISO-8601", "round": 1, "patch": "path", "model": "typesafe/jev-1.13|null",
-  "jev_cost_usd": 0.0,
+  "generated_at": "ISO-8601", "round": 1, "patch": "path", "patch_sha256": "hex",
+  "model": "typesafe/jev-1.13|null", "jev_cost_usd": 0.0,
   "items": [{"slug": "security-1", "finding_ids": ["security-1"],
              "resolved_by_patch": 0.0, "patch_introduces_new_risk": 0.0,
              "status": "resolved (Claude must confirm)|still open|still open (ambiguous -- verify by hand)",
-             "error": "string|null"}]
+             "error": "string|null", "validation_sha256": "hex"}]
 }
 ```
+
+`patch_sha256` is the sha256 of the patch file as read; each item's `validation_sha256` is
+the sha256 of that `validation/<slug>.json` record as it stood at check time — nothing
+reads these back automatically, they let a later comparison detect drift instead of
+trusting the round file on faith.
 
 A `resolved_by_patch ≥ 0.8` item is a **proposal**, not a closed finding — the operator
 still inspects the patch and still updates `validation/<slug>.json` by hand; nothing in
