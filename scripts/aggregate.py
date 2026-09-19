@@ -23,6 +23,7 @@ import hashlib
 import html
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -143,12 +144,25 @@ def check_panel(run, meta, plan, reports, blocked):
     return pcov
 
 
+# A finding id is reviewer-model output, not trusted input. jev_triage.py's own
+# _safe_finding_id() only ever writes triage/<id>.json under this exact charset
+# (rejecting path separators, "..", and the reserved "_summary" name) -- this MUST
+# stay identical to jev_triage.py's _SAFE_FID_RE, or a legitimate id could be
+# silently skipped here, or (if ever loosened) a traversal-shaped id could read a
+# file outside triage/.
+_SAFE_TRIAGE_FID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_RESERVED_TRIAGE_NAME = "_summary"
+
+
 def collect_jev_priors(run, reports):
     """{finding_id: triage-record} for every finding with a recorded
     triage/<finding-id>.json (`jev_triage.py triage` ran for this run). Missing or
     malformed records are simply absent from the result — this is display-only for
     verdict.md; it never feeds fail/blocked/notes, so a bad or absent triage record
-    changes nothing about the computed verdict."""
+    changes nothing about the computed verdict. An id outside jev_triage.py's own
+    safe charset (or the reserved _summary name) is skipped, never used as a path —
+    jev_triage.py would have written such a finding's record under a fallback
+    filename, never under the untrusted id itself."""
     tdir = run / "triage"
     out = {}
     if not tdir.is_dir():
@@ -158,7 +172,9 @@ def collect_jev_priors(run, reports):
             if not isinstance(f, dict):
                 continue
             fid = f.get("id")
-            if not isinstance(fid, str) or not fid or fid in out:
+            if (not isinstance(fid, str) or not fid or fid in out
+                    or not _SAFE_TRIAGE_FID_RE.match(fid)
+                    or fid == _RESERVED_TRIAGE_NAME):
                 continue
             p = tdir / f"{fid}.json"
             if not p.exists():
@@ -1405,7 +1421,7 @@ def _aggregate_cli():
                     bits.append(f"duplicate_of={dup}")
                 if jv.get("error"):
                     bits.append("jev_error")
-                md.append(f"- `{fid}`: " + ", ".join(bits))
+                md.append(f"- `{_snippet(fid)}`: " + ", ".join(bits))
         md += ["", f"Attestation: sha256 {attestation['digest']} over "
                f"{attestation['inputs']} recorded artifacts "
                "(verify with `aggregate.py --check-digest`)"]

@@ -1103,11 +1103,15 @@ def cmd_rebuttal(args):
         # high/critical digest this command would otherwise build itself — reduces the
         # noise a rebuttal round contests without touching who may contest or how a
         # dispute is settled (Step 4 reproduction, never Jev, never majority vote).
-        digest = read_json(digest_file)
+        try:
+            digest = read_json(digest_file)
+        except (OSError, ValueError) as e:
+            die(f"--digest-file could not be read as JSON ({e}): {digest_file}", 2)
         if not isinstance(digest, list) or not all(
-                isinstance(d, dict) and "id" in d and "author_role" in d for d in digest):
+                isinstance(d, dict) and isinstance(d.get("id"), str)
+                and isinstance(d.get("author_role"), str) for d in digest):
             die(f"--digest-file must be a JSON list of finding digest items (each an "
-                f"object with 'id' and 'author_role'), got: {digest_file}", 2)
+                f"object with string 'id' and 'author_role'), got: {digest_file}", 2)
         # Never trust the FILE's content -- only use it to select which findings to
         # contest. Cross-check every entry against this run's own current high/critical
         # digest, freshly recomputed from panel/<role>.json (never from the file), and use

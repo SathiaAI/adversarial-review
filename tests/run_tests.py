@@ -11023,6 +11023,37 @@ def t_panel_rebuttal_digest_file_malformed_dies():
     assert "--digest-file must be" in r.stderr
 
 
+def t_panel_rebuttal_digest_file_unhashable_id_dies():
+    # Codex + CodeRabbit (round 3): an id of the wrong type, such as a list, is not
+    # rejected by the old "'id' in d" shape check -- it then reaches `fid in seen_ids`
+    # and raises an uncaught TypeError (exit 1) instead of the documented die(..., 2).
+    repo, run = _panel_with_finding()
+    bad = run / "unhashable-id-digest.json"
+    write(bad, [{"id": [], "title": "t", "severity": "high", "file": "x", "line": 1,
+                 "evidence": "e", "scenario": "s", "author_role": "security"}])
+    r = sh(["panel.py", "rebuttal", "--digest-file", str(bad)], repo, expect=2)
+    assert "--digest-file must be" in r.stderr and "string" in r.stderr
+
+
+def t_panel_rebuttal_digest_file_missing_path_dies():
+    # Codex + CodeRabbit (round 3): a nonexistent --digest-file previously let
+    # read_json's FileNotFoundError escape as an uncaught traceback (exit 1).
+    repo, run = _panel_with_finding()
+    missing = run / "does-not-exist.json"
+    r = sh(["panel.py", "rebuttal", "--digest-file", str(missing)], repo, expect=2)
+    assert "could not be read as JSON" in r.stderr
+
+
+def t_panel_rebuttal_digest_file_invalid_json_syntax_dies():
+    # Same fix, the JSONDecodeError (a ValueError subclass) side: malformed JSON text
+    # must die(..., 2), not raise past cmd_rebuttal.
+    repo, run = _panel_with_finding()
+    bad = run / "syntax-error-digest.json"
+    bad.write_text("this is not json {", encoding="utf-8")
+    r = sh(["panel.py", "rebuttal", "--digest-file", str(bad)], repo, expect=2)
+    assert "could not be read as JSON" in r.stderr
+
+
 def t_panel_rebuttal_digest_file_subset_runs_normally():
     import panel as panel_mod
     repo, run = _panel_with_finding()
@@ -11168,6 +11199,27 @@ def t_verdict_md_omits_jev_section_when_no_triage_ran():
     sh(["aggregate.py"], repo, expect=0)
     md = (run / "verdict.md").read_text()
     assert "## Jev triage priors" not in md
+
+
+def t_collect_jev_priors_rejects_unsafe_finding_id():
+    # Finding ids are reviewer-model output, not trusted input (Codex + CodeRabbit,
+    # round 3). A traversal-shaped or reserved id must never reach a path under
+    # triage/ -- jev_triage.py's own _safe_finding_id() never writes one there, so a
+    # reader that trusted it anyway could load (and render in verdict.md) an
+    # arbitrary file such an id points at, or collide with triage/_summary.json.
+    import aggregate
+    run = Path(tempfile.mkdtemp())
+    (run / "triage").mkdir()
+    write(run / "outside.json", {"jev": {"is_real": 0.9, "error": None}})
+    write(run / "triage" / "_summary.json", {"generated_at": "x", "findings": 0})
+    write(run / "triage" / "ok-1.json", {"jev": {"is_real": 0.5, "error": None}})
+    reports = {"security": {"findings": [
+        {"id": "../outside"},   # would escape triage/ into the run directory
+        {"id": "_summary"},     # reserved -- collides with triage/_summary.json
+        {"id": "ok-1"},         # safe charset -- the only one that should surface
+    ]}}
+    out = aggregate.collect_jev_priors(run, reports)
+    assert list(out.keys()) == ["ok-1"], out
 
 
 def main():
