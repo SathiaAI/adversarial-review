@@ -543,20 +543,31 @@ def validate_obj(obj, schema, path="$"):
 
 def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_path):
     """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
-    Paul's decision, frontier-gate run pr70-provenance, 2026-09-19): opportunistically
-    sign policy.snapshot.json (bound to this run's run_id) right after it is written —
-    the one moment before the run directory can become attacker-writable — so a LATER
-    coordinated edit to policy.snapshot.json + run.json's policy.sha256 (widening
-    waiver policy, e.g. flipping allow_critical_waivers) cannot produce a snapshot that
-    still verifies, and a signature from a DIFFERENT run cannot be replayed onto this
-    one.
+    Paul's decision, frontier-gate run pr70-provenance, 2026-09-19; hardened per
+    frontier-gate run pr70-provenance-2, 2026-09-19, closing 6 Codex-found bypasses):
+    opportunistically sign policy.snapshot.json — bound to this run's run_id, run_nonce,
+    run DIRECTORY NAME, and resolved risk tier (policy_attest_bytes v2) — right after it
+    is written, the one moment before the run directory can become attacker-writable.
+    This closes three replay/forgery shapes: (1) a LATER coordinated edit to
+    policy.snapshot.json + run.json's policy.sha256 (widening waiver policy, e.g.
+    flipping allow_critical_waivers) cannot produce a snapshot that still verifies;
+    (2) a signature from a DIFFERENT run cannot be replayed onto this one even if the
+    attacker also copies that other run's run.json wholesale, because the payload is
+    checked against the run directory's own OS-assigned name, which the copy cannot also
+    forge to match; (3) editing run.json's risk tier after signing (to downgrade e.g.
+    CRITICAL to SENSITIVE and unlock a normally-forbidden waiver) invalidates the
+    signature, because risk is part of what was signed.
 
     Deliberately BEST-EFFORT and never fatal to `init`: the common no-exception
     aggregation path must stay completely infrastructure-free, so an unconfigured or
-    misbehaving signer here is a printed note, not a die(). aggregate.py enforces this
-    signature — hard BLOCK on failure — ONLY when the run ends up recording a WAIVED or
-    NOT_APPLICABLE gate (see aggregate.py's _verify_policy_snapshot_signature); a run
-    that never waives anything never needs this signature to exist at all."""
+    misbehaving signer here is a printed note, not a die(). The shared
+    verify_policy_snapshot_signature() in _common.py enforces this signature — hard
+    BLOCK on failure — from two call sites: aggregate.py, ONLY when the run ends up
+    recording a WAIVED or NOT_APPLICABLE gate (a run that never waives anything never
+    needs this signature to exist at all), and gate.py's own `plan --waive` /
+    `record --status NOT_APPLICABLE`, so a waiver can never be written that aggregate.py
+    would later reject — the two call sites can never disagree, because they share one
+    function."""
     note = ("this run will BLOCK at aggregate time if any gate is later waived or "
             "marked not-applicable")
     argv_tmpl, kind = resolve_signing_tool(
