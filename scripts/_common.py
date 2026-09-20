@@ -57,6 +57,28 @@ def write_json(path, obj):
 POLICY_SIG_FILENAME = "policy.snapshot.sig"
 
 
+def policy_attest_bytes(run_id, run_nonce, snap_path):
+    """The exact bytes signed/verified for the policy-snapshot signature: run_id and a
+    cryptographically random per-run nonce, both PREPENDED to policy.snapshot.json's raw
+    bytes. Shared by panel.py (signing at init) and aggregate.py (verifying at aggregate
+    time) so the two can never drift apart — panel.py and aggregate.py used to rebuild
+    this format independently, and any drift between them would make every signed
+    snapshot fail verification, BLOCKing every run that records a WAIVED or
+    NOT_APPLICABLE gate (CodeRabbit, PR70 review 5258750734).
+
+    Binding to run_id stops a signature minted for one run from being replayed onto a
+    different run's policy.snapshot.json. run_id alone is NOT sufficient: it is a
+    second-granularity UTC timestamp with no randomness (see panel.py's cmd_init), so
+    two runs created within the same wall-clock second — realistic under CI/automation
+    throughput, and how a real CI run surfaced this — collide on run_id, and if their
+    policy content also matches, the full attest bytes would then be identical too,
+    making one run's signature trivially "valid" for the other. run_nonce
+    (secrets.token_hex(16), minted fresh per run in cmd_init and recorded in run.json)
+    closes that gap deterministically instead of relying on timestamp luck."""
+    return (run_id.encode("utf-8") + b"\n" + run_nonce.encode("utf-8") + b"\n"
+            + Path(snap_path).read_bytes())
+
+
 def sign_fail(msg):
     """Loud, non-zero failure for the signing/verifying TOOLING path (no signer
     configured, a malformed command template, or the external tool could not start /

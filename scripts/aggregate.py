@@ -34,12 +34,12 @@ from _common import (POLICY_SIG_FILENAME, _policy_bool,
                      cosign_verify_argv as _cosign_verify_argv, family_of,
                      load_attested_policy, meta_cost,
                      minisign_sign_argv as _minisign_sign_argv,
-                     minisign_verify_argv as _minisign_verify_argv, now_iso, read_json,
-                     resolve_run, resolve_signing_tool as _resolve_tool,
-                     resolve_waiver_clock, run_signing_tool as _run_tool,
-                     sign_fail as _sign_fail, sign_timeout as _sign_timeout,
-                     validate_gate_name, validate_not_applicable_gate,
-                     validate_waived_gate, write_json)
+                     minisign_verify_argv as _minisign_verify_argv, now_iso,
+                     policy_attest_bytes, read_json, resolve_run,
+                     resolve_signing_tool as _resolve_tool, resolve_waiver_clock,
+                     run_signing_tool as _run_tool, sign_fail as _sign_fail,
+                     sign_timeout as _sign_timeout, validate_gate_name,
+                     validate_not_applicable_gate, validate_waived_gate, write_json)
 
 HIGH = ("critical", "high")
 
@@ -746,8 +746,9 @@ def _verify_policy_snapshot_signature(run, snap_p, run_id, run_nonce):
     (possibly tampered) policy snapshot — the attack happens before that signature
     exists. So this checks a DIFFERENT, EARLIER artifact: POLICY_SIG_FILENAME
     (policy.snapshot.sig), written by panel.py at init over run_id + run_nonce +
-    policy.snapshot.json (see _policy_attest_bytes in panel.py) — the one moment
-    before the run directory can become attacker-writable. A later coordinated edit
+    policy.snapshot.json (see _common.py's policy_attest_bytes, shared by both
+    panel.py's signing and this verification so the two formats cannot drift apart) —
+    the one moment before the run directory can become attacker-writable. A later coordinated edit
     to policy.snapshot.json + run.json cannot forge a matching signature without the
     signing key/identity, and a signature minted for a DIFFERENT run cannot be
     replayed onto this one, because run_id + run_nonce are part of what was signed
@@ -789,8 +790,7 @@ def _verify_policy_snapshot_signature(run, snap_p, run_id, run_nonce):
                 "AR_MINISIGN_PUBKEY or AR_MINISIGN_PUBKEY_FILE)")
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.snapshot.attest"
-        msg_tmp.write_bytes(run_id.encode("utf-8") + b"\n" + run_nonce.encode("utf-8")
-                             + b"\n" + snap_p.read_bytes())
+        msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, snap_p))
         proc, err = _run_tool(argv_tmpl, msg_tmp, sig_p, fatal=False)
     if err:
         return f"verifier '{kind}' could not run: {err}"
