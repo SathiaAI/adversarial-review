@@ -18,7 +18,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (die, load_attested_policy, load_policy, now_iso, read_json,
                      resolve_run, resolve_waiver_clock, validate_gate_name,
-                     validate_not_applicable_gate, validate_waived_gate, write_json)
+                     validate_not_applicable_gate, validate_waived_gate,
+                     verify_policy_snapshot_signature, write_json)
 
 # Floors per tier: these cannot be silently omitted, only waived on the record with a
 # named authorizer (surfaced in the verdict reasons and the report). A waived floor gate
@@ -99,6 +100,15 @@ def cmd_plan(args):
         att_pol, att_err = load_attested_policy(run)
         if att_err:
             die(f"cannot validate waiver: {att_err}")
+        # Same fail-closed signature check aggregate.py enforces, done here too so `plan`
+        # can never report success on a waiver `aggregate` will later BLOCK as unsigned or
+        # invalid (Codex, PR70 review, frontier-gate run pr70-provenance-2: plan and
+        # aggregate used to disagree because only aggregate checked this).
+        snap_p = run / "policy.snapshot.json"
+        if snap_p.is_file():
+            sig_err = verify_policy_snapshot_signature(run, snap_p, read_json(run / "run.json"))
+            if sig_err:
+                die(f"cannot waive: attested policy snapshot is not verifiably signed: {sig_err}")
         clock_date, clock_err = resolve_waiver_clock()
         if clock_err:
             die(clock_err)
@@ -240,10 +250,20 @@ def cmd_record(args):
         # Enforce the CRITICAL-tier N/A restrictions at record time too (fail fast), with the
         # SAME validator AND the SAME attested policy source aggregate applies: mutation on
         # CRITICAL can never be N/A, and any CRITICAL N/A needs policy allow_critical_waivers.
-        tier = read_json(run / "run.json").get("risk")
+        meta = read_json(run / "run.json")
+        tier = meta.get("risk")
         att_pol, att_err = load_attested_policy(run)
         if att_err:
             die(f"cannot validate NOT_APPLICABLE: {att_err}")
+        # Same fail-closed signature check aggregate.py and cmd_plan enforce, done here too
+        # so `record` can never report success on a NOT_APPLICABLE gate `aggregate` will
+        # later BLOCK as unsigned or invalid (Codex, PR70 review, frontier-gate run
+        # pr70-provenance-2).
+        snap_p = run / "policy.snapshot.json"
+        if snap_p.is_file():
+            sig_err = verify_policy_snapshot_signature(run, snap_p, meta)
+            if sig_err:
+                die(f"cannot mark NOT_APPLICABLE: attested policy snapshot is not verifiably signed: {sig_err}")
         nerr = validate_not_applicable_gate(
             args.name, tier, {"authorized_by": args.authorized_by, "summary": args.summary},
             att_pol)

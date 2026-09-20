@@ -629,7 +629,7 @@ def t_attestation_reproducible():
     sh(["aggregate.py"], repo, expect=0)
     v1 = read(run / "verdict.json")
     att1 = v1["attestation"]
-    assert att1["algorithm"] == "sha256-canonical-json-v2"
+    assert att1["algorithm"] == "sha256-canonical-json-v3"
     assert att1["inputs"] == len(att1["files"]) > 0
     assert "verdict.json" not in att1["files"]
     assert "run.json" in att1["files"] and "gates/unit.json" in att1["files"]
@@ -769,7 +769,7 @@ def t_attestation_wide_integer_raw_hashed_deterministically():
     sh(["aggregate.py"], repo, expect=0)
     att = read(run / "verdict.json")["attestation"]
     assert att["files"]["wide.json"].startswith("raw:"), att["files"]["wide.json"]
-    assert att["algorithm"] == "sha256-canonical-json-v2", att["algorithm"]
+    assert att["algorithm"] == "sha256-canonical-json-v3", att["algorithm"]
     sh(["aggregate.py", "--check-digest"], repo, expect=0)          # recomputed digest matches -> intact
 
 
@@ -789,10 +789,10 @@ def t_check_digest_legacy_deep_artifact_is_cannot_verify_not_drift():
         "severity": "high", "evidence": "reproduced", "reproduced": True,
         "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
     (run / "deep.json").write_bytes(("[" * 100000 + "]" * 100000).encode("utf-8"))  # re-parse RecursionErrors
-    sh(["aggregate.py"], repo, expect=0)                            # v2 verdict: deep.json -> "raw:"
+    sh(["aggregate.py"], repo, expect=0)                            # v3 verdict: deep.json -> "raw:"
     v = read(run / "verdict.json")
     att = v["attestation"]
-    assert att["algorithm"] == "sha256-canonical-json-v2", att["algorithm"]
+    assert att["algorithm"] == "sha256-canonical-json-v3", att["algorithm"]
     assert att["files"]["deep.json"].startswith("raw:"), att["files"]["deep.json"]
     # (1) Forge a LEGACY verdict: stamp the PREVIOUS algorithm id and store a plain (non-"raw:") canonical
     # hash for the deep artifact, as the old tool on a high-recursion-limit runtime did. (Its true canonical
@@ -812,11 +812,11 @@ def t_check_digest_legacy_deep_artifact_is_cannot_verify_not_drift():
     assert "CANNOT BE VERIFIED" in blob, (r.stdout, r.stderr)
     assert "deep.json" in blob, blob
     assert "MISMATCH" not in r.stdout, "legacy transition must not be reported as definitive drift"
-    # (2) Security preserved: the version gate NEVER excuses a CURRENT (v2) verdict. Add a shallow artifact,
-    # aggregate a fresh v2 verdict (extra.json is stored as a plain canonical hash), then TAMPER by
-    # replacing it with DEEP content so it recomputes "raw:". stored is v2 == current, so this same
+    # (2) Security preserved: the version gate NEVER excuses a CURRENT (v3) verdict. Add a shallow artifact,
+    # aggregate a fresh v3 verdict (extra.json is stored as a plain canonical hash), then TAMPER by
+    # replacing it with DEEP content so it recomputes "raw:". stored is v3 == current, so this same
     # canonical->raw shape is real DRIFT (exit 1), never the transitional cannot-verify.
-    (run / "extra.json").write_text('{"x": 1}')                    # shallow -> canonical under v2
+    (run / "extra.json").write_text('{"x": 1}')                    # shallow -> canonical under v3
     sh(["aggregate.py"], repo, expect=0)
     att2 = read(run / "verdict.json")["attestation"]
     assert not att2["files"]["extra.json"].startswith("raw:"), att2["files"]["extra.json"]
@@ -1340,7 +1340,7 @@ def t_sign_verify_require_current_attestation_algorithm():
     good_sig = (run / "attestation.sig").read_bytes()
     v = read(run / "verdict.json")
     assert v["attestation"]["algorithm"] == aggregate._ATTESTATION_ALGO, v["attestation"].get("algorithm")
-    v["attestation"]["algorithm"] = "sha256-canonical-json-v3"                    # unrecognized future id
+    v["attestation"]["algorithm"] = "sha256-canonical-json-v4"                    # unrecognized future id
     write(run / "verdict.json", v)
     # sign refuses at the algorithm gate (exit 1), before any signer work, leaving the sidecar untouched
     rs = sh(["aggregate.py", "--sign"], repo, expect=1, env=env)
@@ -1484,13 +1484,16 @@ def t_policy_sig_signed_at_init_when_signer_configured():
     run = latest_run(repo)
     assert "signed:" in r.stdout and "policy.snapshot.sig" in r.stdout, r.stdout
     sig = (run / "policy.snapshot.sig").read_bytes()
-    # signed bytes are run_id + "\n" + run_nonce + "\n" + policy.snapshot.json (bound to
-    # this run's id AND its random nonce — see panel.py's _policy_attest_bytes — so the
-    # signature cannot be replayed onto another run, even one that happens to collide on
-    # run_id, which is only a second-granularity timestamp with no randomness of its own)
-    run_nonce = read(run / "run.json")["run_nonce"]
-    msg = (run.name.encode("utf-8") + b"\n" + run_nonce.encode("utf-8") + b"\n"
-           + (run / "policy.snapshot.json").read_bytes())
+    # v2 signed bytes are "ar-policy-attest-v2" + run_id + run_nonce + run_name + risk +
+    # policy.snapshot.json (see _common.py's policy_attest_bytes). v2 additionally binds
+    # run_name (the run directory's own immutable basename — closes the directory-copy
+    # replay bypass, Codex P1) and risk (the resolved tier — closes the risk-downgrade
+    # bypass, Codex P1) beyond the v1 run_id+run_nonce+snapshot format.
+    meta = read(run / "run.json")
+    run_nonce, risk = meta["run_nonce"], meta["risk"]
+    msg = (b"ar-policy-attest-v2\n" + run.name.encode("utf-8") + b"\n"
+           + run_nonce.encode("utf-8") + b"\n" + run.name.encode("utf-8") + b"\n"
+           + risk.encode("utf-8") + b"\n" + (run / "policy.snapshot.json").read_bytes())
     assert sig == b"STUBSIG-v1:" + hashlib.sha256(msg).hexdigest().encode(), sig
 
 
@@ -1523,14 +1526,19 @@ def t_policy_sig_no_policy_at_all_is_exempt():
 
 
 def t_policy_sig_missing_blocks_waiver_run():
-    # A policy IS configured, the run DOES record a waiver, but policy.snapshot.json was
-    # never signed (no signer at init) -> BLOCK, never a silent pass, even though the
-    # waiver record itself is perfectly valid and load_attested_policy sees no tamper.
-    env = _no_signer_env()
+    # Defense in depth: aggregate.py must independently BLOCK a waiver run whose
+    # attested policy snapshot lacks a valid signature AT AGGREGATE TIME -- e.g. the
+    # sidecar was deleted (or never made it into a CI artifact) after `gate.py plan`
+    # accepted the waiver with a signer configured. plan's own check (finding 2 /
+    # t_gate_plan_rejects_unsigned_waiver_before_aggregate) only guards the plan step;
+    # aggregate remains the final authority regardless of what happened to the run
+    # directory in between, and never a silent pass just because the waiver record
+    # itself is perfectly valid and load_attested_policy sees no tamper.
+    env = _stub_signer_env()
     repo = _sensitive_repo_with_policy(env=env, waive=True)
     run = latest_run(repo)
-    assert (run / "policy.snapshot.json").exists()
-    assert not (run / "policy.snapshot.sig").exists()
+    assert (run / "policy.snapshot.sig").exists()
+    (run / "policy.snapshot.sig").unlink()          # signature vanishes after planning
     _resolve_open_finding(run)
     r = sh(["aggregate.py"], repo, expect=2, env=env)
     assert "not verifiably signed" in r.stdout, r.stdout
@@ -1625,28 +1633,37 @@ def t_policy_sig_replay_survives_run_id_collision_thanks_to_nonce():
     # this by luck of non-colliding timestamps. This test forces the exact collision
     # instead of hoping timing avoids it, proving run_nonce (not run_id timing luck)
     # is what actually closes the gap.
+    # v2 update (frontier-gate run pr70-provenance-2): run_name binding (finding 1)
+    # would now ALSO catch a same-named directory copy on its own, so this test renames
+    # run_b's directory to match the colliding run_id too -- isolating run_nonce as the
+    # ONLY thing left standing between the replay and a false verify.
     env = _stub_signer_env()
     repo_a = _sensitive_repo_with_policy(env=env, waive=True)
     run_a = latest_run(repo_a)
     repo_b = _sensitive_repo_with_policy(env=env, waive=True)
-    run_b = latest_run(repo_b)
-    _resolve_open_finding(run_b)
+    run_b_orig = latest_run(repo_b)
+    _resolve_open_finding(run_b_orig)
     # sanity: run_b verifies fine with its OWN signature before the attack
     sh(["aggregate.py"], repo_b, expect=0, env=env)
 
-    # Force the exact collision the CI failure exhibited: make run_b's run_id
-    # identical to run_a's (simulating both being minted in the same wall-clock
-    # second), while run_b's run_nonce -- independently random -- is left untouched.
-    rj_a, rj_b = read(run_a / "run.json"), read(run_b / "run.json")
+    # Force the exact collision the CI failure exhibited: make run_b's run_id AND its
+    # directory name identical to run_a's (simulating both being minted in the same
+    # wall-clock second), while run_b's run_nonce -- independently random -- is left
+    # untouched.
+    rj_a, rj_b = read(run_a / "run.json"), read(run_b_orig / "run.json")
     assert rj_a["run_nonce"] != rj_b["run_nonce"], "nonces must be independently random"
+    run_b = run_b_orig.parent / rj_a["run_id"]
+    run_b_orig.rename(run_b)
     rj_b["run_id"] = rj_a["run_id"]
     write(run_b / "run.json", rj_b)
 
     # replay: paste run_a's signature (minted for run_a's run_id + run_a's run_nonce)
-    # onto run_b, which now shares run_a's run_id but keeps its own distinct nonce
+    # onto run_b, which now shares run_a's run_id AND directory name but keeps its own
+    # distinct nonce
     (run_b / "policy.snapshot.sig").write_bytes((run_a / "policy.snapshot.sig").read_bytes())
     r = sh(["aggregate.py"], repo_b, expect=2, env=env)
-    # even with run_id colliding, the mismatched nonce still defeats the replay
+    # even with run_id (and directory name) colliding, the mismatched nonce still
+    # defeats the replay
     assert "not verifiably signed" in r.stdout, r.stdout
     assert "did not verify" in r.stdout, r.stdout
 
@@ -1686,6 +1703,179 @@ def t_policy_sig_verifier_unavailable_blocks_not_crashes():
     assert (run / "verdict.json").exists(), "a verdict must still be written"
     v = read(run / "verdict.json")
     assert v["verdict"] == "BLOCKED"
+
+
+# ------------------------------------------------- PR70 provenance-hardening v2
+# (frontier-gate run pr70-provenance-2, 2026-09-19, Paul's decision "A - fix all", 4/4
+# panel consensus 0.97): a delayed Codex review against commit 673bf58 reproduced 4
+# distinct bypasses of the Option B mechanism above, all closed by policy_attest_bytes
+# v2 (_common.py) binding run_name and risk in addition to run_id + run_nonce, plus two
+# independent fail-closed guards (gate.py plan's own signature check; the encoding
+# guard in load_attested_policy). One regression test per reproducible finding.
+
+def t_policy_sig_directory_identity_forgery_blocks():
+    # Codex P1 (finding 1): an actor with write access to the run directory can copy an
+    # ENTIRE older run's self-consistent artifacts -- run.json (with its own run_id,
+    # run_nonce, policy digest) AND policy.snapshot.json/.sig -- wholesale into a
+    # DIFFERENT run's directory. The old check verified meta['run_id'] against the
+    # signature using values taken from the SAME copied, attacker-controlled run.json,
+    # so a whole-directory copy passed cleanly (reproduced by Codex between two runs in
+    # the same run root). The fix cross-checks the copied run_id against the run
+    # DIRECTORY'S OWN name -- assigned once, immutably, by cmd_init -- which the copy
+    # does not (and, short of renaming the directory itself, cannot) also forge to match.
+    env = _stub_signer_env()
+    repo_a = _sensitive_repo_with_policy(env=env, waive=True)
+    run_a = latest_run(repo_a)
+    repo_b = _sensitive_repo_with_policy(env=env, waive=True)
+    run_b = latest_run(repo_b)
+    _resolve_open_finding(run_b)
+    sh(["aggregate.py"], repo_b, expect=0, env=env)  # sanity: run_b passes before the swap
+
+    for name in ("run.json", "policy.snapshot.json", "policy.snapshot.sig"):
+        (run_b / name).write_bytes((run_a / name).read_bytes())
+    r = sh(["aggregate.py"], repo_b, expect=2, env=env)
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "does not match" in r.stdout, r.stdout
+
+
+def t_policy_sig_risk_tamper_blocks():
+    # Codex P1 (finding 4, in panel.py): the signed payload did not bind run.json's
+    # resolved risk tier, so an actor who can edit run.json could downgrade risk from
+    # CRITICAL to SENSITIVE post-signing without invalidating the signature -- Codex
+    # reproduced this as: init a signed CRITICAL run with critical waivers disabled,
+    # edit only run.json's risk to SENSITIVE, then successfully plan+pass a waiver for
+    # mutation (a gate CRITICAL never allows to be waived). v2 now binds risk into the
+    # signed payload, so tampering it invalidates the signature; combined with gate.py
+    # plan's own signature check (finding 2, below), the downgrade is rejected before a
+    # waiver record is ever written, not merely caught later at aggregate time.
+    env = _stub_signer_env()
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})  # allow_critical_waivers unset
+    sh(["panel.py", "init", "--risk", "CRITICAL", "--dev-providers", "anthropic"], repo, env=env)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.sig").exists()
+
+    rj = read(run / "run.json")
+    assert rj["risk"] == "CRITICAL"
+    rj["risk"] = "SENSITIVE"
+    write(run / "run.json", rj)
+
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI for this repo yet",
+            "--waive-expires", (date.today() + timedelta(days=7)).isoformat()],
+           repo, env=env, expect=1)
+    assert "not verifiably signed" in r.stderr, r.stderr
+
+
+def t_policy_sig_snapshot_lone_surrogate_blocks_not_crashes():
+    # Codex P2 (finding 6, in _common.py): a tampered-but-syntactically-valid
+    # policy.snapshot.json with an escaped lone surrogate in "text" (e.g. \ud800) makes
+    # json.load() return a string that UTF-8 cannot encode -- the old
+    # hashlib.sha256(text.encode("utf-8")) raised UnicodeEncodeError, which aggregate.py
+    # turned into an unexpected crash instead of the required BLOCKED verdict. No
+    # signer/waiver needed: load_attested_policy() runs for every run with a policy
+    # snapshot, so the crash reproduces even on a clean run.
+    repo = _sensitive_repo_with_policy(waive=False)
+    run = latest_run(repo)
+    obj = read(run / "policy.snapshot.json")
+    obj["text"] = "\ud800"          # lone surrogate: valid JSON string, invalid UTF-8
+    (run / "policy.snapshot.json").write_text(json.dumps(obj), encoding="utf-8")
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "not valid UTF-8" in r.stdout, r.stdout
+    assert (run / "verdict.json").exists(), "a verdict must still be written, never a crash"
+    v = read(run / "verdict.json")
+    assert v["verdict"] == "BLOCKED"
+
+
+def t_attestation_covers_policy_snapshot_sig():
+    # Codex P1 (finding 5, in aggregate.py): policy.snapshot.sig is a REQUIRED verdict
+    # input for any policy-backed run using an exception, but as a non-JSON sidecar it
+    # was excluded from compute_attestation()'s "*.json only" glob. Reproduced: deleting
+    # the sidecar left the attestation digest, and even --check-digest, unchanged -- the
+    # evidence required to justify the PASS could vanish undetected. The fix hashes this
+    # input explicitly (raw bytes, keyed by POLICY_SIG_FILENAME) while continuing to
+    # exclude only the unrelated POST-verdict attestation.sig (a detached signature over
+    # verdict.json itself -- including it would be circular).
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    sh(["aggregate.py"], repo, expect=0, env=env)
+    att = read(run / "verdict.json")["attestation"]
+    assert "policy.snapshot.sig" in att["files"], att["files"]
+    sh(["aggregate.py", "--check-digest"], repo, expect=0, env=env)
+    (run / "policy.snapshot.sig").unlink()
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=1, env=env)
+    assert "DRIFT removed" in r.stdout and "policy.snapshot.sig" in r.stdout, r.stdout
+
+
+def t_gate_plan_rejects_unsigned_waiver_before_aggregate():
+    # Codex P2 (finding 2, in gate.py): when a policy file is configured but no signer
+    # was available at init, `gate.py plan --waive ...` used to succeed and write a
+    # WAIVED record that `aggregate.py` would ALWAYS later BLOCK as unsigned -- a false
+    # acceptance signal to CLI/MCP automation that only surfaced much later. `plan` (and
+    # `record`'s NOT_APPLICABLE path) now run the SAME fail-closed signature check
+    # aggregate.py enforces, so the rejection surfaces immediately, at plan time.
+    env = _no_signer_env()
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo, env=env)
+    run = latest_run(repo)
+    sh(["panel.py", "assign"], repo, env=env)
+    sh(["panel.py", "run", "--context-file", "context.md"], repo, env=env)
+    sh(["panel.py", "rebuttal"], repo, env=env)
+    assert (run / "policy.snapshot.json").exists()
+    assert not (run / "policy.snapshot.sig").exists()
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI for this repo yet",
+            "--waive-expires", (date.today() + timedelta(days=7)).isoformat()],
+           repo, env=env, expect=1)
+    assert "not verifiably signed" in r.stderr, r.stderr
+    assert "no policy.snapshot.sig" in r.stderr, r.stderr
+
+
+def t_gate_record_rejects_unsigned_not_applicable_before_aggregate():
+    # The NOT_APPLICABLE half of finding 2's fix: `gate.py record --status NOT_APPLICABLE`
+    # runs the same fail-closed signature check `plan`'s --waive path does (and aggregate.py
+    # always enforced), so a policy-backed run with no signer configured is rejected at
+    # record time, not just later, silently, at aggregate.
+    env = _no_signer_env()
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo, env=env)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.json").exists()
+    assert not (run / "policy.snapshot.sig").exists()
+    r = sh(["gate.py", "record", "--name", "sast", "--status", "NOT_APPLICABLE",
+            "--authorized-by", "Paul", "--summary", "no source in this repo"],
+           repo, env=env, expect=1)
+    assert "not verifiably signed" in r.stderr, r.stderr
+    assert "no policy.snapshot.sig" in r.stderr, r.stderr
+
+
+def t_gate_record_not_applicable_passes_with_valid_signature():
+    # Happy path for the same check: a signed policy snapshot lets NOT_APPLICABLE through
+    # `record` exactly as before, all the way to a clean PASS.
+    env = _stub_signer_env()
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo, env=env)
+    run = latest_run(repo)
+    sh(["panel.py", "assign"], repo, env=env)
+    sh(["panel.py", "run", "--context-file", "context.md"], repo, env=env)
+    sh(["panel.py", "rebuttal"], repo, env=env)
+    assert (run / "policy.snapshot.sig").exists()
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation"], repo, env=env)
+    sh(["gate.py", "record", "--name", "sast", "--status", "NOT_APPLICABLE",
+        "--authorized-by", "Paul", "--summary", "no source in this repo"], repo, env=env)
+    for g in ["build", "unit", "secrets", "deps", "mutation"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo, env=env)
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0, env=env)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
 
 
 def t_gate_blocked_status_yields_blocked_not_fail():
@@ -4211,7 +4401,7 @@ def _write_run(path, verdict="PASS", risk="NORMAL", run_id="run-x", reports=None
         (d / "panel" / (role + ".json")).write_text(json.dumps({"role": role, "findings": findings}))
     for i, rec in enumerate(validations or []):
         (d / "validation" / ("v%d.json" % i)).write_text(json.dumps(rec))
-    att = compute_attestation(d)  # sha256-canonical-json-v2 over every .json except verdict.json
+    att = compute_attestation(d)  # sha256-canonical-json-v3 over every .json (+ policy.snapshot.sig raw) except verdict.json
     (d / "verdict.json").write_text(json.dumps({
         "verdict": verdict, "risk": risk, "run_id": run_id, "computed_at": "2026-08-20T00:00:00Z",
         "counts": {"findings_high_critical": 0, "findings_medium_low": 0, "confirmed": 0, "unresolved": 0},
@@ -9901,10 +10091,10 @@ def t_check_digest_unrecognized_algorithm_id_matching_digest_is_cannot_verify():
         "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
     sh(["aggregate.py"], repo, expect=0)
     base = read(run / "verdict.json")
-    assert base["attestation"]["algorithm"] == "sha256-canonical-json-v2", base["attestation"]["algorithm"]
+    assert base["attestation"]["algorithm"] == "sha256-canonical-json-v3", base["attestation"]["algorithm"]
     # Change ONLY the algorithm id (unknown string, then malformed non-string); leave files + digest exactly
     # as written so the recompute still equals the stored digest -- the digest-match path would exit 0.
-    for algo in ("sha256-canonical-json-v3", 2):
+    for algo in ("sha256-canonical-json-v4", 2):
         base["attestation"]["algorithm"] = algo
         (run / "verdict.json").write_text(json.dumps(base))
         r = sh(["aggregate.py", "--check-digest"], repo, expect=2)
@@ -10258,7 +10448,7 @@ def t_mcp_rebuttal_tool_description_covers_any_policy():
 
 def t_check_digest_unrecognized_algorithm_id_is_cannot_verify():
     # CodeRabbit r3930631485: --check-digest must validate the stored `algorithm` id BEFORE any legacy
-    # handling. Only the current sha256-canonical-json-v2 and recognized predecessors (...-v1) are
+    # handling. Only the current sha256-canonical-json-v3 and recognized predecessors (...-v1, -v2) are
     # interpretable; a NEWER, unknown, or malformed (non-string) id means this version cannot interpret the
     # representation, so a digest mismatch is cannot-verify (exit 2) -- never the legacy canonical->raw path
     # and never DRIFT (exit 1). Fails on the pre-fix source, which had no id whitelist: an unknown id whose
@@ -10272,7 +10462,7 @@ def t_check_digest_unrecognized_algorithm_id_is_cannot_verify():
     sh(["aggregate.py"], repo, expect=0)
     v = read(run / "verdict.json")
     att = v["attestation"]
-    assert att["algorithm"] == "sha256-canonical-json-v2", att["algorithm"]
+    assert att["algorithm"] == "sha256-canonical-json-v3", att["algorithm"]
     some = sorted(att["files"])[0]                                  # any recorded artifact
     assert not att["files"][some].startswith("raw:"), \
         "the tampered file's recompute must be a PLAIN hash so the drift is not a canonical->raw transition"
@@ -10287,11 +10477,11 @@ def t_check_digest_unrecognized_algorithm_id_is_cannot_verify():
         (run / "verdict.json").write_text(json.dumps(doc))
 
     # (a) a NEWER/unknown string id this version does not know
-    forge("sha256-canonical-json-v3")
+    forge("sha256-canonical-json-v4")
     r = sh(["aggregate.py", "--check-digest"], repo, expect=2)
     blob = r.stdout + r.stderr
     assert "CANNOT BE VERIFIED" in blob, blob
-    assert "sha256-canonical-json-v3" in blob, "message must name the unrecognized id"
+    assert "sha256-canonical-json-v4" in blob, "message must name the unrecognized id"
     assert "recognize" in blob, blob
     assert "MISMATCH" not in r.stdout and "DRIFT" not in r.stdout, \
         "an unrecognized id is cannot-verify, never DRIFT"
@@ -10848,7 +11038,7 @@ def t_ai_defects_invalid_diffref_never_empty_diff_pass():
     assert "cannot read diff file" in r.stdout and "empty-diff" not in r.stdout
 
 
-def _min_repo(tier, dev="anthropic", policy=None):
+def _min_repo(tier, dev="anthropic", policy=None, env=None):
     """A repo with just `panel.py init` done — enough for `gate.py plan`/`record` and
     `aggregate.py` to run, without the panel/rebuttal/validation machinery a full PASS
     needs. Gate-waiver tests only need the gates to be checked, so this keeps them fast
@@ -10858,11 +11048,15 @@ def _min_repo(tier, dev="anthropic", policy=None):
     `policy`, when given, is written to .adversarial-review.yml BEFORE init, so it is
     captured in the attested policy.snapshot.json — the only policy aggregate honors for
     waiver limits. (A policy written AFTER init is deliberately ignored at aggregate time;
-    see t_gate_waiver_post_init_policy_drift_ignored.)"""
+    see t_gate_waiver_post_init_policy_drift_ignored.) A REAL policy file makes `gate.py
+    plan --waive`/NOT_APPLICABLE require a verifiably-signed snapshot (finding 2, PR70
+    provenance-hardening v2), so callers that will waive/N-A against a `policy=`-configured
+    repo must pass a signer `env` (e.g. `_stub_signer_env()`) through to it."""
+    e = env or ENV
     repo = fresh_repo()
     if policy is not None:
         (repo / ".adversarial-review.yml").write_text(policy)
-    sh(["panel.py", "init", "--risk", tier, "--dev-providers", dev], repo)
+    sh(["panel.py", "init", "--risk", tier, "--dev-providers", dev], repo, env=e)
     return repo
 
 
@@ -10982,16 +11176,18 @@ def t_gate_waiver_custom_cap_from_policy():
     # A policy max_waiver_days raises (or could lower) the cap; 20 days here is over the
     # built-in default (14) but within the configured policy cap, so it passes cleanly.
     # The policy is attested at init (so aggregate honors it) AND is in the working tree
-    # (so the plan-time check honors it too).
-    repo = _min_repo("SENSITIVE", policy="max_waiver_days: 20\n")
+    # (so the plan-time check honors it too). A real policy file requires a signer for
+    # any waiver (finding 2), so this test configures one and threads it through.
+    env = _stub_signer_env()
+    repo = _min_repo("SENSITIVE", policy="max_waiver_days: 20\n", env=env)
     within_custom_cap = (date.today() + timedelta(days=18)).isoformat()
     sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
         "--waive", "mutation", "--authorized-by", "Paul",
         "--waive-reason", "mutation runner not wired into CI yet",
-        "--waive-expires", within_custom_cap], repo)
+        "--waive-expires", within_custom_cap], repo, env=env)
     for g in ["build", "unit", "secrets", "deps", "sast"]:
-        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
-    r = sh(["aggregate.py"], repo, expect=2)  # still BLOCKED (no panel/rebuttal/etc in _min_repo)
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo, env=env)
+    r = sh(["aggregate.py"], repo, expect=2, env=env)  # still BLOCKED (no panel/rebuttal/etc in _min_repo)
     assert "capped at" not in r.stdout, r.stdout
     assert "waiver expired" not in r.stdout, r.stdout
 
@@ -11010,29 +11206,34 @@ def t_gate_waiver_unauthorized_critical_blocks():
 
 def t_gate_waiver_critical_allowed_when_policy_opts_in():
     # With allow_critical_waivers: true (attested at init), a NON-mutation CRITICAL gate CAN
-    # be waived — plan accepts it and aggregate honors it from the snapshot.
-    repo = _min_repo("CRITICAL", policy="allow_critical_waivers: true\n")
+    # be waived — plan accepts it and aggregate honors it from the snapshot. A real policy
+    # file requires a signer for any waiver (finding 2), so this test configures one.
+    env = _stub_signer_env()
+    repo = _min_repo("CRITICAL", policy="allow_critical_waivers: true\n", env=env)
     future = (date.today() + timedelta(days=7)).isoformat()
     sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,mutation",
         "--waive", "sast", "--authorized-by", "Paul",
         "--waive-reason", "static analyzer unavailable for this legacy module",
-        "--waive-expires", future], repo)
+        "--waive-expires", future], repo, env=env)
     for g in ["build", "unit", "secrets", "deps", "mutation"]:
-        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
-    r = sh(["aggregate.py"], repo, expect=2)  # still BLOCKED (no panel in _min_repo)
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo, env=env)
+    r = sh(["aggregate.py"], repo, expect=2, env=env)  # still BLOCKED (no panel in _min_repo)
     assert "allow_critical_waivers" not in r.stdout, r.stdout
     assert "sast' waived by Paul" in r.stdout, r.stdout
 
 
 def t_gate_mutation_critical_waiver_always_blocks():
     # mutation on CRITICAL can NEVER be waived, even with allow_critical_waivers: true —
-    # that one restriction is not policy-configurable, and plan rejects it outright.
-    repo = _min_repo("CRITICAL", policy="allow_critical_waivers: true\nmax_waiver_days: 30\n")
+    # that one restriction is not policy-configurable, and plan rejects it outright. A
+    # signer is configured so the mutation-specific rejection (not the unrelated missing-
+    # signature rejection) is what's actually being exercised here.
+    env = _stub_signer_env()
+    repo = _min_repo("CRITICAL", policy="allow_critical_waivers: true\nmax_waiver_days: 30\n", env=env)
     future = (date.today() + timedelta(days=7)).isoformat()
     r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
             "--waive", "mutation", "--authorized-by", "Paul",
             "--waive-reason", "mutation runner not implemented for CRITICAL yet",
-            "--waive-expires", future], repo, expect=1)
+            "--waive-expires", future], repo, env=env, expect=1)
     assert "mutation cannot be waived" in r.stderr, r.stderr
 
 

@@ -237,6 +237,20 @@ authorizer, the reason — exactly as if it had never seen `gate.py plan` do the
 a hand-edited or otherwise tampered record is caught exactly like a fresh one. An invalid or
 expired waiver BLOCKS the required gate it was meant to cover.
 
+**Waiving (and marking NOT_APPLICABLE) also requires a signed policy snapshot, whenever a
+policy file is configured.** `panel.py init` opportunistically signs `policy.snapshot.json`
+if a signer is available (`AR_SIGNER_CMD`, or auto-detected cosign/minisign — see
+`references/config.md`, *Signing the verdict*). A clean run that never waives or marks a gate
+NOT_APPLICABLE never needs this. But the moment it does, `gate.py plan --waive` / `gate.py
+record --status NOT_APPLICABLE` refuse outright — and `aggregate.py` independently BLOCKS —
+without a verifiably-signed snapshot, so the two commands can never disagree (`plan` cannot
+report success on an exception `aggregate` will later reject as unsigned). The signature is
+bound to the run's id, a random per-run nonce, the run directory's own immutable name, and
+the run's resolved risk tier, so it cannot be replayed onto a different run, a colliding run
+id, a copied run directory, or a run whose risk was edited after signing. A repo with no
+policy file at all is exempt — waiver limits fall back to strict built-in defaults, which
+are not a mutable attested artifact.
+
 **CRITICAL tier is more restrictive by design.** Waiving or marking NOT_APPLICABLE *any*
 CRITICAL-tier gate is refused by default; a repo must opt in with policy
 `allow_critical_waivers: true`. **`mutation` on CRITICAL is the one exception that policy

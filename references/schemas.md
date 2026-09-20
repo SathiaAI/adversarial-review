@@ -205,7 +205,7 @@ human-readable `verdict.md` is written alongside `verdict.json`.
    "cost_usd": 0.0, "cost_aborted": false, "cost_cap_usd": 20.0, "cost_cap_source": "default",
    "policy_snapshot_sha256": "hex or null (sha256 of the policy attested at init whose waiver limits governed this verdict; null when the run had no policy file or the snapshot was rejected)",
    "areas_not_reviewed": ["union of reviewer attestations"]},
- "attestation": {"algorithm": "sha256-canonical-json-v2", "inputs": 0,
+ "attestation": {"algorithm": "sha256-canonical-json-v3", "inputs": 0,
    "digest": "hex", "files": {"run.json": "hex", "gates/unit.json": "hex"}},
  "computed_at": "ISO-8601"}
 ```
@@ -236,8 +236,15 @@ path by whichever process created it; a process never unlinks a lock it did not 
 
 The `attestation` block makes the audit record tamper-evident. Every `*.json` file in
 the run directory except `verdict.json` (the output) is canonicalized — sorted keys,
-compact separators, so cosmetic re-serialization is not tampering — and hashed; a
-`.json` file that fails UTF-8 decoding or JSON parsing, **or whose bytes exceed a fixed,
+compact separators, so cosmetic re-serialization is not tampering — and hashed, **plus
+one explicit non-JSON exception: `policy.snapshot.json`'s detached signature sidecar,
+`policy.snapshot.sig`, is hashed as a raw-bytes input whenever it exists** (v3; it is a
+required, pre-verdict input for any policy-backed exception, so deleting or corrupting
+it now changes the digest — v2 and earlier missed this, since `compute_attestation`
+only globbed `*.json`). The unrelated, post-verdict `attestation.sig` (the standalone
+`--sign` feature's detached signature *over* `verdict.json` itself) stays excluded —
+including it would be circular. A `.json` file that fails UTF-8 decoding or JSON
+parsing, **or whose bytes exceed a fixed,
 version-independent cap on nesting depth OR integer-literal width**, is hashed over its raw
 bytes (`raw:` prefix) rather than crashing the aggregator — these cases are treated
 identically and deliberately. Deciding raw-vs-canonical **from the bytes, *before* parsing**

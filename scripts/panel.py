@@ -541,7 +541,7 @@ def validate_obj(obj, schema, path="$"):
 
 # ---------------------------------------------------------------- subcommands
 
-def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, snap_path):
+def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_path):
     """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
     Paul's decision, frontier-gate run pr70-provenance, 2026-09-19): opportunistically
     sign policy.snapshot.json (bound to this run's run_id) right after it is written —
@@ -568,7 +568,7 @@ def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, snap_path):
     want_sig_out = any("{sig}" in a for a in argv_tmpl)
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.snapshot.attest"
-        msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, snap_path))
+        msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, run.name, risk, snap_path))
         sig_tmp = Path(td) / "sig.out"
         proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_tmp, fatal=False)
         if err:
@@ -639,7 +639,8 @@ def cmd_init(args):
         write_json(run / "policy.snapshot.json", {
             "file": pol["path"].name, "sha256": pol["sha256"],
             "captured_at": now_iso(), "text": pol["text"]})
-        _sign_policy_snapshot_if_possible(run, run_id, run_nonce, run / "policy.snapshot.json")
+        _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk,
+                                          run / "policy.snapshot.json")
     write_json(run / "run.json", {
         "run_id": run_id, "run_nonce": run_nonce, "product": args.product or "",
         "risk": risk,

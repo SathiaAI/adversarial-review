@@ -35,8 +35,9 @@ from _common import (POLICY_SIG_FILENAME, _policy_bool,
                      load_attested_policy, meta_cost,
                      minisign_sign_argv as _minisign_sign_argv,
                      minisign_verify_argv as _minisign_verify_argv, now_iso,
-                     policy_attest_bytes, read_json, resolve_run,
+                     read_json, resolve_run,
                      resolve_signing_tool as _resolve_tool, resolve_waiver_clock,
+                     verify_policy_snapshot_signature,
                      run_signing_tool as _run_tool, sign_fail as _sign_fail,
                      sign_timeout as _sign_timeout, validate_gate_name,
                      validate_not_applicable_gate, validate_waived_gate, write_json)
@@ -305,17 +306,23 @@ _MAX_CANON_DEPTH = 200
 
 # Algorithm id stamped into every attestation. It is bumped whenever the canonical-vs-raw REPRESENTATION
 # changes, so --check-digest can date a stored attestation from the id alone (never by re-parsing an
-# artifact, which is runtime-dependent). "v2" marks the byte-based raw policy (depth AND integer-width
-# caps); "v1" verdicts predate it. The id is metadata, NOT folded into the digest, so bumping it does not
-# change any digest — an unchanged shallow run verifies identically under either id. (Codex r3930239157.)
-_ATTESTATION_ALGO = "sha256-canonical-json-v2"
+# artifact, which is runtime-dependent). "v3" additionally folds POLICY_SIG_FILENAME (policy.snapshot.sig)
+# into the digest as a raw-hashed input alongside the *.json artifacts — a delayed Codex review on PR70
+# found that the pre-v3 *.json-only glob made this init-time signature invisible to the attestation, so
+# deleting it (destroying the evidence a PASS with a WAIVED/NOT_APPLICABLE gate relied on) did not change
+# --check-digest's verdict. "v2" marks the byte-based raw policy (depth AND integer-width caps); "v1"
+# verdicts predate it. The id is metadata, NOT folded into the digest, so bumping it does not change any
+# digest for a run that doesn't have the new input — an unchanged shallow run with no policy.snapshot.sig
+# verifies identically under v2 or v3. (Codex r3930239157; PR70 provenance-binding hardening.)
+_ATTESTATION_ALGO = "sha256-canonical-json-v3"
 
 # Attestation algorithm ids this version can interpret in --check-digest: the current one plus recognized
 # PREDECESSORS. "sha256-canonical-json-v1" is the pre-byte-cap representation (a deep/wide artifact it
-# canonicalized, this version hashes "raw:"). An id OUTSIDE this set — a newer tool's format, or a
-# malformed/non-string value — is not interpretable, so on a digest mismatch it is cannot-verify, never
-# classified as a legacy transition or as drift. (CodeRabbit r3930631485.)
-_LEGACY_ALGOS = ("sha256-canonical-json-v1",)
+# canonicalized, this version hashes "raw:"). "sha256-canonical-json-v2" predates policy.snapshot.sig
+# coverage. An id OUTSIDE this set — a newer tool's format, or a malformed/non-string value — is not
+# interpretable, so on a digest mismatch it is cannot-verify, never classified as a legacy transition or
+# as drift. (CodeRabbit r3930631485.)
+_LEGACY_ALGOS = ("sha256-canonical-json-v1", "sha256-canonical-json-v2")
 _RECOGNIZED_ALGOS = _LEGACY_ALGOS + (_ATTESTATION_ALGO,)
 
 # A JSON integer literal wider than this many digits is routed to the raw path, for the same
@@ -405,6 +412,16 @@ def compute_attestation(run):
     Same untouched run in, same digest out — bit for bit, from the BYTES, so the raw-vs-canonical choice
     never depends on a per-runtime parser limit (recursion depth or integer-string width)."""
     files = {}
+    # POLICY_SIG_FILENAME (policy.snapshot.sig) is a non-JSON, PRE-verdict artifact — it is
+    # written by panel.py at init, well before this function ever runs, so hashing it here is
+    # not circular (unlike SIG_FILENAME/attestation.sig below, which signs THIS digest and so
+    # must stay excluded). Hash it as raw bytes, same as any other artifact that can't be
+    # JSON-canonicalized, so deleting it (destroying the evidence a WAIVED/NOT_APPLICABLE PASS
+    # relied on) changes the digest instead of being invisible to it. (Codex, PR70 review,
+    # frontier-gate run pr70-provenance-2.)
+    sig_p = run / POLICY_SIG_FILENAME
+    if sig_p.is_file():
+        files[POLICY_SIG_FILENAME] = "raw:" + hashlib.sha256(sig_p.read_bytes()).hexdigest()
     for p in sorted(run.rglob("*.json")):
         rel = p.relative_to(run).as_posix()
         if rel == "verdict.json":
@@ -731,74 +748,6 @@ def verify_signature(run):
     if err:
         print("  " + err[-500:])
     sys.exit(1)
-
-
-def _verify_policy_snapshot_signature(run, snap_p, run_id, run_nonce):
-    """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
-    Paul's decision, frontier-gate run pr70-provenance, 2026-09-19).
-
-    The bug: load_attested_policy() cross-checks policy.snapshot.json's own sha256
-    against run.json's policy.sha256 — but BOTH files live in the same mutable run
-    directory, so an actor with write access there can edit both together and widen
-    waiver policy (e.g. flip allow_critical_waivers to true) undetected. The frontier
-    panel also caught that the pipeline's EXISTING opt-in signature (--sign) does not
-    close this: it signs verdict.json, produced AFTER aggregation already trusted the
-    (possibly tampered) policy snapshot — the attack happens before that signature
-    exists. So this checks a DIFFERENT, EARLIER artifact: POLICY_SIG_FILENAME
-    (policy.snapshot.sig), written by panel.py at init over run_id + run_nonce +
-    policy.snapshot.json (see _common.py's policy_attest_bytes, shared by both
-    panel.py's signing and this verification so the two formats cannot drift apart) —
-    the one moment before the run directory can become attacker-writable. A later coordinated edit
-    to policy.snapshot.json + run.json cannot forge a matching signature without the
-    signing key/identity, and a signature minted for a DIFFERENT run cannot be
-    replayed onto this one, because run_id + run_nonce are part of what was signed
-    (panel checklist items 2 and 12: bind to run context; test replay).
-
-    run_id alone would not be enough: it is a second-granularity UTC timestamp with
-    no randomness, so two runs created within the same wall-clock second (realistic
-    under CI/automation throughput — this is how a real CI run surfaced the gap)
-    collide on run_id, and if their policy content also matches, the attest bytes
-    would be identical too. run_nonce, minted fresh per run in cmd_init and recorded
-    in run.json, closes that gap deterministically. Accordingly this fails closed —
-    BLOCKS rather than silently falling back to run_id-only verification — whenever
-    run_nonce is missing or not a non-empty string, since that means either an
-    old-format run.json predating this fix or a tampered one with the nonce stripped.
-
-    Scope: the caller only invokes this when the run contains a WAIVED or
-    NOT_APPLICABLE gate record — the common no-exception aggregation path stays
-    completely infrastructure-free, exactly as decided. Returns None when the
-    signature verifies, else a short error string for the BLOCKED reason list — this
-    never raises and never calls sys.exit; a signing-tool problem here is an ordinary
-    BLOCK reason like any other missing prerequisite, not a process abort (mirroring
-    every other check in this function)."""
-    if not isinstance(run_nonce, str) or not run_nonce:
-        return ("run.json has no run_nonce — the policy-snapshot signature cannot be "
-                "verified without it (this run predates the nonce fix, or run.json was "
-                "tampered with); re-init this run to get a signable, verifiable snapshot")
-    sig_p = run / POLICY_SIG_FILENAME
-    if not sig_p.is_file():
-        return (f"no {POLICY_SIG_FILENAME} — the policy snapshot was not signed at init. "
-                "Configure a signer (AR_SIGNER_CMD, or install cosign / minisign with "
-                "AR_MINISIGN_KEY) before `panel.py init` so any run that later records a "
-                "waiver or not-applicable gate can be trusted")
-    argv_tmpl, kind = _resolve_tool(
-        "AR_VERIFIER_CMD",
-        [("cosign-keyless", _cosign_verify_argv), ("minisign", _minisign_verify_argv)])
-    if argv_tmpl is None:
-        return ("no verifier available: set AR_VERIFIER_CMD, or install cosign (with "
-                "AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned) or minisign (with "
-                "AR_MINISIGN_PUBKEY or AR_MINISIGN_PUBKEY_FILE)")
-    with tempfile.TemporaryDirectory() as td:
-        msg_tmp = Path(td) / "policy.snapshot.attest"
-        msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, snap_p))
-        proc, err = _run_tool(argv_tmpl, msg_tmp, sig_p, fatal=False)
-    if err:
-        return f"verifier '{kind}' could not run: {err}"
-    if proc.returncode != 0:
-        stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()[-300:]
-        detail = f" — {stderr}" if stderr else ""
-        return f"signature did not verify (verifier: {kind}, exit {proc.returncode}){detail}"
-    return None
 
 
 def author_families(finding_ids, plan):
@@ -1365,14 +1314,13 @@ def _aggregate_cli():
         # Paul's decision): the no-exception path above stays infrastructure-free, but
         # the moment this run recorded a WAIVED or NOT_APPLICABLE gate, the attested
         # policy snapshot that governed it must carry a verified init-time signature —
-        # see _verify_policy_snapshot_signature for the full rationale. Gated on
+        # see _common.py's verify_policy_snapshot_signature for the full rationale. Gated on
         # `snap_p.is_file() and not att_err` so this never fires for a run with no
         # policy configured at all (waivers there are governed by strict built-in
         # defaults, not a mutable file, so there is nothing to tamper) or one whose
         # snapshot is already untrustworthy (already BLOCKED above by that reason).
         if (gcov["waived"] or gcov["not_applicable"]) and snap_p.is_file() and not att_err:
-            sig_err = _verify_policy_snapshot_signature(
-                run, snap_p, meta["run_id"], meta.get("run_nonce"))
+            sig_err = verify_policy_snapshot_signature(run, snap_p, meta)
             if sig_err:
                 blocked.append(
                     "run recorded a waived or not-applicable gate but its attested "

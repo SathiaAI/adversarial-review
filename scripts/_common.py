@@ -8,6 +8,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -57,11 +58,34 @@ def write_json(path, obj):
 POLICY_SIG_FILENAME = "policy.snapshot.sig"
 
 
-def policy_attest_bytes(run_id, run_nonce, snap_path):
-    """The exact bytes signed/verified for the policy-snapshot signature: run_id and a
-    cryptographically random per-run nonce, both PREPENDED to policy.snapshot.json's raw
-    bytes. Shared by panel.py (signing at init) and aggregate.py (verifying at aggregate
-    time) so the two can never drift apart — panel.py and aggregate.py used to rebuild
+POLICY_ATTEST_VERSION = "2"
+
+def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path,
+                         version=POLICY_ATTEST_VERSION):
+    """The exact bytes signed/verified for the policy-snapshot signature.
+
+    v2 (current) binds: version tag, run_id, run_nonce, run_name (the run directory's
+    OWN basename), risk (the resolved tier from run.json), then policy.snapshot.json's
+    raw bytes. v1 (superseded, see verify_policy_snapshot_signature) bound only run_id +
+    run_nonce + snapshot bytes and had two gaps a delayed Codex review on PR70 found and
+    reproduced:
+
+      - run_name closes: copying a whole legitimately-signed (run_id, run_nonce,
+        policy.snapshot.json, policy.snapshot.sig) tuple from an old, permissive run
+        into a NEW run directory used to still verify, because nothing checked the
+        self-reported run_id against the one thing cmd_init assigns independently and
+        immutably: the directory's own name (RUN_ROOT/run_id, checked for uniqueness,
+        never reused -- see cmd_init). v2 signs run_name, and
+        verify_policy_snapshot_signature separately cross-checks it against the actual
+        resolved run directory before even trying the signature, so a run directory
+        under a different name can never present as the one that was signed.
+      - risk closes: editing run.json's `risk` field downward AFTER init (e.g. CRITICAL
+        -> SENSITIVE) used to leave the policy signature untouched, letting a waiver
+        that should have been blocked at the original tier slip through at the lowered
+        one, since risk was never part of what got signed.
+
+    Shared by panel.py (signing at init) and aggregate.py/gate.py (verifying) so the
+    formats can never drift apart — panel.py and aggregate.py used to rebuild
     this format independently, and any drift between them would make every signed
     snapshot fail verification, BLOCKing every run that records a WAIVED or
     NOT_APPLICABLE gate (CodeRabbit, PR70 review 5258750734).
@@ -75,8 +99,99 @@ def policy_attest_bytes(run_id, run_nonce, snap_path):
     making one run's signature trivially "valid" for the other. run_nonce
     (secrets.token_hex(16), minted fresh per run in cmd_init and recorded in run.json)
     closes that gap deterministically instead of relying on timestamp luck."""
-    return (run_id.encode("utf-8") + b"\n" + run_nonce.encode("utf-8") + b"\n"
+    return (b"ar-policy-attest-v" + str(version).encode("ascii") + b"\n"
+            + run_id.encode("utf-8") + b"\n" + run_nonce.encode("utf-8") + b"\n"
+            + str(run_name).encode("utf-8") + b"\n" + str(risk).encode("utf-8") + b"\n"
             + Path(snap_path).read_bytes())
+
+
+def verify_policy_snapshot_signature(run, snap_p, meta):
+    """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
+    Paul's decision, frontier-gate run pr70-provenance, 2026-09-19; hardened against 3
+    further P1 findings from a delayed Codex review, frontier-gate run
+    pr70-provenance-2, 2026-09-19 — Paul chose fix_all_six_now).
+
+    Shared by aggregate.py (verifying at aggregate time) and gate.py (verifying at plan/
+    record time, so `plan`/`record` can never report success on a waiver `aggregate`
+    will later BLOCK as unsigned or invalid — see gate.py's cmd_plan/cmd_record).
+
+    `run` is the run's resolved directory (a real Path — see resolve_run), `snap_p` is
+    policy.snapshot.json's path, and `meta` is run.json's already-parsed dict. Checks, in
+    order, ALL fail-closed (return a short BLOCKED-reason string; never raise or exit):
+
+      1. run.name must equal meta['run_id']. cmd_init assigns a run's directory name
+         ONCE, from a UTC timestamp, checking existence to guarantee it is never reused
+         (see cmd_init) — it is the one identity in this scheme an attacker who can only
+         edit FILES inside a run directory cannot also forge, because it is the name of
+         the directory they are writing into, not something read from those files. A
+         mismatch means this run.json was copied from (or edited to claim) a different
+         run than the one actually being verified — exactly the directory-copy replay a
+         delayed Codex review reproduced against the v1 payload (run_id + run_nonce +
+         snapshot bytes only, no independent identity check).
+      2. run_nonce must be a non-empty string (closes the run_id-collision replay gap;
+         unchanged from the original nonce fix).
+      3. POLICY_SIG_FILENAME must exist, and a verifier must be configured.
+      4. The signature must verify over policy_attest_bytes(run_id, run_nonce, run.name,
+         meta['risk'], snap_p) — the v2 payload, which additionally binds run_name (so a
+         signature is unusable outside the exact run directory it was made for, per #1)
+         and risk (so downgrading run.json's risk tier post-init no longer leaves a
+         waiver's governing signature intact — the second Codex P1: risk was previously
+         unsigned, so a CRITICAL run whose waivers should be blocked could be relabeled
+         SENSITIVE after signing and pass).
+
+    A v1-format signature (from a run initialized before this fix) cannot verify against
+    the v2 payload — this is intentional fail-closed behavior, not a bug: the BLOCKED
+    reason it produces (an ordinary "signature did not verify") tells the operator to
+    re-init, exactly like any other invalid signature. There is no real deployment with
+    v1 signatures yet (no repo's CI currently configures AR_SIGNER_CMD), so no migration
+    path is needed; if that ever changes, bump POLICY_ATTEST_VERSION again and extend
+    this function to recognize the version tag it can no longer verify, the same pattern
+    aggregate.py's _ATTESTATION_ALGO/_LEGACY_ALGOS already use for the run's overall
+    attestation digest.
+
+    Scope: callers only invoke this when the run contains a WAIVED or NOT_APPLICABLE gate
+    record — the common no-exception path stays completely infrastructure-free."""
+    run_id = meta.get("run_id")
+    run_nonce = meta.get("run_nonce")
+    risk = meta.get("risk")
+    run_name = Path(run).name
+    if not isinstance(run_id, str) or not run_id:
+        return "run.json has no run_id — cannot verify the policy-snapshot signature"
+    if run_name != run_id:
+        return (f"run directory name ({run_name!r}) does not match run.json's run_id "
+                f"({run_id!r}) — this run.json does not describe the run being "
+                "verified (possible copy from another run); re-init to get a "
+                "signable, verifiable snapshot")
+    if not isinstance(run_nonce, str) or not run_nonce:
+        return ("run.json has no run_nonce — the policy-snapshot signature cannot be "
+                "verified without it (this run predates the nonce fix, or run.json was "
+                "tampered with); re-init this run to get a signable, verifiable snapshot")
+    if not isinstance(risk, str) or not risk:
+        return "run.json has no risk tier — cannot verify the policy-snapshot signature"
+    sig_p = Path(run) / POLICY_SIG_FILENAME
+    if not sig_p.is_file():
+        return (f"no {POLICY_SIG_FILENAME} — the policy snapshot was not signed at init. "
+                "Configure a signer (AR_SIGNER_CMD, or install cosign / minisign with "
+                "AR_MINISIGN_KEY) before `panel.py init` so any run that later records a "
+                "waiver or not-applicable gate can be trusted")
+    argv_tmpl, kind = resolve_signing_tool(
+        "AR_VERIFIER_CMD",
+        [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)])
+    if argv_tmpl is None:
+        return ("no verifier available: set AR_VERIFIER_CMD, or install cosign (with "
+                "AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned) or minisign (with "
+                "AR_MINISIGN_PUBKEY or AR_MINISIGN_PUBKEY_FILE)")
+    with tempfile.TemporaryDirectory() as td:
+        msg_tmp = Path(td) / "policy.snapshot.attest"
+        msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_p))
+        proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_p, fatal=False)
+    if err:
+        return f"verifier '{kind}' could not run: {err}"
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()[-300:]
+        detail = f" — {stderr}" if stderr else ""
+        return f"signature did not verify (verifier: {kind}, exit {proc.returncode}){detail}"
+    return None
 
 
 def sign_fail(msg):
@@ -831,7 +946,18 @@ def load_attested_policy(run):
         return None, "policy.snapshot.json 'file' field is not a string"
     if not isinstance(text, str):
         return None, "policy.snapshot.json has no captured policy text"
-    if hashlib.sha256(text.encode("utf-8")).hexdigest() != sha:
+    # A syntactically valid JSON string can still contain an unpaired UTF-16 surrogate
+    # (e.g. an escaped "\ud800" with no matching low surrogate) — json.load() accepts it,
+    # but .encode("utf-8") raises UnicodeEncodeError. Without this guard that exception
+    # would propagate out of load_attested_policy(), past aggregate.py's normal BLOCKED-
+    # verdict path, and crash the run instead of failing closed (Codex, PR70 review,
+    # frontier-gate run pr70-provenance-2). Treat it exactly like any other corrupt
+    # snapshot: BLOCK, never crash.
+    try:
+        text_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError as e:
+        return None, f"policy.snapshot.json text is not valid UTF-8 ({e}) — corrupt/tampered"
+    if text_sha != sha:
         return None, "policy.snapshot.json text does not match its recorded sha256 — tampered"
     # The snapshot's OWN sha256 is not tamper-proof (an attacker can rewrite text AND sha
     # together). Cross-check it against the digest recorded in run.json at init — the

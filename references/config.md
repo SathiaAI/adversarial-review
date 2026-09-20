@@ -102,6 +102,24 @@ marking NOT_APPLICABLE any gate on CRITICAL tier — refused by default. `max_wa
 `--waive-expires` may be set. Neither key can make `mutation` waivable/NOT_APPLICABLE on
 CRITICAL: that one restriction is not policy-configurable.
 
+**A policy file makes waiving or marking NOT_APPLICABLE require a signed snapshot.**
+Whenever a policy file is configured, `panel.py init` opportunistically signs
+`policy.snapshot.json` if a signer is available (`AR_SIGNER_CMD`, or auto-detected
+cosign/minisign — see *Signing the verdict* below; the same env vars and auto-detect
+apply here). A run with **no** waived or NOT_APPLICABLE gate never needs this — the
+common path stays infrastructure-free. But the moment a run records one, both `gate.py
+plan --waive` / `gate.py record --status NOT_APPLICABLE` **and** `aggregate.py`
+independently require a verifiably-signed snapshot, and BLOCK (or refuse outright at
+plan/record time) without one — so a repo that wants to use waivers or NOT_APPLICABLE
+must configure a signer before `panel.py init`, or those exceptions will never pass. A
+repo with **no** policy file at all is exempt — waiver limits fall back to strict
+built-in defaults, which are not a mutable attested artifact, so there is nothing to
+sign. The signed payload binds the run's id, a random per-run nonce, the run
+directory's own (immutable) name, and the run's resolved risk tier, in addition to the
+policy text itself, so a signature cannot be replayed onto a different run, a
+colliding run id, a copied run directory, or a run whose risk was edited after
+signing.
+
 Precedence, everywhere: **CLI flag > env var > policy file > built-in default** —
 explicit beats ambient. The resolution is recorded in the run's artifacts so the
 audit trail shows where every setting came from: `run.json` gets a `sources` block
@@ -253,8 +271,8 @@ keyless `panel.py prepare` + `ingest` (MCP) transport does **not** take corrobor
 | `AR_PINS` | — | Comma list `role=model-slug` to pin specific models |
 | `AR_REBUTTAL` | `contention` | Rebuttal policy at init: `critical`, `contention`, `any` |
 | `AR_CAP_OVERRIDES` | — | Path to a capability-overrides file (see *Model capability profiles*) |
-| `AR_SIGNER_CMD` | auto | `aggregate.py --sign` signer command template (`{msg}`/`{sig}` tokens); overrides cosign/minisign auto-detect (see *Signing the verdict*) |
-| `AR_VERIFIER_CMD` | auto | `aggregate.py --verify-signature` verifier command template (`{msg}`/`{sig}` tokens); overrides auto-detect |
+| `AR_SIGNER_CMD` | auto | `aggregate.py --sign` signer command template (`{msg}`/`{sig}` tokens); overrides cosign/minisign auto-detect (see *Signing the verdict*). Also used, unchanged, by `panel.py init` to opportunistically sign `policy.snapshot.json` when a policy file is configured (see *policy file* above) |
+| `AR_VERIFIER_CMD` | auto | `aggregate.py --verify-signature` verifier command template (`{msg}`/`{sig}` tokens); overrides auto-detect. Also used, unchanged, by `gate.py plan`/`record` and `aggregate.py` to verify `policy.snapshot.sig` whenever a run records a waived or NOT_APPLICABLE gate |
 | `AR_MINISIGN_KEY` | — | Path to a minisign secret key; enables the minisign signing fallback |
 | `AR_MINISIGN_PUBKEY` | — | minisign **inline** public-key value for `--verify-signature` (`-P`) |
 | `AR_MINISIGN_PUBKEY_FILE` | — | Path to a minisign public-key **file** for `--verify-signature` (`-p`); wins over `AR_MINISIGN_PUBKEY` when both are set |
