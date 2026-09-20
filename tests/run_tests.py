@@ -1111,7 +1111,24 @@ def _stub_signer_env(extra=None):
            # happen needs this set, same as it always needed a working AR_SIGNER_CMD.
            # Tests that specifically exercise the new guard (t_trusted_signer_*) override
            # or unset it via `extra` below.
-           "AR_TRUSTED_SIGNER": "1"}
+           "AR_TRUSTED_SIGNER": "1",
+           # This test SUITE runs inside real CI (this repo's own ci.yml triggers on
+           # pull_request), so `ENV = {**os.environ, ...}` above -- and therefore this
+           # dict -- inherits the CI runner's OWN ambient GITHUB_EVENT_NAME=pull_request
+           # (plus GITHUB_REPOSITORY/SHA/RUN_ID/RUN_ATTEMPT) whether a test asked for it
+           # or not. A real CI failure on this branch (run 35525947669, 2026-09-20) is
+           # exactly this: 21 tests that expect opportunistic signing to succeed all hit
+           # trusted_signer_guard_error()'s pull_request refusal, NOT because the test
+           # logic was wrong, but because the test process's own ambient environment
+           # leaked into what should have been a fully test-controlled signing
+           # environment. Explicitly neutralize the whole CI-identity surface here so
+           # every test using this fixture is deterministic regardless of what
+           # environment the SUITE ITSELF happens to run in -- `extra` below (or a
+           # dict update after calling this function) is how a test opts back into a
+           # specific value, exactly as t_trusted_signer_refuses_under_pull_request_
+           # event_even_when_opted_in and the t_policy_sig_ci_context_* tests already do.
+           "GITHUB_EVENT_NAME": "", "GITHUB_REPOSITORY": "", "GITHUB_SHA": "",
+           "GITHUB_RUN_ID": "", "GITHUB_RUN_ATTEMPT": ""}
     if extra:
         env.update(extra)
     return env
@@ -1516,8 +1533,24 @@ def t_policy_sig_signed_at_init_when_signer_configured():
     sig = (run / "policy.snapshot.sig").read_bytes()
     meta = read(run / "run.json")
     run_nonce, risk = meta["run_nonce"], meta["risk"]
+    # Build the expected ci_context from `env` -- the dict the SUBPROCESS actually saw --
+    # not by calling ci_signing_context() fresh in THIS (the test runner's own) process.
+    # This test suite itself may be running inside real CI (this repo's own ci.yml
+    # triggers on pull_request), so this process's own os.environ can carry real
+    # GITHUB_REPOSITORY/SHA/RUN_ID/RUN_ATTEMPT/EVENT_NAME values that `_stub_signer_env()`
+    # deliberately neutralizes in the subprocess env but cannot reach into this process's
+    # own environment to also neutralize (see the CI leak this fixture's docstring
+    # describes, and the real CI failure it fixed: run 35525947669, 2026-09-20). Mirroring
+    # ci_signing_context()'s exact fallback logic against `env` keeps this test's expected
+    # message correct regardless of what environment the suite itself happens to run in.
+    ci_context = {
+        "repository": env.get("GITHUB_REPOSITORY", "").strip() or "local",
+        "commit": env.get("GITHUB_SHA", "").strip() or "local",
+        "run_id": env.get("GITHUB_RUN_ID", "").strip() or "local",
+        "run_attempt": env.get("GITHUB_RUN_ATTEMPT", "").strip() or "local",
+    }
     msg = policy_attest_bytes(run.name, run_nonce, run.name, risk,
-                               run / "policy.snapshot.json")
+                               run / "policy.snapshot.json", ci_context=ci_context)
     assert sig == b"STUBSIG-v1:" + hashlib.sha256(msg).hexdigest().encode(), sig
 
 
