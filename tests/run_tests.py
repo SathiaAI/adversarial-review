@@ -1724,10 +1724,21 @@ def t_policy_sig_directory_identity_forgery_blocks():
     # DIRECTORY'S OWN name -- assigned once, immutably, by cmd_init -- which the copy
     # does not (and, short of renaming the directory itself, cannot) also forge to match.
     env = _stub_signer_env()
-    repo_a = _sensitive_repo_with_policy(env=env, waive=True)
-    run_a = latest_run(repo_a)
-    repo_b = _sensitive_repo_with_policy(env=env, waive=True)
-    run_b = latest_run(repo_b)
+    # run_id is a second-resolution timestamp generated independently per repo (panel.py's own
+    # collision-avoidance only dedupes WITHIN one repo's run root), so two separate repos' inits can
+    # rarely land in the same wall-clock second and get the identical run_id string (observed on a fast
+    # CI runner). That coincidence is not what this test is about -- it needs run_a and run_b to have
+    # genuinely DIFFERENT names to prove the fix checks the copied run_id against the run directory's
+    # OWN name, not merely against itself -- so retry until they differ.
+    for _attempt in range(5):
+        repo_a = _sensitive_repo_with_policy(env=env, waive=True)
+        run_a = latest_run(repo_a)
+        repo_b = _sensitive_repo_with_policy(env=env, waive=True)
+        run_b = latest_run(repo_b)
+        if run_a.name != run_b.name:
+            break
+    else:
+        raise AssertionError("could not obtain two run directories with distinct names after 5 tries")
     _resolve_open_finding(run_b)
     sh(["aggregate.py"], repo_b, expect=0, env=env)  # sanity: run_b passes before the swap
 
