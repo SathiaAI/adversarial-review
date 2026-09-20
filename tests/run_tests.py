@@ -1486,6 +1486,18 @@ def _resolve_open_finding(run):
 def t_policy_sig_signed_at_init_when_signer_configured():
     # panel.py init signs policy.snapshot.json opportunistically when a signer is
     # configured — the sidecar exists immediately, before any gate/waiver is recorded.
+    #
+    # Builds the expected message via the real policy_attest_bytes() (not a hand-copied
+    # byte format) so this test tracks the current POLICY_ATTEST_VERSION automatically --
+    # v2->v3 (frontier-gate run pr70-architecture-review, 2026-09-20) added the live CI
+    # context (repository/commit/CI-run-id/CI-run-attempt, see ci_signing_context()) on
+    # top of v2's run_id/run_nonce/run_name/risk/snapshot-bytes, and a hand-copied format
+    # string here would have silently gone stale at that bump, exactly like the two
+    # attestation-algorithm tests that DID go stale in round 2. This test's own job is
+    # checking that `init` actually invokes the signer over the CURRENT canonical
+    # payload, which the replay/tamper/version-specific tests elsewhere in this file
+    # cover directly.
+    from _common import policy_attest_bytes
     env = _stub_signer_env()
     repo = fresh_repo()
     write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
@@ -1494,16 +1506,10 @@ def t_policy_sig_signed_at_init_when_signer_configured():
     run = latest_run(repo)
     assert "signed:" in r.stdout and "policy.snapshot.sig" in r.stdout, r.stdout
     sig = (run / "policy.snapshot.sig").read_bytes()
-    # v2 signed bytes are "ar-policy-attest-v2" + run_id + run_nonce + run_name + risk +
-    # policy.snapshot.json (see _common.py's policy_attest_bytes). v2 additionally binds
-    # run_name (the run directory's own immutable basename — closes the directory-copy
-    # replay bypass, Codex P1) and risk (the resolved tier — closes the risk-downgrade
-    # bypass, Codex P1) beyond the v1 run_id+run_nonce+snapshot format.
     meta = read(run / "run.json")
     run_nonce, risk = meta["run_nonce"], meta["risk"]
-    msg = (b"ar-policy-attest-v2\n" + run.name.encode("utf-8") + b"\n"
-           + run_nonce.encode("utf-8") + b"\n" + run.name.encode("utf-8") + b"\n"
-           + risk.encode("utf-8") + b"\n" + (run / "policy.snapshot.json").read_bytes())
+    msg = policy_attest_bytes(run.name, run_nonce, run.name, risk,
+                               run / "policy.snapshot.json")
     assert sig == b"STUBSIG-v1:" + hashlib.sha256(msg).hexdigest().encode(), sig
 
 
@@ -1787,6 +1793,148 @@ def t_policy_sig_risk_tamper_blocks():
             "--waive-expires", (date.today() + timedelta(days=7)).isoformat()],
            repo, env=env, expect=1)
     assert "not verifiably signed" in r.stderr, r.stderr
+
+
+# ------------------------------------------------- PR70 architecture hardening v3
+# (frontier-gate run pr70-architecture-review, 2026-09-20, Paul's decision "A -
+# redesign_signing_boundary", 3/4 panel consensus 0.84): v2 closed directory-identity
+# and risk-downgrade forgery, but a signature check running inside the SAME
+# compromised workspace/checkout that untrusted PR code controls is not yet an
+# independent security boundary on its own (Astra's original round-1 finding). Batch 2
+# is the first of two fixes: bind the CI orchestrator's OWN ambient identity
+# (repository, commit, CI run id, CI run attempt -- ci_signing_context(), read FRESH
+# from THIS process's environment at both sign and verify time, never from any file a
+# copied run directory could carry along) into the signed payload (policy_attest_bytes
+# v3). This closes cross-run, cross-commit, and cross-repository replay even when the
+# run directory name/run_id/run_nonce all match -- checklist item 12. Batch 3 (separate,
+# not yet built as of this commit) isolates WHO can run the signer into a job untrusted
+# PR code can never reach; v3's CI-context binding is necessary but not sufficient for
+# that on its own, and is disclosed as such.
+
+def t_policy_sig_ci_context_directory_copy_with_matching_name_still_blocked():
+    # panel checklist item 12, literal scenario: a run directory copied wholesale from
+    # one CI job into another -- forced to share the EXACT SAME directory name (and
+    # therefore the same run_id/run_nonce/run_name/risk that v2's checks alone accept)
+    # -- must still fail verification when the two jobs' live CI context (repository,
+    # commit, CI run id) differs. v2 cannot catch this: nothing about a copied
+    # run.json/policy.snapshot.json/.sig differs between the two directories once the
+    # name is forced to match. Only binding the CI orchestrator's OWN ambient values,
+    # read fresh at verify time from the verifying process's own environment -- never
+    # from a file the copy could carry along -- closes this.
+    ci_a = {"GITHUB_REPOSITORY": "SathiaAI/adversarial-review",
+            "GITHUB_SHA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "GITHUB_RUN_ID": "1000000001", "GITHUB_RUN_ATTEMPT": "1"}
+    ci_b = {"GITHUB_REPOSITORY": "SathiaAI/adversarial-review-fork",
+            "GITHUB_SHA": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "GITHUB_RUN_ID": "2000000002", "GITHUB_RUN_ATTEMPT": "2"}
+    env_a = _stub_signer_env(extra=ci_a)
+    env_b = _stub_signer_env(extra=ci_b)
+    repo_a = _sensitive_repo_with_policy(env=env_a, waive=True)
+    run_a = latest_run(repo_a)
+    repo_b = _sensitive_repo_with_policy(env=env_b, waive=True)
+    run_b_orig = latest_run(repo_b)
+    _resolve_open_finding(run_b_orig)
+    # sanity: run_b verifies fine with its own signature, under its own CI context,
+    # before the attack
+    sh(["aggregate.py"], repo_b, expect=0, env=env_b)
+
+    # force run_b's directory name (and the run_id/nonce inside run.json) to exactly
+    # match run_a's, then copy run_a's entire signed policy artifact set over -- the
+    # same directory-identity attack t_policy_sig_directory_identity_forgery_blocks
+    # exercises, but this time the two runs were genuinely signed under different CI
+    # jobs (different repo/commit/run id/run attempt)
+    rj_a = read(run_a / "run.json")
+    run_b = run_b_orig.parent / rj_a["run_id"]
+    run_b_orig.rename(run_b)
+    for name in ("run.json", "policy.snapshot.json", "policy.snapshot.sig"):
+        (run_b / name).write_bytes((run_a / name).read_bytes())
+
+    # verify as if we were STILL job B (repository-fork/commit-b/run-id-2000000002) --
+    # exactly what a real CI runner would report as its own ambient environment
+    # regardless of what got copied into the run directory
+    r = sh(["aggregate.py"], repo_b, expect=2, env=env_b)
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "did not verify" in r.stdout, r.stdout
+
+
+def t_policy_sig_ci_context_repository_mismatch_blocks():
+    # v3 binding, isolated to ONE field: a policy signed while GITHUB_REPOSITORY
+    # reported one repo must fail verification the moment that same run (same
+    # directory, same run_id/run_nonce/run_name/risk -- nothing AR-internal tampered)
+    # is verified from a process whose own environment reports a different repository.
+    ci = {"GITHUB_REPOSITORY": "SathiaAI/adversarial-review",
+          "GITHUB_SHA": "cccccccccccccccccccccccccccccccccccccccc",
+          "GITHUB_RUN_ID": "3000000003", "GITHUB_RUN_ATTEMPT": "1"}
+    env = _stub_signer_env(extra=ci)
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    sh(["aggregate.py"], repo, expect=0, env=env)  # sanity: same CI context still verifies
+
+    verify_env = {**env, "GITHUB_REPOSITORY": "someone-else/adversarial-review-fork"}
+    r = sh(["aggregate.py"], repo, expect=2, env=verify_env)
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "did not verify" in r.stdout, r.stdout
+
+
+def t_policy_sig_ci_context_commit_mismatch_blocks():
+    # Same isolation as the repository test, for GITHUB_SHA: a run signed on one commit
+    # must not verify from a process reporting a different commit -- guards against a
+    # signed policy snapshot being carried forward (or backward) onto a different
+    # commit within the same repository and run.
+    ci = {"GITHUB_REPOSITORY": "SathiaAI/adversarial-review",
+          "GITHUB_SHA": "1111111111111111111111111111111111111111",
+          "GITHUB_RUN_ID": "4000000004", "GITHUB_RUN_ATTEMPT": "1"}
+    env = _stub_signer_env(extra=ci)
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    sh(["aggregate.py"], repo, expect=0, env=env)
+
+    verify_env = {**env, "GITHUB_SHA": "2222222222222222222222222222222222222222"}
+    r = sh(["aggregate.py"], repo, expect=2, env=verify_env)
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "did not verify" in r.stdout, r.stdout
+
+
+def t_policy_sig_ci_context_run_id_mismatch_blocks():
+    # Same isolation, for GITHUB_RUN_ID -- the CI orchestrator's own run identity,
+    # distinct from AR's internal run.json run_id (the timestamp-based directory name,
+    # unaffected here): a policy signed during CI run N must not verify as having been
+    # signed during a re-run/different run N+1 of the same job, even on the same commit
+    # of the same repository.
+    ci = {"GITHUB_REPOSITORY": "SathiaAI/adversarial-review",
+          "GITHUB_SHA": "3333333333333333333333333333333333333333",
+          "GITHUB_RUN_ID": "5000000005", "GITHUB_RUN_ATTEMPT": "1"}
+    env = _stub_signer_env(extra=ci)
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    sh(["aggregate.py"], repo, expect=0, env=env)
+
+    verify_env = {**env, "GITHUB_RUN_ID": "5000000006"}
+    r = sh(["aggregate.py"], repo, expect=2, env=verify_env)
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "did not verify" in r.stdout, r.stdout
+
+
+def t_policy_sig_ci_context_consistent_real_ci_env_still_passes():
+    # Happy-path counterpart to the mismatch tests above: a run signed AND verified
+    # under a full, consistent, realistic set of GITHUB_* Actions values (not just the
+    # "local"/"local" default both sign and verify fall back to when no GITHUB_* vars
+    # are set at all, which is what every other test in this file exercises implicitly)
+    # still verifies cleanly. Guards against the v3 CI-context binding being
+    # accidentally over-strict.
+    ci = {"GITHUB_REPOSITORY": "SathiaAI/adversarial-review",
+          "GITHUB_SHA": "4444444444444444444444444444444444444444",
+          "GITHUB_RUN_ID": "6000000006", "GITHUB_RUN_ATTEMPT": "2"}
+    env = _stub_signer_env(extra=ci)
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0, env=env)
+    v = read(run / "verdict.json")
+    assert v["verdict"] == "PASS", v
 
 
 def t_policy_sig_snapshot_lone_surrogate_blocks_not_crashes():

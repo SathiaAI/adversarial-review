@@ -58,17 +58,61 @@ def write_json(path, obj):
 POLICY_SIG_FILENAME = "policy.snapshot.sig"
 
 
-POLICY_ATTEST_VERSION = "2"
+POLICY_ATTEST_VERSION = "3"
 
-def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path,
+# CI context values with no CI-provided source (a local/dev run, or a CI system that
+# doesn't set the GitHub Actions env vars below) fall back to this literal marker rather
+# than an empty string, so "no CI context available" is an explicit, visible value in the
+# signed payload rather than something that could collide with a blank/missing field.
+_NO_CI_CONTEXT = "local"
+
+
+def ci_signing_context():
+    """The CI-orchestrator-assigned identity to bind into a v3 policy-attest payload,
+    read fresh from THIS process's own environment every time -- never from run.json or
+    any other file a copied/replayed run directory could carry along. On GitHub Actions
+    these four are runner-provided ambient values that a job's own code cannot choose or
+    rewrite (unlike a value read from a config file or CLI flag): GITHUB_REPOSITORY
+    ("owner/repo"), GITHUB_SHA (the commit under test), GITHUB_RUN_ID (unique per
+    workflow execution, never reused), GITHUB_RUN_ATTEMPT (increments per re-run of that
+    same execution). Outside GitHub Actions (local dev, a different CI system) all four
+    fall back to "local" -- this still round-trips correctly (sign and verify agree,
+    since both read the same live environment) but provides NO cross-run identity in
+    that shape, only the pre-existing run_name/run_nonce/risk binding does. See
+    docs/THREAT-MODEL.md for what this can and cannot prove on its own, in particular
+    that these values only protect against REPLAY (an old, validly-signed run's files
+    copied elsewhere) -- they do not stop code running in the SAME job that performs the
+    signing from choosing its own policy content to sign; that is what the isolated
+    trusted-signer job (see action.yml / ci.yml) is for."""
+    return {
+        "repository": os.environ.get("GITHUB_REPOSITORY", "").strip() or _NO_CI_CONTEXT,
+        "commit": os.environ.get("GITHUB_SHA", "").strip() or _NO_CI_CONTEXT,
+        "run_id": os.environ.get("GITHUB_RUN_ID", "").strip() or _NO_CI_CONTEXT,
+        "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "").strip() or _NO_CI_CONTEXT,
+    }
+
+
+def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path, ci_context=None,
                          version=POLICY_ATTEST_VERSION):
     """The exact bytes signed/verified for the policy-snapshot signature.
 
-    v2 (current) binds: version tag, run_id, run_nonce, run_name (the run directory's
+    v3 (current) additionally binds the four ci_signing_context() values -- repository,
+    commit, CI run id, CI run attempt -- ahead of the snapshot bytes (frontier-gate run
+    pr70-architecture-review, 2026-09-20, batch 2 of the redesign_signing_boundary
+    decision). `ci_context` defaults to a fresh ci_signing_context() call when omitted,
+    so both the signer (panel.py, at init) and the verifier (this module, at aggregate/
+    gate time) always bind whatever THEIR OWN live environment reports -- never a value
+    carried in run.json or any other file a copied run directory could bring with it.
+    This is what closes cross-run, cross-commit, and cross-repository replay: copying an
+    older, validly-signed run's policy.snapshot.json/.sig into a new run directory (even
+    one matching the original's exact name, defeating v2's run_name check alone) still
+    fails verification the moment the current job's repository, commit, or CI run
+    identity differs from what was actually signed.
+
+    v2 (superseded) binds: version tag, run_id, run_nonce, run_name (the run directory's
     OWN basename), risk (the resolved tier from run.json), then policy.snapshot.json's
-    raw bytes. v1 (superseded, see verify_policy_snapshot_signature) bound only run_id +
-    run_nonce + snapshot bytes and had two gaps a delayed Codex review on PR70 found and
-    reproduced:
+    raw bytes. v1 (further superseded) bound only run_id + run_nonce + snapshot bytes and
+    had two gaps a delayed Codex review on PR70 found and reproduced:
 
       - run_name closes: copying a whole legitimately-signed (run_id, run_nonce,
         policy.snapshot.json, policy.snapshot.sig) tuple from an old, permissive run
@@ -99,9 +143,15 @@ def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path,
     making one run's signature trivially "valid" for the other. run_nonce
     (secrets.token_hex(16), minted fresh per run in cmd_init and recorded in run.json)
     closes that gap deterministically instead of relying on timestamp luck."""
+    if ci_context is None:
+        ci_context = ci_signing_context()
     return (b"ar-policy-attest-v" + str(version).encode("ascii") + b"\n"
             + run_id.encode("utf-8") + b"\n" + run_nonce.encode("utf-8") + b"\n"
             + str(run_name).encode("utf-8") + b"\n" + str(risk).encode("utf-8") + b"\n"
+            + ci_context["repository"].encode("utf-8") + b"\n"
+            + ci_context["commit"].encode("utf-8") + b"\n"
+            + ci_context["run_id"].encode("utf-8") + b"\n"
+            + ci_context["run_attempt"].encode("utf-8") + b"\n"
             + Path(snap_path).read_bytes())
 
 
@@ -132,22 +182,27 @@ def verify_policy_snapshot_signature(run, snap_p, meta):
          unchanged from the original nonce fix).
       3. POLICY_SIG_FILENAME must exist, and a verifier must be configured.
       4. The signature must verify over policy_attest_bytes(run_id, run_nonce, run.name,
-         meta['risk'], snap_p) — the v2 payload, which additionally binds run_name (so a
-         signature is unusable outside the exact run directory it was made for, per #1)
-         and risk (so downgrading run.json's risk tier post-init no longer leaves a
-         waiver's governing signature intact — the second Codex P1: risk was previously
-         unsigned, so a CRITICAL run whose waivers should be blocked could be relabeled
-         SENSITIVE after signing and pass).
+         meta['risk'], snap_p) with NO explicit ci_context — the default fetches a FRESH
+         ci_signing_context() from this process's own environment, the same call panel.py
+         makes at sign time. This is the v3 payload (frontier-gate run
+         pr70-architecture-review, 2026-09-20): beyond v2's run_name and risk binding, it
+         additionally binds the live repository/commit/CI-run-id/CI-run-attempt at BOTH
+         sign and verify time, independently — never a value carried in run.json or any
+         other file a copied run directory could bring with it. A run directory copied
+         wholesale into a different repository, onto a different commit, or into a
+         different CI execution now fails verification even when run_name coincidentally
+         matches (v2 alone could not catch that; only the directory name was checked).
 
-    A v1-format signature (from a run initialized before this fix) cannot verify against
-    the v2 payload — this is intentional fail-closed behavior, not a bug: the BLOCKED
-    reason it produces (an ordinary "signature did not verify") tells the operator to
-    re-init, exactly like any other invalid signature. There is no real deployment with
-    v1 signatures yet (no repo's CI currently configures AR_SIGNER_CMD), so no migration
-    path is needed; if that ever changes, bump POLICY_ATTEST_VERSION again and extend
-    this function to recognize the version tag it can no longer verify, the same pattern
-    aggregate.py's _ATTESTATION_ALGO/_LEGACY_ALGOS already use for the run's overall
-    attestation digest.
+    A v1- or v2-format signature (from a run initialized before this fix) cannot verify
+    against the v3 payload — this is intentional fail-closed behavior, not a bug: the
+    BLOCKED reason it produces (an ordinary "signature did not verify") tells the
+    operator to re-init, exactly like any other invalid signature. There is no real
+    deployment with v1 or v2 signatures yet (no repo's CI currently configures
+    AR_SIGNER_CMD or AR_ALLOW_KEYLESS), so no migration path is needed; if that ever
+    changes, bump POLICY_ATTEST_VERSION again and extend this function to recognize the
+    version tag it can no longer verify, the same pattern aggregate.py's
+    _ATTESTATION_ALGO/_LEGACY_ALGOS already use for the run's overall attestation
+    digest.
 
     Scope: callers only invoke this when the run contains a WAIVED or NOT_APPLICABLE gate
     record — the common no-exception path stays completely infrastructure-free."""

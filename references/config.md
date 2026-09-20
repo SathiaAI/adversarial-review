@@ -118,7 +118,13 @@ sign. The signed payload binds the run's id, a random per-run nonce, the run
 directory's own (immutable) name, and the run's resolved risk tier, in addition to the
 policy text itself, so a signature cannot be replayed onto a different run, a
 colliding run id, a copied run directory, or a run whose risk was edited after
-signing.
+signing. It also binds the live CI-orchestrator identity (`GITHUB_REPOSITORY`,
+`GITHUB_SHA`, `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT` on GitHub Actions; `local` for all
+four outside CI), read fresh from the process's own environment at both sign and
+verify time — never from a file a copied run directory could carry along — so a
+directory copied wholesale between repos, commits, or CI runs still fails to verify
+even when its name, id, nonce, and risk all match. These are ordinary GitHub
+Actions-provided variables, not something you configure; see `docs/THREAT-MODEL.md`.
 
 Precedence, everywhere: **CLI flag > env var > policy file > built-in default** —
 explicit beats ambient. The resolution is recorded in the run's artifacts so the
