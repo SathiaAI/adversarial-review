@@ -1926,6 +1926,29 @@ def t_policy_sig_ci_context_run_id_mismatch_blocks():
     assert "did not verify" in r.stdout, r.stdout
 
 
+def t_policy_sig_ci_context_run_attempt_mismatch_blocks():
+    # Same isolation as the other three CI-context fields, for GITHUB_RUN_ATTEMPT --
+    # directly maps to panel checklist item 19's "reruns": GitHub Actions bumps this
+    # value on a manual re-run of a failed job. A policy signed during attempt 1 must
+    # not verify as having been signed during attempt 2 of the very same run id, on the
+    # same commit of the same repository -- a rerun's own trusted-signer job must
+    # produce (and does, automatically, since ci_signing_context() is read fresh each
+    # time) its own signature rather than reusing attempt 1's.
+    ci = {"GITHUB_REPOSITORY": "SathiaAI/adversarial-review",
+          "GITHUB_SHA": "5555555555555555555555555555555555555555",
+          "GITHUB_RUN_ID": "7000000007", "GITHUB_RUN_ATTEMPT": "1"}
+    env = _stub_signer_env(extra=ci)
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    sh(["aggregate.py"], repo, expect=0, env=env)
+
+    verify_env = {**env, "GITHUB_RUN_ATTEMPT": "2"}
+    r = sh(["aggregate.py"], repo, expect=2, env=verify_env)
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "did not verify" in r.stdout, r.stdout
+
+
 def t_policy_sig_ci_context_consistent_real_ci_env_still_passes():
     # Happy-path counterpart to the mismatch tests above: a run signed AND verified
     # under a full, consistent, realistic set of GITHUB_* Actions values (not just the

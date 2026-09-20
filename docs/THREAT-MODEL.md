@@ -1,8 +1,8 @@
 # Threat model — policy-snapshot signing (waiver / NOT_APPLICABLE authorization)
 
-**Status:** batches 1-3 of 4 shipped (frontier-gate run `pr70-architecture-review`, 2026-09-20,
-Paul's decision "A — `redesign_signing_boundary`"). Batch 4 (adoption/consumer regression tests)
-is the remaining item; this document itself is part of batch 3.
+**Status:** batches 1-4 of 4 shipped (frontier-gate run `pr70-architecture-review`, 2026-09-20,
+Paul's decision "A — `redesign_signing_boundary`"). Two design questions remain explicitly open
+(the cross-job signature hand-off, and approval-gated waivers) — see the status table below, not silently dropped.
 **Scope:** the policy-snapshot signature (`policy.snapshot.sig`, `_common.py`'s
 `policy_attest_bytes()` / `verify_policy_snapshot_signature()` / `trusted_signer_guard_error()`,
 and `panel.py`'s `_sign_policy_snapshot_if_possible()`) — the mechanism that lets `gate.py plan
@@ -121,9 +121,89 @@ into another), not a general trust-topology verifier.
 | Waiver signed without any human approval evidence | Not yet built — candidate follow-up beyond the current 4-batch plan | Open |
 | A trusted job's signature cannot reach the untrusted review job's own run directory (cross-job hand-off) | Not yet designed — candidate approaches sketched above; needs its own frontier-gate panel run before implementation | Open |
 
-## Batch 4 (planned, not yet built)
+## Batch 4 — adoption/consumer coverage and remaining documentation
 
-Adoption/consumer regression tests: a forged same-name status check, old-run artifact
-substitution, artifact replacement after signing, signature deletion, relabeling a WAIVED outcome
-as PASS, forks/same-repo PRs/reruns, missing signing infrastructure, and confirming an ordinary
-review still passes with no signer configured at all.
+Regression tests proving each adoption/consumer attack shape is rejected, mapped to what actually
+runs them:
+
+| Scenario (checklist item 19) | Covered by |
+|---|---|
+| Old-run artifact substitution (matching directory name forced) | `t_policy_sig_directory_identity_forgery_blocks`, `t_policy_sig_replay_from_another_run_blocks`, `t_policy_sig_ci_context_directory_copy_with_matching_name_still_blocked` |
+| Cross-run/commit/repository/CI-run/CI-run-attempt replay | `t_policy_sig_ci_context_repository_mismatch_blocks`, `_commit_mismatch_blocks`, `_run_id_mismatch_blocks`, `_run_attempt_mismatch_blocks` (batch 4) |
+| Artifact replacement after signing (policy text + risk tier) | `t_policy_sig_coordinated_two_file_tamper_still_blocks`, `t_policy_sig_risk_tamper_blocks` |
+| Signature deletion after a waiver was planned | `t_policy_sig_missing_blocks_waiver_run` |
+| Relabeling a WAIVED/BLOCKED outcome as PASS in `verdict.json` | `t_sign_verify_detects_relabeled_verdict` (pre-existing, E6-S1) |
+| Run-id collision between two independently-created runs | `t_policy_sig_replay_survives_run_id_collision_thanks_to_nonce` |
+| Signing attempted from a PR-author-controlled job (same-repo **or** fork — `GITHUB_EVENT_NAME=pull_request` does not distinguish them, and the guard treats them identically on purpose) | `t_trusted_signer_refuses_under_pull_request_event_even_when_opted_in` |
+| Signing skipped entirely without the trusted-job opt-in | `t_trusted_signer_unset_skips_signing_even_with_working_signer` |
+| Missing signing infrastructure / no policy file at all — ordinary review still passes | `t_policy_sig_no_signer_is_a_note_not_a_failure`, `t_policy_sig_no_policy_at_all_is_exempt`, `t_trusted_signer_guard_never_touched_when_no_policy_file_configured`, and every plain `_complete_sensitive_repo()`-based test in this file (no signer configured at all) |
+| Signing succeeds from a legitimately trusted trigger + opt-in | `t_trusted_signer_opted_in_from_trusted_trigger_signs_normally`, `t_policy_sig_ci_context_consistent_real_ci_env_still_passes` |
+
+Three items from checklist item 19 are **not** Python-testable — they depend on GitHub's own
+platform behavior (check-run publishing, branch-protection matching, merge-queue semantics), not
+on anything this repo's scripts compute. Documented here instead of faked as a unit test:
+
+### Forged same-name status check (checklist item 11)
+
+A PR job could attempt to post its own check run or commit status using the **same name** as the
+real "adversarial-review" required check, to trick branch protection into treating a forged PASS
+as the real one. This repo's scripts never publish a GitHub check themselves — that is the
+workflow's `permissions:`/`checks: write` scope and GitHub's own required-status-check matching
+(by exact job name **and** the workflow file that produced it). Adopter responsibility:
+
+- The trusted job that runs `aggregate.py` should be the **only** job with `checks: write` (or
+  `statuses: write`) permission targeting the required check's name; the untrusted review job
+  should have `checks: read`/none.
+- Configure the branch protection rule's required check against the **trusted job's** check name,
+  not a name any `pull_request`-triggered job could also produce.
+- A `pull_request`-triggered job's default `GITHUB_TOKEN` is read-only for a fork PR (GitHub
+  enforces this platform-side) — but for a **same-repo** (non-fork) PR it is read-write by default
+  unless the repository's Actions settings restrict it. Explicitly set
+  `permissions: { contents: read }` (no `checks:`/`statuses:` write) on the untrusted review job
+  regardless of fork status, rather than relying on GitHub's fork-vs-same-repo default.
+
+### Merge queues and `pull_request_target` (not definitively characterized here)
+
+Two GitHub Actions triggers have trust semantics this document does not assert a definitive answer
+for, because they are configuration-dependent in ways `trusted_signer_guard_error()` cannot inspect:
+
+- **`merge_group`** (merge-queue entries): runs against a synthetic merge commit of the PR into the
+  target branch. Whether this should be treated as "trusted" depends on the queue's own
+  configuration (which required checks gate queue entry) — this repo's guard does **not**
+  currently refuse `merge_group`, which means a repo relying on a merge queue as its *only*
+  protection before the trusted signer job runs should verify independently that queue entry
+  itself requires the untrusted review job to have already passed. Flagged as unverified rather
+  than silently assumed safe.
+- **`pull_request_target`**: runs with the **base** repository's context and secrets by default,
+  and by default checks out the **base** ref, not the PR head — safe in that default form. It
+  becomes exactly as dangerous as `pull_request` the moment a workflow overrides
+  `actions/checkout`'s `ref:` to the PR's head SHA, which is a common (and commonly
+  security-relevant) pattern for workflows that need to test PR code with secrets available. This
+  repo's guard does **not** refuse `pull_request_target` — doing so would break the safe, default
+  usage. **Never use `pull_request_target` with a PR-head checkout for the trusted signer job.**
+
+### Secret storage, required-check configuration, key rotation/revocation
+
+- **Secret storage.** Store `AR_SIGNER_CMD`'s underlying key material (a minisign secret key file,
+  or nothing at all for cosign keyless/OIDC) as a GitHub Actions **environment** secret scoped to
+  the trusted job's environment (`environment: policy-signer` with required reviewers, or at
+  minimum a repository secret never referenced by the untrusted review job's workflow file). Never
+  a repository-wide secret referenced from both jobs' workflow files — that reintroduces the
+  opportunistic-signing gap batch 3 closes at the code level, but at the credential-scoping level
+  instead.
+- **Required-check configuration.** Branch protection must require the check produced by the
+  **trusted** job (or a job downstream of it), not the untrusted review job's own check — otherwise
+  a repo could pass its required check without ever running the trusted signer at all on a run that
+  needs one.
+- **Key rotation/revocation.** Rotating `AR_SIGNER_CMD`'s key (or a minisign key pair) does not
+  need to invalidate already-completed runs' signatures — `policy.snapshot.sig` is checked only at
+  `gate.py plan --waive`/`record --status NOT_APPLICABLE` and `aggregate.py` time for that specific
+  run, not re-verified later. A rotated key simply means: (1) update the verifier-side
+  configuration (`AR_VERIFIER_CMD`/`AR_MINISIGN_PUBKEY`) everywhere it is read, atomically with the
+  signer-side update, so an in-flight run signed under the old key still verifies against the old
+  public key during its own lifetime, never a mixed state where the same run is checked against
+  two different keys at different times; (2) revoking a compromised key means rotating it — there
+  is no separate revocation list or expiry mechanism today, so a key believed compromised must be
+  rotated immediately and any run signed after the suspected compromise treated as untrusted by the
+  operator, manually, since nothing here can retroactively invalidate a signature that still
+  verifies under the (compromised) key it was made with.
