@@ -11638,6 +11638,17 @@ def t_config_md_documents_jev_three_tier_credentials():
         "the doc must describe the origin-based (not hostname-only) fallback comparison"
 
 
+def t_schemas_md_documents_rebuttal_plan_digest_fields():
+    # CodeRabbit (PR69, round 4): fix #3 added required_finding_digests/
+    # skipped_finding_digests to rebuttal/plan.json but references/schemas.md's example
+    # for that file still only showed the id-based fields -- an operator reading the
+    # canonical schema doc couldn't discover the digest fields aggregate.py actually
+    # requires (see t_check_rebuttal_jev_gate_requires_digest_fields).
+    text = (SKILL / "references" / "schemas.md").read_text(encoding="utf-8")
+    for field in ("required_finding_digests", "skipped_finding_digests"):
+        assert field in text, f"{field} must be documented in references/schemas.md"
+
+
 def t_jev_credentials_key_file_read_error_falls_through_safely():
     # Fix #11: kf.is_file() can be True while read_text() still raises OSError (permission
     # denied, removed mid-check, ...) -- this must fall through to unavailable, not crash.

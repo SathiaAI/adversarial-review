@@ -183,15 +183,25 @@ skipped for a policy/tier that requires it.
 
 ```json
 // rebuttal/plan.json — from `jev_triage.py rebuttal-gate`; read by aggregate.py's
-// _rebuttal_jev_gate(). Absent, malformed (not an object, or required_finding_ids/
-// skipped_finding_ids not a list of strings), or not covering every real high/critical
-// finding id in this run's own panel/<role>.json reports (required ∪ skipped must be a
-// superset) is treated identically to a run that never ran rebuttal-gate.
+// _rebuttal_jev_gate(). required_finding_digests/skipped_finding_digests (round 4) are
+// REQUIRED alongside required_finding_ids/skipped_finding_ids, one digest per id in the
+// same order — each is _common.canonical_finding_digest() of the corresponding finding's
+// title/file/line/severity/evidence/scenario/author_role, not the id itself, so a stale
+// plan whose ids happen to match a `panel.py run --force` re-run's NEW findings (which
+// can reuse a conventional id like "security-1" for a completely different defect) is
+// detected and rejected rather than silently trusted. A plan is treated identically to a
+// run that never ran rebuttal-gate (falls back to the stricter blanket rebuttal rule) if
+// it is absent; malformed (not an object); required_finding_ids/skipped_finding_ids or
+// required_finding_digests/skipped_finding_digests not same-length lists of strings; or
+// the digest sets recomputed fresh from this run's own panel/<role>.json reports are not
+// a subset of (required_finding_digests ∪ skipped_finding_digests) — content coverage,
+// not just id-set coverage.
 {
   "generated_at": "ISO-8601", "model": "typesafe/jev-1.13|null",
   "decisions": {"<finding-id>": {"contested": 0.0, "would_change": 0.0, "error": "string|null",
-                                  "decision": "run|skip"}},
+                                  "decision": "run|skip", "digest": "sha256 hex string"}},
   "required_finding_ids": ["security-1"], "skipped_finding_ids": [],
+  "required_finding_digests": ["sha256 hex string"], "skipped_finding_digests": [],
   "jev_cost_usd": 0.0
 }
 ```
