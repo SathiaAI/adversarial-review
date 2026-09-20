@@ -1240,20 +1240,30 @@ def t_sign_cosign_verify_requires_identity():
     # aggregate.py's namespace as _cosign_verify_argv; its `shutil.which` lookup resolves
     # against _common's module globals, so the monkeypatch targets _common.shutil, not
     # aggregate.shutil (aggregate no longer imports shutil directly at all).
+    #
+    # Also covers the LATER, separate gate (frontier-gate run pr70-architecture-review,
+    # 2026-09-20): identity+issuer being pinned is necessary but, since that run, no longer
+    # sufficient on its own -- AR_ALLOW_KEYLESS must be explicitly set too (Paul's "not
+    # keyless" decision), so this test now checks both gates independently before checking
+    # them together.
     import importlib
     import aggregate
     import _common
     importlib.reload(aggregate)
     orig_which = _common.shutil.which
     _common.shutil.which = lambda name: "/usr/bin/cosign" if name == "cosign" else orig_which(name)
-    saved = {k: os.environ.get(k) for k in ("AR_COSIGN_IDENTITY", "AR_COSIGN_ISSUER")}
+    saved = {k: os.environ.get(k) for k in ("AR_COSIGN_IDENTITY", "AR_COSIGN_ISSUER", "AR_ALLOW_KEYLESS")}
     try:
-        for k in ("AR_COSIGN_IDENTITY", "AR_COSIGN_ISSUER"):
+        for k in ("AR_COSIGN_IDENTITY", "AR_COSIGN_ISSUER", "AR_ALLOW_KEYLESS"):
             os.environ.pop(k, None)
         assert aggregate._cosign_verify_argv() is None, "cosign selected without identity+issuer"
         os.environ["AR_COSIGN_IDENTITY"] = "ci@example.com"
         assert aggregate._cosign_verify_argv() is None, "issuer is still required"
         os.environ["AR_COSIGN_ISSUER"] = "https://token.actions.githubusercontent.com"
+        # identity+issuer alone, still without AR_ALLOW_KEYLESS, must still be None -- the
+        # explicit-opt-in gate is independent of and layered on top of identity pinning.
+        assert aggregate._cosign_verify_argv() is None, "AR_ALLOW_KEYLESS is still required"
+        os.environ["AR_ALLOW_KEYLESS"] = "1"
         argv = aggregate._cosign_verify_argv()
         assert argv and "--certificate-identity" in argv and "--certificate-oidc-issuer" in argv, argv
     finally:
@@ -1820,6 +1830,82 @@ def t_attestation_covers_policy_snapshot_sig():
     (run / "policy.snapshot.sig").unlink()
     r = sh(["aggregate.py", "--check-digest"], repo, expect=1, env=env)
     assert "DRIFT removed" in r.stdout and "policy.snapshot.sig" in r.stdout, r.stdout
+
+
+def t_cosign_keyless_auto_detect_requires_explicit_allow_keyless():
+    # frontier-gate run pr70-architecture-review (2026-09-20), Paul: option A. Paul's
+    # original decision on this exact mechanism (run pr70-provenance, 2026-09-19) was
+    # "let's not go keyless" -- but cosign_sign_argv/cosign_verify_argv used to
+    # auto-activate keyless the instant the `cosign` binary happened to be on PATH (plus,
+    # for verify, AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER), with no signal anyone had chosen
+    # it. AR_ALLOW_KEYLESS must now be explicitly set first. Tested at the function level
+    # (not via a fake `cosign` binary on PATH, which isn't portable across the CI matrix)
+    # by monkeypatching shutil.which so "cosign is installed" is true regardless of the
+    # test machine's actual environment.
+    from _common import cosign_sign_argv, cosign_verify_argv
+    saved_which = shutil.which
+    saved_env = dict(os.environ)
+    try:
+        shutil.which = lambda name: ("/usr/bin/cosign" if name == "cosign" else saved_which(name))
+        os.environ["AR_COSIGN_IDENTITY"] = "https://github.com/SathiaAI/adversarial-review/.github/workflows/ci.yml@refs/heads/main"
+        os.environ["AR_COSIGN_ISSUER"] = "https://token.actions.githubusercontent.com"
+        for k in ("AR_ALLOW_KEYLESS",):
+            os.environ.pop(k, None)
+        # Not opted in: cosign present, identity+issuer pinned -- still None. This is the
+        # exact bug: previously this combination alone was enough to auto-activate keyless.
+        assert cosign_sign_argv() is None, "keyless must not auto-activate without AR_ALLOW_KEYLESS"
+        assert cosign_verify_argv() is None, "keyless verify must not auto-activate without AR_ALLOW_KEYLESS"
+        # A falsy explicit value (0/false/no) must not count as opting in either.
+        for falsy in ("0", "false", "False", "no", ""):
+            os.environ["AR_ALLOW_KEYLESS"] = falsy
+            assert cosign_sign_argv() is None, f"AR_ALLOW_KEYLESS={falsy!r} must not opt in"
+            assert cosign_verify_argv() is None, f"AR_ALLOW_KEYLESS={falsy!r} must not opt in"
+        # Explicitly opted in: now it activates, same argv shape as before this change.
+        os.environ["AR_ALLOW_KEYLESS"] = "1"
+        sign_argv = cosign_sign_argv()
+        verify_argv = cosign_verify_argv()
+        assert sign_argv == ["cosign", "sign-blob", "--yes", "--bundle", "{sig}", "{msg}"], sign_argv
+        assert verify_argv[:2] == ["cosign", "verify-blob"], verify_argv
+        assert "--certificate-identity" in verify_argv and "--certificate-oidc-issuer" in verify_argv, verify_argv
+    finally:
+        shutil.which = saved_which
+        os.environ.clear()
+        os.environ.update(saved_env)
+
+
+def t_cosign_keyless_opt_in_does_not_relax_identity_pinning():
+    # AR_ALLOW_KEYLESS is a separate, additive gate -- it must not weaken the pre-existing
+    # security-1 protection (never verify keyless without BOTH AR_COSIGN_IDENTITY and
+    # AR_COSIGN_ISSUER pinned). Opting in to keyless with an unpinned identity must still
+    # fall through to "no verifier available", not to an unconstrained verify.
+    from _common import cosign_verify_argv
+    saved_which = shutil.which
+    saved_env = dict(os.environ)
+    try:
+        shutil.which = lambda name: ("/usr/bin/cosign" if name == "cosign" else saved_which(name))
+        os.environ["AR_ALLOW_KEYLESS"] = "1"
+        for k in ("AR_COSIGN_IDENTITY", "AR_COSIGN_ISSUER"):
+            os.environ.pop(k, None)
+        assert cosign_verify_argv() is None, "opting into keyless must not itself relax identity pinning"
+        os.environ["AR_COSIGN_IDENTITY"] = "someone"
+        assert cosign_verify_argv() is None, "issuer alone is still not enough"
+    finally:
+        shutil.which = saved_which
+        os.environ.clear()
+        os.environ.update(saved_env)
+
+
+def t_policy_sig_ordinary_review_unaffected_by_keyless_gate():
+    # Adoption constraint must hold regardless of this change: an ordinary (no waiver, no
+    # NOT_APPLICABLE) run with no signer configured at all -- keyless, minisign, or custom
+    # -- still reaches PASS unsigned, exactly as before.
+    env = _no_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=False)
+    run = latest_run(repo)
+    assert not (run / "policy.snapshot.sig").exists()
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0, env=env)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
 
 
 def t_gate_plan_rejects_unsigned_waiver_before_aggregate():

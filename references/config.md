@@ -277,8 +277,9 @@ keyless `panel.py prepare` + `ingest` (MCP) transport does **not** take corrobor
 | `AR_MINISIGN_PUBKEY` | — | minisign **inline** public-key value for `--verify-signature` (`-P`) |
 | `AR_MINISIGN_PUBKEY_FILE` | — | Path to a minisign public-key **file** for `--verify-signature` (`-p`); wins over `AR_MINISIGN_PUBKEY` when both are set |
 | `AR_SIGN_TIMEOUT` | `120` | Bounded timeout (seconds) for each signer/verifier subprocess; expiry converts to the tooling-error exit (3) |
-| `AR_COSIGN_IDENTITY` | — | Expected signer identity (SAN) for cosign keyless `--verify-signature` |
-| `AR_COSIGN_ISSUER` | — | Expected OIDC issuer for cosign keyless `--verify-signature` |
+| `AR_ALLOW_KEYLESS` | — | Explicit opt-in required before cosign keyless is even attempted for auto-detected signing/verification (both `policy.snapshot.sig` and `--sign`/`--verify-signature`). Without it, cosign keyless is never auto-selected even if the `cosign` binary and `AR_COSIGN_IDENTITY`/`AR_COSIGN_ISSUER` are all present — see `docs/THREAT-MODEL.md`. Minisign (or an explicit `AR_SIGNER_CMD`/`AR_VERIFIER_CMD`) is the only thing that auto-activates without this set |
+| `AR_COSIGN_IDENTITY` | — | Expected signer identity (SAN) for cosign keyless `--verify-signature`; ignored unless `AR_ALLOW_KEYLESS` is also set |
+| `AR_COSIGN_ISSUER` | — | Expected OIDC issuer for cosign keyless `--verify-signature`; ignored unless `AR_ALLOW_KEYLESS` is also set |
 
 An empty env var counts as unset. Note one precedence fix shipped with the policy
 feature: `--pin` now beats `AR_PINS` for the same role (previously the env var

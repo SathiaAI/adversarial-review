@@ -171,7 +171,8 @@ def verify_policy_snapshot_signature(run, snap_p, meta):
     sig_p = Path(run) / POLICY_SIG_FILENAME
     if not sig_p.is_file():
         return (f"no {POLICY_SIG_FILENAME} — the policy snapshot was not signed at init. "
-                "Configure a signer (AR_SIGNER_CMD, or install cosign / minisign with "
+                "Configure a signer (AR_SIGNER_CMD, or install cosign with AR_ALLOW_KEYLESS=1 "
+                "and AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned, or minisign with "
                 "AR_MINISIGN_KEY) before `panel.py init` so any run that later records a "
                 "waiver or not-applicable gate can be trusted")
     argv_tmpl, kind = resolve_signing_tool(
@@ -179,8 +180,8 @@ def verify_policy_snapshot_signature(run, snap_p, meta):
         [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)])
     if argv_tmpl is None:
         return ("no verifier available: set AR_VERIFIER_CMD, or install cosign (with "
-                "AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned) or minisign (with "
-                "AR_MINISIGN_PUBKEY or AR_MINISIGN_PUBKEY_FILE)")
+                "AR_ALLOW_KEYLESS=1 and AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned) or "
+                "minisign (with AR_MINISIGN_PUBKEY or AR_MINISIGN_PUBKEY_FILE)")
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.snapshot.attest"
         msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_p))
@@ -235,12 +236,32 @@ def resolve_signing_tool(env_cmd, builders):
     return None, None
 
 
+def _policy_bool_env(name):
+    """True iff env var `name` is set to a non-empty value other than '0'/'false'/'no'
+    (case-insensitive) -- the same "explicit opt-in" shape AR_ALLOW_KEYLESS uses. Unset
+    or blank is False, matching every other AR_* env toggle in this module."""
+    v = os.environ.get(name, "").strip().lower()
+    return bool(v) and v not in ("0", "false", "no")
+
+
 def cosign_sign_argv():
-    # Primary: sigstore/cosign KEYLESS. An ephemeral Fulcio certificate (from an ambient
-    # OIDC identity) plus a Rekor transparency-log entry; no long-lived private key.
-    # `--yes` suppresses the confirmation prompt; `--bundle` packs signature +
-    # certificate + log proof into ONE self-contained sidecar an outside verifier
-    # consumes with `verify-blob --bundle`.
+    # sigstore/cosign KEYLESS. An ephemeral Fulcio certificate (from an ambient OIDC
+    # identity) plus a Rekor transparency-log entry; no long-lived private key. `--yes`
+    # suppresses the confirmation prompt; `--bundle` packs signature + certificate + log
+    # proof into ONE self-contained sidecar an outside verifier consumes with
+    # `verify-blob --bundle`.
+    #
+    # EXPLICIT OPT-IN ONLY (frontier-gate run pr70-architecture-review, 2026-09-20,
+    # Paul: option A). Paul's original decision on this exact mechanism (frontier-gate
+    # run pr70-provenance, 2026-09-19) was "let's not go keyless" -- yet this
+    # auto-detect builder used to activate the moment the `cosign` binary happened to be
+    # on PATH, with no signal that anyone had actually chosen it. AR_ALLOW_KEYLESS must
+    # be explicitly set (any non-empty, non-"0"/"false" value) before keyless is even
+    # attempted; minisign (or a custom AR_SIGNER_CMD) stays the only thing that activates
+    # by default. This does not by itself make keyless a real per-run identity boundary
+    # -- see docs/THREAT-MODEL.md for what does.
+    if not _policy_bool_env("AR_ALLOW_KEYLESS"):
+        return None
     if not shutil.which("cosign"):
         return None
     return ["cosign", "sign-blob", "--yes", "--bundle", "{sig}", "{msg}"]
@@ -264,6 +285,13 @@ def cosign_verify_argv():
     # through (to minisign, or to a loud "no verifier available" naming
     # AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER) rather than silently verifying against an
     # unconstrained identity (panel finding security-1).
+    #
+    # EXPLICIT OPT-IN ONLY (frontier-gate run pr70-architecture-review, 2026-09-20) --
+    # same AR_ALLOW_KEYLESS gate as cosign_sign_argv above, and for the same reason:
+    # Paul said not keyless for this mechanism, and auto-detection contradicted that the
+    # moment `cosign` was merely present with ambient identity/issuer env vars set.
+    if not _policy_bool_env("AR_ALLOW_KEYLESS"):
+        return None
     if not shutil.which("cosign"):
         return None
     ident = os.environ.get("AR_COSIGN_IDENTITY", "").strip()
