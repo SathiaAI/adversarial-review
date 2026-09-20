@@ -103,15 +103,17 @@ marking NOT_APPLICABLE any gate on CRITICAL tier — refused by default. `max_wa
 CRITICAL: that one restriction is not policy-configurable.
 
 **A policy file makes waiving or marking NOT_APPLICABLE require a signed snapshot.**
-Whenever a policy file is configured, `panel.py init` opportunistically signs
-`policy.snapshot.json` if a signer is available (`AR_SIGNER_CMD`, or auto-detected
-cosign/minisign — see *Signing the verdict* below; the same env vars and auto-detect
-apply here). A run with **no** waived or NOT_APPLICABLE gate never needs this — the
-common path stays infrastructure-free. But the moment a run records one, both `gate.py
+Whenever a policy file is configured, `panel.py init` signs `policy.snapshot.json` if a signer is
+available (`AR_SIGNER_CMD`, or auto-detected cosign/minisign — see *Signing the verdict* below; the
+same env vars and auto-detect apply here) **and** `AR_TRUSTED_SIGNER` is explicitly set **and**
+the process is not obviously running from a `pull_request`-triggered GitHub Actions job — signing
+is never attempted just because a working signer happens to be configured (see `AR_TRUSTED_SIGNER`
+below and `docs/THREAT-MODEL.md`). A run with **no** waived or NOT_APPLICABLE gate never needs
+this — the common path stays infrastructure-free. But the moment a run records one, both `gate.py
 plan --waive` / `gate.py record --status NOT_APPLICABLE` **and** `aggregate.py`
 independently require a verifiably-signed snapshot, and BLOCK (or refuse outright at
 plan/record time) without one — so a repo that wants to use waivers or NOT_APPLICABLE
-must configure a signer before `panel.py init`, or those exceptions will never pass. A
+must configure a signer AND set `AR_TRUSTED_SIGNER` from a trusted job before `panel.py init`, or those exceptions will never pass. A
 repo with **no** policy file at all is exempt — waiver limits fall back to strict
 built-in defaults, which are not a mutable attested artifact, so there is nothing to
 sign. The signed payload binds the run's id, a random per-run nonce, the run
@@ -286,6 +288,7 @@ keyless `panel.py prepare` + `ingest` (MCP) transport does **not** take corrobor
 | `AR_ALLOW_KEYLESS` | — | Explicit opt-in required before cosign keyless is even attempted for auto-detected signing/verification (both `policy.snapshot.sig` and `--sign`/`--verify-signature`). Without it, cosign keyless is never auto-selected even if the `cosign` binary and `AR_COSIGN_IDENTITY`/`AR_COSIGN_ISSUER` are all present — see `docs/THREAT-MODEL.md`. Minisign (or an explicit `AR_SIGNER_CMD`/`AR_VERIFIER_CMD`) is the only thing that auto-activates without this set |
 | `AR_COSIGN_IDENTITY` | — | Expected signer identity (SAN) for cosign keyless `--verify-signature`; ignored unless `AR_ALLOW_KEYLESS` is also set |
 | `AR_COSIGN_ISSUER` | — | Expected OIDC issuer for cosign keyless `--verify-signature`; ignored unless `AR_ALLOW_KEYLESS` is also set |
+| `AR_TRUSTED_SIGNER` | — | Explicit opt-in required before `panel.py init` will even attempt to sign `policy.snapshot.json` (any signer kind) — signing is never opportunistic based on a configured signer alone. Additionally refused outright when `GITHUB_EVENT_NAME=pull_request` (the GitHub Actions trigger whose job runs with the PR author's own code checked out), regardless of this being set. Verification is unaffected — `gate.py`/`aggregate.py` verify a signature from any job. See `docs/THREAT-MODEL.md` |
 
 An empty env var counts as unset. Note one precedence fix shipped with the policy
 feature: `--pin` now beats `AR_PINS` for the same role (previously the env var

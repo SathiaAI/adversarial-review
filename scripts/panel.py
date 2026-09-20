@@ -35,7 +35,7 @@ from _common import (MAX_HIGH_SAMPLES, POLICY_SIG_FILENAME, RUN_ROOT, VALID_REBU
                      load_capabilities, load_policy, merge_usage, meta_cost,
                      minisign_sign_argv, now_iso, policy_attest_bytes, read_json,
                      resolve_run, resolve_setting, resolve_signing_tool,
-                     run_signing_tool, write_json)
+                     run_signing_tool, trusted_signer_guard_error, write_json)
 
 DEFAULT_BASE = "https://openrouter.ai/api/v1"
 
@@ -544,23 +544,32 @@ def validate_obj(obj, schema, path="$"):
 def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_path):
     """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
     Paul's decision, frontier-gate run pr70-provenance, 2026-09-19; hardened per
-    frontier-gate run pr70-provenance-2, 2026-09-19, closing 6 Codex-found bypasses):
-    opportunistically sign policy.snapshot.json — bound to this run's run_id, run_nonce,
-    run DIRECTORY NAME, and resolved risk tier (policy_attest_bytes v2) — right after it
-    is written, the one moment before the run directory can become attacker-writable.
+    frontier-gate run pr70-provenance-2, 2026-09-19, closing 6 Codex-found bypasses;
+    further redesigned per frontier-gate run pr70-architecture-review, 2026-09-20 —
+    see batches 2/3 below): sign policy.snapshot.json — bound to this run's run_id,
+    run_nonce, run DIRECTORY NAME, resolved risk tier, and (as of batch 2,
+    policy_attest_bytes v3) the live CI-orchestrator identity — right after it is
+    written, the one moment before the run directory can become attacker-writable.
     This closes three replay/forgery shapes: (1) a LATER coordinated edit to
     policy.snapshot.json + run.json's policy.sha256 (widening waiver policy, e.g.
     flipping allow_critical_waivers) cannot produce a snapshot that still verifies;
-    (2) a signature from a DIFFERENT run cannot be replayed onto this one even if the
-    attacker also copies that other run's run.json wholesale, because the payload is
-    checked against the run directory's own OS-assigned name, which the copy cannot also
-    forge to match; (3) editing run.json's risk tier after signing (to downgrade e.g.
-    CRITICAL to SENSITIVE and unlock a normally-forbidden waiver) invalidates the
-    signature, because risk is part of what was signed.
+    (2) a signature from a DIFFERENT run — or a different repository, commit, or CI
+    execution entirely (batch 2) — cannot be replayed onto this one even if the
+    attacker also copies that other run's artifacts wholesale and forces the
+    directory name to match; (3) editing run.json's risk tier after signing (to
+    downgrade e.g. CRITICAL to SENSITIVE and unlock a normally-forbidden waiver)
+    invalidates the signature, because risk is part of what was signed.
+
+    As of batch 3, signing is no longer attempted merely because a working signer is
+    configured — trusted_signer_guard_error() (_common.py) must return None first,
+    requiring an explicit AR_TRUSTED_SIGNER opt-in and refusing outright from a
+    GitHub Actions `pull_request`-triggered job. See docs/THREAT-MODEL.md for what
+    this guard does and does not protect against.
 
     Deliberately BEST-EFFORT and never fatal to `init`: the common no-exception
     aggregation path must stay completely infrastructure-free, so an unconfigured or
-    misbehaving signer here is a printed note, not a die(). The shared
+    misbehaving signer (or a signer refused by the trust guard) here is a printed
+    note, not a die(). The shared
     verify_policy_snapshot_signature() in _common.py enforces this signature — hard
     BLOCK on failure — from two call sites: aggregate.py, ONLY when the run ends up
     recording a WAIVED or NOT_APPLICABLE gate (a run that never waives anything never
@@ -570,6 +579,11 @@ def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_path):
     function."""
     note = ("this run will BLOCK at aggregate time if any gate is later waived or "
             "marked not-applicable")
+    trust_err = trusted_signer_guard_error()
+    if trust_err:
+        print(f"note: policy-snapshot signing skipped ({trust_err}) — "
+              f"policy.snapshot.json is unsigned; {note}")
+        return
     argv_tmpl, kind = resolve_signing_tool(
         "AR_SIGNER_CMD", [("cosign-keyless", cosign_sign_argv), ("minisign", minisign_sign_argv)])
     if argv_tmpl is None:

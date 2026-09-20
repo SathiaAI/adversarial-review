@@ -1103,7 +1103,15 @@ def _stub_signer_env(extra=None):
         "sys.exit(0 if s==b'STUBSIG-v1:'+hashlib.sha256(m).hexdigest().encode() else 1)\n")
     env = {**ENV,
            "AR_SIGNER_CMD": f"{sys.executable} {d / 'sign.py'} {{msg}} {{sig}}",
-           "AR_VERIFIER_CMD": f"{sys.executable} {d / 'verify.py'} {{sig}} {{msg}}"}
+           "AR_VERIFIER_CMD": f"{sys.executable} {d / 'verify.py'} {{sig}} {{msg}}",
+           # batch 3 (trusted_signer_guard_error, frontier-gate run
+           # pr70-architecture-review): panel.py init now refuses to sign
+           # policy.snapshot.json at all unless AR_TRUSTED_SIGNER is explicitly set --
+           # every test in this file that expects opportunistic signing to actually
+           # happen needs this set, same as it always needed a working AR_SIGNER_CMD.
+           # Tests that specifically exercise the new guard (t_trusted_signer_*) override
+           # or unset it via `extra` below.
+           "AR_TRUSTED_SIGNER": "1"}
     if extra:
         env.update(extra)
     return env
@@ -1935,6 +1943,97 @@ def t_policy_sig_ci_context_consistent_real_ci_env_still_passes():
     r = sh(["aggregate.py"], repo, expect=0, env=env)
     v = read(run / "verdict.json")
     assert v["verdict"] == "PASS", v
+
+
+# ------------------------------------------------- PR70 architecture hardening v3b
+# (frontier-gate run pr70-architecture-review, 2026-09-20, batch 3): binding live CI
+# context (batch 2) closes replay across runs/commits/repos, but a signature check
+# running inside the SAME job untrusted PR code controls is still not an independent
+# security boundary on its own (Astra's original round-1 finding, panel checklist items
+# 6/9). trusted_signer_guard_error() (_common.py) adds a code-level circuit breaker:
+# policy-snapshot signing is never attempted "opportunistically" anymore -- it requires
+# an explicit AR_TRUSTED_SIGNER opt-in AND refuses outright when GITHUB_EVENT_NAME shows
+# the process is running inside GitHub Actions' one PR-author-controlled trigger
+# (`pull_request`). This is a defense-in-depth guard, not a substitute for actual
+# job/workflow separation -- see docs/THREAT-MODEL.md and the worked two-job example in
+# docs/ci-integration.md for what remains an adopter (workflow-configuration)
+# responsibility this code cannot verify about itself (checklist item 3).
+
+def t_trusted_signer_unset_skips_signing_even_with_working_signer():
+    # The core behavior change: a fully working signer (AR_SIGNER_CMD configured, would
+    # have signed successfully before this fix) produces NO policy.snapshot.sig at all
+    # when AR_TRUSTED_SIGNER is not set -- init must never again sign "just because it
+    # can." The run itself still succeeds (signing is best-effort/non-fatal, same as an
+    # unconfigured signer always was) and the printed note explains why it's unsigned.
+    env = _stub_signer_env()
+    del env["AR_TRUSTED_SIGNER"]  # the one thing _stub_signer_env sets that we're testing
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
+    r = sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
+           repo, env=env)
+    run = latest_run(repo)
+    assert not (run / "policy.snapshot.sig").exists(), "must NOT sign without AR_TRUSTED_SIGNER"
+    assert "AR_TRUSTED_SIGNER is not set" in r.stdout, r.stdout
+    assert "policy.snapshot.json is unsigned" in r.stdout, r.stdout
+
+    # downstream: waiving must then BLOCK, exactly like any other unsigned snapshot
+    r2 = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+             "--waive", "mutation", "--authorized-by", "Paul",
+             "--waive-reason", "mutation runner not wired into CI for this repo yet",
+             "--waive-expires", (date.today() + timedelta(days=7)).isoformat()],
+            repo, env=env, expect=1)
+    assert "not verifiably signed" in r2.stderr, r2.stderr
+    assert "no policy.snapshot.sig" in r2.stderr, r2.stderr
+
+
+def t_trusted_signer_refuses_under_pull_request_event_even_when_opted_in():
+    # AR_TRUSTED_SIGNER=1 alone is not enough: if the process's own environment shows
+    # GITHUB_EVENT_NAME=pull_request -- the GitHub Actions trigger whose job checks out
+    # and runs alongside the PR author's own code -- signing is refused outright, even
+    # though the adopter opted in. This is the scenario the guard exists for: a repo
+    # that (by mistake, or because its workflow isn't actually split into two jobs yet)
+    # sets AR_TRUSTED_SIGNER in a PR-triggered job.
+    env = {**_stub_signer_env(), "GITHUB_EVENT_NAME": "pull_request"}
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
+    r = sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
+           repo, env=env)
+    run = latest_run(repo)
+    assert not (run / "policy.snapshot.sig").exists(), \
+        "must NOT sign from a pull_request-triggered job"
+    assert "GITHUB_EVENT_NAME='pull_request'" in r.stdout, r.stdout
+    assert "PR-author-controlled trigger" in r.stdout, r.stdout
+
+
+def t_trusted_signer_opted_in_from_trusted_trigger_signs_normally():
+    # The happy path: AR_TRUSTED_SIGNER=1 from a trusted trigger (workflow_run here --
+    # push/schedule/workflow_dispatch/unset all pass the same check) signs exactly as
+    # the pre-batch-3 opportunistic behavior did. Guards against the new checks being
+    # accidentally over-strict.
+    env = {**_stub_signer_env(), "GITHUB_EVENT_NAME": "workflow_run"}
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
+    r = sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
+           repo, env=env)
+    run = latest_run(repo)
+    assert "signed:" in r.stdout and "policy.snapshot.sig" in r.stdout, r.stdout
+    assert (run / "policy.snapshot.sig").exists()
+
+
+def t_trusted_signer_guard_never_touched_when_no_policy_file_configured():
+    # A repo with NO policy file at all never calls the signer (or the new guard) --
+    # the common no-exception path stays completely infrastructure-free, exactly as
+    # before this fix. Sanity check that the guard is wired into the policy-snapshot
+    # signing call site only, not some earlier/broader code path.
+    env = _stub_signer_env()
+    del env["AR_TRUSTED_SIGNER"]
+    repo = fresh_repo()  # no .adversarial-review.json written
+    r = sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
+           repo, env=env)
+    assert "AR_TRUSTED_SIGNER" not in r.stdout, r.stdout
+    run = latest_run(repo)
+    assert not (run / "policy.snapshot.json").exists()
+    assert not (run / "policy.snapshot.sig").exists()
 
 
 def t_policy_sig_snapshot_lone_surrogate_blocks_not_crashes():

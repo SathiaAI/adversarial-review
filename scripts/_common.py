@@ -299,6 +299,61 @@ def _policy_bool_env(name):
     return bool(v) and v not in ("0", "false", "no")
 
 
+_UNTRUSTED_GITHUB_EVENTS = frozenset({"pull_request"})
+
+
+def trusted_signer_guard_error():
+    """Best-effort, defense-in-depth check that the CURRENT process is not obviously
+    running inside a job an adversarial PR's own code controls, called immediately
+    before any attempt to SIGN policy.snapshot.json (never before verifying -- ordinary
+    review and signature verification must keep working everywhere, unsigned included).
+    Returns a short reason string to refuse signing, or None to allow it. (frontier-gate
+    run pr70-architecture-review, 2026-09-20, batch 3 of the redesign_signing_boundary
+    decision -- checklist items 6/9.)
+
+    Two checks, both fail-closed:
+
+      1. AR_TRUSTED_SIGNER must be explicitly set (_policy_bool_env) -- signing a policy
+         snapshot is never attempted "opportunistically" merely because a working signer
+         happens to be configured, the way it always has been before this fix. An
+         adopter must deliberately mark the job that runs `panel.py init` as the trusted
+         signer, exactly like AR_ALLOW_KEYLESS requires an explicit opt-in for cosign
+         keyless (frontier-gate run pr70-provenance, batch 1, commit 6ac59c0) -- same
+         shape, different gap: that one closed an accidental auto-activation of ONE
+         signer kind; this one closes ALL signer kinds being invoked in the wrong job.
+
+      2. GITHUB_EVENT_NAME must not be a trigger whose job runs with PR-author-
+         controlled code checked out and (for a fork) a read-only GITHUB_TOKEN --
+         `pull_request` is that trigger on GitHub Actions. A trusted signer job should
+         instead run from `workflow_run` (triggered by completion of the untrusted
+         review job, checking out the BASE ref), `push`, `schedule`, or
+         `workflow_dispatch` -- see docs/THREAT-MODEL.md and the worked example in
+         docs/ci-integration.md. Unset (local dev, a non-GitHub-Actions CI, or this
+         test suite) passes this check -- it cannot protect what it cannot see, and
+         refusing all local/offline signing outright would break every existing
+         signer-configured workflow and test that predates this fix.
+
+    NOT a substitute for actual job/workflow separation -- see docs/THREAT-MODEL.md for
+    what this can and cannot prove on its own. In particular: this cannot detect a
+    trusted `workflow_run` job that itself executes a tampered copy of panel.py /
+    _common.py checked out from the PR's own ref instead of a pinned action ref or the
+    base branch (checklist item 3) -- that is a workflow-configuration guarantee this
+    code has no way to verify about itself, disclosed as an adopter responsibility in
+    docs/THREAT-MODEL.md, not a gap silently left unmentioned."""
+    if not _policy_bool_env("AR_TRUSTED_SIGNER"):
+        return ("AR_TRUSTED_SIGNER is not set -- policy-snapshot signing must be "
+                "explicitly opted into from the job you have designated as the trusted "
+                "signer (never opportunistically just because a signer happens to be "
+                "configured); see docs/THREAT-MODEL.md")
+    event = os.environ.get("GITHUB_EVENT_NAME", "").strip()
+    if event in _UNTRUSTED_GITHUB_EVENTS:
+        return (f"GITHUB_EVENT_NAME={event!r} is a PR-author-controlled trigger -- "
+                "the trusted signer must run from workflow_run, push, schedule, or "
+                "workflow_dispatch instead, in a job the PR cannot modify; see "
+                "docs/THREAT-MODEL.md")
+    return None
+
+
 def cosign_sign_argv():
     # sigstore/cosign KEYLESS. An ephemeral Fulcio certificate (from an ambient OIDC
     # identity) plus a Rekor transparency-log entry; no long-lived private key. `--yes`
