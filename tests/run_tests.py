@@ -1484,9 +1484,13 @@ def t_policy_sig_signed_at_init_when_signer_configured():
     run = latest_run(repo)
     assert "signed:" in r.stdout and "policy.snapshot.sig" in r.stdout, r.stdout
     sig = (run / "policy.snapshot.sig").read_bytes()
-    # signed bytes are run_id + "\n" + policy.snapshot.json (bound to this run — see
-    # panel.py's _policy_attest_bytes — so the signature cannot be replayed onto another)
-    msg = run.name.encode("utf-8") + b"\n" + (run / "policy.snapshot.json").read_bytes()
+    # signed bytes are run_id + "\n" + run_nonce + "\n" + policy.snapshot.json (bound to
+    # this run's id AND its random nonce — see panel.py's _policy_attest_bytes — so the
+    # signature cannot be replayed onto another run, even one that happens to collide on
+    # run_id, which is only a second-granularity timestamp with no randomness of its own)
+    run_nonce = read(run / "run.json")["run_nonce"]
+    msg = (run.name.encode("utf-8") + b"\n" + run_nonce.encode("utf-8") + b"\n"
+           + (run / "policy.snapshot.json").read_bytes())
     assert sig == b"STUBSIG-v1:" + hashlib.sha256(msg).hexdigest().encode(), sig
 
 
@@ -1563,7 +1567,15 @@ def t_policy_sig_coordinated_two_file_tamper_still_blocks():
     # sanity: unmodified run verifies and passes
     sh(["aggregate.py"], repo, expect=0, env=env)
 
-    widened_text = json.dumps({"max_waiver_days": 3650, "allow_critical_waivers": True})
+    # max_waiver_days must stay <= MAX_WAIVER_DAYS_CAP (365, in _common.py) so this
+    # tamper is rejected by the NEW signature check, not by _validate_policy's
+    # unrelated schema cap -- an earlier version of this test used 3650 (10x the cap),
+    # which made _validate_policy() die() before the signature-verification code path
+    # was ever reached, so the test passed for the wrong reason (root-caused against a
+    # real CI failure on this branch: run-20260919-220018 BLOCKED with "failed to
+    # parse/validate against the current schema" instead of the intended "not
+    # verifiably signed" / "did not verify").
+    widened_text = json.dumps({"max_waiver_days": 300, "allow_critical_waivers": True})
     widened_sha = hashlib.sha256(widened_text.encode("utf-8")).hexdigest()
     snap = read(run / "policy.snapshot.json")
     snap["text"] = widened_text
@@ -1599,6 +1611,62 @@ def t_policy_sig_replay_from_another_run_blocks():
     r = sh(["aggregate.py"], repo_b, expect=2, env=env)
     assert "not verifiably signed" in r.stdout, r.stdout
     assert "did not verify" in r.stdout, r.stdout
+
+
+def t_policy_sig_replay_survives_run_id_collision_thanks_to_nonce():
+    # Regression for a real CI failure on this branch (job run-20260919-220020, PR70):
+    # run_id is only a second-granularity UTC timestamp with no randomness (see
+    # panel.py cmd_init), so two runs created within the same wall-clock second --
+    # exactly what happened when this suite ran on CI -- collide on run_id. When two
+    # such runs also carry identical policy content (as t_policy_sig_replay_from_
+    # another_run_blocks's repo_a/repo_b do), the OLD run_id-only attest bytes would
+    # then be byte-for-byte identical between the two runs, making run_a's signature
+    # trivially "valid" for run_b too -- the replay-protection test above only caught
+    # this by luck of non-colliding timestamps. This test forces the exact collision
+    # instead of hoping timing avoids it, proving run_nonce (not run_id timing luck)
+    # is what actually closes the gap.
+    env = _stub_signer_env()
+    repo_a = _sensitive_repo_with_policy(env=env, waive=True)
+    run_a = latest_run(repo_a)
+    repo_b = _sensitive_repo_with_policy(env=env, waive=True)
+    run_b = latest_run(repo_b)
+    _resolve_open_finding(run_b)
+    # sanity: run_b verifies fine with its OWN signature before the attack
+    sh(["aggregate.py"], repo_b, expect=0, env=env)
+
+    # Force the exact collision the CI failure exhibited: make run_b's run_id
+    # identical to run_a's (simulating both being minted in the same wall-clock
+    # second), while run_b's run_nonce -- independently random -- is left untouched.
+    rj_a, rj_b = read(run_a / "run.json"), read(run_b / "run.json")
+    assert rj_a["run_nonce"] != rj_b["run_nonce"], "nonces must be independently random"
+    rj_b["run_id"] = rj_a["run_id"]
+    write(run_b / "run.json", rj_b)
+
+    # replay: paste run_a's signature (minted for run_a's run_id + run_a's run_nonce)
+    # onto run_b, which now shares run_a's run_id but keeps its own distinct nonce
+    (run_b / "policy.snapshot.sig").write_bytes((run_a / "policy.snapshot.sig").read_bytes())
+    r = sh(["aggregate.py"], repo_b, expect=2, env=env)
+    # even with run_id colliding, the mismatched nonce still defeats the replay
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "did not verify" in r.stdout, r.stdout
+
+
+def t_policy_sig_missing_run_nonce_blocks_fail_closed():
+    # An old-format run.json (predating this fix) or one tampered to strip run_nonce
+    # must fail CLOSED -- BLOCK -- rather than silently falling back to run_id-only
+    # verification, which is exactly the mechanism the CI failure showed is unsafe.
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    sh(["aggregate.py"], repo, expect=0, env=env)  # sanity: passes before tampering
+
+    rj = read(run / "run.json")
+    del rj["run_nonce"]
+    write(run / "run.json", rj)
+    r = sh(["aggregate.py"], repo, expect=2, env=env)
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "run_nonce" in r.stdout, r.stdout
 
 
 def t_policy_sig_verifier_unavailable_blocks_not_crashes():

@@ -540,18 +540,30 @@ def validate_obj(obj, schema, path="$"):
 
 # ---------------------------------------------------------------- subcommands
 
-def _policy_attest_bytes(run_id, snap_path):
+def _policy_attest_bytes(run_id, run_nonce, snap_path):
     """The exact bytes signed/verified for the policy-snapshot signature: the run_id
-    PREPENDED to policy.snapshot.json's raw bytes. Binding to run_id (not just the
-    snapshot content) stops a signature minted for one run from being replayed onto a
+    and a cryptographically random per-run nonce, both PREPENDED to
+    policy.snapshot.json's raw bytes. Binding to run_id (not just the snapshot
+    content) stops a signature minted for one run from being replayed onto a
     different run's policy.snapshot.json — e.g. an old run that once legitimately
     carried a looser policy cannot have its valid signature copied onto a new run to
     smuggle that looser policy in (frontier-gate panel checklist items 2 and 12:
-    verify against run context; test signature replay)."""
-    return run_id.encode("utf-8") + b"\n" + Path(snap_path).read_bytes()
+    verify against run context; test signature replay).
+
+    run_id alone is NOT sufficient for this binding: run_id is a second-granularity
+    UTC timestamp with no randomness (see cmd_init), so two runs created within the
+    same wall-clock second — realistic under CI/automation throughput, and observed
+    in practice — collide on run_id. When their policy content is also identical
+    (e.g. two runs of the same repo/policy back-to-back), the full attest bytes would
+    then be byte-for-byte identical too, making any valid signature for one trivially
+    'valid' for the other. run_nonce (secrets.token_hex(16), minted fresh in cmd_init
+    and recorded in run.json) makes the binding deterministic instead of merely
+    probabilistic: verification fails closed if run_nonce is missing or malformed."""
+    return (run_id.encode("utf-8") + b"\n" + run_nonce.encode("utf-8") + b"\n"
+            + Path(snap_path).read_bytes())
 
 
-def _sign_policy_snapshot_if_possible(run, run_id, snap_path):
+def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, snap_path):
     """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
     Paul's decision, frontier-gate run pr70-provenance, 2026-09-19): opportunistically
     sign policy.snapshot.json (bound to this run's run_id) right after it is written —
@@ -578,7 +590,7 @@ def _sign_policy_snapshot_if_possible(run, run_id, snap_path):
     want_sig_out = any("{sig}" in a for a in argv_tmpl)
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.snapshot.attest"
-        msg_tmp.write_bytes(_policy_attest_bytes(run_id, snap_path))
+        msg_tmp.write_bytes(_policy_attest_bytes(run_id, run_nonce, snap_path))
         sig_tmp = Path(td) / "sig.out"
         proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_tmp, fatal=False)
         if err:
@@ -637,6 +649,10 @@ def cmd_init(args):
     run = RUN_ROOT / run_id
     for sub in ("gates", "panel/raw", "panel/meta", "panel/requests", "rebuttal", "validation"):
         (run / sub).mkdir(parents=True, exist_ok=True)
+    # run_nonce: a fresh cryptographically-random per-run value (independent of the
+    # second-granularity, non-random run_id) that the policy-snapshot signature is
+    # also bound to — see _policy_attest_bytes for why run_id alone is not enough.
+    run_nonce = secrets.token_hex(16)
     policy_rec = None
     if pol is not None:
         policy_rec = {"file": pol["path"].name, "sha256": pol["sha256"]}
@@ -645,9 +661,10 @@ def cmd_init(args):
         write_json(run / "policy.snapshot.json", {
             "file": pol["path"].name, "sha256": pol["sha256"],
             "captured_at": now_iso(), "text": pol["text"]})
-        _sign_policy_snapshot_if_possible(run, run_id, run / "policy.snapshot.json")
+        _sign_policy_snapshot_if_possible(run, run_id, run_nonce, run / "policy.snapshot.json")
     write_json(run / "run.json", {
-        "run_id": run_id, "product": args.product or "", "risk": risk,
+        "run_id": run_id, "run_nonce": run_nonce, "product": args.product or "",
+        "risk": risk,
         "dev_providers": dev, "diff_ref": args.diff_ref or "",
         "rebuttal_policy": rebuttal,
         "sources": {"risk": risk_src, "dev_providers": dev_src,

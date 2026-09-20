@@ -717,7 +717,7 @@ def verify_signature(run):
     sys.exit(1)
 
 
-def _verify_policy_snapshot_signature(run, snap_p, run_id):
+def _verify_policy_snapshot_signature(run, snap_p, run_id, run_nonce):
     """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
     Paul's decision, frontier-gate run pr70-provenance, 2026-09-19).
 
@@ -729,12 +729,23 @@ def _verify_policy_snapshot_signature(run, snap_p, run_id):
     close this: it signs verdict.json, produced AFTER aggregation already trusted the
     (possibly tampered) policy snapshot — the attack happens before that signature
     exists. So this checks a DIFFERENT, EARLIER artifact: POLICY_SIG_FILENAME
-    (policy.snapshot.sig), written by panel.py at init over run_id + policy.snapshot.json
-    (see _policy_attest_bytes in panel.py) — the one moment before the run directory can
-    become attacker-writable. A later coordinated edit to policy.snapshot.json + run.json
-    cannot forge a matching signature without the signing key/identity, and a signature
-    minted for a DIFFERENT run cannot be replayed onto this one, because run_id is part
-    of what was signed (panel checklist items 2 and 12: bind to run context; test replay).
+    (policy.snapshot.sig), written by panel.py at init over run_id + run_nonce +
+    policy.snapshot.json (see _policy_attest_bytes in panel.py) — the one moment
+    before the run directory can become attacker-writable. A later coordinated edit
+    to policy.snapshot.json + run.json cannot forge a matching signature without the
+    signing key/identity, and a signature minted for a DIFFERENT run cannot be
+    replayed onto this one, because run_id + run_nonce are part of what was signed
+    (panel checklist items 2 and 12: bind to run context; test replay).
+
+    run_id alone would not be enough: it is a second-granularity UTC timestamp with
+    no randomness, so two runs created within the same wall-clock second (realistic
+    under CI/automation throughput — this is how a real CI run surfaced the gap)
+    collide on run_id, and if their policy content also matches, the attest bytes
+    would be identical too. run_nonce, minted fresh per run in cmd_init and recorded
+    in run.json, closes that gap deterministically. Accordingly this fails closed —
+    BLOCKS rather than silently falling back to run_id-only verification — whenever
+    run_nonce is missing or not a non-empty string, since that means either an
+    old-format run.json predating this fix or a tampered one with the nonce stripped.
 
     Scope: the caller only invokes this when the run contains a WAIVED or
     NOT_APPLICABLE gate record — the common no-exception aggregation path stays
@@ -743,6 +754,10 @@ def _verify_policy_snapshot_signature(run, snap_p, run_id):
     never raises and never calls sys.exit; a signing-tool problem here is an ordinary
     BLOCK reason like any other missing prerequisite, not a process abort (mirroring
     every other check in this function)."""
+    if not isinstance(run_nonce, str) or not run_nonce:
+        return ("run.json has no run_nonce — the policy-snapshot signature cannot be "
+                "verified without it (this run predates the nonce fix, or run.json was "
+                "tampered with); re-init this run to get a signable, verifiable snapshot")
     sig_p = run / POLICY_SIG_FILENAME
     if not sig_p.is_file():
         return (f"no {POLICY_SIG_FILENAME} — the policy snapshot was not signed at init. "
@@ -758,7 +773,8 @@ def _verify_policy_snapshot_signature(run, snap_p, run_id):
                 "AR_MINISIGN_PUBKEY or AR_MINISIGN_PUBKEY_FILE)")
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.snapshot.attest"
-        msg_tmp.write_bytes(run_id.encode("utf-8") + b"\n" + snap_p.read_bytes())
+        msg_tmp.write_bytes(run_id.encode("utf-8") + b"\n" + run_nonce.encode("utf-8")
+                             + b"\n" + snap_p.read_bytes())
         proc, err = _run_tool(argv_tmpl, msg_tmp, sig_p, fatal=False)
     if err:
         return f"verifier '{kind}' could not run: {err}"
@@ -1339,7 +1355,8 @@ def _aggregate_cli():
         # defaults, not a mutable file, so there is nothing to tamper) or one whose
         # snapshot is already untrustworthy (already BLOCKED above by that reason).
         if (gcov["waived"] or gcov["not_applicable"]) and snap_p.is_file() and not att_err:
-            sig_err = _verify_policy_snapshot_signature(run, snap_p, meta["run_id"])
+            sig_err = _verify_policy_snapshot_signature(
+                run, snap_p, meta["run_id"], meta.get("run_nonce"))
             if sig_err:
                 blocked.append(
                     "run recorded a waived or not-applicable gate but its attested "
