@@ -11493,6 +11493,34 @@ def t_gate_plan_tolerates_nonobject_record():
     assert (run / "gates" / "_required.json").exists()
 
 
+def t_gate_manifest_nonobject_document_blocks():
+    # CodeRabbit (aggregate.py:73-75): if _required.json itself is not a JSON object --
+    # invalid JSON, or valid JSON that parses to null/a number/a string/an array -- the very
+    # next line's gplan.get(...) raised AttributeError before this fix, which the outer
+    # try/except in aggregate.py's main() only turns into an unexpected exit-3 crash (never
+    # reaching the code that writes a BLOCKED verdict.json). This is DISTINCT from the
+    # adjacent, already-fixed case where gplan IS a dict but its 'required'/'waived' keys hold
+    # malformed values (see t_gate_waiver_manifest_waived_malformed_blocks and the
+    # required-list guard in check_gates) -- here the top-level document itself is the
+    # problem, before any key is even read.
+    repo = _min_repo("SENSITIVE")
+    run = latest_run(repo)
+    req_path = run / "gates" / "_required.json"
+    for bad_json_text, label in [("null", "null"), ("42", "number"), ('"x"', "string"),
+                                  ("[]", "empty array"), ("[1,2]", "array")]:
+        req_path.write_text(bad_json_text)
+        r = sh(["aggregate.py"], repo, expect=2)
+        assert "is not a JSON object" in r.stdout, (label, r.stdout)
+        assert (run / "verdict.json").exists(), f"a verdict must still be written ({label})"
+        v = read(run / "verdict.json")
+        assert v["verdict"] == "BLOCKED", (label, v)
+    # not even valid JSON at all
+    req_path.write_text("{not valid json!!!")
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "unreadable or not valid JSON" in r.stdout, r.stdout
+    assert (run / "verdict.json").exists(), "a verdict must still be written (invalid JSON)"
+
+
 def t_next_steps_pass_names_na_exception():
     # A PASS with BOTH a waiver and an N/A gate names both as accountable exceptions.
     repo = _complete_sensitive_repo()   # waives mutation

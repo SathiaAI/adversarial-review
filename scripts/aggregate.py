@@ -73,7 +73,23 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
     if not req_path.exists():
         blocked.append("gate plan missing — run `gate.py plan` after detecting the stack")
         return {}, gcov
-    gplan = read_json(req_path)
+    # Reject a malformed manifest document itself before treating it as a mapping: invalid
+    # JSON (ValueError from json.load) or valid JSON that isn't an object (null/number/string/
+    # array — read_json returns whatever json.load parses to, with no type restriction) would
+    # otherwise raise AttributeError on the very next line's gplan.get(...), which check_gates'
+    # caller (aggregate.py's main()) only catches at the top level as an unexpected exit-3
+    # crash — never reaching the code that writes a BLOCKED verdict.json (CodeRabbit,
+    # aggregate.py:73-75, "Handle malformed _required.json as BLOCKED").
+    try:
+        gplan = read_json(req_path)
+    except (ValueError, OSError) as e:
+        blocked.append(f"gate plan (_required.json) is unreadable or not valid JSON: {e}")
+        return {}, gcov
+    if not isinstance(gplan, dict):
+        blocked.append(
+            f"gate plan (_required.json) is not a JSON object (got {type(gplan).__name__}) — "
+            "malformed or tampered manifest")
+        return {}, gcov
     gcov["plan_recorded"] = True
     manifest_planned_at = gplan.get("planned_at")
     # The manifest `required` must be a list of safe string gate names before it is turned into
