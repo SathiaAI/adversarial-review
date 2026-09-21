@@ -1,4 +1,5 @@
 """Shared helpers for adversarial-review scripts. Stdlib only, by design."""
+import errno
 import hashlib
 import json
 import math
@@ -6,6 +7,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,16 +36,120 @@ def resolve_run(run_arg=None):
     return runs[-1]
 
 
+# security-2 (frontier-gate run pr70-design, 2026-09-21, checklist items 3/5/15/20):
+# a run directory is, by design, writable by whatever produced it -- untrusted input in
+# the FIFO/symlink/oversize-file sense, not just its JSON contents. Every read of a
+# run-directory file (run.json, policy.snapshot.json, policy.absence.json, gates/*.json,
+# signature sidecars) goes through read_regular_file_once() so this property is enforced
+# exactly once, not re-derived per call site.
+_MAX_RUN_FILE_BYTES = 16 * 1024 * 1024  # 16 MiB; generous for any artifact this tool
+                                         # writes itself, tight enough to bound memory
+                                         # against a maliciously huge planted file.
+
+
+class NotRegularFileError(OSError):
+    """A run-directory path that should be an ordinary file turned out not to be one:
+    a FIFO/socket/device, a directory, a symlink at the leaf, or over the size cap.
+    An OSError subclass on purpose -- every existing `except (ValueError, OSError):`
+    call site in this codebase already treats that as "could not read this artifact,"
+    with no call-site changes needed."""
+
+
+def read_regular_file_once(path):
+    """Open, fstat-verify-regular, and read a run-directory file's bytes in ONE
+    descriptor's lifetime -- the only way any such file is read from here on. Three
+    load-bearing properties (frontier-gate run pr70-design, 2026-09-21, checklist items
+    3/5/8/15/20; thread 4055706486 for the FIFO-hang report this closes):
+
+      1. FIFO/socket/device-safe: O_NONBLOCK makes open() on a FIFO with no writer
+         return immediately (EAGAIN -> OSError) instead of hanging the process forever.
+         It has no effect on an ordinary regular file.
+      2. Symlink-safe at the leaf: O_NOFOLLOW refuses to open a path whose FINAL
+         component is a symlink (ELOOP), so a run directory an attacker can write into
+         cannot redirect e.g. policy.snapshot.json to a file outside the run directory.
+         This does NOT protect a symlinked ANCESTOR directory (the run directory itself,
+         or gates/, being a symlink) -- callers resolve the run directory with
+         Path.resolve() before any file inside it is opened; that is a separate,
+         directory-level guarantee this function does not attempt to re-derive.
+      3. fstat, not stat: the regular-file check runs against the ALREADY-OPEN
+         descriptor, so there is no window between checking "is this a regular file"
+         and reading it in which the path could be replaced -- the classic TOCTOU on
+         the check itself. O_NOFOLLOW+O_NONBLOCK apply at open()-time, before any
+         check could even run.
+
+    O_NOFOLLOW/O_NONBLOCK are not defined on Windows -- getattr(..., 0) degrades to a
+    plain, blocking open() there (this codebase's own CI and test harness run on
+    Windows). The fstat S_ISREG check and the size cap still apply unconditionally on
+    every platform; only the symlink-leaf and non-blocking-FIFO guarantees are
+    Windows-specific gaps, disclosed here rather than silently assumed away.
+
+    Returns bytes. Raises NotRegularFileError (OSError subclass) for a FIFO/socket/
+    device/directory, a symlinked leaf, or a file over the size cap -- even a lying/
+    stale st_size cannot produce more than _MAX_RUN_FILE_BYTES of returned data, since
+    the read loop enforces the cap independently as it accumulates, not only from the
+    single fstat() snapshot. Raises a plain OSError for a missing/unreadable path,
+    unchanged from open()'s ordinary behavior."""
+    flags = os.O_RDONLY
+    for flag_name in ("O_NOFOLLOW", "O_NONBLOCK"):
+        flags |= getattr(os, flag_name, 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise NotRegularFileError(f"{path}: refusing to follow a symlink at the leaf") from e
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise NotRegularFileError(f"{path}: not a regular file (mode {oct(st.st_mode)})")
+        if st.st_size > _MAX_RUN_FILE_BYTES:
+            raise NotRegularFileError(f"{path}: {st.st_size} bytes exceeds the "
+                                       f"{_MAX_RUN_FILE_BYTES}-byte run-file cap")
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _MAX_RUN_FILE_BYTES:
+                raise NotRegularFileError(f"{path}: exceeded the {_MAX_RUN_FILE_BYTES}-byte "
+                                           "run-file cap while reading")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def read_json(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    return json.loads(read_regular_file_once(path).decode("utf-8"))
 
 
 def write_json(path, obj):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    """Write `obj` to `path` as an atomic replace, not an in-place write. Two properties
+    this gets for free, neither present in the previous plain open(path, "w") (frontier-
+    gate run pr70-design, 2026-09-21 -- found while testing the read-side FIFO fix above:
+    gate.py plan writes gates/<name>.json for the gate it is actively waiving, and a
+    plain write-mode open() on an existing FIFO with no reader attached hangs, the
+    write-side mirror of the read-side bug read_regular_file_once() closes):
+
+      1. Never blocks on a non-regular file already at `path` (a FIFO, say): the new
+         content is written to a fresh temp file in the same directory (tempfile.mkstemp
+         -- guaranteed new, so there is nothing at that name to follow or block on), then
+         os.replace() swaps the directory entry atomically. replace() never opens the
+         DESTINATION path at all, so whatever was there (FIFO, symlink, stale file)
+         is atomically replaced, never written through or blocked on.
+      2. No reader can ever observe a partially-written file, and a destination that is
+         a symlink is replaced as that directory entry rather than followed and written
+         through to wherever it points (the old open(path, "w") would follow it)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = (json.dumps(obj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------- signing (shared)

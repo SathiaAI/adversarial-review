@@ -13742,5 +13742,136 @@ def t_eval_thresholds_verify_digest_detects_tamper():
     assert th.verify_digest({"result": {"corpus": "c", "aggregate": {}}}) is not None, "missing digest -> reject"
 
 
+# ---------------------------------------------------------------- read_regular_file_once()
+# (frontier-gate run pr70-design, 2026-09-21, checklist items 3/5/8/12/15/20) -- the shared
+# primitive every run-directory file read routes through. Unit-level (direct import), not
+# subprocess round-trips, since these exercise open()/fstat() edge cases precisely.
+
+def t_read_regular_file_once_reads_normal_file():
+    sys.path.insert(0, str(SKILL / "scripts"))
+    import _common
+    d = Path(tempfile.mkdtemp(prefix="ar-rrfo-"))
+    p = d / "x.json"
+    p.write_bytes(b'{"a": 1}')
+    assert _common.read_regular_file_once(p) == b'{"a": 1}'
+    assert _common.read_json(p) == {"a": 1}
+
+
+def t_read_regular_file_once_rejects_directory():
+    sys.path.insert(0, str(SKILL / "scripts"))
+    import _common
+    d = Path(tempfile.mkdtemp(prefix="ar-rrfo-"))
+    sub = d / "adir"; sub.mkdir()
+    try:
+        _common.read_regular_file_once(sub)
+        raise AssertionError("a directory must be rejected, not read")
+    except _common.NotRegularFileError:
+        pass
+
+
+def t_read_regular_file_once_rejects_fifo_without_hanging():
+    # The bug this closes (thread 4055706486): a plain open() on a FIFO with no writer
+    # blocks the whole process forever. O_NONBLOCK means this call must return promptly
+    # with NotRegularFileError -- if the fix regresses, this test hangs (and the harness's
+    # own process-level timeout, not an assertion, is what would eventually fail it).
+    if not hasattr(os, "mkfifo"):
+        return  # Windows has no FIFOs; the S_ISREG/size-cap guarantees still hold there
+    sys.path.insert(0, str(SKILL / "scripts"))
+    import _common
+    d = Path(tempfile.mkdtemp(prefix="ar-rrfo-"))
+    fifo = d / "x.json"
+    os.mkfifo(fifo)
+    try:
+        _common.read_regular_file_once(fifo)
+        raise AssertionError("a FIFO must be rejected, not read")
+    except _common.NotRegularFileError:
+        pass
+
+
+def t_read_regular_file_once_rejects_symlinked_leaf():
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "symlink"):
+        return  # platform without leaf-symlink protection; documented gap, not a silent one
+    sys.path.insert(0, str(SKILL / "scripts"))
+    import _common
+    d = Path(tempfile.mkdtemp(prefix="ar-rrfo-"))
+    target = d / "secret.txt"
+    target.write_text("outside the run directory")
+    link = d / "x.json"
+    os.symlink(target, link)
+    try:
+        _common.read_regular_file_once(link)
+        raise AssertionError("a symlinked leaf must be rejected, not followed")
+    except _common.NotRegularFileError:
+        pass
+
+
+def t_read_regular_file_once_enforces_size_cap():
+    sys.path.insert(0, str(SKILL / "scripts"))
+    import _common
+    d = Path(tempfile.mkdtemp(prefix="ar-rrfo-"))
+    p = d / "big.json"
+    p.write_bytes(b"x" * 4096)
+    orig_cap = _common._MAX_RUN_FILE_BYTES
+    _common._MAX_RUN_FILE_BYTES = 1024  # shrink the cap instead of writing a real 16MiB file
+    try:
+        _common.read_regular_file_once(p)
+        raise AssertionError("a file over the cap must be rejected")
+    except _common.NotRegularFileError:
+        pass
+    finally:
+        _common._MAX_RUN_FILE_BYTES = orig_cap
+
+
+def t_gate_plan_fifo_in_gates_dir_no_hang():
+    # End-to-end (thread 4055706486): a STALE FIFO planted where a previous plan's
+    # gates/<name>.json waiver record would be -- NOT the gate being actively waived
+    # this call (writing THAT one is a separate concern, see
+    # t_gate_plan_fifo_as_active_waiver_target_no_hang below) -- must not hang the
+    # stale-waiver cleanup loop's read_json(gp) scan. The existing
+    # `except (ValueError, OSError): continue` already handles the new
+    # NotRegularFileError with zero call-site changes -- this proves that end-to-end.
+    if not hasattr(os, "mkfifo"):
+        return
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+    run = latest_run(repo)
+    os.mkfifo(run / "gates" / "stale-fifo-gate.json")
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation",
+            "--waive", "mutation", "--authorized-by", "tester",
+            "--waive-reason", "fifo test to check no hang",
+            "--waive-expires", (date.today() + timedelta(days=1)).isoformat()], repo)
+    assert r.returncode == 0, r.stdout + r.stderr
+    # The stale FIFO itself is left alone (cleanup only unlinks its OWN prior WAIVED
+    # records, source=="plan" -- a FIFO never parses as that dict shape, so it is
+    # correctly skipped rather than deleted).
+    assert (run / "gates" / "stale-fifo-gate.json").exists()
+
+
+def t_gate_plan_fifo_as_active_waiver_target_no_hang():
+    # A DIFFERENT hang, found while writing the test above: `gate.py plan` WRITES
+    # gates/<name>.json for the gate it is actively waiving this call -- if that path is
+    # already a FIFO (planted by anything with write access to the run directory since
+    # init), a plain open(path, "w") with no reader attached blocked forever, symmetric to
+    # the read-side bug this same fix closes. write_json() now writes to a fresh temp file
+    # and atomically os.replace()s it into place, which never opens (or blocks on) the
+    # destination -- so this must now SUCCEED and the FIFO is atomically replaced by the
+    # real waiver record, not merely fail closed.
+    if not hasattr(os, "mkfifo"):
+        return
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+    run = latest_run(repo)
+    gate_path = run / "gates" / "mutation.json"
+    os.mkfifo(gate_path)
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation",
+            "--waive", "mutation", "--authorized-by", "tester",
+            "--waive-reason", "fifo test to check no hang",
+            "--waive-expires", (date.today() + timedelta(days=1)).isoformat()], repo)
+    assert r.returncode == 0, r.stdout + r.stderr
+    import stat as _stat
+    assert _stat.S_ISREG(gate_path.stat().st_mode), "FIFO must be atomically replaced by a regular file"
+    assert read(gate_path)["status"] == "WAIVED"
+
+
 if __name__ == "__main__":
     main()
