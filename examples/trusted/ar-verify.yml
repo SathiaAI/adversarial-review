@@ -39,7 +39,7 @@ jobs:
       pull-requests: read   # to resolve the PR's base branch below (workflow_run's own payload
                              # omits it for fork-originated PRs) -- also just a metadata read
     env:
-      AR_REF: v0.2.1   # PIN to a tag or a full 40-char commit SHA -- never a moving branch
+      AR_REF: bca832a9c890503407d16ee6ffabe694564c160c   # v0.2.1, pinned to its commit SHA -- tags are mutable
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
     outputs:
       secrets_ok: ${{ steps.secrets.outputs.ok }}
@@ -138,7 +138,7 @@ jobs:
       contents: read
       actions: read   # to download gates's own artifact from this same run
     env:
-      AR_REF: v0.2.1
+      AR_REF: bca832a9c890503407d16ee6ffabe694564c160c   # v0.2.1, pinned to its commit SHA -- tags are mutable
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
       - name: Fetch the pinned adversarial-review tooling (this job never checks out PR code)

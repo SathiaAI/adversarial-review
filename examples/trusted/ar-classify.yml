@@ -32,7 +32,7 @@ jobs:
   gates:
     runs-on: ubuntu-latest
     env:
-      AR_REF: v0.2.1   # PIN to a tag or a full 40-char commit SHA -- never a moving branch
+      AR_REF: bca832a9c890503407d16ee6ffabe694564c160c   # v0.2.1, pinned to its commit SHA -- tags are mutable
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
         with:
