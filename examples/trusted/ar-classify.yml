@@ -1,0 +1,92 @@
+# Hardened two-workflow split for a REQUIRED adversarial-review check (issue #61).
+# Copy both files in this directory into .github/workflows/ in the reviewed repo.
+#
+# This file (untrusted): runs on the PR's own branch via plain `pull_request`, so its YAML and
+# gate commands ARE PR-editable. It therefore carries NO secret -- not OPENROUTER_API_KEY, not
+# a signing key -- so gutting this job's body cannot expose credentials or forge a trusted
+# result.
+#
+# Its results are ADVISORY ONLY -- fast feedback for the PR author, nothing more. ar-verify.yml
+# (File 2) does not read or trust anything this job records: it independently re-runs every gate
+# against the real code in its own secrets-free job, because a PR author who fully controls this
+# file could otherwise edit a gate command into a no-op and get a forged PASS recorded here (the
+# gap CodeRabbit flagged on PR #72). Treat a green check here as "looks fine so far", never as
+# "adversarial-review passed" -- only adversarial-review/verify (posted by ar-verify.yml) is that.
+#
+# Mirrors examples/.gitlab-ci.yml's ar-gates job. Adjust AR_REQUIRE and the gate commands to
+# your stack; the 'secrets' gate is deliberately NOT run here -- it authorizes transmitting the
+# diff to reviewers, so it runs in the trusted job instead (see ar-verify.yml).
+
+name: ar-classify
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ar-classify-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    env:
+      AR_REF: bca832a9c890503407d16ee6ffabe694564c160c   # v0.2.1, pinned to its commit SHA -- tags are mutable
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+        with:
+          fetch-depth: 0   # the panel reviews a real git range
+          persist-credentials: false   # this job's token is read-only anyway; don't leave it on disk
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Fetch a pinned copy of the adversarial-review tooling
+        run: |
+          set -euo pipefail
+          git init -q /tmp/ar
+          git -C /tmp/ar remote add origin https://github.com/SathiaAI/adversarial-review
+          git -C /tmp/ar fetch -q --depth 1 origin "$AR_REF"
+          git -C /tmp/ar checkout -q FETCH_HEAD
+      - name: Record deterministic gates
+        env:
+          # Expanded here, not inline in the run: block below -- BASE_REF becomes a shell
+          # variable rather than text substituted into the script before bash ever sees it, so a
+          # base branch name (however it's chosen) can't be read as shell syntax.
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          python /tmp/ar/scripts/panel.py init --diff-ref "origin/$BASE_REF...HEAD"
+          python /tmp/ar/scripts/gate.py plan --require build,unit,deps,sast
+          python /tmp/ar/scripts/gate.py run --name build -- sh -c "python -m py_compile \$(git ls-files '*.py')" || true
+          python /tmp/ar/scripts/gate.py run --name unit -- python -m pytest -q || true
+          python /tmp/ar/scripts/gate.py run --name deps -- pip-audit || true
+          python /tmp/ar/scripts/gate.py run --name sast -- bandit -ll -q -r . || true
+      - name: Banner -- these results are advisory only, not the required check
+        # A footgun the review panel on PR #72 explicitly flagged: a reviewer glancing at this
+        # job's green checkmark could mistake it for "adversarial-review passed" and not wait for
+        # the actual required check. This banner is the cheap mitigation; ar-verify.yml
+        # independently re-running every gate for real (rather than trusting this job's results)
+        # is the actual fix.
+        if: always()
+        run: |
+          {
+            echo "## ⚠️ Informational only -- not the required check"
+            echo
+            echo "This job's gate results are PR-editable and are not trusted by anything."
+            echo "Wait for **\`adversarial-review/verify\`** (posted separately, from a"
+            echo "trusted context) before treating this PR as reviewed."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload run directory for ar-verify
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+        with:
+          # Attempt-scoped name: a `gh run rerun` produces a fresh artifact instead of a 409
+          # conflict, and ar-verify's pattern match picks it up regardless of attempt number.
+          name: ar-run-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .adversarial-review/
+          retention-days: 7
+          # v4 excludes hidden files/dirs by default, and `.adversarial-review/` is itself a
+          # dot-dir -- without this the upload silently finds nothing and ar-verify always
+          # downloads 0 artifacts. Confirmed by live-testing this exact step in Sandbox.
+          include-hidden-files: true

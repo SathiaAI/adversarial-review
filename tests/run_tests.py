@@ -5717,7 +5717,7 @@ def t_ingest_notes_corroboration_not_applied_on_mcp():
 
 
 def _http_transport(origins=(), max_bytes=4096, require_session=None, max_sessions=None, max_streams=None,
-                    token=None, max_workers=None, read_timeout=None):
+                    token=None, max_workers=None, read_timeout=None, control_reserve=None):
     """Start an HttpTransport on an ephemeral localhost port in a daemon thread; return (transport, port).
     Offline — binds 127.0.0.1 only, no external network. require_session/max_sessions/max_streams (E3-S2b)
     and token/max_workers/read_timeout (E3-S2c) default to None so the transport reads the env (require off,
@@ -5726,7 +5726,7 @@ def _http_transport(origins=(), max_bytes=4096, require_session=None, max_sessio
     t = mcpsrv.HttpTransport(host="127.0.0.1", port=0, origins=origins, max_bytes=max_bytes,
                              require_session=require_session, max_sessions=max_sessions,
                              max_streams=max_streams, token=token, max_workers=max_workers,
-                             read_timeout=read_timeout)
+                             read_timeout=read_timeout, control_reserve=control_reserve)
     _host, port = t.bind()
     threading.Thread(target=t.serve_forever, daemon=True).start()
     return t, port
@@ -6625,9 +6625,11 @@ def t_mcp_http_max_workers_must_exceed_max_streams():
 
 
 def t_mcp_http_bounded_worker_pool():
-    # E3-S2c: the worker pool caps concurrent connections. With max_workers=2, two in-flight requests hold
-    # both workers (one inside serve_message, one blocked on the process-wide dispatch lock — both hold their
-    # worker permit); a third connection is refused (socket closed with no HTTP response) rather than served.
+    # E3-S2c + SAT-1109: the general DATA-PLANE work pool caps concurrent POST/GET dispatch. With
+    # max_workers=2, two in-flight POSTs hold both work permits (one inside serve_message, one blocked on
+    # the process-wide dispatch lock — both hold their _work_sem permit); a third POST is admitted at the
+    # accept layer (accept cap = max_workers + control_reserve) but SHED in the handler with a NO-BODY
+    # close (never a 503 body) because the work pool is full.
     import threading as _th, socket as _sock, time as _time
     release = _th.Event()        # held until the test lets the two in-flight requests finish
     orig = mcpsrv.serve_message
@@ -6649,9 +6651,9 @@ def t_mcp_http_bounded_worker_pool():
             held.append(s)
         # wait until both worker permits are taken (both connections occupy the bounded pool)
         deadline = _time.time() + 5
-        while t.httpd._worker_sem._value != 0 and _time.time() < deadline:
+        while t.httpd._work_sem._value != 0 and _time.time() < deadline:
             _time.sleep(0.02)
-        assert t.httpd._worker_sem._value == 0, "pool not fully occupied (value=%r)" % t.httpd._worker_sem._value
+        assert t.httpd._work_sem._value == 0, "work pool not fully occupied (value=%r)" % t.httpd._work_sem._value
         third = _sock.create_connection(("127.0.0.1", port), timeout=5)
         try:
             third.sendall(req)
@@ -6677,6 +6679,249 @@ def t_mcp_http_bounded_worker_pool():
                 pass
             s.close()
         mcpsrv.serve_message = orig
+        t.shutdown()
+
+
+def t_mcp_http_control_reserve_bounds():
+    # SAT-1109: control_reserve is a fixed small headroom; bind() enforces 1 <= it <= 4 so it can never
+    # become a second unbounded pool that defeats the accept cap. Default (2) binds and sizes the three
+    # pools: work == max_workers, control == control_reserve (accept cap == their sum).
+    # 1.5 / 2.5 are IN the 1..4 range but fractional: BoundedSemaphore(1.5) never blocks (only blocks at
+    # exactly 0), so a float capacity leaves the lane unbounded -- bind() must reject it (Codex, PR #71).
+    for bad in (0, 5, -1, 1.5, 2.5):
+        tr = mcpsrv.HttpTransport(host="127.0.0.1", port=0, max_workers=8, max_streams=4,
+                                  control_reserve=bad)
+        try:
+            tr.bind()
+        except ValueError as e:
+            assert "control_reserve" in str(e), str(e)
+        else:
+            if tr.httpd is not None:
+                tr.httpd.server_close()
+            raise AssertionError("bind() must refuse control_reserve=%r" % bad)
+    ok = mcpsrv.HttpTransport(host="127.0.0.1", port=0, max_workers=8, max_streams=4)  # default reserve
+    try:
+        _h, port = ok.bind()
+        assert port > 0
+        assert ok.httpd._work_sem._value == 8, ok.httpd._work_sem._value
+        assert ok.httpd._control_sem._value == ok.control_reserve, ok.httpd._control_sem._value
+    finally:
+        if ok.httpd is not None:
+            ok.httpd.server_close()
+
+
+def t_mcp_http_delete_admitted_under_data_plane_saturation():
+    # SAT-1109: a DELETE (session teardown) rides the dedicated control lane, so it is admitted and
+    # returns 204 even when the general data-plane work pool is fully saturated -- one POST parked INSIDE
+    # serve_message (holding the process-wide dispatch lock) and another blocked ON that lock, both
+    # holding a _work_sem permit. This proves BOTH (a) teardown under pool saturation and (b) teardown
+    # not queued behind a dispatch-lock-holding POST. Without the control lane the DELETE would be denied
+    # a worker and fast-closed alongside the load it is trying to relieve.
+    import threading as _th, socket as _sock, time as _time
+    t, port = _http_transport(max_workers=2, max_streams=1)   # control_reserve defaults to 2
+    release = _th.Event()
+    orig = mcpsrv.serve_message
+    held = []
+    try:
+        _s, sid, _r = _http_initialize(port)   # mint a session BEFORE saturating (this dispatches)
+        assert sid, "initialize did not mint a session"
+
+        def blocking(raw):
+            release.wait(10)
+            return orig(raw)
+        mcpsrv.serve_message = blocking
+
+        body = _authbody().encode("utf-8")
+        req = (b"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: "
+               + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+        for _ in range(2):
+            s = _sock.create_connection(("127.0.0.1", port), timeout=5)
+            s.sendall(req)
+            held.append(s)
+        deadline = _time.time() + 5
+        while t.httpd._work_sem._value != 0 and _time.time() < deadline:
+            _time.sleep(0.02)
+        assert t.httpd._work_sem._value == 0, "work pool not saturated (value=%r)" % t.httpd._work_sem._value
+        start = _time.time()
+        code = _http_method(port, "DELETE", {"Mcp-Session-Id": sid})
+        assert code == 204, "DELETE under saturation returned %r, expected 204" % code
+        assert _time.time() - start < 4, "DELETE was not admitted promptly under data-plane saturation"
+    finally:
+        release.set()
+        for s in held:
+            try:
+                s.recv(65536)
+            except OSError:
+                pass
+            s.close()
+        mcpsrv.serve_message = orig
+        t.shutdown()
+
+
+def t_mcp_http_control_lane_still_requires_auth():
+    # SAT-1109: the control lane isolates SCHEDULING, never AUTHORIZATION. With a token set, an
+    # unauthenticated DELETE is 401 AND must NOT consume a control permit (auth runs before the lane is
+    # taken), so an unauthenticated flood cannot drain the control lane. A correctly authenticated DELETE
+    # reaches the lane (404 for an unknown session -- past auth).
+    import time as _time
+    tok = "x" * 16
+    t, port = _http_transport(token=tok)
+    try:
+        before = t.httpd._control_sem._value
+        code = _http_method(port, "DELETE", {"Mcp-Session-Id": "whatever"})   # no Authorization
+        assert code == 401, "unauthenticated DELETE returned %r, expected 401" % code
+        assert t.httpd._control_sem._value == before, "unauthenticated DELETE consumed a control permit"
+        code2 = _http_method(port, "DELETE",
+                             {"Mcp-Session-Id": "nope", "Authorization": "Bearer " + tok})
+        assert code2 == 404, "authenticated DELETE for unknown session returned %r, expected 404" % code2
+        # the control permit is released in do_DELETE's finally AFTER the response flushes; poll briefly
+        deadline = _time.time() + 3
+        while t.httpd._control_sem._value != before and _time.time() < deadline:
+            _time.sleep(0.02)
+        assert t.httpd._control_sem._value == before, "control permit leaked after an authenticated DELETE"
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_control_lane_exhaustion_sheds_without_body():
+    # SAT-1109: the control lane is itself bounded (control_reserve). If it is exhausted, an EXCESS DELETE
+    # is shed with a NO-BODY close (same flood contract as the data plane), never a 503 -- so the lane
+    # cannot be turned into a body-writing amplifier or an unbounded thread pool.
+    import threading as _th, socket as _sock, time as _time
+    t, port = _http_transport(max_workers=2, max_streams=1, control_reserve=1)
+    release = _th.Event()
+    store = t.httpd.sessions
+    orig_terminate = store.terminate
+    held = None
+    try:
+        _s, sid, _r = _http_initialize(port)
+        assert sid
+
+        def blocking_terminate(*a, **k):
+            release.wait(10)
+            return orig_terminate(*a, **k)
+        store.terminate = blocking_terminate
+
+        delreq = (b"DELETE / HTTP/1.1\r\nHost: x\r\nMcp-Session-Id: " + sid.encode()
+                  + b"\r\nConnection: close\r\n\r\n")
+        held = _sock.create_connection(("127.0.0.1", port), timeout=5)
+        held.sendall(delreq)   # DELETE #1 takes the single control permit and parks inside terminate()
+        deadline = _time.time() + 5
+        while t.httpd._control_sem._value != 0 and _time.time() < deadline:
+            _time.sleep(0.02)
+        assert t.httpd._control_sem._value == 0, "control lane not occupied (value=%r)" % t.httpd._control_sem._value
+        s2 = _sock.create_connection(("127.0.0.1", port), timeout=5)   # DELETE #2 finds the lane exhausted
+        try:
+            s2.sendall(delreq)
+            s2.settimeout(5)
+            data = b""
+            while True:
+                try:
+                    chunk = s2.recv(4096)
+                except _sock.timeout as exc:
+                    raise AssertionError("excess DELETE not closed promptly (control lane exhausted)") from exc
+                if not chunk:
+                    break
+                data += chunk
+            assert data == b"", "excess DELETE should get no HTTP body, got %r" % data[:80]
+        finally:
+            s2.close()
+    finally:
+        release.set()
+        if held is not None:
+            try:
+                held.recv(65536)
+            except OSError:
+                pass
+            held.close()
+        store.terminate = orig_terminate
+        t.shutdown()
+
+
+def t_mcp_http_no_keepalive_closes_and_releases_work_permit():
+    # SAT-1109 (Codex P1, PR #71): HTTP keep-alive is disabled -- every POST response closes the
+    # connection so no idle kept-alive connection pins an accept permit and starves the control lane.
+    # Verify the server closes after each POST (Connection: close, then EOF) AND that the per-request
+    # work permit is released with no leak across sequential connections.
+    import socket as _sock, time as _time
+    t, port = _http_transport(max_workers=2, max_streams=1)
+    try:
+        before_work = t.httpd._work_sem._value
+        before_accept = t.httpd._accept_sem._value
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover"}).encode("utf-8")
+        req = (b"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: "
+               + str(len(body)).encode() + b"\r\n\r\n" + body)   # no Connection header -> HTTP/1.1 default
+        for _ in range(2):
+            s = _sock.create_connection(("127.0.0.1", port), timeout=5)
+            try:
+                s.sendall(req)
+                s.settimeout(5)
+                data = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break   # server closed the connection (no keep-alive) -> clean EOF, no spin
+                    data += chunk
+            finally:
+                s.close()
+            head = data.split(b"\r\n\r\n", 1)[0]
+            assert head.split(b" ")[1] == b"200", head[:80]
+            assert b"connection: close" in head.lower(), "POST response must close the connection (no keep-alive)"
+        # Both permits fully restored: the work permit is released per request, AND the connection closes
+        # so its ACCEPT permit is released too -- a completed POST cannot linger idle holding an accept
+        # slot (the Codex P1 starvation vector). Poll (the finally-release runs just after the response).
+        deadline = _time.time() + 3
+        while (t.httpd._work_sem._value != before_work
+               or t.httpd._accept_sem._value != before_accept) and _time.time() < deadline:
+            _time.sleep(0.02)
+        assert t.httpd._work_sem._value == before_work, "work permit leaked (%r != %r)" % (
+            t.httpd._work_sem._value, before_work)
+        assert t.httpd._accept_sem._value == before_accept, "accept permit leaked -- POST connection stayed idle (%r != %r)" % (
+            t.httpd._accept_sem._value, before_accept)
+    finally:
+        t.shutdown()
+
+
+def t_mcp_http_accept_flood_starves_control_lane_documented_residual():
+    # SAT-1109 RESIDUAL (documented in docs/mcp-http-threat-model.md): the control lane isolates DELETE
+    # from data-plane WORK, not from a pure CONNECTION flood. When half-open connections fill every accept
+    # slot (max_workers + control_reserve), even a DELETE is refused at the ACCEPT layer with a no-body
+    # close -- bounded only by AR_MCP_HTTP_READ_TIMEOUT, which reaps the stalled connections. This test
+    # PINS that boundary so the documented guarantee cannot silently widen to "DELETE always admitted".
+    import socket as _sock, time as _time
+    t, port = _http_transport(max_workers=2, max_streams=1, control_reserve=1, read_timeout=10)
+    accept_cap = 2 + 1
+    half_open = []
+    try:
+        for _ in range(accept_cap):
+            s = _sock.create_connection(("127.0.0.1", port), timeout=5)
+            s.sendall(b"DELETE / HTTP/1.1\r\nHost: x\r\n")  # partial: never terminated -> parked in header read
+            half_open.append(s)
+        deadline = _time.time() + 5
+        while t.httpd._accept_sem._value != 0 and _time.time() < deadline:
+            _time.sleep(0.02)
+        assert t.httpd._accept_sem._value == 0, "accept pool not saturated (value=%r)" % t.httpd._accept_sem._value
+        extra = _sock.create_connection(("127.0.0.1", port), timeout=5)   # even a well-formed DELETE
+        try:
+            extra.settimeout(5)
+            data = b""
+            try:
+                extra.sendall(b"DELETE / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                while True:
+                    chunk = extra.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                pass  # server refused the over-cap connection by closing it -> no body, exactly the point
+            except _sock.timeout as exc:
+                raise AssertionError("accept-flooded connection not closed promptly") from exc
+            assert data == b"", "accept-flooded DELETE should get no HTTP body, got %r" % data[:80]
+        finally:
+            extra.close()
+    finally:
+        for s in half_open:
+            s.close()
         t.shutdown()
 
 
