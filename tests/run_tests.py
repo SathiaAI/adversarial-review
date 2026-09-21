@@ -23,7 +23,23 @@ import mcp_server as mcpsrv  # noqa: E402
 PORT = 8811
 ENV = {**os.environ, "AR_BASE_URL": f"http://127.0.0.1:{PORT}/v1",
        "AR_API_KEY": "test-key", "AR_TIMEOUT_S": "15", "AR_MAX_TOKENS": "2000",
-       "AR_JEV_BASE_URL": f"http://127.0.0.1:{PORT}", "AR_JEV_TIMEOUT_S": "15"}
+       "AR_JEV_BASE_URL": f"http://127.0.0.1:{PORT}", "AR_JEV_TIMEOUT_S": "15",
+       # Explicitly neutralize the whole signer/verifier detection surface in the
+       # DEFAULT env every test inherits unless it opts in (_stub_signer_env()) --
+       # frontier-gate run pr70-design, 2026-09-21, GAP A: load_attested_policy_bundle's
+       # require_signature=True now probes AR_VERIFIER_CMD (and, via cosign_verify_argv/
+       # minisign_verify_argv, AR_ALLOW_KEYLESS+PATH+AR_COSIGN_IDENTITY/ISSUER or
+       # AR_MINISIGN_PUBKEY(_FILE)) to decide whether "no policy artifact at all" BLOCKS
+       # a waiver. Verified empirically (2026-09-21) that none of these leak ambiently
+       # into this repo's own dev/CI environment today, but this codebase has already
+       # been bitten once by exactly this class of bug (GITHUB_EVENT_NAME leaking real
+       # pull_request context into what should have been a fully test-controlled signing
+       # environment, run 35525947669) -- clearing this here turns "true today" into
+       # "true by construction," matching the pattern _stub_signer_env() already
+       # established for the CI-identity surface.
+       "AR_VERIFIER_CMD": "", "AR_SIGNER_CMD": "", "AR_ALLOW_KEYLESS": "",
+       "AR_COSIGN_IDENTITY": "", "AR_COSIGN_ISSUER": "",
+       "AR_MINISIGN_PUBKEY": "", "AR_MINISIGN_PUBKEY_FILE": "", "AR_MINISIGN_KEY": ""}
 
 PASSED, FAILED = [], []
 
@@ -1135,9 +1151,29 @@ def _stub_signer_env(extra=None):
     return env
 
 
-def _pass_run_for_signing():
-    """A completed PASS run whose verdict.json therefore carries an attestation digest to sign."""
-    repo = _complete_sensitive_repo()
+def _pass_run_for_signing(policy_env=None):
+    """A completed PASS run whose verdict.json therefore carries an attestation digest to
+    sign.
+
+    `policy_env=None` (the default, unchanged behavior): _complete_sensitive_repo — no
+    policy file at all, the run's own aggregate.py calls must use an env with no
+    verifier configured (matching GAP A's preserved no-infrastructure-at-all exemption,
+    frontier-gate run pr70-design, 2026-09-21) or they will now correctly BLOCK.
+
+    `policy_env=<a signer/verifier env, typically _stub_signer_env()>`: some E6-S1
+    verdict-signing tests need their FIRST, verdict-computing aggregate.py call to run
+    under a WORKING verifier (they are testing the separate --sign/--verify-signature
+    feature, which happens to share the same AR_SIGNER_CMD/AR_VERIFIER_CMD plumbing as
+    policy-snapshot signing) — under GAP A that means the run needs an actual signed
+    policy snapshot, not _complete_sensitive_repo's policy-free one, or that first call
+    would BLOCK before the test gets anywhere near what it means to test. Pass the EXACT
+    SAME env here as the one used for the run's own subsequent aggregate.py/--sign calls
+    — _sensitive_repo_with_policy captures+signs the policy snapshot under it, exactly
+    matching how a real repo using both features together would be configured."""
+    if policy_env is not None:
+        repo = _sensitive_repo_with_policy(env=policy_env, waive=True)
+    else:
+        repo = _complete_sensitive_repo()
     run = latest_run(repo)
     write(run / "validation" / "idor.json", {
         "finding_ids": ["security-1"], "classification": "confirmed",
@@ -1152,8 +1188,8 @@ def t_sign_additive_and_sidecar_over_verdict():
     # that it is a detached signature over the canonical verdict.json (binding the verdict decision,
     # not merely the digest), and that signing left verdict.json + verdict.md byte-identical — the
     # signature is NOT folded into the digest and --sign never re-aggregates.
-    repo, run = _pass_run_for_signing()
     env = _stub_signer_env()
+    repo, run = _pass_run_for_signing(policy_env=env)
     sh(["aggregate.py"], repo, expect=0, env=env)                       # OFF: no --sign
     v_off = read(run / "verdict.json")
     md_off = (run / "verdict.md").read_text()
@@ -1185,8 +1221,8 @@ def t_sign_signature_not_attested_and_check_digest_intact():
     # E6-S1 invariant #5: the signature is a SIDECAR that must NOT feed back into the attestation
     # digest. With the sidecar present, --check-digest is still intact AND re-aggregating reproduces
     # the exact same digest (attestation.sig is not a *.json, so compute_attestation never sees it).
-    repo, run = _pass_run_for_signing()
     env = _stub_signer_env()
+    repo, run = _pass_run_for_signing(policy_env=env)
     sh(["aggregate.py"], repo, expect=0, env=env)
     sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
     digest = read(run / "verdict.json")["attestation"]["digest"]
@@ -1200,8 +1236,8 @@ def t_sign_signature_not_attested_and_check_digest_intact():
 def t_sign_verify_accepts_good_rejects_tamper():
     # E6-S1 AC(b): --verify-signature accepts a good signature and REJECTS a tampered signature or a
     # tampered digest. Fully offline via the stub verifier.
-    repo, run = _pass_run_for_signing()
     env = _stub_signer_env()
+    repo, run = _pass_run_for_signing(policy_env=env)
     sh(["aggregate.py"], repo, expect=0, env=env)
     sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
     assert "signature OK" in sh(["aggregate.py", "--verify-signature"], repo, expect=0, env=env).stdout
@@ -1227,8 +1263,8 @@ def t_sign_verify_rejects_malformed_signature():
     # non-UTF8 / arbitrary binary garbage) as exit 1 — never crash, never false-pass. verify_signature
     # hands the sidecar to the verifier by PATH (it never decodes the bytes itself), so a stub verifier
     # that only accepts the exact good signature rejects anything else.
-    repo, run = _pass_run_for_signing()
     env = _stub_signer_env()
+    repo, run = _pass_run_for_signing(policy_env=env)
     sh(["aggregate.py"], repo, expect=0, env=env)
     sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
     sh(["aggregate.py", "--verify-signature"], repo, expect=0, env=env)          # good baseline
@@ -1315,8 +1351,8 @@ def t_sign_verify_detects_tampered_input_artifact():
     # E6-S1 (Codex): --verify-signature catches a tampered ATTESTED INPUT even when verdict.json and the
     # sidecar are untouched — it recomputes the attestation and requires it to match the recorded
     # digest. Sign a good run, mutate an attested input (gates/unit.json) -> verify fails (exit 1).
-    repo, run = _pass_run_for_signing()
     env = _stub_signer_env()
+    repo, run = _pass_run_for_signing(policy_env=env)
     sh(["aggregate.py"], repo, expect=0, env=env)
     sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
     assert "signature OK" in sh(["aggregate.py", "--verify-signature"], repo, expect=0, env=env).stdout
@@ -1330,8 +1366,8 @@ def t_sign_verify_detects_relabeled_verdict():
     # E6-S1 (Codex): the signature binds the COMPUTED VERDICT, not only its input digest. Relabel the
     # verdict in verdict.json (inputs — and thus the attestation digest — untouched) and
     # --verify-signature rejects it (exit 1): the sidecar signs canonical verdict.json.
-    repo, run = _pass_run_for_signing()
     env = _stub_signer_env()
+    repo, run = _pass_run_for_signing(policy_env=env)
     sh(["aggregate.py"], repo, expect=0, env=env)
     sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
     v = read(run / "verdict.json")
@@ -1345,8 +1381,8 @@ def t_sign_refuses_drift():
     # E6-S1 (Codex): --sign REFUSES a run whose artifacts drifted since the verdict was computed, rather
     # than silently re-attesting the changed state. Aggregate, mutate an attested input, --sign ->
     # refuse (exit 1), no sidecar written.
-    repo, run = _pass_run_for_signing()
     env = _stub_signer_env()
+    repo, run = _pass_run_for_signing(policy_env=env)
     sh(["aggregate.py"], repo, expect=0, env=env)
     gpath = run / "gates" / "unit.json"
     g = read(gpath); g["summary"] = (g.get("summary", "") + " drift"); write(gpath, g)
@@ -1368,8 +1404,8 @@ def t_sign_verify_require_current_attestation_algorithm():
     # On e51160c (no algorithm gate) the digest still matches, so --sign SIGNS the mislabeled verdict
     # (exit 0) and --verify-signature reports OK (exit 0) — so this test fails there.
     import aggregate
-    repo, run = _pass_run_for_signing()
     env = _stub_signer_env()
+    repo, run = _pass_run_for_signing(policy_env=env)
     sh(["aggregate.py"], repo, expect=0, env=env)
     sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
     sh(["aggregate.py", "--verify-signature"], repo, expect=0, env=env)          # clean baseline
@@ -1570,10 +1606,16 @@ def t_policy_sig_no_signer_is_a_note_not_a_failure():
 
 
 def t_policy_sig_no_policy_at_all_is_exempt():
-    # A run with NO policy file at all is governed by strict built-in defaults, not a
-    # mutable attested artifact — there is nothing to sign, and the fix must not demand
-    # a signature that could never exist. _complete_sensitive_repo (no policy file) has
-    # a genuine WAIVED gate (mutation) and must still reach PASS unsigned.
+    # A run with NO policy file at all, in an environment with NO verifier configured
+    # (the default ENV -- see its own comment on why that's guaranteed, not merely
+    # assumed), is governed by strict built-in defaults, not a mutable attested artifact
+    # — there is nothing to sign or verify, and the fix must not demand a signature that
+    # could never exist. This is GAP A's explicitly preserved exemption (frontier-gate
+    # run pr70-design, 2026-09-21): load_attested_policy_bundle's require_signature=True
+    # only BLOCKS a missing-snapshot run when a verifier IS resolvable in the verifying
+    # environment -- see t_policy_sig_no_policy_but_verifier_configured_is_blocked below
+    # for the case this test does NOT cover. _complete_sensitive_repo (no policy file)
+    # has a genuine WAIVED gate (mutation) and must still reach PASS unsigned.
     repo = _complete_sensitive_repo()
     run = latest_run(repo)
     assert not (run / "policy.snapshot.json").exists()
@@ -1581,6 +1623,38 @@ def t_policy_sig_no_policy_at_all_is_exempt():
     _resolve_open_finding(run)
     r = sh(["aggregate.py"], repo, expect=0)
     assert "VERDICT: PASS" in r.stdout, r.stdout
+
+
+def t_policy_sig_no_policy_but_verifier_configured_is_blocked():
+    # The other half of GAP A (frontier-gate run pr70-design, 2026-09-21, checklist item
+    # 2): t_policy_sig_no_policy_at_all_is_exempt above proved a repo with NO
+    # verification infrastructure at all stays exempt. This proves the opposite: a repo
+    # whose environment DOES have a verifier configured (_stub_signer_env — the same
+    # fixture t_policy_sig_valid_signature_allows_waiver_run_to_pass uses) can no longer
+    # get an unauthenticated free pass on a waiver merely because there is no policy
+    # file at all (so no signer ever ran at init, and neither policy.snapshot.json nor
+    # policy.absence.json was ever written). Before this fix, `gate.py plan --waive`
+    # would have accepted this waiver unconditionally (({}, None) from the old
+    # load_attested_policy with no snapshot) and aggregate.py would never even have
+    # checked a signature for it (gated on `snap_p.is_file()`, which was always False
+    # here). Now BOTH must reject it, at plan time.
+    env = _stub_signer_env()
+    repo = fresh_repo()   # deliberately NO .adversarial-review.json policy file
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo, env=env)
+    run = latest_run(repo)
+    assert not (run / "policy.snapshot.json").exists()
+    assert not (run / "policy.snapshot.sig").exists()
+    sh(["panel.py", "assign"], repo, env=env)
+    sh(["panel.py", "run", "--context-file", "context.md"], repo, env=env)
+    sh(["panel.py", "rebuttal"], repo, env=env)
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI for this repo yet",
+            "--waive-expires", (date.today() + timedelta(days=7)).isoformat()],
+           repo, env=env, expect=1)
+    assert "cannot waive" in r.stderr, r.stderr
+    assert "no policy.snapshot.json" in r.stderr, r.stderr
+    assert "verifier IS configured" in r.stderr, r.stderr
 
 
 def t_policy_sig_missing_blocks_waiver_run():
@@ -1603,6 +1677,37 @@ def t_policy_sig_missing_blocks_waiver_run():
     assert "no policy.snapshot.sig" in r.stdout, r.stdout
 
 
+def t_aggregate_independently_blocks_no_policy_waiver_when_verifier_configured_at_aggregate_time():
+    # aggregate.py is the FINAL authority and must not simply trust that `gate.py plan`
+    # already checked this (frontier-gate run pr70-design, 2026-09-21, checklist item 2)
+    # -- and, distinctly from t_policy_sig_no_policy_but_verifier_configured_is_blocked
+    # above (which shows gate.py plan itself rejecting this), this proves aggregate.py's
+    # OWN independent enforcement of the exact same rule, in the realistic scenario
+    # where `plan` and `aggregate` run in DIFFERENT environments: `plan` here runs with
+    # NO verifier configured (so it succeeds -- this repo predates having any signer
+    # set up), but `aggregate` later runs in an environment that DOES have one (e.g. a
+    # CI job that was subsequently hardened to require signed waivers). A run that was
+    # never signed must still be BLOCKED once verification is actually possible,
+    # regardless of what tooling was or wasn't available when it was planned.
+    repo = fresh_repo()   # deliberately NO .adversarial-review.json policy file
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo)
+    run = latest_run(repo)
+    assert not (run / "policy.snapshot.json").exists()
+    sh(["panel.py", "assign"], repo)
+    sh(["panel.py", "run", "--context-file", "context.md"], repo)
+    sh(["panel.py", "rebuttal"], repo)
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+        "--waive", "mutation", "--authorized-by", "Paul",
+        "--waive-reason", "mutation runner not wired into CI for this repo yet",
+        "--waive-expires", (date.today() + timedelta(days=7)).isoformat()], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=2, env=_stub_signer_env())
+    assert "no attested policy snapshot" in r.stdout, r.stdout
+    assert "no policy.snapshot.json" in r.stdout, r.stdout
+
+
 def t_policy_sig_valid_signature_allows_waiver_run_to_pass():
     # The intended happy path for Option B: signer configured at init -> waiver run
     # verifies and reaches PASS, naming the accountable waiver exactly as before.
@@ -1616,6 +1721,86 @@ def t_policy_sig_valid_signature_allows_waiver_run_to_pass():
     v = read(run / "verdict.json")
     assert v["verdict"] == "PASS"
     assert any(w["name"] == "mutation" for w in v["coverage"]["gates"]["waived"]), v["coverage"]
+
+
+def t_toctou_single_read_of_policy_snapshot_for_full_bundle_load():
+    # THE property the TOCTOU refactor exists to guarantee (frontier-gate run
+    # pr70-design, 2026-09-21, checklist item 8; Fable's TOCTOU design, adopted):
+    # load_attested_policy_bundle(require_signature=True) -- content validation AND
+    # signature verification together -- reads policy.snapshot.json's bytes exactly
+    # ONCE, never a second independent read for the signature check. Proved by
+    # monkeypatching read_regular_file_once to count calls keyed by path, against a
+    # REAL signed run (so the signature-verification branch genuinely executes, not
+    # just the content-validation branch).
+    import _common
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.sig").exists()
+    # This call happens IN-PROCESS (not via sh()'s subprocess), so it needs the same
+    # AR_*/GITHUB_* env _stub_signer_env() built for the subprocess mirrored onto this
+    # process's own os.environ -- saved and restored so it cannot leak into any other
+    # test that runs later in this same test-runner process.
+    touched = [k for k in env if k.startswith("AR_") or k.startswith("GITHUB_")]
+    saved = {k: os.environ.get(k) for k in touched}
+    for k in touched:
+        os.environ[k] = env[k]
+    calls = []
+    orig = _common.read_regular_file_once
+    def counting(path):
+        calls.append(str(path))
+        return orig(path)
+    _common.read_regular_file_once = counting
+    try:
+        bundle, err = _common.load_attested_policy_bundle(run, require_signature=True)
+    finally:
+        _common.read_regular_file_once = orig
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert err is None, err
+    snap_calls = [c for c in calls if c.endswith("policy.snapshot.json")]
+    assert len(snap_calls) == 1, (
+        f"policy.snapshot.json read {len(snap_calls)} times, expected exactly 1: {calls}")
+    runjson_calls = [c for c in calls if c.endswith("run.json")]
+    assert len(runjson_calls) == 1, (
+        f"run.json read {len(runjson_calls)} times, expected exactly 1: {calls}")
+
+
+def t_toctou_verify_uses_caller_supplied_bytes_never_rereads():
+    # Companion to the call-count test above, proving WHY the count is 1: monkeypatch
+    # os.open itself to raise for policy.snapshot.json after the bundle has already read
+    # it, and confirm the signature still verifies successfully -- verify_policy_
+    # snapshot_signature's snap_bytes= is a REQUIRED keyword arg specifically so no call
+    # site can silently reintroduce a second, independent open() of the file.
+    import _common
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    touched = [k for k in env if k.startswith("AR_") or k.startswith("GITHUB_")]
+    saved = {k: os.environ.get(k) for k in touched}
+    for k in touched:
+        os.environ[k] = env[k]
+    raw = _common.read_regular_file_once(run / "policy.snapshot.json")
+    meta = read(run / "run.json")
+    orig_open = _common.os.open
+    def refusing_open(path, *a, **kw):
+        if str(path).endswith("policy.snapshot.json"):
+            raise AssertionError("policy.snapshot.json re-opened after the bundle already read it")
+        return orig_open(path, *a, **kw)
+    _common.os.open = refusing_open
+    try:
+        sig_err = _common.verify_policy_snapshot_signature(run, meta, snap_bytes=raw)
+    finally:
+        _common.os.open = orig_open
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert sig_err is None, sig_err
 
 
 def t_policy_sig_coordinated_two_file_tamper_still_blocks():
@@ -12429,15 +12614,23 @@ def t_next_steps_critical_gate_na_allowed_when_policy_opts_in():
 
 def t_load_attested_policy_fails_closed_on_unreadable_runjson():
     # Unreadable/corrupt provenance must fail closed, never be treated as 'no policy at init'
-    # (which would silently widen a waiver to the default cap).
+    # (which would silently widen a waiver to the default cap). Post-TOCTOU-refactor
+    # (frontier-gate run pr70-design, 2026-09-21), load_attested_policy_bundle() separates
+    # the read step from the parse step (read_regular_file_once() then json.loads()), so
+    # malformed-but-readable JSON now reports "not valid JSON" rather than the old,
+    # imprecise "is unreadable" wording that conflated the two failure modes -- an actually
+    # unreadable path (missing/permission-denied) still reports "is unreadable".
     import _common
     d = Path(tempfile.mkdtemp())
     (d / "run.json").write_text("this is not json {", encoding="utf-8")
     data, err = _common.load_attested_policy(d)
-    assert data is None and err and "run.json is unreadable" in err, (data, err)
+    assert data is None and err and "run.json is not valid JSON" in err, (data, err)
     (d / "run.json").write_text("[]", encoding="utf-8")   # valid JSON but not an object
     data, err = _common.load_attested_policy(d)
     assert data is None and "not a JSON object" in (err or ""), (data, err)
+    (d / "run.json").unlink()   # genuinely missing -- the OTHER failure mode
+    data, err = _common.load_attested_policy(d)
+    assert data is None and err and "run.json is unreadable" in err, (data, err)
 
 
 def t_gate_required_malformed_blocks():

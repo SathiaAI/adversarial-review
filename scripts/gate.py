@@ -16,10 +16,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (die, load_attested_policy, load_policy, now_iso, read_json,
+from _common import (die, load_attested_policy_bundle, load_policy, now_iso, read_json,
                      resolve_run, resolve_waiver_clock, validate_gate_name,
-                     validate_not_applicable_gate, validate_waived_gate,
-                     verify_policy_snapshot_signature, write_json)
+                     validate_not_applicable_gate, validate_waived_gate, write_json)
 
 # Floors per tier: these cannot be silently omitted, only waived on the record with a
 # named authorizer (surfaced in the verdict reasons and the report). A waived floor gate
@@ -97,18 +96,20 @@ def cmd_plan(args):
     # versa). Aggregate remains the authority; this is the identical early check. Only touched
     # when there is actually a waiver to validate (a plan with no waivers reads no policy).
     if waived:
-        att_pol, att_err = load_attested_policy(run)
+        # TOCTOU-safe, signature-required load (frontier-gate run pr70-design,
+        # 2026-09-21, checklist items 2/8/19): load_attested_policy_bundle() reads
+        # policy.snapshot.json exactly once and, under require_signature=True, verifies
+        # the cryptographic signature over those SAME bytes before this ever returns
+        # success — no separate `if snap_p.is_file():`-guarded re-read. The GAP A fix:
+        # when neither policy.snapshot.json nor a signed policy.absence.json exists, and
+        # a verifier IS configured in THIS environment, this now BLOCKS instead of
+        # silently falling through to an unauthenticated empty policy (a repo with no
+        # verification infrastructure configured at all stays exempt, unchanged from
+        # before — see the function's own docstring for the full rationale).
+        bundle, att_err = load_attested_policy_bundle(run, require_signature=True)
         if att_err:
-            die(f"cannot validate waiver: {att_err}")
-        # Same fail-closed signature check aggregate.py enforces, done here too so `plan`
-        # can never report success on a waiver `aggregate` will later BLOCK as unsigned or
-        # invalid (Codex, PR70 review, frontier-gate run pr70-provenance-2: plan and
-        # aggregate used to disagree because only aggregate checked this).
-        snap_p = run / "policy.snapshot.json"
-        if snap_p.is_file():
-            sig_err = verify_policy_snapshot_signature(run, snap_p, read_json(run / "run.json"))
-            if sig_err:
-                die(f"cannot waive: attested policy snapshot is not verifiably signed: {sig_err}")
+            die(f"cannot waive: {att_err}")
+        att_pol = bundle.data
         clock_date, clock_err = resolve_waiver_clock()
         if clock_err:
             die(clock_err)
@@ -250,20 +251,16 @@ def cmd_record(args):
         # Enforce the CRITICAL-tier N/A restrictions at record time too (fail fast), with the
         # SAME validator AND the SAME attested policy source aggregate applies: mutation on
         # CRITICAL can never be N/A, and any CRITICAL N/A needs policy allow_critical_waivers.
-        meta = read_json(run / "run.json")
-        tier = meta.get("risk")
-        att_pol, att_err = load_attested_policy(run)
+        # TOCTOU-safe, signature-required load (same rationale as cmd_plan's waiver check
+        # above): `tier` is read from the bundle's OWN run_meta (a single read.json() inside
+        # load_attested_policy_bundle), not from a separately-read run.json, so a run.json
+        # swapped between two independent reads cannot make the risk tier checked here
+        # disagree with the risk tier actually bound into the signature.
+        bundle, att_err = load_attested_policy_bundle(run, require_signature=True)
         if att_err:
-            die(f"cannot validate NOT_APPLICABLE: {att_err}")
-        # Same fail-closed signature check aggregate.py and cmd_plan enforce, done here too
-        # so `record` can never report success on a NOT_APPLICABLE gate `aggregate` will
-        # later BLOCK as unsigned or invalid (Codex, PR70 review, frontier-gate run
-        # pr70-provenance-2).
-        snap_p = run / "policy.snapshot.json"
-        if snap_p.is_file():
-            sig_err = verify_policy_snapshot_signature(run, snap_p, meta)
-            if sig_err:
-                die(f"cannot mark NOT_APPLICABLE: attested policy snapshot is not verifiably signed: {sig_err}")
+            die(f"cannot mark NOT_APPLICABLE: {att_err}")
+        att_pol = bundle.data
+        tier = bundle.run_meta.get("risk")
         nerr = validate_not_applicable_gate(
             args.name, tier, {"authorized_by": args.authorized_by, "summary": args.summary},
             att_pol)

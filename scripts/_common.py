@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -198,9 +199,19 @@ def ci_signing_context():
     }
 
 
-def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path, ci_context=None,
-                         version=POLICY_ATTEST_VERSION):
+def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path=None, ci_context=None,
+                         version=POLICY_ATTEST_VERSION, snap_bytes=None):
     """The exact bytes signed/verified for the policy-snapshot signature.
+
+    `snap_bytes`, when given, is used verbatim instead of re-reading `snap_path` from
+    disk — the TOCTOU fix (frontier-gate run pr70-design, 2026-09-21, checklist item 8):
+    a caller that already has the file's bytes in hand (from
+    load_attested_policy_bundle(), or from panel.py having just written them at init)
+    passes them here so the bytes that get SIGNED/VERIFIED are provably the exact same
+    bytes that were content-validated or just written — never a second, independent
+    `open()` of the same path that an attacker with write access to the run directory
+    could have swapped in between the two reads. `snap_path` stays required when
+    `snap_bytes` is omitted (back-compat for any caller that has only a path).
 
     v3 (current) additionally binds the four ci_signing_context() values -- repository,
     commit, CI run id, CI run attempt -- ahead of the snapshot bytes (frontier-gate run
@@ -251,6 +262,8 @@ def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path, ci_context
     closes that gap deterministically instead of relying on timestamp luck."""
     if ci_context is None:
         ci_context = ci_signing_context()
+    if snap_bytes is None:
+        snap_bytes = Path(snap_path).read_bytes()
     return (b"ar-policy-attest-v" + str(version).encode("ascii") + b"\n"
             + run_id.encode("utf-8") + b"\n" + run_nonce.encode("utf-8") + b"\n"
             + str(run_name).encode("utf-8") + b"\n" + str(risk).encode("utf-8") + b"\n"
@@ -258,10 +271,10 @@ def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path, ci_context
             + ci_context["commit"].encode("utf-8") + b"\n"
             + ci_context["run_id"].encode("utf-8") + b"\n"
             + ci_context["run_attempt"].encode("utf-8") + b"\n"
-            + Path(snap_path).read_bytes())
+            + snap_bytes)
 
 
-def verify_policy_snapshot_signature(run, snap_p, meta):
+def verify_policy_snapshot_signature(run, meta, *, snap_bytes):
     """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
     Paul's decision, frontier-gate run pr70-provenance, 2026-09-19; hardened against 3
     further P1 findings from a delayed Codex review, frontier-gate run
@@ -271,9 +284,17 @@ def verify_policy_snapshot_signature(run, snap_p, meta):
     record time, so `plan`/`record` can never report success on a waiver `aggregate`
     will later BLOCK as unsigned or invalid — see gate.py's cmd_plan/cmd_record).
 
-    `run` is the run's resolved directory (a real Path — see resolve_run), `snap_p` is
-    policy.snapshot.json's path, and `meta` is run.json's already-parsed dict. Checks, in
-    order, ALL fail-closed (return a short BLOCKED-reason string; never raise or exit):
+    `run` is the run's resolved directory (a real Path — see resolve_run), `meta` is
+    run.json's already-parsed dict, and `snap_bytes` (keyword-only, REQUIRED — no
+    default, so no call site can silently reintroduce a second read) is
+    policy.snapshot.json's exact bytes as already read by the caller — normally
+    load_attested_policy_bundle()'s `.raw`. This is the TOCTOU fix (frontier-gate run
+    pr70-design, 2026-09-21, checklist item 8; Fable's TOCTOU design, adopted): the
+    signature is verified over the SAME bytes the caller already content-validated,
+    never a second, independent `open()` of policy.snapshot.json that an attacker with
+    write access to the run directory could have swapped in between the two reads.
+    Checks, in order, ALL fail-closed (return a short BLOCKED-reason string; never raise
+    or exit):
 
       1. run.name must equal meta['run_id']. cmd_init assigns a run's directory name
          ONCE, from a UTC timestamp, checking existence to guarantee it is never reused
@@ -288,7 +309,7 @@ def verify_policy_snapshot_signature(run, snap_p, meta):
          unchanged from the original nonce fix).
       3. POLICY_SIG_FILENAME must exist, and a verifier must be configured.
       4. The signature must verify over policy_attest_bytes(run_id, run_nonce, run.name,
-         meta['risk'], snap_p) with NO explicit ci_context — the default fetches a FRESH
+         meta['risk'], snap_bytes=snap_bytes) with NO explicit ci_context — the default fetches a FRESH
          ci_signing_context() from this process's own environment, the same call panel.py
          makes at sign time. This is the v3 payload (frontier-gate run
          pr70-architecture-review, 2026-09-20): beyond v2's run_name and risk binding, it
@@ -345,7 +366,8 @@ def verify_policy_snapshot_signature(run, snap_p, meta):
                 "minisign (with AR_MINISIGN_PUBKEY or AR_MINISIGN_PUBKEY_FILE)")
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.snapshot.attest"
-        msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_p))
+        msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, run_name, risk,
+                                                 snap_bytes=snap_bytes))
         proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_p, fatal=False)
     if err:
         return f"verifier '{kind}' could not run: {err}"
@@ -1186,41 +1208,129 @@ def load_policy(root=None):
             "text": text}
 
 
-def load_attested_policy(run):
-    """Return (pol_data, error) from the run's attested policy.snapshot.json — the exact
-    policy text captured at init — NEVER the mutable working-tree policy, so a post-init edit
-    cannot widen a waiver that is absent from the audit record (#3).
+@dataclass(frozen=True)
+class AttestedPolicy:
+    """The result of a successful load_attested_policy_bundle() call — everything a
+    caller needs about the run's init-time policy, read and validated exactly once.
 
-      ({}, None)     no policy at init (no snapshot) → strict built-in defaults apply.
-      (data, None)   snapshot present, its text matches its recorded sha256, and it parses
-                     and validates against the current schema.
-      (None, msg)    snapshot present but unreadable, sha-mismatched (tampered), or no longer
-                     valid — the caller must BLOCK (fail closed), never fall back to the
-                     working tree."""
-    # The init-time provenance: run.json.policy.sha256 records whether a policy governed the
-    # run at init. Read it first so a DELETED snapshot can be told apart from 'no policy'.
-    # Fail closed on unreadable/corrupt provenance — never treat it as 'no policy at init', or a
-    # damaged run.json could silently widen a waiver from an attested limit to the default.
+      data              {} for an authenticated no-policy run, else the validated policy dict.
+      sha256            policy.snapshot.json's recorded sha256, or None when there is no
+                         snapshot (a no-policy run, whether attested or not).
+      raw               policy.snapshot.json's exact bytes, as read ONCE by this call.
+                         Pass this to verify_policy_snapshot_signature's snap_bytes= so the
+                         signature is checked over the SAME bytes that were content-
+                         validated here, never a second, independently re-read copy (the
+                         TOCTOU this closes). None when there is no snapshot.
+      absence_attested  True only for a run whose policy.absence.json + .sig were present
+                         and verified — an authenticated "no policy governed this run"
+                         claim, distinct from the merely-unsigned {} fallback below.
+      run_meta          run.json's already-parsed dict, so callers needing e.g. meta['risk']
+                         never re-read run.json themselves."""
+    data: dict
+    sha256: "str | None"
+    raw: "bytes | None"
+    absence_attested: bool
+    run_meta: dict
+
+
+def load_attested_policy_bundle(run, *, require_signature):
+    """The single, TOCTOU-safe way to learn what policy governed a run at init — replaces
+    the old load_attested_policy() as the primitive every caller should reach for going
+    forward (frontier-gate run pr70-design, 2026-09-21, checklist items 3/7/8; Fable's
+    TOCTOU design §2, adopted, extended here with the GAP-A-closing require_signature
+    contract).
+
+    Reads run.json and (if present) policy.snapshot.json EXACTLY ONCE EACH, via
+    read_regular_file_once(), and returns an AttestedPolicy carrying the raw bytes
+    alongside the validated data — so a caller that also needs the cryptographic
+    signature checked (this function does that itself when require_signature=True; see
+    below) never triggers a second, independent read of the same path that an attacker
+    with write access to the run directory could have swapped in between two reads.
+
+    require_signature=False — content-only; matches the pre-fix load_attested_policy()
+    contract exactly (see the back-compat shim below). Validates policy.snapshot.json's
+    content (sha256, schema) but does NOT invoke an external verifier — works without
+    cosign/minisign installed, for read-only inspection tooling that has nothing to sign
+    or waive. A run with no snapshot and no policy recorded at init returns the
+    unauthenticated {} fallback, exactly as before.
+
+    require_signature=True — every caller that is about to accept a WAIVED or
+    NOT_APPLICABLE gate (gate.py cmd_plan/cmd_record, aggregate.py's verdict path) must
+    use this. Beyond the content checks above, this ALSO verifies the cryptographic
+    signature (over the identical already-read bytes — see verify_policy_snapshot_
+    signature's snap_bytes= contract) before returning success. This is the GAP-A fix:
+    previously, a run with NO policy.snapshot.json at all silently fell through to an
+    UNAUTHENTICATED ({}, None) "no restrictions" pass — file absence itself was never an
+    authenticated claim, so an attacker (or a broken pipeline) that simply deleted or
+    never wrote the snapshot got the same free pass as a genuinely policy-free run. Under
+    require_signature=True that same no-file case is now BLOCKED, not passed:
+    policy.absence.json (added in the commit that follows this one) is the signed escape
+    hatch a genuinely no-policy run uses to still pass this check.
+
+    Returns (AttestedPolicy, None) on success, (None, error_message) on any failure —
+    never raises; every failure mode is a caller-facing BLOCKED-reason string."""
+    run = Path(run)
     try:
-        runjson = read_json(Path(run) / "run.json")
-    except (ValueError, OSError):
-        return None, "run.json is unreadable — cannot determine the attested policy; run BLOCKED"
+        runjson_bytes = read_regular_file_once(run / "run.json")
+    except (ValueError, OSError) as e:
+        return None, f"run.json is unreadable — cannot determine the attested policy; run BLOCKED ({e})"
+    try:
+        runjson = json.loads(runjson_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        return None, (f"run.json is not valid JSON/UTF-8 — cannot determine the attested "
+                      f"policy; run BLOCKED ({e})")
     if not isinstance(runjson, dict):
         return None, "run.json is not a JSON object — cannot determine the attested policy; run BLOCKED"
     init_pol = runjson.get("policy")
     init_sha = init_pol.get("sha256") if isinstance(init_pol, dict) else None
-    snap_path = Path(run) / "policy.snapshot.json"
-    if not snap_path.is_file():
+    snap_p = run / "policy.snapshot.json"
+
+    if not snap_p.is_file():
         if init_sha:
-            # A policy governed the run at init but its attested snapshot is gone — falling back
-            # to built-in defaults could accept a waiver the attested policy would have rejected.
-            return None, ("run.json records a policy at init but policy.snapshot.json is missing "
-                          "— the attested policy cannot be recovered; run BLOCKED")
-        return {}, None
+            # A policy governed the run at init but its attested snapshot is gone — falling
+            # back to built-in defaults could accept a waiver the attested policy would
+            # have rejected.
+            return None, ("run.json records a policy at init but policy.snapshot.json is "
+                          "missing — the attested policy cannot be recovered; run BLOCKED")
+        if require_signature:
+            # Checklist item 19's explicit alternative ("always-on when signer/verifier
+            # configured", frontier-gate run pr70-design, 2026-09-21): whether "no policy
+            # artifact at all" BLOCKS here is driven by whether a VERIFIER resolves in
+            # THIS (the verifying) process's own environment — never by anything read
+            # from the run directory itself, which is exactly what an attacker with
+            # write access to it could forge to look like "no signer was ever
+            # configured." A repo that has never configured any verification at all
+            # keeps the original, documented, infrastructure-free exemption (matches
+            # Option B's original scope, Paul's decision, frontier-gate run
+            # pr70-provenance, 2026-09-19) — there is no cryptographic mechanism to
+            # enforce this policy without one, so nothing is lost by staying exempt. A
+            # repo that HAS configured verification, though, can no longer be fooled by
+            # simple file absence: if this run predates the signed-init fix, or its own
+            # init never configured a signer while THIS environment nonetheless expects
+            # one, that is exactly the ambiguity GAP A closes — re-init under a
+            # configured signer to get a verifiable run.
+            argv_tmpl, _kind = resolve_signing_tool(
+                "AR_VERIFIER_CMD",
+                [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)])
+            if argv_tmpl is not None:
+                return None, ("no policy.snapshot.json and no signed no-policy "
+                              "attestation for this run, but a verifier IS configured "
+                              "here and a signature is required to accept a waiver or "
+                              "NOT_APPLICABLE gate — this run predates the signed-init "
+                              "fix, or no signer was configured at its own init; "
+                              "re-init this run under a configured signer "
+                              "(AR_TRUSTED_SIGNER=1 plus AR_SIGNER_CMD / cosign / "
+                              "minisign)")
+        return AttestedPolicy({}, None, None, False, runjson), None
+
     try:
-        snap = read_json(snap_path)
+        raw = read_regular_file_once(snap_p)
     except (ValueError, OSError) as e:
         return None, f"policy.snapshot.json is unreadable/corrupt: {e}"
+    try:
+        snap = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        return None, f"policy.snapshot.json is not valid JSON/UTF-8: {e}"
     if not isinstance(snap, dict):
         return None, "policy.snapshot.json is not a JSON object"
     text = snap.get("text")
@@ -1231,12 +1341,12 @@ def load_attested_policy(run):
     if not isinstance(text, str):
         return None, "policy.snapshot.json has no captured policy text"
     # A syntactically valid JSON string can still contain an unpaired UTF-16 surrogate
-    # (e.g. an escaped "\ud800" with no matching low surrogate) — json.load() accepts it,
-    # but .encode("utf-8") raises UnicodeEncodeError. Without this guard that exception
-    # would propagate out of load_attested_policy(), past aggregate.py's normal BLOCKED-
-    # verdict path, and crash the run instead of failing closed (Codex, PR70 review,
-    # frontier-gate run pr70-provenance-2). Treat it exactly like any other corrupt
-    # snapshot: BLOCK, never crash.
+    # (e.g. an escaped "\ud800" with no matching low surrogate) — json.loads() accepts
+    # it, but .encode("utf-8") raises UnicodeEncodeError. Without this guard that
+    # exception would propagate past aggregate.py's normal BLOCKED-verdict path and crash
+    # the run instead of failing closed (Codex, PR70 review, frontier-gate run
+    # pr70-provenance-2). Treat it exactly like any other corrupt snapshot: BLOCK, never
+    # crash.
     try:
         text_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
     except UnicodeEncodeError as e:
@@ -1251,14 +1361,34 @@ def load_attested_policy(run):
         return None, ("policy.snapshot.json sha256 does not match the policy digest recorded in "
                       "run.json at init — the snapshot was replaced")
     try:
-        data = json.loads(text) if fname.endswith(".json") else _parse_policy_yaml(
-            text, "policy.snapshot.json")
+        data = (json.loads(text) if fname.endswith(".json")
+                else _parse_policy_yaml(text, "policy.snapshot.json"))
         _validate_policy(data, "policy.snapshot.json")
     except (ValueError, SystemExit):
         return None, "policy.snapshot.json failed to parse/validate against the current schema"
     if not isinstance(data, dict):
         return None, "policy.snapshot.json did not parse to a mapping"
-    return data, None
+
+    if require_signature:
+        sig_err = verify_policy_snapshot_signature(run, runjson, snap_bytes=raw)
+        if sig_err:
+            return None, f"attested policy snapshot is not verifiably signed: {sig_err}"
+
+    return AttestedPolicy(data, sha, raw, False, runjson), None
+
+
+def load_attested_policy(run):
+    """Back-compat shim over load_attested_policy_bundle(require_signature=False) — the
+    exact (pol_data, error) two-tuple shape every pre-TOCTOU-fix caller and test already
+    expects (({}, None) / (data, None) / (None, msg), same as before). New code that is
+    about to accept a waiver or NOT_APPLICABLE gate should call
+    load_attested_policy_bundle(run, require_signature=True) directly instead, both for
+    the stronger authenticated-absence guarantee and to get the bundle's `raw` bytes for
+    signature reuse rather than triggering a second read."""
+    bundle, err = load_attested_policy_bundle(run, require_signature=False)
+    if err:
+        return None, err
+    return bundle.data, None
 
 
 def resolve_setting(cli_value, env_var, pol, key, default=None):

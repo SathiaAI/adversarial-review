@@ -34,7 +34,7 @@ from _common import (POLICY_SIG_FILENAME, _policy_bool,
                      canonical_finding_digest,
                      cosign_sign_argv as _cosign_sign_argv,
                      cosign_verify_argv as _cosign_verify_argv, family_of,
-                     load_attested_policy, meta_cost,
+                     load_attested_policy_bundle, meta_cost,
                      minisign_sign_argv as _minisign_sign_argv,
                      minisign_verify_argv as _minisign_verify_argv, now_iso,
                      read_json, resolve_run,
@@ -1410,27 +1410,27 @@ def _aggregate_cli():
                   "findings_medium_low": 0, "confirmed": 0, "unresolved": 0}
 
         # Waiver limits (max_waiver_days, allow_critical_waivers) come ONLY from the policy
-        # attested at init (policy.snapshot.json), NEVER the mutable working-tree policy — a
-        # post-init edit must not be able to widen a waiver that is absent from the audit
-        # record. A snapshot that is present but untrustworthy (unreadable / sha-mismatched /
-        # no longer valid) fails closed to strict built-in defaults AND blocks the run.
-        pol_data, att_err = load_attested_policy(run)
-        attested_policy_sha = None
-        snap_p = run / "policy.snapshot.json"
-        if snap_p.is_file():
-            try:
-                _snap = read_json(snap_p)
-            except (ValueError, OSError):
-                _snap = None
-            # A non-object snapshot (array/string/number) has no .get — guard so the sha
-            # re-read cannot raise AttributeError before the verdict is written. The
-            # untrustworthy snapshot is already caught (and BLOCKED) by load_attested_policy.
-            if isinstance(_snap, dict) and isinstance(_snap.get("sha256"), str):
-                attested_policy_sha = _snap["sha256"]
+        # attested at init (policy.snapshot.json / policy.absence.json), NEVER the mutable
+        # working-tree policy — a post-init edit must not be able to widen a waiver that is
+        # absent from the audit record. A snapshot/absence that is present but untrustworthy
+        # (unreadable / sha-mismatched / no longer valid) fails closed to strict built-in
+        # defaults AND blocks the run.
+        #
+        # TOCTOU-safe (frontier-gate run pr70-design, 2026-09-21, checklist item 8): this
+        # require_signature=False call is the ONLY read of run.json/policy.snapshot.json for
+        # the whole policy-attestation question in this function. `bundle` keeps the
+        # already-read raw bytes so the conditional signature check below (only needed once
+        # gcov, computed after this, reveals an actual waiver/NOT_APPLICABLE) verifies over
+        # the SAME bytes just content-validated here — never a second, independent read of
+        # policy.snapshot.json that a concurrent, attacker-controlled step in the same job
+        # could race between the two reads.
+        bundle, att_err = load_attested_policy_bundle(run, require_signature=False)
+        pol_data = bundle.data if bundle else {}
+        attested_policy_sha = bundle.sha256 if bundle else None
         if att_err:
-            pol_data = {}
             # The rejected snapshot did NOT govern the verdict (strict defaults did), so its
             # sha must not be reported as the governing-policy provenance.
+            pol_data = {}
             attested_policy_sha = None
             blocked.append(f"attested policy snapshot could not be trusted: {att_err}")
         # Resolved once per aggregate run: GITHUB_RUN_STARTED_AT's date if set (else today
@@ -1444,20 +1444,43 @@ def _aggregate_cli():
         counts["gates"] = len(gates)
 
         # PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only,
-        # Paul's decision): the no-exception path above stays infrastructure-free, but
-        # the moment this run recorded a WAIVED or NOT_APPLICABLE gate, the attested
-        # policy snapshot that governed it must carry a verified init-time signature —
-        # see _common.py's verify_policy_snapshot_signature for the full rationale. Gated on
-        # `snap_p.is_file() and not att_err` so this never fires for a run with no
-        # policy configured at all (waivers there are governed by strict built-in
-        # defaults, not a mutable file, so there is nothing to tamper) or one whose
-        # snapshot is already untrustworthy (already BLOCKED above by that reason).
-        if (gcov["waived"] or gcov["not_applicable"]) and snap_p.is_file() and not att_err:
-            sig_err = verify_policy_snapshot_signature(run, snap_p, meta)
-            if sig_err:
-                blocked.append(
-                    "run recorded a waived or not-applicable gate but its attested "
-                    f"policy snapshot is not verifiably signed: {sig_err}")
+        # Paul's decision), extended by the GAP A fix (frontier-gate run pr70-design,
+        # 2026-09-21, checklist item 2): the no-exception path above stays
+        # infrastructure-free, but the moment this run recorded a WAIVED or NOT_APPLICABLE
+        # gate, the policy that governed it must be AUTHENTICATED — either a verifiably-
+        # signed policy.snapshot.json, or a verifiably-signed policy.absence.json explicitly
+        # attesting that no policy governed this run. `not att_err` so this never re-blocks a
+        # run already BLOCKED above for the same underlying reason.
+        if (gcov["waived"] or gcov["not_applicable"]) and not att_err:
+            if bundle.absence_attested:
+                pass  # already cryptographically verified inside the bundle load above
+            elif bundle.raw is not None:
+                sig_err = verify_policy_snapshot_signature(run, bundle.run_meta,
+                                                            snap_bytes=bundle.raw)
+                if sig_err:
+                    blocked.append(
+                        "run recorded a waived or not-applicable gate but its attested "
+                        f"policy snapshot is not verifiably signed: {sig_err}")
+            else:
+                # No policy.snapshot.json and no policy.absence.json were present at the
+                # content-only (require_signature=False) load above. Re-derive the
+                # authoritative answer via require_signature=True — this decides, based
+                # SOLELY on whether a verifier is configured in THIS environment (never
+                # on anything read from the run directory itself, which is exactly what
+                # an attacker with write access to it could forge to look like "no
+                # signer was ever configured" — see load_attested_policy_bundle's own
+                # docstring), whether this is the historically exempt "no verification
+                # infra configured at all" case or the GAP-A hole this fix closes (a run
+                # whose environment DOES expect authentication getting an unauthenticated
+                # free pass merely because both artifacts are absent). This second call
+                # costs only a second run.json read — there is no snapshot/absence FILE
+                # here to re-read, so it does not reintroduce the TOCTOU this refactor
+                # exists to eliminate.
+                _, sig_err = load_attested_policy_bundle(run, require_signature=True)
+                if sig_err:
+                    blocked.append(
+                        "run recorded a waived or not-applicable gate but there is no "
+                        f"attested policy snapshot for this run: {sig_err}")
 
         plan_path = run / "panel" / "plan.json"
         plan = read_json(plan_path) if plan_path.exists() else {}
