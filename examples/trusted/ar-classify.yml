@@ -60,3 +60,7 @@ jobs:
           name: ar-run-${{ github.run_id }}-${{ github.run_attempt }}
           path: .adversarial-review/
           retention-days: 7
+          # v4 excludes hidden files/dirs by default, and `.adversarial-review/` is itself a
+          # dot-dir -- without this the upload silently finds nothing and ar-verify always
+          # downloads 0 artifacts. Confirmed by live-testing this exact step in Sandbox.
+          include-hidden-files: true

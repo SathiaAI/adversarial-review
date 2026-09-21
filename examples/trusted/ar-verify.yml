@@ -123,6 +123,7 @@ jobs:
           name: ar-verify-run-${{ github.event.workflow_run.id }}
           path: .adversarial-review/
           retention-days: 30
+          include-hidden-files: true   # same dot-dir issue as ar-classify.yml's upload step
 
 # OPTIONAL, stronger variant -- pin the required check to a specific identity so it can only be
 # posted by that identity, not by anyone with the repo's default checks:write token (e.g. anyone
