@@ -29,10 +29,11 @@ jobs:
     env:
       AR_REF: v0.2.1   # PIN to a tag or a full 40-char commit SHA -- never a moving branch
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
         with:
           fetch-depth: 0   # the panel reviews a real git range
-      - uses: actions/setup-python@v5
+          persist-credentials: false   # this job's token is read-only anyway; don't leave it on disk
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
         with:
           python-version: '3.12'
       - name: Fetch a pinned copy of the adversarial-review tooling
@@ -43,9 +44,14 @@ jobs:
           git -C /tmp/ar fetch -q --depth 1 origin "$AR_REF"
           git -C /tmp/ar checkout -q FETCH_HEAD
       - name: Record deterministic gates
+        env:
+          # Expanded here, not inline in the run: block below -- BASE_REF becomes a shell
+          # variable rather than text substituted into the script before bash ever sees it, so a
+          # base branch name (however it's chosen) can't be read as shell syntax.
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
-          python /tmp/ar/scripts/panel.py init --diff-ref "origin/${{ github.base_ref }}...HEAD"
+          python /tmp/ar/scripts/panel.py init --diff-ref "origin/$BASE_REF...HEAD"
           python /tmp/ar/scripts/gate.py plan --require build,unit,deps,sast
           python /tmp/ar/scripts/gate.py run --name build -- sh -c "python -m py_compile \$(git ls-files '*.py')" || true
           python /tmp/ar/scripts/gate.py run --name unit -- python -m pytest -q || true
@@ -53,7 +59,7 @@ jobs:
           python /tmp/ar/scripts/gate.py run --name sast -- bandit -ll -q -r . || true
       - name: Upload run directory for ar-verify
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
         with:
           # Attempt-scoped name: a `gh run rerun` produces a fresh artifact instead of a 409
           # conflict, and ar-verify's pattern match picks it up regardless of attempt number.

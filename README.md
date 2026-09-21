@@ -355,7 +355,16 @@ a context pinned to your default branch, not the PR's own workflow file. See
 adoption guide in ci-integration.md](docs/ci-integration.md#secure-adoption-required-checks) for
 the hardened two-workflow split, and add a `CODEOWNERS` entry for `.github/workflows/` and
 `.adversarial-review.yml` so changes to the check itself need review, not just changes it's
-checking.
+checking. A `CODEOWNERS` entry only *requires* review if your branch protection also has
+**"Require review from Code Owners"** turned on for that branch - the file alone doesn't enforce
+anything.
+
+The default `ar-verify.yml` posts its check with the plain `secrets.GITHUB_TOKEN`, which is
+simpler to adopt but means *any* workflow in your repo with `checks: write` could post a check
+under the same name (`adversarial-review/verify`) - GitHub's required-check matching is by name,
+not by identity. If that's a real threat in your repo (e.g. many contributors can add workflows),
+pin the required check to a specific GitHub App instead; see the comment block at the end of
+`ar-verify.yml` for the stronger, opt-in variant.
 
 **CLI (PyPI packaging prepped)** — `pyproject.toml` ships `ar-panel`,
 `ar-gate`, `ar-aggregate`, `ar-mcp` console scripts (`python -m build`, then pip/pipx
