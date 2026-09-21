@@ -61,7 +61,19 @@ jobs:
           set -euo pipefail
           run_dir=$(ls -d .adversarial-review/run-*/ 2>/dev/null | head -1)
           if [ -z "$run_dir" ]; then echo "::error::no run directory in the downloaded artifact"; exit 1; fi
-          recorded_sha=$(python3 -c "import json,glob; f=glob.glob('$run_dir/run.json'); print(json.load(open(f[0])).get('head_sha','')) if f else print('')" 2>/dev/null || true)
+          # run_dir comes from ar-classify's artifact -- a directory NAME the PR author fully
+          # controls. Passed as an argv, not interpolated into the Python source string: a name
+          # containing a single quote could otherwise break out of the literal and inject code
+          # that runs in this job, which is about to receive OPENROUTER_API_KEY.
+          recorded_sha=$(python3 -I -c '
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1]) / "run.json"
+          value = json.loads(path.read_text())
+          print(value.get("head_sha", ""))
+          ' "$run_dir")
           # run.json's own recorded head SHA (if the tooling version records one) must match the
           # workflow_run event's head_sha -- defends against a stale or substituted artifact from a
           # different, unrelated ar-classify run being fed in here.

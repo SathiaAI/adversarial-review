@@ -5,3 +5,6 @@
 /.adversarial-review.yml @pjpoulose
 /examples/trusted/       @pjpoulose
 /action.yml              @pjpoulose
+# This file has to own itself, or a contributor can edit CODEOWNERS to remove every rule above
+# (including this one) without needing code-owner approval to do it.
+/.github/CODEOWNERS      @pjpoulose

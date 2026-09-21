@@ -133,7 +133,9 @@ Also add, once you adopt the required-check posture:
 
 - A `CODEOWNERS` entry for `.github/workflows/` and `.adversarial-review.yml`, so changes to the
   check itself (not just changes it's checking) need a second reviewer — this repo's own
-  [`.github/CODEOWNERS`](../.github/CODEOWNERS) is a working example.
+  [`.github/CODEOWNERS`](../.github/CODEOWNERS) is a working example. **Include the
+  `CODEOWNERS` file itself** in its own rules — otherwise a contributor can edit it to remove
+  every other rule without needing code-owner approval to do that edit.
 - Branch protection requiring the `adversarial-review/verify` check (not `adversarial-review` —
   that's `ar-classify`'s own, still-advisory job name) before merge.
 

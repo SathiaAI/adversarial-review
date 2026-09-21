@@ -355,9 +355,10 @@ a context pinned to your default branch, not the PR's own workflow file. See
 adoption guide in ci-integration.md](docs/ci-integration.md#secure-adoption-required-checks) for
 the hardened two-workflow split, and add a `CODEOWNERS` entry for `.github/workflows/` and
 `.adversarial-review.yml` so changes to the check itself need review, not just changes it's
-checking. A `CODEOWNERS` entry only *requires* review if your branch protection also has
-**"Require review from Code Owners"** turned on for that branch - the file alone doesn't enforce
-anything.
+checking — **including `CODEOWNERS` itself**, or a contributor can edit it to remove every rule
+above without needing code-owner approval to make that edit. A `CODEOWNERS` entry only
+*requires* review if your branch protection also has **"Require review from Code Owners"**
+turned on for that branch - the file alone doesn't enforce anything.
 
 The default `ar-verify.yml` posts its check with the plain `secrets.GITHUB_TOKEN`, which is
 simpler to adopt but means *any* workflow in your repo with `checks: write` could post a check
