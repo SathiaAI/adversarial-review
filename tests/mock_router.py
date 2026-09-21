@@ -42,7 +42,15 @@ STATE = {"fail_models": set(), "malformed_once": set(), "calls": {}, "concur_agr
          "response_provider": None,
          # Per-response usage.cost (USD) reported to the client — lets a suite trip the cost
          # cap (E4-S2). 0.0 means the router reports no cost, like a provider that omits it.
-         "reviewer_cost": 0.0}
+         "reviewer_cost": 0.0,
+         # --- Jev (`/alpha/decisions`), jev_triage.py's endpoint ---
+         "jev_calls": 0,
+         "jev_fail": False,               # True -> every Jev call returns HTTP 500
+         "jev_cost": 0.00003,
+         # Optional hook: Callable[[dict], dict|None]. Called with the request body
+         # ({"model","state","questions"}); a non-None return REPLACES the default
+         # per-question answers dict (still wrapped in {"answers": ..., "usage": ...}).
+         "jev_response_provider": None}
 
 
 def _report(role, model):
@@ -79,12 +87,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _do_jev(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        STATE["jev_calls"] += 1
+        if STATE.get("jev_fail"):
+            return self._send(500, {"error": "jev unavailable"})
+        override = None
+        if STATE.get("jev_response_provider"):
+            override = STATE["jev_response_provider"](body)
+        answers = override if override is not None else _default_jev_answers(body.get("questions"))
+        return self._send(200, {"answers": answers, "usage": {"cost": STATE.get("jev_cost", 0.0)}})
+
     def do_GET(self):
         if self.path.endswith("/models"):
             return self._send(200, CATALOG)
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path.endswith("/alpha/decisions"):
+            return self._do_jev()
         if not self.path.endswith("/chat/completions"):
             return self._send(404, {"error": "not found"})
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -130,6 +151,28 @@ class Handler(BaseHTTPRequestHandler):
                          "provider": "MockServe"})
 
 
+def _default_jev_answers(questions):
+    """A plausible default answer per question type -- deliberately LOW on every 'noul'
+    (0.1) so a test must opt in (via jev_response_provider) to exercise the fail-closed /
+    escalation branches, and doesn't accidentally exercise them by default."""
+    answers = {}
+    for name, q in (questions or {}).items():
+        qtype = q.get("type") if isinstance(q, dict) else None
+        if qtype == "noul":
+            answers[name] = {"noul": 0.1}
+        elif qtype == "choice":
+            criteria = q.get("criteria") if isinstance(q.get("criteria"), dict) else {}
+            first = next(iter(criteria), "none")
+            answers[name] = {"choice": first, "confidence": 0.9,
+                             "probabilities": {k: (1.0 if k == first else 0.0) for k in criteria}}
+        elif qtype == "score":
+            criteria = q.get("criteria") if isinstance(q.get("criteria"), list) else ["low"]
+            answers[name] = {"score": 0.0, "legend": {str(i): c for i, c in enumerate(criteria)}}
+        else:
+            answers[name] = {}
+    return answers
+
+
 def start(port=8811):
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -145,3 +188,7 @@ def reset():
     STATE["concur_agrees"] = True
     STATE["response_provider"] = None
     STATE["reviewer_cost"] = 0.0
+    STATE["jev_calls"] = 0
+    STATE["jev_fail"] = False
+    STATE["jev_cost"] = 0.00003
+    STATE["jev_response_provider"] = None

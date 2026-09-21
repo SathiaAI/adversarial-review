@@ -178,9 +178,28 @@ tool search, execute with the payload verbatim), save each raw response to a fil
 `panel.py ingest --role <role> --response-file <path>`. Validation and everything
 downstream is identical. See `references/config.md` for privacy limits of this path.
 
+**Optional — Jev triage, before Step 4:**
+
+```bash
+python <skill>/scripts/jev_triage.py triage --context-file context.md
+```
+
+If Jev is available (`references/jev.md` — `AR_JEV_API_KEY` for a dedicated key, or it
+falls back to the panel's own key when their endpoints share a host; `AR_JEV_DISABLE=1` to
+turn it off outright), one fast cheap call per finding prioritizes Step 4's worklist —
+high/critical findings Jev thinks are real first, possible duplicates grouped, candidate
+false positives flagged last — without deciding anything. `aggregate.py` never reads Jev's
+numbers to compute the verdict; `verdict.md` only displays them next to each finding for
+your reference. Skip this command entirely and go straight to Step 4 by hand if Jev isn't
+available — nothing else in the pipeline depends on it.
+
 **Rebuttal round — when high/critical findings exist:**
 
 ```bash
+# optional: narrow which findings actually need contesting
+python <skill>/scripts/jev_triage.py rebuttal-gate --context-file context.md
+python <skill>/scripts/panel.py rebuttal --digest-file .adversarial-review/<run>/rebuttal/digest.json
+# or, without Jev, contest every high/critical finding as before:
 python <skill>/scripts/panel.py rebuttal
 ```
 
@@ -191,6 +210,10 @@ than merely parallel. The aggregator requires it per the run's rebuttal policy (
 init, default `contention`): `critical` = CRITICAL runs only; `contention` = SENSITIVE
 and CRITICAL; `any` = every tier. In all policies it is only required when there are
 high/critical findings to contest — cost scales with contention, not ceremony.
+`jev_triage.py rebuttal-gate` narrows *which* high/critical findings actually need a
+rebuttal round (fail-closed: any Jev error, or no Jev at all, keeps every finding in);
+`aggregate.py` reads its recorded decision when present and otherwise falls back to
+requiring contest for every high/critical finding — identical to never having run it.
 
 ## Step 4 — Validate findings
 
@@ -217,7 +240,22 @@ Write one validation record per issue to `.adversarial-review/<run>/validation/`
   technical evidence, owner, expiry date) or the run FAILS.
 
 Medium/low findings do not block, but they must be triaged in the report — silence is
-not triage.
+not triage. If `jev_triage.py triage` ran, its worklist and each finding's
+`triage/<id>.json` are a prioritization aid only — validate every finding exactly as this
+step requires regardless of what Jev estimated; a "candidate false positive" still gets a
+full validation record, never a skip.
+
+**Optional — before the next round, once a patch addresses this round's `confirmed`
+findings:**
+
+```bash
+python <skill>/scripts/jev_triage.py patch-check <patch-file>
+```
+
+Checks the patch against every `confirmed` validation record and prints a one-screen
+resolved/still-open/new-risk summary. A finding Jev marks resolved is a **proposal** —
+inspect the patch yourself and update `validation/<slug>.json` by hand; nothing here closes
+a finding automatically. A flagged new risk goes back to the panel.
 
 ## Step 5 — Release enforcement (SENSITIVE/CRITICAL, when a repo host is in scope)
 
@@ -280,3 +318,6 @@ Report reviewer cost/usage from the recorded artifacts.
 - `references/schemas.md` — reviewer report, validation record, gate record, and verdict
   schemas. Read at Step 4.
 - `references/report.md` — final report template. Read at Step 6.
+- `references/jev.md` — optional TypeSafe Jev finding-triage layer (`jev_triage.py`):
+  prioritizes Step 4's worklist and narrows the rebuttal round, never decides the verdict.
+  Read before using it, between Step 3 and Step 4.
