@@ -39,7 +39,7 @@ every request must authenticate**, on every host including loopback.
 | **Spoofing / DNS-rebinding** — a malicious web page rebinds a localhost hostname and drives the server from the victim's browser | Validate the `Origin` header against an allowlist (`AR_MCP_HTTP_ORIGINS`) → **403**; bind **127.0.0.1** by default. The Origin check runs **before** auth on every verb. | Shipped S2a; auth-ordering added S2c |
 | **Elevation of privilege / unauthenticated access** — any network caller invoking tools without being the local user | **Bearer-token auth** (`AR_MCP_HTTP_TOKEN`): no tool dispatch before auth, **401** on missing/invalid, constant-time compare (`hmac.compare_digest`); a non-localhost bind is **refused unless a token is set**. `server/discover` is gated too — no pre-auth catalog/version leak. | **Shipped S2c** |
 | **Tampering / session hijack** — guessing or fixating a session id | **Cryptographically-random**, server-minted `Mcp-Session-Id` (via `secrets`), bound to the negotiated protocol version, rotatable/terminable; a client-supplied id the server never minted is refused **404**. | Shipped S2b |
-| **Denial of service / resource exhaustion** — oversized bodies, slow-loris, unbounded concurrency/sessions/streams | Max body size (**413**); `Transfer-Encoding` refused (**400**, anti-smuggling); **bounded, evicting session store** (`AR_MCP_HTTP_MAX_SESSIONS`); **bounded SSE stream pool** (`AR_MCP_HTTP_MAX_STREAMS` → **503**); **bounded worker/connection pool** (`AR_MCP_HTTP_MAX_WORKERS`, refuse-by-close past the cap, enforced `> MAX_STREAMS` at bind); **per-recv socket read timeout** (`AR_MCP_HTTP_READ_TIMEOUT`) on the request read and response write; a malformed/oversized message frames as a JSON-RPC error and never crashes the listener. | Body/limits S2a; sessions/streams S2b; **worker pool + read timeout S2c** |
+| **Denial of service / resource exhaustion** — oversized bodies, slow-loris, unbounded concurrency/sessions/streams | Max body size (**413**); `Transfer-Encoding` refused (**400**, anti-smuggling); **bounded, evicting session store** (`AR_MCP_HTTP_MAX_SESSIONS`); **bounded SSE stream pool** (`AR_MCP_HTTP_MAX_STREAMS` → **503**); **bounded worker/connection pool** (`AR_MCP_HTTP_MAX_WORKERS`, refuse-by-close past the cap, enforced `> MAX_STREAMS` at bind); a **dedicated control-plane admission lane** (`HTTP_CONTROL_RESERVE`) so a `DELETE` (session teardown) is admitted even under full data-plane saturation (SAT-1109); **per-recv socket read timeout** (`AR_MCP_HTTP_READ_TIMEOUT`) on the request read and response write; a malformed/oversized message frames as a JSON-RPC error and never crashes the listener. | Body/limits S2a; sessions/streams S2b; **worker pool + read timeout S2c**; **control-plane lane SAT-1109** |
 | **Information disclosure** — stack traces or secrets in error bodies/headers | JSON-RPC errors only (no tracebacks on the wire — `serve_message` normalizes to `-32603`); tools already scrub secrets; minimal `Server` header; the bearer token is **env-only** (never argv/URL/query) and **never logged**; a 401 body is a constant that never echoes the supplied credential. | Shipped S2a; token hygiene S2c |
 | **Repudiation** | None new from the transport: the verdict is computed by `aggregate.py`, and every write path (including re-running `ar_aggregate` to recompute a completed run's `verdict.json`) is one stdio already exposes — the transport adds no new tampering path. Run-dir integrity is by convention, not transport-enforced (see Assets). | n/a |
 
@@ -66,21 +66,34 @@ every request must authenticate**, on every host including loopback.
   remote request flooding, remain residual risks even behind TLS; the bounded pools cap the flooding blast
   radius. Terminating TLS in-process is a possible future hardening, deliberately out of this PR.
 - **Sub-timeout slow-loris.** The per-recv read timeout bounds an *idle* connection; a client dribbling a byte
-  just under the timeout can still hold a worker. The **bounded worker pool caps the blast radius** (a flood
-  can hold at most `MAX_WORKERS` connections, beyond which new connections are fast-closed). A true absolute
+  just under the timeout can still hold a worker. The **bounded pool caps the blast radius** (a flood can hold
+  at most `AR_MCP_HTTP_MAX_WORKERS + HTTP_CONTROL_RESERVE` concurrent connections — the accept cap — beyond
+  which new connections are fast-closed). A true absolute
   wall-clock read deadline is a follow-up (S2d hardening), kept out of the SENSITIVE auth PR to avoid a fragile
   stdlib `http.server` read-path override.
 - **Serialized dispatch.** `_HTTP_DISPATCH_LOCK` serializes tool dispatch (the handlers are stateful/one-at-a-
   time by design). A long-running tool (up to `AR_TIMEOUT_S`) makes concurrent authenticated POSTs queue, each
   holding a worker; the bounded pool caps this at `MAX_WORKERS`. A bounded pending-queue / busy-503 admission is
   a possible follow-up.
-- **Control-plane starvation at minimal worker counts.** The bounded worker pool does not distinguish a
-  control-plane verb (a `DELETE` terminating a session) from data-plane work. At a minimal config
-  (`AR_MCP_HTTP_MAX_WORKERS=2`, `AR_MCP_HTTP_MAX_STREAMS=1`) one SSE stream plus one long-running POST can occupy
-  both workers, so a `DELETE` is fast-closed and the session cannot be terminated (nor its stream woken) until
-  the in-flight work finishes — the "immediate termination" property degrades under saturation (Codex, PR #58).
-  The default (128 workers / 64 streams) leaves ample headroom; reserving dedicated control-plane capacity is a
-  follow-up, composing with the best-effort-cancellation note below.
+- **Control-plane isolation and its accept-layer boundary (SAT-1109, shipped).** A `DELETE` (session teardown)
+  is admitted on a **dedicated control lane** — its own small permit pool (`HTTP_CONTROL_RESERVE`, a fixed
+  default of 2, clamped 1–4 at bind) that data-plane work can **never** consume — so a teardown is admitted even
+  when every general work permit is held (e.g. at a minimal `AR_MCP_HTTP_MAX_WORKERS=2` with a stream plus a
+  long-running POST), closing the Codex PR #58 finding. Admission is **three-tier**: an accept-level connection
+  cap (`max_workers + control_reserve`, still refuse-by-close with **no body**), a general **work** pool
+  (`max_workers`, POST dispatch + SSE stream life, `> MAX_STREAMS` at bind), and the **control** pool
+  (`control_reserve`, DELETE). A saturated data-plane request is shed with the same **no-body close** as the
+  accept cap — never a 503 body (the stream-count cap's retryable 503 is a distinct, cooperative backpressure
+  and is unchanged). Auth is unchanged: a DELETE still 401s without a token and consumes no control permit — the
+  lane isolates *scheduling*, never *authorization*. **HTTP keep-alive is disabled** on this transport (every
+  POST response closes the connection, as GET/DELETE already did): an idle kept-alive connection would
+  otherwise hold an accept permit **without** a work permit, and `control_reserve` such idle connections could
+  fill the accept cap and starve a DELETE at the accept layer before its verb is known (Codex, PR #71).
+  **Residual:** with keep-alive off, only sockets *actively* being flooded — each parked in its initial header
+  read, before its verb is known — can still occupy the accept slots, bounded by the per-recv
+  `AR_MCP_HTTP_READ_TIMEOUT` that reaps them. So control-plane admission is isolated from ordinary data-plane
+  load and from idle connections, but remains bounded (not immune) under an active new-connection flood.
+  Preemptive cancellation of an already-running tool remains out of scope (below).
 - **Cancellation is best-effort, not forced.** SSE client-disconnect frees the stream slot promptly and a
   DELETE wakes streams (both tested). A client that disconnects mid-POST does **not** abort the running
   subprocess — it completes and its result is discarded. Preemptive "kill-means-kill" cancellation of an
