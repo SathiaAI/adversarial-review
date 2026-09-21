@@ -1,0 +1,62 @@
+# Hardened two-workflow split for a REQUIRED adversarial-review check (issue #61).
+# Copy both files in this directory into .github/workflows/ in the reviewed repo.
+#
+# This file (untrusted): runs on the PR's own branch via plain `pull_request`, so its YAML and
+# gate commands ARE PR-editable. It therefore carries NO secret -- not OPENROUTER_API_KEY, not
+# a signing key -- so gutting this job's body cannot expose credentials or forge a trusted
+# result. It records deterministic gates only and uploads them as an artifact; the actual
+# verdict, the reviewer panel, and the required check are computed by ar-verify.yml (File 2),
+# which GitHub always runs from the DEFAULT branch's copy, never the PR's.
+#
+# Mirrors examples/.gitlab-ci.yml's ar-gates job. Adjust AR_REQUIRE and the gate commands to
+# your stack; the 'secrets' gate is deliberately NOT run here -- it authorizes transmitting the
+# diff to reviewers, so it runs in the trusted job instead (see ar-verify.yml).
+
+name: ar-classify
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ar-classify-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    env:
+      AR_REF: v0.2.1   # PIN to a tag or a full 40-char commit SHA -- never a moving branch
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the panel reviews a real git range
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch a pinned copy of the adversarial-review tooling
+        run: |
+          set -euo pipefail
+          git init -q /tmp/ar
+          git -C /tmp/ar remote add origin https://github.com/SathiaAI/adversarial-review
+          git -C /tmp/ar fetch -q --depth 1 origin "$AR_REF"
+          git -C /tmp/ar checkout -q FETCH_HEAD
+      - name: Record deterministic gates
+        run: |
+          set -euo pipefail
+          python /tmp/ar/scripts/panel.py init --diff-ref "origin/${{ github.base_ref }}...HEAD"
+          python /tmp/ar/scripts/gate.py plan --require build,unit,deps,sast
+          python /tmp/ar/scripts/gate.py run --name build -- sh -c "python -m py_compile \$(git ls-files '*.py')" || true
+          python /tmp/ar/scripts/gate.py run --name unit -- python -m pytest -q || true
+          python /tmp/ar/scripts/gate.py run --name deps -- pip-audit || true
+          python /tmp/ar/scripts/gate.py run --name sast -- bandit -ll -q -r . || true
+      - name: Upload run directory for ar-verify
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # Attempt-scoped name: a `gh run rerun` produces a fresh artifact instead of a 409
+          # conflict, and ar-verify's pattern match picks it up regardless of attempt number.
+          name: ar-run-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .adversarial-review/
+          retention-days: 7

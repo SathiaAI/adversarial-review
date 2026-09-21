@@ -96,6 +96,56 @@ These mirror `action.yml` exactly — do not pass anything not listed here.
 - **The verdict is written to the job summary** (`verdict.md`), and `verdict` / `exit-code` are
   exposed as step outputs you can branch on.
 
+### Secure adoption (required checks)
+
+The workflow above is the fastest path to wired-up. It is **not** the secure-by-default posture
+for a **required** check, because of two structural traps that catch every adopter who makes a
+plain `pull_request` workflow required on merge (issue #61):
+
+1. **Hollow green.** `fail-on: fail` reports a BLOCKED verdict (missing gates, no panel
+   coverage — see "Behavior" above) as a passing job. Correct while you're wiring things up;
+   wrong once the check gates a merge, since a green that never actually reviewed anything is
+   worse than an honest red. Use `fail-on: blocked` for a required check.
+2. **Self-mutating required check.** A plain `pull_request` workflow runs from the PR's own
+   branch. This repo's own transmit-only-after-secrets-pass precondition (above) is a
+   single-job mitigation, not a hard isolation boundary — for a same-repo PR (not just forks),
+   an author can still edit the workflow file itself in their branch: shrink `gates:`, drop
+   `fail-on: blocked` back to `fail`, or remove the `openrouter-api-key` line entirely, and the
+   check still reports whatever that edited job produces. `OPENROUTER_API_KEY` is live in that
+   same run regardless.
+
+The fix for both is the same shape already used above for GitLab (**GitLab CI template**,
+below): split gates (untrusted, no secret) from verdict (trusted, keyed, re-computes its own
+secrets authorization). GitHub's `pull_request` trigger doesn't give you that isolation for
+free the way GitLab's protected CI/CD variables do, so the trusted half needs a different
+mechanism — `workflow_run`, which GitHub always executes from the **default branch's** copy of
+the workflow file, never the triggering PR's, even for a same-repo PR that edits that exact
+file in its own branch.
+
+**[`examples/trusted/`](../examples/trusted/)** — `ar-classify.yml` (untrusted: records
+deterministic gates, uploads them as an artifact, carries no secret) and `ar-verify.yml`
+(trusted: `workflow_run`-triggered, downloads that artifact, re-runs the secrets gate itself,
+runs the panel and `aggregate.py`, and posts the actual required check — `adversarial-review/verify`
+— on the PR's head SHA). Copy both files into `.github/workflows/`; the two-workflow split is
+the point, don't merge them back into one.
+
+Also add, once you adopt the required-check posture:
+
+- A `CODEOWNERS` entry for `.github/workflows/` and `.adversarial-review.yml`, so changes to the
+  check itself (not just changes it's checking) need a second reviewer — this repo's own
+  [`.github/CODEOWNERS`](../.github/CODEOWNERS) is a working example.
+- Branch protection requiring the `adversarial-review/verify` check (not `adversarial-review` —
+  that's `ar-classify`'s own, still-advisory job name) before merge.
+
+**Stronger, optional variant.** `ar-verify.yml`'s default posts the check with the workflow's
+own `GITHUB_TOKEN`, scoped by its `permissions:` block — sufficient for both traps above. A
+GitHub App-authenticated variant additionally pins the required check to a specific App
+identity, so it can only be satisfied by that App's installation token, not by anyone who can
+trigger a workflow with `checks: write`. Live-tested end-to-end (normal-tier and manually-gated
+critical-tier waiver flows, a genuine fork-originated PR, and rapid re-signs on the same commit)
+in `SathiaAI/Sandbox`, tag `reference-v1-tested` — see the comment block at the end of
+`ar-verify.yml` for how to adopt it. Not required for the baseline #61 guarantees.
+
 ---
 
 ## GitLab CI template
