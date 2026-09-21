@@ -4,9 +4,14 @@
 # This file (untrusted): runs on the PR's own branch via plain `pull_request`, so its YAML and
 # gate commands ARE PR-editable. It therefore carries NO secret -- not OPENROUTER_API_KEY, not
 # a signing key -- so gutting this job's body cannot expose credentials or forge a trusted
-# result. It records deterministic gates only and uploads them as an artifact; the actual
-# verdict, the reviewer panel, and the required check are computed by ar-verify.yml (File 2),
-# which GitHub always runs from the DEFAULT branch's copy, never the PR's.
+# result.
+#
+# Its results are ADVISORY ONLY -- fast feedback for the PR author, nothing more. ar-verify.yml
+# (File 2) does not read or trust anything this job records: it independently re-runs every gate
+# against the real code in its own secrets-free job, because a PR author who fully controls this
+# file could otherwise edit a gate command into a no-op and get a forged PASS recorded here (the
+# gap CodeRabbit flagged on PR #72). Treat a green check here as "looks fine so far", never as
+# "adversarial-review passed" -- only adversarial-review/verify (posted by ar-verify.yml) is that.
 #
 # Mirrors examples/.gitlab-ci.yml's ar-gates job. Adjust AR_REQUIRE and the gate commands to
 # your stack; the 'secrets' gate is deliberately NOT run here -- it authorizes transmitting the
@@ -57,6 +62,21 @@ jobs:
           python /tmp/ar/scripts/gate.py run --name unit -- python -m pytest -q || true
           python /tmp/ar/scripts/gate.py run --name deps -- pip-audit || true
           python /tmp/ar/scripts/gate.py run --name sast -- bandit -ll -q -r . || true
+      - name: Banner -- these results are advisory only, not the required check
+        # A footgun the review panel on PR #72 explicitly flagged: a reviewer glancing at this
+        # job's green checkmark could mistake it for "adversarial-review passed" and not wait for
+        # the actual required check. This banner is the cheap mitigation; ar-verify.yml
+        # independently re-running every gate for real (rather than trusting this job's results)
+        # is the actual fix.
+        if: always()
+        run: |
+          {
+            echo "## ⚠️ Informational only -- not the required check"
+            echo
+            echo "This job's gate results are PR-editable and are not trusted by anything."
+            echo "Wait for **\`adversarial-review/verify\`** (posted separately, from a"
+            echo "trusted context) before treating this PR as reviewed."
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload run directory for ar-verify
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2

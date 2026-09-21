@@ -1,44 +1,147 @@
 # Hardened two-workflow split for a REQUIRED adversarial-review check (issue #61). File 2 of 2 --
-# see ar-classify.yml (File 1) for the untrusted gate-recording job this one consumes.
+# see ar-classify.yml (File 1) for the fast, non-authoritative feedback job this one supersedes.
 #
 # TRUSTED. Triggered by workflow_run, so GitHub always runs THIS file's copy from the DEFAULT
-# branch -- never the PR's -- even for a same-repo PR that edits this very file. This is the one
-# structural guarantee the whole pattern rests on: a PR author can gut ar-classify.yml (it's
-# their own branch) but cannot touch what runs here. Only this job ever sees
-# OPENROUTER_API_KEY, and it re-computes the secrets-gate authorization itself rather than
-# trusting anything ar-classify recorded -- mirrors examples/.gitlab-ci.yml's ar-panel job.
+# branch -- never the PR's -- even for a same-repo PR that edits this very file.
+#
+# Split into two jobs so nothing that holds a credential ever executes PR-controlled code (the
+# "pwn request" pattern GitHub's own security docs warn about -- see
+# https://gh.io/securely-using-pull_request_target, whose own recommendation for this exact
+# situation is: "restructure workflows to separate potentially dangerous handling of pull request
+# code from accessing secrets"):
+#   - `gates` checks out the PR's actual code at its head SHA (even from a fork) and re-runs
+#     build/unit/deps/sast/secrets against it for real. It has NO secrets in scope -- permissions
+#     are read-only metadata, nothing else -- so even if the checked-out code is hostile, there is
+#     nothing on this runner worth stealing. ar-classify.yml's own recorded results are NOT
+#     trusted here or anywhere else in this file; re-running them for real is what closes the gap
+#     CodeRabbit flagged on PR #72 (a PR author could otherwise forge a PASS by editing
+#     ar-classify.yml's gate commands to a no-op, since that file is fully PR-editable).
+#   - `panel` never checks out PR code at all. It only reads `gates`'s outputs (plain data: gate
+#     pass/fail, a diff as text) and is the only job that ever sees OPENROUTER_API_KEY or a
+#     credential able to post the required check.
 
 name: ar-verify
 on:
-  # zizmor flags workflow_run generically as "almost always used insecurely" (dangerous-triggers)
-  # -- that warning is about the common misuse of checking out and RUNNING the PR's own code
-  # inside the elevated trusted job. This job deliberately never does that: it never checks out
-  # the PR branch, treats the downloaded artifact as inert data (parsed as JSON/text, never
-  # executed or sourced -- see the SHA-verification step below), and fetches its own tooling
-  # from this repo's pinned tag, not from anything PR-controlled. workflow_run is used here only
-  # for the one property that matters: GitHub always resolves this file from the DEFAULT branch.
   workflow_run:
     workflows: ["ar-classify"]
     types: [completed]
-
-permissions:
-  contents: read
-  checks: write   # to post the required check on the PR's head SHA
-  actions: read   # to download ar-classify's artifact from another run
 
 concurrency:
   group: ar-verify-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: true
 
 jobs:
-  verify:
+  gates:
     if: github.event.workflow_run.conclusion != 'cancelled'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read        # read-only; no write, no secrets
+      pull-requests: read   # to resolve the PR's base branch below (workflow_run's own payload
+                             # omits it for fork-originated PRs) -- also just a metadata read
     env:
       AR_REF: v0.2.1   # PIN to a tag or a full 40-char commit SHA -- never a moving branch
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+    outputs:
+      secrets_ok: ${{ steps.secrets.outputs.ok }}
     steps:
+      - name: Resolve the PR's base branch
+        # workflow_run's own event payload only populates `pull_requests[]` for same-repo PRs, not
+        # fork PRs, so the base branch name has to come from the API instead. This runs BEFORE the
+        # PR's code is ever checked out, and github.token is scoped step-local (env: on this one
+        # step only), so it is never present once anything PR-controlled is on disk.
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base_ref=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/pulls" --jq '.[0].base.ref')
+          if [ -z "$base_ref" ] || [ "$base_ref" = "null" ]; then
+            echo "::error::could not resolve the PR base branch for $HEAD_SHA"; exit 1
+          fi
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+      - name: Check out the PR's code at its exact head SHA (works for forks; no secrets in this job)
+        # allow-unsafe-pr-checkout: actions/checkout v7 refuses a fork-PR checkout from a
+        # workflow_run/pull_request_target job by default (the same "pwn request" guard cited
+        # above) unless this is set explicitly. This job is the deliberate, reviewed exception the
+        # flag exists for -- see the job-level comment above for why nothing here is worth
+        # stealing even if the checked-out code is hostile.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          repository: ${{ github.event.workflow_run.head_repository.full_name }}
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+      - name: Confirm the checked-out commit really is this workflow_run's head SHA
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          if [ "$actual" != "$HEAD_SHA" ]; then
+            echo "::error::checked out $actual, expected $HEAD_SHA"; exit 1
+          fi
+      - name: Add the base repo as a remote and fetch its base branch, for diffing
+        # "origin" now points at the PR's own (possibly forked) repo, so the base branch this PR
+        # targets has to be fetched from this repo (the one the workflow file lives in) instead.
+        env:
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          git remote add base "https://github.com/${GITHUB_REPOSITORY}"
+          git fetch -q --depth 1 base "$BASE_REF"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
+        with:
+          python-version: '3.12'
       - name: Fetch a pinned, trusted copy of the adversarial-review tooling
+        run: |
+          set -euo pipefail
+          git init -q /tmp/ar
+          git -C /tmp/ar remote add origin https://github.com/SathiaAI/adversarial-review
+          git -C /tmp/ar fetch -q --depth 1 origin "$AR_REF"
+          git -C /tmp/ar checkout -q FETCH_HEAD
+      - name: Re-run every deterministic gate against the real checked-out code
+        # Computed fresh here, against the actual code on this runner -- never trusted from
+        # ar-classify.yml's artifact, which repository-controlled commands could have forged.
+        env:
+          AR_SECRETS_CMD: gitleaks detect --no-banner --redact --source .
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          python /tmp/ar/scripts/panel.py init --diff-ref "base/$BASE_REF...HEAD"
+          python /tmp/ar/scripts/gate.py plan --require build,unit,deps,sast,secrets
+          python /tmp/ar/scripts/gate.py run --name build -- sh -c "python -m py_compile \$(git ls-files '*.py')" || true
+          python /tmp/ar/scripts/gate.py run --name unit -- python -m pytest -q || true
+          python /tmp/ar/scripts/gate.py run --name deps -- pip-audit || true
+          python /tmp/ar/scripts/gate.py run --name sast -- bandit -ll -q -r . || true
+          python /tmp/ar/scripts/gate.py run --name secrets -- sh -c "$AR_SECRETS_CMD" || true
+      - name: Surface whether the secrets gate passed, for the panel job's guard below
+        id: secrets
+        run: |
+          set -euo pipefail
+          SECRETS_OK=$(python3 -c 'import json,glob; f=sorted(glob.glob(".adversarial-review/run-*/gates/secrets.json")); print("1" if f and json.load(open(f[-1])).get("status")=="PASS" else "0")')
+          echo "ok=$SECRETS_OK" >> "$GITHUB_OUTPUT"
+      - name: Upload the run directory (gate results + diff -- data only, never executed downstream)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+        with:
+          name: ar-gates-${{ github.event.workflow_run.id }}
+          path: .adversarial-review/
+          retention-days: 7
+          # v4 excludes hidden files/dirs by default, and `.adversarial-review/` is itself a
+          # dot-dir -- without this the upload silently finds nothing.
+          include-hidden-files: true
+
+  panel:
+    needs: gates
+    if: always() && needs.gates.result != 'cancelled'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read   # to download gates's own artifact from this same run
+    env:
+      AR_REF: v0.2.1
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Fetch the pinned adversarial-review tooling (this job never checks out PR code)
         run: |
           set -euo pipefail
           git init -q /tmp/ar
@@ -48,59 +151,37 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065   # v5.6.0
         with:
           python-version: '3.12'
-      - name: Download ar-classify's recorded gates
+      - name: Download gates's run directory (plain data -- JSON + diff text, never executed)
+        continue-on-error: true   # a hard-failed gates job may have uploaded nothing at all;
+                                   # aggregate.py below correctly turns that into BLOCKED rather
+                                   # than this step failing the whole job before a check gets posted
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4.3.0
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ github.event.workflow_run.id }}
-          pattern: ar-run-${{ github.event.workflow_run.id }}-*
+          name: ar-gates-${{ github.event.workflow_run.id }}
           path: .adversarial-review/
-          merge-multiple: true
-      - name: Verify the downloaded run matches this exact PR head SHA
-        run: |
-          set -euo pipefail
-          run_dir=$(ls -d .adversarial-review/run-*/ 2>/dev/null | head -1)
-          if [ -z "$run_dir" ]; then echo "::error::no run directory in the downloaded artifact"; exit 1; fi
-          # run_dir comes from ar-classify's artifact -- a directory NAME the PR author fully
-          # controls. Passed as an argv, not interpolated into the Python source string: a name
-          # containing a single quote could otherwise break out of the literal and inject code
-          # that runs in this job, which is about to receive OPENROUTER_API_KEY.
-          recorded_sha=$(python3 -I -c '
-          import json
-          import pathlib
-          import sys
-
-          path = pathlib.Path(sys.argv[1]) / "run.json"
-          value = json.loads(path.read_text())
-          print(value.get("head_sha", ""))
-          ' "$run_dir")
-          # run.json's own recorded head SHA (if the tooling version records one) must match the
-          # workflow_run event's head_sha -- defends against a stale or substituted artifact from a
-          # different, unrelated ar-classify run being fed in here.
-          if [ -n "$recorded_sha" ] && [ "$recorded_sha" != "$HEAD_SHA" ]; then
-            echo "::error::downloaded run's head_sha ($recorded_sha) does not match this workflow_run's head_sha ($HEAD_SHA)"; exit 1
-          fi
-      - name: Re-run the secrets gate and, if it passes, the independent reviewer panel
+      - name: Run the independent reviewer panel, only if gates's secrets scan passed
+        # Panel invocation kept byte-for-byte identical to the pre-existing lines here (only
+        # relocated, from an inline "if secrets_ok" check to this step's own `if:` above) -- see
+        # the PR handoff for a separate, newly-found issue with this exact invocation that is out
+        # of scope for this change and needs its own look, not a guess-fix bundled in here.
+        if: needs.gates.outputs.secrets_ok == '1'
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          AR_SECRETS_CMD: gitleaks detect --no-banner --redact --source .
         run: |
           set -euo pipefail
-          # SECRETS AUTHORIZATION IS COMPUTED HERE -- never trusted from ar-classify's artifact,
-          # which repository-controlled commands could have overwritten with a forged PASS.
-          python /tmp/ar/scripts/gate.py run --name secrets -- sh -c "$AR_SECRETS_CMD" || true
-          SECRETS_OK=$(python3 -c 'import json,glob; f=sorted(glob.glob(".adversarial-review/run-*/gates/secrets.json")); print("1" if f and json.load(open(f[-1])).get("status")=="PASS" else "0")')
-          if [ -n "${OPENROUTER_API_KEY:-}" ] && [ "$SECRETS_OK" = "1" ]; then
+          if [ -n "${OPENROUTER_API_KEY:-}" ]; then
             python /tmp/ar/scripts/panel.py assign || true
             python /tmp/ar/scripts/panel.py run --force --diff-ref "origin/main...$HEAD_SHA" || true
           else
-            echo "adversarial-review: skipping panel -- no key, or the secrets scan run in THIS job did not pass" >&2
+            echo "adversarial-review: skipping panel -- no OPENROUTER_API_KEY configured" >&2
           fi
-      - name: Compute the verdict and sign it
+      - name: Compute the verdict
         id: verdict
         run: |
           set -euo pipefail
-          # aggregate.py's exit code (0/1/2) IS the verdict; nothing here narrates around it.
+          # aggregate.py's exit code (0/1/2) IS the verdict; nothing here narrates around it. A
+          # missing/empty run directory (gates hard-failed before uploading anything) correctly
+          # BLOCKs here rather than silently passing.
           set +e
           python /tmp/ar/scripts/aggregate.py; code=$?
           set -e
@@ -115,17 +196,33 @@ jobs:
             *) echo "verdict=BLOCKED" >> "$GITHUB_OUTPUT" ;;
           esac
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-      - name: Post the required check on the PR's head SHA
+      - name: Mint a short-lived token from the adversarial-review signer App
+        # Posts the required check under the App's identity instead of the repo's default
+        # secrets.GITHUB_TOKEN, so GitHub's required-check matching (which is by NAME, not
+        # identity) can be pinned to only accept this App -- see docs/ci-integration.md's
+        # "Pinning the required check to this App" section for the one-time repository ruleset
+        # setup that actually enforces that exclusivity; minting the token alone does not.
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1   # v3.2.0
+        with:
+          app-id: ${{ secrets.AR_SIGNER_APP_ID }}
+          private-key: ${{ secrets.AR_SIGNER_APP_PRIVATE_KEY }}
+          # Without this, the token inherits every permission the App's installation has,
+          # however broad -- scoping it down to exactly what posting a check needs (nothing
+          # else) is the whole point of using an App instead of a wider standing credential.
+          permission-checks: write
+      - name: Post the required check, signed by the App -- not the repo's default token
         if: always()
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b   # v7.1.0
         env:
-          # Passed as real env vars, not interpolated into the script: string via ${{ }} --
-          # both values are already trusted (computed by the step above in this same job, never
-          # from PR content), but this keeps the pattern uniform and removes any doubt for a
-          # reviewer scanning for template-injection.
+          # Passed as real env vars, not interpolated into the script string: both values are
+          # already trusted (computed by this same job, never from PR content), but this keeps
+          # the pattern uniform and removes any doubt for a reviewer scanning for template
+          # injection.
           VERDICT: ${{ steps.verdict.outputs.verdict }}
           EXIT_CODE: ${{ steps.verdict.outputs.exit_code }}
         with:
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const verdict = process.env.VERDICT;
             const conclusion = verdict === 'PASS' ? 'success' : 'failure';
@@ -140,7 +237,7 @@ jobs:
                 title: `adversarial-review: ${verdict}`,
                 summary: verdict === 'BLOCKED'
                   ? 'BLOCKED -- a required gate did not run or was not confirmed. This is a real red, not a soft pass: see the run artifact for which gate.'
-                  : `Verdict: ${verdict} (exit ${process.env.EXIT_CODE}). Computed by aggregate.py in a trusted, workflow_run-pinned job -- the PR branch cannot influence this result.`,
+                  : `Verdict: ${verdict} (exit ${process.env.EXIT_CODE}). Computed by aggregate.py in a trusted, workflow_run-pinned job, from gates re-run against the real PR code in a secrets-free job -- the PR branch cannot influence this result.`,
               },
             })
       - name: Preserve the run artifact (reports, verdict.json, any signature)
@@ -150,18 +247,13 @@ jobs:
           name: ar-verify-run-${{ github.event.workflow_run.id }}
           path: .adversarial-review/
           retention-days: 30
-          include-hidden-files: true   # same dot-dir issue as ar-classify.yml's upload step
+          include-hidden-files: true
 
-# OPTIONAL, stronger variant -- pin the required check to a specific identity so it can only be
-# posted by that identity, not by anyone with the repo's default checks:write token (e.g. anyone
-# who can push to a branch that triggers a workflow with that permission). Live-tested end-to-end
-# (normal-tier, critical-tier manual approval, a genuine fork PR, and rapid re-signs) against a
-# GitHub App instead of the default token above -- see SathiaAI/Sandbox, tag reference-v1-tested,
-# for the full working reference (App-authenticated installation token, a separate
-# workflow_dispatch-gated critical-tier approval step, and the concurrency-group tuning that
-# makes re-signs on the same commit idempotent). Adopt it by minting an installation token in the
-# step above instead of using secrets.GITHUB_TOKEN, and pinning branch protection's required
-# check to that App's app_id (Settings -> Branches -> the check's "..." -> "Require signed
-# commits"-style app pin). Not required for #61's baseline guarantees; worth it if you also want
-# "only this specific App can satisfy this check" as a defense against a compromised or
-# over-privileged repo token.
+# WITHOUT a GitHub App configured (AR_SIGNER_APP_ID / AR_SIGNER_APP_PRIVATE_KEY unset): the
+# "Mint a short-lived token" step above fails closed (create-github-app-token errors on an empty
+# app-id), which correctly blocks the check-posting step rather than silently falling back to a
+# weaker token. If you don't want to set up a GitHub App, replace those two inputs with
+# `github-token: ${{ secrets.GITHUB_TOKEN }}` directly on the github-script step instead, and
+# drop the "Mint a short-lived token" step -- but then GitHub's required-check matching is by
+# NAME only, so any other workflow in this repo with `checks: write` could post a same-named
+# check; see the README's "Secure adoption" section for that tradeoff.

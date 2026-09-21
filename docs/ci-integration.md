@@ -99,7 +99,7 @@ These mirror `action.yml` exactly — do not pass anything not listed here.
 ### Secure adoption (required checks)
 
 The workflow above is the fastest path to wired-up. It is **not** the secure-by-default posture
-for a **required** check, because of two structural traps that catch every adopter who makes a
+for a **required** check, because of three structural traps that catch every adopter who makes a
 plain `pull_request` workflow required on merge (issue #61):
 
 1. **Hollow green.** `fail-on: fail` reports a BLOCKED verdict (missing gates, no panel
@@ -113,21 +113,40 @@ plain `pull_request` workflow required on merge (issue #61):
    `fail-on: blocked` back to `fail`, or remove the `openrouter-api-key` line entirely, and the
    check still reports whatever that edited job produces. `OPENROUTER_API_KEY` is live in that
    same run regardless.
+3. **Trusting the untrusted job's own results.** Even once gates and verdict are split across a
+   trusted/untrusted boundary, if the trusted side only checks that an artifact *came from* this
+   PR (a head-SHA binding check) without re-running the gates themselves, a PR author who fully
+   controls the untrusted job can still edit a gate command into a no-op (`true` instead of
+   `pytest -q`) and get a forged PASS recorded — and the trusted side, trusting the record rather
+   than re-computing it, reports that PASS as real. Binding proves the artifact's *origin*, not
+   its *truth*.
 
-The fix for both is the same shape already used above for GitLab (**GitLab CI template**,
+The fix for all three is the same shape already used above for GitLab (**GitLab CI template**,
 below): split gates (untrusted, no secret) from verdict (trusted, keyed, re-computes its own
-secrets authorization). GitHub's `pull_request` trigger doesn't give you that isolation for
-free the way GitLab's protected CI/CD variables do, so the trusted half needs a different
-mechanism — `workflow_run`, which GitHub always executes from the **default branch's** copy of
-the workflow file, never the triggering PR's, even for a same-repo PR that edits that exact
-file in its own branch.
+secrets authorization) — and don't stop at splitting; make sure the trusted side actually
+re-executes the gates rather than reading someone else's report card. GitHub's `pull_request`
+trigger doesn't give you that isolation for free the way GitLab's protected CI/CD variables do,
+so the trusted half needs a different mechanism — `workflow_run`, which GitHub always executes
+from the **default branch's** copy of the workflow file, never the triggering PR's, even for a
+same-repo PR that edits that exact file in its own branch.
 
-**[`examples/trusted/`](../examples/trusted/)** — `ar-classify.yml` (untrusted: records
-deterministic gates, uploads them as an artifact, carries no secret) and `ar-verify.yml`
-(trusted: `workflow_run`-triggered, downloads that artifact, re-runs the secrets gate itself,
-runs the panel and `aggregate.py`, and posts the actual required check — `adversarial-review/verify`
-— on the PR's head SHA). Copy both files into `.github/workflows/`; the two-workflow split is
-the point, don't merge them back into one.
+**[`examples/trusted/`](../examples/trusted/)** — `ar-classify.yml` (untrusted: runs fast
+build/unit/deps/sast checks on the PR's own branch for quick author feedback; its results are
+**advisory only** and nothing downstream trusts them — see the banner it prints in its own job
+summary) and `ar-verify.yml` (trusted, `workflow_run`-triggered, split into two jobs of its own):
+
+- **`gates`** — no secrets in scope (`permissions: contents: read, pull-requests: read` only).
+  Checks out the PR's actual code at its exact head SHA (works for fork PRs too, via
+  `actions/checkout`'s `allow-unsafe-pr-checkout` — see the inline comment for why that's safe
+  here specifically: nothing in this job is worth stealing even if the checked-out code is
+  hostile) and re-runs build/unit/deps/sast/secrets against it **for real**. This is what closes
+  trap 3 above: nothing here is taken on ar-classify's word.
+- **`panel`** — the only job with `OPENROUTER_API_KEY` or a credential that can post the check.
+  It never checks out PR code at all; it only reads `gates`'s output (gate pass/fail, a diff as
+  plain text) and posts `adversarial-review/verify` on the PR's head SHA.
+
+Copy both files into `.github/workflows/`; the workflow split (and the job split inside
+`ar-verify.yml`) is the point — don't merge any of it back together.
 
 Also add, once you adopt the required-check posture:
 
@@ -139,14 +158,50 @@ Also add, once you adopt the required-check posture:
 - Branch protection requiring the `adversarial-review/verify` check (not `adversarial-review` —
   that's `ar-classify`'s own, still-advisory job name) before merge.
 
-**Stronger, optional variant.** `ar-verify.yml`'s default posts the check with the workflow's
-own `GITHUB_TOKEN`, scoped by its `permissions:` block — sufficient for both traps above. A
-GitHub App-authenticated variant additionally pins the required check to a specific App
-identity, so it can only be satisfied by that App's installation token, not by anyone who can
-trigger a workflow with `checks: write`. Live-tested end-to-end (normal-tier and manually-gated
-critical-tier waiver flows, a genuine fork-originated PR, and rapid re-signs on the same commit)
-in `SathiaAI/Sandbox`, tag `reference-v1-tested` — see the comment block at the end of
-`ar-verify.yml` for how to adopt it. Not required for the baseline #61 guarantees.
+### Posting the check as a GitHub App (recommended default)
+
+GitHub's required-check matching is by **name**, not identity — any workflow in the repo with
+`checks: write` could post a same-named check using the plain `secrets.GITHUB_TOKEN`. `ar-verify.yml`
+ships with a GitHub App-authenticated token by default for exactly this reason: it lets you pin
+the required check to one specific identity, so no other credential in the repo can satisfy it.
+
+1. **Create (or reuse) a GitHub App** with the **Checks: Write** repository permission, and
+   install it on the repo(s) that will run `ar-verify.yml`. Live-tested end-to-end (normal-tier
+   and manually-gated critical-tier waiver flows, a genuine fork-originated PR, and rapid
+   re-signs on the same commit) in `SathiaAI/Sandbox`, tag `reference-v1-tested`.
+2. **Add two repository secrets**: `AR_SIGNER_APP_ID` (the App's numeric ID) and
+   `AR_SIGNER_APP_PRIVATE_KEY` (the App's private key, generated from the App's settings page).
+   Add these yourself through the GitHub UI or `gh secret set` — an agent should never be asked
+   to handle raw key material on your behalf.
+   `ar-verify.yml`'s `panel` job mints a short-lived, `checks: write`-only token from these via
+   [`actions/create-github-app-token`](https://github.com/actions/create-github-app-token)
+   (`permission-checks: write` — the token gets *only* that permission, regardless of what else
+   the App's installation can do) and uses it to post the check instead of `secrets.GITHUB_TOKEN`.
+3. **Pin the required check to that App** — minting the token alone does not stop some *other*
+   workflow from also posting a check named `adversarial-review/verify` with the plain token;
+   this step is what actually makes the check identity-exclusive. Create or edit a repository
+   ruleset (Settings → Rules → Rulesets) with a `required_status_checks` rule whose entry sets
+   `integration_id` to the App's ID:
+   ```json
+   {
+     "type": "required_status_checks",
+     "parameters": {
+       "required_status_checks": [
+         { "context": "adversarial-review/verify", "integration_id": 5021396 }
+       ]
+     }
+   }
+   ```
+   (via `PUT /repos/{owner}/{repo}/rulesets/{id}` or the UI's "select an app as the expected
+   source of status updates" option on the check). Once pinned, a check posted by any other
+   identity — including the repo's own default `GITHUB_TOKEN` — no longer satisfies the
+   requirement.
+
+**Don't want a GitHub App?** Replace the `permission-checks` / `create-github-app-token` step
+with `github-token: ${{ secrets.GITHUB_TOKEN }}` directly on the check-posting step instead, and
+drop the token-minting step — you keep traps 1–3 closed, you just lose identity-pinning (trap
+2's residual: *some* workflow in the repo, not necessarily this one, could still post a
+same-named check). See the comment block at the bottom of `ar-verify.yml`.
 
 ---
 
