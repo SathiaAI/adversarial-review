@@ -1,0 +1,10 @@
+# Changes to the review check itself, and to the reference templates consumers copy, need a
+# human who isn't the PR's own author -- the issue #61 "self-mutating required check" defense
+# extended to this repo's own CI files and the examples it distributes.
+/.github/workflows/      @pjpoulose
+/.adversarial-review.yml @pjpoulose
+/examples/trusted/       @pjpoulose
+/action.yml              @pjpoulose
+# This file has to own itself, or a contributor can edit CODEOWNERS to remove every rule above
+# (including this one) without needing code-owner approval to do it.
+/.github/CODEOWNERS      @pjpoulose

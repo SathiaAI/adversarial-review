@@ -23,6 +23,7 @@ import hashlib
 import html
 import json
 import os
+import re
 import sys
 import tempfile
 from datetime import date
@@ -30,6 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (POLICY_SIG_FILENAME, _policy_bool,
+                     canonical_finding_digest,
                      cosign_sign_argv as _cosign_sign_argv,
                      cosign_verify_argv as _cosign_verify_argv, family_of,
                      load_attested_policy, meta_cost,
@@ -262,6 +264,64 @@ def check_panel(run, meta, plan, reports, blocked):
     return pcov
 
 
+# A finding id is reviewer-model output, not trusted input. jev_triage.py's own
+# _safe_finding_id() only ever writes triage/<id>.json under this exact charset
+# (rejecting path separators, "..", and the reserved "_summary" name) -- this MUST
+# stay identical to jev_triage.py's _SAFE_FID_RE, or a legitimate id could be
+# silently skipped here, or (if ever loosened) a traversal-shaped id could read a
+# file outside triage/.
+_SAFE_TRIAGE_FID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_RESERVED_TRIAGE_NAME = "_summary"
+
+
+def collect_jev_priors(run, reports):
+    """{finding_id: triage-record} for every finding with a recorded
+    triage/<finding-id>.json (`jev_triage.py triage` ran for this run). Missing or
+    malformed records are simply absent from the result — this is display-only for
+    verdict.md; it never feeds fail/blocked/notes, so a bad or absent triage record
+    changes nothing about the computed verdict. An id outside jev_triage.py's own
+    safe charset (or the reserved _summary name) is skipped, never used as a path —
+    jev_triage.py would have written such a finding's record under a fallback
+    filename, never under the untrusted id itself."""
+    tdir = run / "triage"
+    out = {}
+    if not tdir.is_dir():
+        return out
+    for rep in reports.values():
+        for f in rep.get("findings", []) if isinstance(rep.get("findings"), list) else []:
+            if not isinstance(f, dict):
+                continue
+            fid = f.get("id")
+            if (not isinstance(fid, str) or not fid or fid in out
+                    or not _SAFE_TRIAGE_FID_RE.match(fid)
+                    or fid == _RESERVED_TRIAGE_NAME):
+                continue
+            p = tdir / f"{fid}.json"
+            if not p.exists():
+                continue
+            try:
+                rec = read_json(p)
+            except (OSError, ValueError):
+                continue
+            if not (isinstance(rec, dict) and isinstance(rec.get("jev"), dict)):
+                continue
+            jv = rec["jev"]
+            # A triage/<id>.json file is on-disk data, not this process's own recent
+            # output (it could be from an older schema, hand-edited, or corrupted) -- the
+            # verdict.md renderer below indexes into severity/duplicate_of as dicts, so
+            # validate that shape here rather than let a malformed field crash aggregate.py
+            # entirely (this function's own contract is "malformed records are simply
+            # absent from the result").
+            if jv.get("severity") is not None and not isinstance(jv["severity"], dict):
+                continue
+            if jv.get("duplicate_of") is not None and not isinstance(jv["duplicate_of"], dict):
+                continue
+            if jv.get("is_real") is not None and not isinstance(jv["is_real"], (int, float)):
+                continue
+            out[fid] = rec
+    return out
+
+
 REBUTTAL_SCOPE = {
     "critical": {"CRITICAL"},
     "contention": {"SENSITIVE", "CRITICAL"},
@@ -269,21 +329,94 @@ REBUTTAL_SCOPE = {
 }
 
 
+def _rebuttal_jev_gate(run, reports):
+    """The recorded decision from `jev_triage.py rebuttal-gate` (rebuttal/plan.json), if
+    present, well-formed, AND covering every real high/critical finding in this run's own
+    panel reports -- else None, which means "fall back to the pre-Jev blanket rule"
+    exactly (see check_rebuttal). Jev's own numbers never reach here: this reads only the
+    CLI-recorded 'required_finding_ids'/'skipped_finding_ids' lists (plus their digest
+    counterparts, see below), and that recording is itself fail-closed (any Jev error ->
+    the finding lands in required_finding_ids) — so a malformed or tampered file can only
+    ever make MORE rebuttal required, never less, once it fails validation and is treated
+    as absent.
+
+    Coverage is bound to a canonical CONTENT digest per finding
+    (_common.canonical_finding_digest: title/file/line/severity/evidence/scenario/
+    author_role, normalized) — not to the finding's 'id' alone. Ids are reviewer-model
+    output, not guaranteed stable or unique across a `panel.py run --force` re-run of the
+    SAME run directory: an id-only coverage check let a stale rebuttal/plan.json from an
+    earlier invocation "cover" a completely different finding that happened to reuse the
+    same conventional id (e.g. 'security-1'), with no Jev call ever having evaluated the
+    new content. A plan.json written before this digest binding existed (missing
+    required_finding_digests/skipped_finding_digests, or a digest list whose length
+    doesn't match its id list) cannot be verified this way and is treated as absent —
+    fall back to the pre-Jev blanket rule, same as any other malformed/incomplete gate
+    file. The id lists are still returned (rcov reads them for the audit trail) but the
+    coverage DECISION below is made on digests alone."""
+    path = run / "rebuttal" / "plan.json"
+    if not path.exists():
+        return None
+    try:
+        g = read_json(path)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(g, dict):
+        return None
+    ids = g.get("required_finding_ids")
+    if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
+        return None
+    skipped = g.get("skipped_finding_ids")
+    if not isinstance(skipped, list) or not all(isinstance(x, str) for x in skipped):
+        skipped = []
+    req_digests = g.get("required_finding_digests")
+    if not isinstance(req_digests, list) or not all(isinstance(x, str) for x in req_digests) \
+            or len(req_digests) != len(ids):
+        return None
+    skip_digests = g.get("skipped_finding_digests")
+    if not isinstance(skip_digests, list) or not all(isinstance(x, str) for x in skip_digests) \
+            or len(skip_digests) != len(skipped):
+        return None
+    real_hc = [dict(f, author_role=role) for role, rep in reports.items()
+               for f in (rep.get("findings") or []) if isinstance(f, dict)
+               and f.get("severity") in HIGH and isinstance(f.get("id"), str)]
+    real_digests = {canonical_finding_digest(f) for f in real_hc}
+    covered = set(req_digests) | set(skip_digests)
+    if not real_digests <= covered:
+        return None  # gate doesn't account, by content, for every real high/critical finding
+    return {"required_finding_ids": ids, "skipped_finding_ids": skipped,
+            "required_finding_digests": req_digests, "skipped_finding_digests": skip_digests}
+
+
 def check_rebuttal(run, meta, plan, reports, blocked, notes):
     """Rebuttal is required when the tier is in the policy's scope AND there is
-    something to contest (high/critical findings). Cost scales with contention.
-    Returns rebuttal coverage."""
+    something to contest. Cost scales with contention. Returns rebuttal coverage.
+
+    "Something to contest" is, by default, every high/critical finding raised by the
+    panel — unchanged from before Jev triage existed. When `jev_triage.py rebuttal-gate`
+    has run, its recorded decision (rebuttal/plan.json) narrows this to the specific
+    findings it flagged contested/outcome-changing (fail-closed: any Jev error keeps a
+    finding in the required set) — Jev only reduces which findings must be contested,
+    never whether the rebuttal MECHANISM (per-role reproduction/evidence, Step 4) still
+    applies to every one of them. Absent or malformed rebuttal/plan.json is byte-identical
+    to a run that never used Jev triage at all."""
     policy = meta.get("rebuttal_policy", "contention")
     scope = REBUTTAL_SCOPE.get(policy, REBUTTAL_SCOPE["contention"])
-    contested = any(f["severity"] in HIGH
-                    for rep in reports.values() for f in rep.get("findings", []))
+    any_high_critical = any(f["severity"] in HIGH
+                            for rep in reports.values() for f in rep.get("findings", []))
+    gate = _rebuttal_jev_gate(run, reports)
+    contested = bool(gate["required_finding_ids"]) if gate is not None else any_high_critical
     required = meta["risk"] in scope and contested
     ran = bool(plan.get("roles")) and all(
         (run / "rebuttal" / f"{r}.json").exists() for r in plan.get("roles", {}))
     rcov = {"policy": policy, "required": required, "ran": ran}
+    if gate is not None:
+        rcov["jev_gate"] = gate
     if not required:
         if contested:
             notes.append(f"rebuttal not required at {meta['risk']} under policy '{policy}'")
+        elif gate is not None and any_high_critical:
+            notes.append(f"rebuttal gated by jev triage: {len(gate['skipped_finding_ids'])} "
+                         "high/critical finding(s) did not require contest")
         return rcov
     missing = [r for r in plan.get("roles", {})
                if not (run / "rebuttal" / f"{r}.json").exists()]
@@ -1330,6 +1463,7 @@ def _aggregate_cli():
         plan = read_json(plan_path) if plan_path.exists() else {}
         reports = load_reports(run, plan)
         counts["reviewers"] = len(reports)
+        jev_priors = collect_jev_priors(run, reports)
         pcov = check_panel(run, meta, plan, reports, blocked)
         rcov = check_rebuttal(run, meta, plan, reports, blocked, notes)
         fcov = check_findings(run, meta, plan, reports, fail, blocked, counts)
@@ -1425,6 +1559,26 @@ def _aggregate_cli():
         md += [f"- waived: gate '{w['name']}' (authorized by {_oneline(w['authorized_by'])}, "
                f"expires {_oneline(w['expires'])}): {_oneline(w['reason'])}"
                for w in gcov["waived"]]
+        if jev_priors:
+            # Informational only, read straight from the recorded triage/<id>.json files —
+            # never fed back into fail/blocked/notes above. Showing it here, next to the
+            # verdict this run actually computed, makes the (advisory) prior visible without
+            # letting it anywhere near the gate.
+            md += ["", f"## Jev triage priors ({len(jev_priors)}/{counts.get('findings_high_critical', 0) + counts.get('findings_medium_low', 0)} finding(s) triaged)", ""]
+            for fid in sorted(jev_priors):
+                jv = jev_priors[fid]["jev"]
+                sev_obj = jv.get("severity")
+                dup_obj = jv.get("duplicate_of")
+                sev = sev_obj.get("label") if isinstance(sev_obj, dict) else None
+                dup = dup_obj.get("choice") if isinstance(dup_obj, dict) else None
+                bits = [f"is_real={jv.get('is_real'):.2f}" if isinstance(jv.get("is_real"), (int, float)) else "is_real=?"]
+                if sev:
+                    bits.append(f"jev_severity={sev}")
+                if dup and dup != "none":
+                    bits.append(f"duplicate_of={dup}")
+                if jv.get("error"):
+                    bits.append("jev_error")
+                md.append(f"- `{_snippet(fid)}`: " + ", ".join(bits))
         md += ["", f"Attestation: sha256 {attestation['digest']} over "
                f"{attestation['inputs']} recorded artifacts "
                "(verify with `aggregate.py --check-digest`)"]

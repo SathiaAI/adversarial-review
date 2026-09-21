@@ -1188,8 +1188,78 @@ def cmd_rebuttal(args):
     run = resolve_run(args.run)
     meta = read_json(run / "run.json")
     plan = read_json(run / "panel" / "plan.json")
-    digest = high_critical_digest(run, plan)
+    digest_file = getattr(args, "digest_file", None)
+    if digest_file:
+        # E.g. from `jev_triage.py rebuttal-gate`: a Jev-narrowed subset of the same
+        # high/critical digest this command would otherwise build itself — reduces the
+        # noise a rebuttal round contests without touching who may contest or how a
+        # dispute is settled (Step 4 reproduction, never Jev, never majority vote).
+        try:
+            digest = read_json(digest_file)
+        except (OSError, ValueError) as e:
+            die(f"--digest-file could not be read as JSON ({e}): {digest_file}", 2)
+        if not isinstance(digest, list) or not all(
+                isinstance(d, dict) and isinstance(d.get("id"), str)
+                and isinstance(d.get("author_role"), str) for d in digest):
+            die(f"--digest-file must be a JSON list of finding digest items (each an "
+                f"object with string 'id' and 'author_role'), got: {digest_file}", 2)
+        # Never trust the FILE's content -- only use it to select which findings to
+        # contest. Cross-check every entry against this run's own current high/critical
+        # digest, freshly recomputed from panel/<role>.json (never from the file), and use
+        # the real content in every case. This closes both directions of staleness: a
+        # digest-file naming a finding id that isn't (or is no longer) a real high/critical
+        # finding, and one whose title/evidence/etc. has drifted from what the panel
+        # actually reported (a stale copy from an earlier round, or a hand/tool edit) —
+        # either dies loudly rather than silently contesting a fabricated finding or
+        # substituting altered content into the rebuttal round.
+        real_by_id = {d["id"]: d for d in high_critical_digest(run, plan)}
+        content_keys = ("id", "title", "severity", "file", "line", "evidence", "scenario",
+                        "author_role")
+        seen_ids, verified = set(), []
+        for item in digest:
+            fid = item.get("id")
+            if fid in seen_ids:
+                die(f"--digest-file lists finding id {fid!r} more than once", 2)
+            seen_ids.add(fid)
+            real = real_by_id.get(fid)
+            if real is None:
+                die(f"--digest-file references finding id {fid!r}, which is not a "
+                    f"current high/critical finding in this run's panel reports — "
+                    f"stale or fabricated digest file (re-run `jev_triage.py "
+                    f"rebuttal-gate` or `panel.py rebuttal` without --digest-file)", 2)
+            if any(item.get(k) != real.get(k) for k in content_keys):
+                die(f"--digest-file entry for {fid!r} does not match this run's current "
+                    f"panel/{real['author_role']}.json content — stale or tampered "
+                    f"digest file (re-run `jev_triage.py rebuttal-gate` or `panel.py "
+                    f"rebuttal` without --digest-file)", 2)
+            verified.append(real)
+        digest = verified
+    else:
+        digest = high_critical_digest(run, plan)
     if not digest:
+        # An empty `digest` here means two very different things depending on how we got
+        # here, and conflating them into one "no high/critical findings" message is
+        # itself misleading: with --digest-file (typically `jev_triage.py rebuttal-gate`'s
+        # output), an empty file means Jev's gate decided NONE of the run's real
+        # high/critical findings needed a rebuttal round -- those findings still exist
+        # and Step 4 validation is still mandatory for every one of them; only the
+        # rebuttal CONTEST step was gated off. Without --digest-file, an empty digest
+        # means what it always meant: this run genuinely raised no high/critical finding.
+        if digest_file:
+            real_now = list(real_by_id.values())
+            if real_now:
+                write_json(run / "rebuttal" / "none-required.json",
+                           {"reason": "jev rebuttal-gate: all real high/critical findings "
+                                      "were skipped -- none required a rebuttal round, "
+                                      "but Step 4 validation is still required for all of "
+                                      "them",
+                            "high_critical_finding_ids": sorted(d["id"] for d in real_now),
+                            "at": now_iso()})
+                print(f"jev rebuttal-gate skipped all {len(real_now)} high/critical "
+                      f"finding(s) in this run -- none required a rebuttal round, but "
+                      f"Step 4 validation is still required for every one of them; "
+                      f"marker written")
+                return
         write_json(run / "rebuttal" / "none-required.json",
                    {"reason": "no high/critical findings to contest", "at": now_iso()})
         print("no high/critical findings — rebuttal round not required, marker written")
@@ -1347,6 +1417,10 @@ def main():
 
     p = sub.add_parser("rebuttal")
     p.add_argument("--run"); p.add_argument("--prepare", action="store_true")
+    p.add_argument("--digest-file",
+                   help="use this pre-filtered high/critical finding digest (e.g. from "
+                        "`jev_triage.py rebuttal-gate`) instead of contesting every "
+                        "high/critical finding in the panel reports")
     p.set_defaults(fn=cmd_rebuttal)
 
     p = sub.add_parser("concur")
