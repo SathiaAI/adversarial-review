@@ -1195,6 +1195,20 @@ def _stub_signer_env(extra=None):
            # Tests that specifically exercise the new guard (t_trusted_signer_*) override
            # or unset it via `extra` below.
            "AR_TRUSTED_SIGNER": "1",
+           # Finding #7 / checklist item 3 (frontier-gate run pr70-trust-model2,
+           # 2026-09-22): verify_policy_snapshot_signature/verify_policy_absence_signature
+           # now refuse to trust a signature by default when the live CI identity is not
+           # actually established (both sign and verify would just agree on "local" — see
+           # _ci_identity_established's docstring). Every test using this fixture WITHOUT
+           # an `extra=` CI override (the vast majority — GAP A's own comment above notes
+           # "local"/"local" is what every other test in this file exercises implicitly)
+           # is deliberately exercising exactly that unidentified-environment case, so it
+           # needs the explicit opt-in set here, same as AR_TRUSTED_SIGNER just above. A
+           # test that specifically exercises the new fail-closed default (t_policy_sig_ci_
+           # identity_*) overrides this back to "" via `extra=`, exactly as t_trusted_
+           # signer_refuses_under_pull_request_event_even_when_opted_in already does for
+           # AR_TRUSTED_SIGNER.
+           "AR_ALLOW_LOCAL_CI_IDENTITY": "1",
            # This test SUITE runs inside real CI (this repo's own ci.yml triggers on
            # pull_request), so `ENV = {**os.environ, ...}` above -- and therefore this
            # dict -- inherits the CI runner's OWN ambient GITHUB_EVENT_NAME=pull_request
@@ -2570,6 +2584,138 @@ def t_policy_sig_ci_context_gitlab_vars_ignored_unless_gitlab_ci_true():
                 os.environ[k] = v
     assert ctx == {"repository": "local", "commit": "local",
                    "run_id": "local", "run_attempt": "local"}, ctx
+
+
+# ------------------------------------------------- Finding #7: CI identity must be
+# ESTABLISHED, not merely self-consistent (frontier-gate run pr70-trust-model2,
+# 2026-09-22, checklist item 3). The CI-context MATCH tests above prove sign-time and
+# verify-time context agree; they say nothing about whether either side had a real
+# CI-provided identity at all -- two independently unidentified environments both
+# compute "local" for all four fields and trivially "match." These tests cover the
+# actual gap: _ci_identity_established() and its fail-closed default in
+# verify_policy_snapshot_signature / verify_policy_absence_signature.
+
+def t_policy_sig_ci_identity_not_established_blocks_by_default():
+    # A run signed under a REAL, established CI identity (so setup succeeds normally,
+    # confirmed by the sanity check) must still BLOCK at verify time when the verifying
+    # process's own environment reports NO CI identity at all (all four
+    # ci_signing_context() fields fall back to "local") and has not opted in via
+    # AR_ALLOW_LOCAL_CI_IDENTITY.
+    ci = {"GITHUB_REPOSITORY": "SathiaAI/adversarial-review",
+          "GITHUB_SHA": "9999999999999999999999999999999999999999",
+          "GITHUB_RUN_ID": "8000000008", "GITHUB_RUN_ATTEMPT": "1"}
+    env = _stub_signer_env(extra=ci)
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    sh(["aggregate.py"], repo, expect=0, env=env)  # sanity: established identity verifies fine
+
+    unidentified_env = {**env}
+    for k in ("GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
+              "AR_ALLOW_LOCAL_CI_IDENTITY"):
+        unidentified_env[k] = ""
+    r = sh(["aggregate.py"], repo, expect=2, env=unidentified_env)
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "no CI-provided identity" in r.stdout, r.stdout
+
+
+def t_policy_sig_ci_identity_opt_in_allows_unidentified_local_signing():
+    # Counterpart: with NO CI identity established AND the explicit
+    # AR_ALLOW_LOCAL_CI_IDENTITY=1 opt-in set (the default _stub_signer_env() now
+    # applies), sign and verify both succeed -- a deliberately local/offline signing
+    # setup (e.g. minisign on a laptop, no CI at all) is not blocked just because it
+    # will never have a real CI identity.
+    env = _stub_signer_env()  # GITHUB_*/GITLAB_* cleared, AR_ALLOW_LOCAL_CI_IDENTITY=1
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0, env=env)
+    v = read(run / "verdict.json")
+    assert v["verdict"] == "PASS", v
+
+
+def t_policy_sig_ci_identity_established_needs_no_opt_in():
+    # A real, established CI identity must verify successfully even with
+    # AR_ALLOW_LOCAL_CI_IDENTITY explicitly OFF -- the opt-in exists only for the
+    # genuinely-unidentified case; it must never become a precondition for the normal,
+    # properly-identified path.
+    ci = {"GITHUB_REPOSITORY": "SathiaAI/adversarial-review",
+          "GITHUB_SHA": "8888888888888888888888888888888888888888",
+          "GITHUB_RUN_ID": "8100000008", "GITHUB_RUN_ATTEMPT": "1",
+          "AR_ALLOW_LOCAL_CI_IDENTITY": ""}
+    env = _stub_signer_env(extra=ci)
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0, env=env)
+    v = read(run / "verdict.json")
+    assert v["verdict"] == "PASS", v
+
+
+def t_policy_absence_sig_ci_identity_not_established_blocks_by_default():
+    # Policy-ABSENCE counterpart (the "no repo policy configured at all" signing path):
+    # same fail-closed default for verify_policy_absence_signature.
+    ci = {"GITHUB_REPOSITORY": "SathiaAI/adversarial-review",
+          "GITHUB_SHA": "7777777777777777777777777777777777777777",
+          "GITHUB_RUN_ID": "8200000008", "GITHUB_RUN_ATTEMPT": "1"}
+    env = _stub_signer_env(extra=ci)
+    repo = fresh_repo()  # no policy file -> policy.absence.json/.sig path
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo, env=env)
+    run = latest_run(repo)
+    assert (run / "policy.absence.sig").exists()
+
+    unidentified_env = {**env}
+    for k in ("GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
+              "AR_ALLOW_LOCAL_CI_IDENTITY"):
+        unidentified_env[k] = ""
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI for this repo yet",
+            "--waive-expires", (date.today() + timedelta(days=7)).isoformat()],
+           repo, env=unidentified_env, expect=1)
+    assert "no CI-provided identity" in r.stderr, r.stderr
+
+
+# ------------------------------------------------- Finding #11: risk tier must be
+# sourced exclusively from load_attested_policy_bundle() (frontier-gate run
+# pr70-trust-model2, 2026-09-22, checklist items 5 & 9) -- gate.py cmd_plan used to read
+# run.json["risk"] a second, independent time before this fix, determining the required
+# GATE SET itself (not just whether a waiver is honored) from that unauthenticated
+# second read.
+
+def t_gate_plan_tier_missing_risk_fails_closed_not_crash():
+    # gate.py cmd_plan used to read run.json["risk"] directly via a bare dict subscript
+    # -- an uncaught KeyError if the field were missing/corrupted. Sourced from
+    # load_attested_policy_bundle() instead, a missing risk tier now degrades to a
+    # controlled die(), never a crash.
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+    run = latest_run(repo)
+    rj = read(run / "run.json")
+    del rj["risk"]
+    write(run / "run.json", rj)
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast"], repo, expect=1)
+    assert "risk tier recorded" in r.stderr, r.stderr
+    assert "Traceback" not in r.stderr
+
+
+def t_aggregate_missing_risk_fails_closed_not_crash():
+    # Same defensive fix, the aggregate.py side: meta["risk"] is used unconditionally
+    # throughout cmd_aggregate (coverage, next_steps, verdict.json, the printed
+    # summary) -- a run.json missing "risk" entirely must BLOCK with a clear reason,
+    # never crash with an uncaught KeyError partway through building the report.
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+    run = latest_run(repo)
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast"], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    rj = read(run / "run.json")
+    del rj["risk"]
+    write(run / "run.json", rj)
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "no risk tier recorded" in r.stdout, r.stdout
+    assert "Traceback" not in r.stdout
 
 
 def t_trusted_signer_refuses_under_gitlab_merge_request_event_even_when_opted_in():

@@ -1565,6 +1565,43 @@ def _aggregate_cli():
             pol_data = {}
             attested_policy_sha = None
             blocked.append(f"attested policy snapshot could not be trusted: {att_err}")
+        # Finding #11 / checklist items 5 & 9 (frontier-gate run pr70-trust-model2,
+        # 2026-09-22): `meta` above and `bundle.run_meta` here are two INDEPENDENT reads
+        # of run.json. Every downstream use of meta["risk"] in this function (check_gates'
+        # required-gate-set lookup, the rebuttal-required check, next_steps guidance,
+        # coverage/verdict.json's own `risk` field) must be driven by
+        # load_attested_policy_bundle()'s read, not the separate one above — an attacker
+        # able to change what the second read sees (a race, a partial/corrupted write)
+        # could otherwise make gating disagree with what actually got recorded. Rather
+        # than hunt down and update every individual meta["risk"] call site below (and
+        # risk missing one), overwrite meta["risk"] in place, once, right here, so every
+        # existing call site picks up the authenticated value automatically. Only done
+        # when the bundle load itself succeeded (bundle is not None) — when it failed,
+        # `att_err` is already reported above and meta["risk"] is left as the sole
+        # available reading rather than discarded.
+        if bundle is not None:
+            b_risk = bundle.run_meta.get("risk")
+            if not b_risk:
+                blocked.append("load_attested_policy_bundle's read of run.json had no "
+                                "risk tier recorded — cannot confirm the risk tier used "
+                                "for gating is authenticated")
+                # Downstream code (check_gates, coverage, next_steps, the print/report
+                # below) all index meta["risk"] unconditionally and predate this fix —
+                # this run is already BLOCKED above; only fill in a clearly-labeled
+                # placeholder here so a genuinely missing key degrades to that BLOCKED
+                # verdict rendering normally, never an uncaught KeyError crash.
+                meta.setdefault("risk", "UNKNOWN")
+            elif b_risk != meta.get("risk"):
+                blocked.append(
+                    f"risk tier mismatch: load_attested_policy_bundle's read of "
+                    f"run.json saw risk {b_risk!r}, but a separate read in this "
+                    f"function saw {meta.get('risk')!r} — this run's risk tier is not "
+                    "internally consistent (possible tampering between two reads of "
+                    "run.json, or a concurrent write); re-run aggregate")
+            else:
+                meta["risk"] = b_risk
+        else:
+            meta.setdefault("risk", "UNKNOWN")
         # Resolved once per aggregate run: GITHUB_RUN_STARTED_AT's date if set (else today
         # UTC). A set-but-unparseable value is fail-closed — every waiver is BLOCKED rather
         # than silently falling back to today (see check_gates/resolve_waiver_clock).

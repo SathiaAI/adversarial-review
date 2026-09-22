@@ -256,6 +256,31 @@ def ci_signing_context():
     }
 
 
+def _ci_identity_established(ci_context):
+    """True iff `ci_context` (a ci_signing_context() result) reports a REAL,
+    CI-provided identity for the fields that actually distinguish one run from another
+    -- repository, commit, run_id. `run_attempt` is deliberately excluded: GitLab's
+    fixed _GITLAB_NO_RUN_ATTEMPT marker is a legitimate, intentional stand-in for a
+    per-attempt counter GitLab does not expose (see its own module-level comment) and
+    must not be confused with _NO_CI_CONTEXT ("local"), which means "nothing identified
+    this run at all."
+
+    Checklist item 3 (frontier-gate run pr70-trust-model2, 2026-09-22, Finding #7): when
+    neither GitLab CI nor GitHub Actions is detected, all four ci_signing_context()
+    fields fall back to "local" -- two independently unidentified environments (e.g. two
+    different laptops, or a laptop and an unrecognized third-party CI system) then
+    compute byte-for-byte identical placeholders. The v3 CI-context binding in
+    policy_attest_bytes/policy_absence_attest_bytes still round-trips correctly in that
+    shape (sign and verify agree, since both read the same live environment), but
+    provides NO actual cross-run identity distinction -- "local" is not an identity, it
+    is the absence of one. This predicate is what lets verify_policy_snapshot_signature /
+    verify_policy_absence_signature refuse to treat that non-distinction as a real
+    guarantee by default (see AR_ALLOW_LOCAL_CI_IDENTITY below)."""
+    return (ci_context.get("repository") != _NO_CI_CONTEXT
+            and ci_context.get("commit") != _NO_CI_CONTEXT
+            and ci_context.get("run_id") != _NO_CI_CONTEXT)
+
+
 def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path=None, ci_context=None,
                          version=POLICY_ATTEST_VERSION, snap_bytes=None):
     """The exact bytes signed/verified for the policy-snapshot signature.
@@ -424,9 +449,28 @@ def verify_policy_absence_signature(run, meta, *, absence_bytes):
         return ("no verifier available: set AR_VERIFIER_CMD, or install cosign (with "
                 "AR_ALLOW_KEYLESS=1 and AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned) or "
                 "minisign (with AR_MINISIGN_PUBKEY or AR_MINISIGN_PUBKEY_FILE)")
+    # Finding #7 / checklist item 3 (frontier-gate run pr70-trust-model2, 2026-09-22): a
+    # verifier IS configured, but if THIS process's own live CI identity is not actually
+    # established (see _ci_identity_established), the v3 CI-context binding this
+    # signature also relies on provides no real cross-run distinction -- both sign and
+    # verify would just agree on "local". Fail closed by default; AR_ALLOW_LOCAL_CI_
+    # IDENTITY=1 is the explicit, named opt-in for a deliberately local/offline signing
+    # setup that accepts this reduced guarantee (same "explicit opt-in" shape
+    # AR_ALLOW_KEYLESS already uses elsewhere in this module).
+    ci_context = ci_signing_context()
+    if (not _ci_identity_established(ci_context)
+            and not _policy_bool_env("AR_ALLOW_LOCAL_CI_IDENTITY")):
+        return (
+            "no CI-provided identity (repository/commit/run id) is available in this "
+            "environment -- the v3 signature binding cannot distinguish this run from "
+            "any other unidentified run, since both would sign/verify against the same "
+            "'local' placeholder. Run this under a recognized CI provider (GitHub "
+            "Actions or GitLab CI), or set AR_ALLOW_LOCAL_CI_IDENTITY=1 to explicitly "
+            "accept this reduced guarantee for a local/offline signing setup")
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.absence.attest"
-        msg_tmp.write_bytes(policy_absence_attest_bytes(run_id, run_nonce, run_name, risk))
+        msg_tmp.write_bytes(policy_absence_attest_bytes(run_id, run_nonce, run_name, risk,
+                                                          ci_context=ci_context))
         proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_p, fatal=False)
     if err:
         return f"verifier '{kind}' could not run: {err}"
@@ -482,6 +526,14 @@ def verify_policy_snapshot_signature(run, meta, *, snap_bytes):
          wholesale into a different repository, onto a different commit, or into a
          different CI execution now fails verification even when run_name coincidentally
          matches (v2 alone could not catch that; only the directory name was checked).
+      5. The live CI identity must actually be ESTABLISHED (see _ci_identity_established)
+         -- not merely present and self-consistent. Checklist item 3 (frontier-gate run
+         pr70-trust-model2, 2026-09-22, Finding #7): check 4 above proves sign-time and
+         verify-time CI context MATCH, but says nothing about whether either side had a
+         real CI-provided identity at all. Two independently unidentified environments
+         both compute "local" for all four fields, so check 4 alone trivially passes
+         with zero actual cross-run distinction. This check refuses that by default;
+         AR_ALLOW_LOCAL_CI_IDENTITY=1 is the explicit opt-in for local/offline signing.
 
     A v1- or v2-format signature (from a run initialized before this fix) cannot verify
     against the v3 payload — this is intentional fail-closed behavior, not a bug: the
@@ -531,10 +583,28 @@ def verify_policy_snapshot_signature(run, meta, *, snap_bytes):
         return ("no verifier available: set AR_VERIFIER_CMD, or install cosign (with "
                 "AR_ALLOW_KEYLESS=1 and AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned) or "
                 "minisign (with AR_MINISIGN_PUBKEY or AR_MINISIGN_PUBKEY_FILE)")
+    # Finding #7 / checklist item 3 (frontier-gate run pr70-trust-model2, 2026-09-22): a
+    # verifier IS configured, but if THIS process's own live CI identity is not actually
+    # established (see _ci_identity_established), the v3 CI-context binding this
+    # signature also relies on provides no real cross-run distinction -- both sign and
+    # verify would just agree on "local". Fail closed by default; AR_ALLOW_LOCAL_CI_
+    # IDENTITY=1 is the explicit, named opt-in for a deliberately local/offline signing
+    # setup that accepts this reduced guarantee (same "explicit opt-in" shape
+    # AR_ALLOW_KEYLESS already uses elsewhere in this module).
+    ci_context = ci_signing_context()
+    if (not _ci_identity_established(ci_context)
+            and not _policy_bool_env("AR_ALLOW_LOCAL_CI_IDENTITY")):
+        return (
+            "no CI-provided identity (repository/commit/run id) is available in this "
+            "environment -- the v3 signature binding cannot distinguish this run from "
+            "any other unidentified run, since both would sign/verify against the same "
+            "'local' placeholder. Run this under a recognized CI provider (GitHub "
+            "Actions or GitLab CI), or set AR_ALLOW_LOCAL_CI_IDENTITY=1 to explicitly "
+            "accept this reduced guarantee for a local/offline signing setup")
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.snapshot.attest"
         msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, run_name, risk,
-                                                 snap_bytes=snap_bytes))
+                                                 snap_bytes=snap_bytes, ci_context=ci_context))
         proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_p, fatal=False)
     if err:
         return f"verifier '{kind}' could not run: {err}"
@@ -1502,6 +1572,43 @@ class AttestedPolicy:
     raw: "bytes | None"
     absence_raw: "bytes | None"
     run_meta: dict
+
+
+def read_run_risk(run):
+    """The risk tier ALONE, from a single TOCTOU-safe read of run.json — deliberately
+    does NOT touch policy.snapshot.json at all, unlike load_attested_policy_bundle.
+
+    Checklist item 5 (frontier-gate run pr70-trust-model2, 2026-09-22, Finding #11):
+    gate.py cmd_plan's ordinary, no-waiver path used to read run.json["risk"] via a
+    second, independent `read_json()` call — an uncontrolled second read of the same
+    file load_attested_policy_bundle also reads, and a bare dict subscript that raised
+    an uncaught KeyError if "risk" were ever missing. This gives that path the same
+    single-read discipline load_attested_policy_bundle uses for run.json, WITHOUT also
+    coupling ordinary gate planning to whether a policy snapshot happens to be present
+    or valid — deliberately kept separate from load_attested_policy_bundle (rather than
+    calling it with require_signature=False and discarding the rest) specifically so a
+    corrupt/tampered policy.snapshot.json cannot block the no-waiver path, which must
+    stay exactly as infrastructure-free as it always has been; only a run that actually
+    goes on to record a waiver or NOT_APPLICABLE gate needs the full bundle (and does,
+    via its own load_attested_policy_bundle call further down cmd_plan).
+
+    Returns (risk_str, None) on success, (None, error_message) on any failure — never
+    raises."""
+    run = Path(run)
+    try:
+        runjson_bytes = read_regular_file_once(run / "run.json")
+    except (ValueError, OSError) as e:
+        return None, f"run.json is unreadable ({e})"
+    try:
+        runjson = json.loads(runjson_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        return None, f"run.json is not valid JSON/UTF-8 ({e})"
+    if not isinstance(runjson, dict):
+        return None, "run.json is not a JSON object"
+    risk = runjson.get("risk")
+    if not isinstance(risk, str) or not risk:
+        return None, "run.json has no valid risk tier recorded"
+    return risk, None
 
 
 def load_attested_policy_bundle(run, *, require_signature):

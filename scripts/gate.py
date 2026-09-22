@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (die, load_attested_policy_bundle, load_policy, now_iso, read_json,
-                     resolve_run, resolve_waiver_clock, validate_gate_name,
+                     read_run_risk, resolve_run, resolve_waiver_clock, validate_gate_name,
                      validate_not_applicable_gate, validate_waived_gate, write_json)
 
 # Floors per tier: these cannot be silently omitted, only waived on the record with a
@@ -37,7 +37,21 @@ MINIMUM_GATES = {
 
 def cmd_plan(args):
     run = resolve_run(args.run)
-    tier = read_json(run / "run.json")["risk"]
+    # Finding #11 / checklist items 5 & 9 (frontier-gate run pr70-trust-model2,
+    # 2026-09-22): source the risk tier from read_run_risk()'s single, TOCTOU-safe read
+    # of run.json rather than a second, independent read here. Before this fix,
+    # MINIMUM_GATES[tier]/policy required_gates lookups below trusted whichever value a
+    # SEPARATE `read_json()` call happened to see -- and this determines the required
+    # GATE SET itself (item 9: not just whether a waiver is honored), so an attacker who
+    # could make that second read see a lower tier could shrink required gates with no
+    # waiver needed at all. read_run_risk() deliberately does NOT touch
+    # policy.snapshot.json (unlike load_attested_policy_bundle) -- a corrupt/tampered
+    # snapshot must not block the ordinary no-waiver path, which stays exactly as
+    # infrastructure-free as it always has been; a run that actually waives something
+    # loads the full attested bundle further down, as before.
+    tier, tier_err = read_run_risk(run)
+    if tier_err:
+        die(f"cannot determine risk tier for this run: {tier_err}")
     # Requested-gate precedence: CLI flag > AR_REQUIRE env > policy file. The
     # policy's required_gates is a per-tier map; a missing tier entry is simply
     # "not provided" (tier keys themselves are validated at policy load).
@@ -109,6 +123,15 @@ def cmd_plan(args):
         bundle, att_err = load_attested_policy_bundle(run, require_signature=True)
         if att_err:
             die(f"cannot waive: {att_err}")
+        # checklist item 5: this is a SECOND, independent read of run.json (the first was
+        # the require_signature=False call above that produced `tier`) — cross-check they
+        # agree before trusting either for a waiver decision. A mismatch means run.json
+        # changed between the two reads (or was corrupted/raced) — block rather than
+        # silently picking one.
+        if bundle.run_meta.get("risk") != tier:
+            die(f"cannot waive: risk tier is not internally consistent between two reads "
+                f"of run.json ({bundle.run_meta.get('risk')!r} vs {tier!r}) — possible "
+                "tampering or a concurrent write; re-plan this run")
         att_pol = bundle.data
         clock_date, clock_err = resolve_waiver_clock()
         if clock_err:
