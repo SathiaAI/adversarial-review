@@ -30,10 +30,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (MAX_HIGH_SAMPLES, POLICY_SIG_FILENAME, RUN_ROOT, VALID_REBUTTAL,
+from _common import (MAX_HIGH_SAMPLES, POLICY_ABSENCE_FILENAME, POLICY_ABSENCE_SIG_FILENAME,
+                     POLICY_SIG_FILENAME, RUN_ROOT, VALID_REBUTTAL,
                      VALID_RISKS, capability_of, cosign_sign_argv, die, family_of,
                      load_capabilities, load_policy, merge_usage, meta_cost,
-                     minisign_sign_argv, now_iso, policy_attest_bytes, read_json,
+                     minisign_sign_argv, now_iso, policy_absence_attest_bytes,
+                     policy_attest_bytes, read_json,
                      resolve_run, resolve_setting, resolve_signing_tool,
                      run_signing_tool, trusted_signer_guard_error, write_json)
 
@@ -621,6 +623,80 @@ def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_path):
     print(f"signed: {run / POLICY_SIG_FILENAME} attests policy.snapshot.json (signer: {kind})")
 
 
+def _sign_policy_absence_if_possible(run, run_id, run_nonce, risk):
+    """GAP A's signed escape hatch (frontier-gate run pr70-design, 2026-09-21, checklist
+    item 2): when `init` finds NO repo policy file at all, opportunistically sign a
+    policy.absence.json explicitly attesting "this run's own init looked for a policy and
+    found none" — bound to the same run_id/run_nonce/run-directory-name/risk/live-CI-
+    identity as a real policy snapshot (see policy_absence_attest_bytes), just over no
+    snapshot bytes. Without this, a genuinely policy-free run and a run whose
+    policy.snapshot.json was simply never written (or was deleted) are cryptographically
+    indistinguishable — load_attested_policy_bundle's require_signature=True now BLOCKS
+    that ambiguous case whenever a verifier is configured, exactly to close this gap.
+
+    UNLIKE _sign_policy_snapshot_if_possible, this function writes policy.absence.json
+    ITSELF, only once signing has actually succeeded — never an orphaned, unsigned
+    policy.absence.json. An unsigned absence marker would be strictly worse than no
+    marker at all: load_attested_policy_bundle's "not snap_p.is_file()" branch treats
+    policy.absence.json's mere PRESENCE as "an absence claim exists, go verify it," which
+    would force even a repo with zero signing infrastructure configured through a
+    verifier check it can never pass — silently destroying the historical, documented,
+    infrastructure-free exemption this whole fix was designed to preserve (checklist item
+    19's explicit alternative; see load_attested_policy_bundle's docstring). Writing
+    nothing on failure keeps "no file at all" meaning exactly what it always has: no
+    verification infrastructure configured for this run.
+
+    Otherwise the same shape as _sign_policy_snapshot_if_possible in every respect that
+    matters: gated on trusted_signer_guard_error() first (never opportunistic just
+    because a signer happens to be configured), deliberately best-effort and never fatal
+    to `init`, and the shared verify_policy_absence_signature() in _common.py is what
+    actually enforces this signature — hard BLOCK on failure — from gate.py's plan/
+    record and aggregate.py's verdict path, never this function itself."""
+    note = "this run will BLOCK at aggregate time if any gate is later waived or marked not-applicable"
+    trust_err = trusted_signer_guard_error()
+    if trust_err:
+        print(f"note: no-policy attestation signing skipped ({trust_err}) — "
+              f"policy.absence.json was not written; {note}")
+        return
+    argv_tmpl, kind = resolve_signing_tool(
+        "AR_SIGNER_CMD", [("cosign-keyless", cosign_sign_argv), ("minisign", minisign_sign_argv)])
+    if argv_tmpl is None:
+        print(f"note: no signer configured (AR_SIGNER_CMD, or install cosign / minisign "
+              f"with AR_MINISIGN_KEY) — policy.absence.json was not written; {note}")
+        return
+    want_sig_out = any("{sig}" in a for a in argv_tmpl)
+    with tempfile.TemporaryDirectory() as td:
+        msg_tmp = Path(td) / "policy.absence.attest"
+        msg_tmp.write_bytes(policy_absence_attest_bytes(run_id, run_nonce, run.name, risk))
+        sig_tmp = Path(td) / "sig.out"
+        proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_tmp, fatal=False)
+        if err:
+            print(f"note: no-policy attestation signer '{kind}' could not run ({err}) — "
+                  f"policy.absence.json was not written; {note}")
+            return
+        if proc.returncode != 0:
+            stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()[-500:]
+            print(f"note: no-policy attestation signer '{kind}' exited {proc.returncode}: "
+                  f"{stderr} — policy.absence.json was not written; {note}")
+            return
+        if want_sig_out:
+            if not sig_tmp.exists():
+                print(f"note: no-policy attestation signer '{kind}' exited 0 but wrote no "
+                      f"signature file — policy.absence.json was not written; {note}")
+                return
+            sig = sig_tmp.read_bytes()
+        else:
+            sig = proc.stdout or b""
+    if not sig:
+        print(f"note: no-policy attestation signer '{kind}' produced an empty signature — "
+              f"policy.absence.json was not written; {note}")
+        return
+    write_json(run / POLICY_ABSENCE_FILENAME, {"policy_absent": True, "captured_at": now_iso()})
+    (run / POLICY_ABSENCE_SIG_FILENAME).write_bytes(sig)
+    print(f"signed: {run / POLICY_ABSENCE_SIG_FILENAME} attests {POLICY_ABSENCE_FILENAME} "
+          f"(signer: {kind})")
+
+
 def cmd_init(args):
     pol = load_policy()  # malformed policy dies here — never silently ignored
     risk, risk_src = resolve_setting(args.risk, "AR_RISK", pol, "risk")
@@ -666,6 +742,16 @@ def cmd_init(args):
             "captured_at": now_iso(), "text": pol["text"]})
         _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk,
                                           run / "policy.snapshot.json")
+    else:
+        # GAP A (frontier-gate run pr70-design, 2026-09-21, checklist item 2): no repo
+        # policy file was found. Opportunistically sign an explicit "checked, found none"
+        # attestation so a genuinely policy-free run stays distinguishable from one whose
+        # policy.snapshot.json was simply never written or was deleted — see
+        # load_attested_policy_bundle's require_signature=True contract in _common.py.
+        # _sign_policy_absence_if_possible writes policy.absence.json itself, and only
+        # when signing actually succeeds (see its docstring for why an unsigned one must
+        # never be written).
+        _sign_policy_absence_if_possible(run, run_id, run_nonce, risk)
     write_json(run / "run.json", {
         "run_id": run_id, "run_nonce": run_nonce, "product": args.product or "",
         "risk": risk,

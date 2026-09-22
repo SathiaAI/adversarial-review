@@ -39,6 +39,7 @@ from _common import (POLICY_SIG_FILENAME, _policy_bool,
                      minisign_verify_argv as _minisign_verify_argv, now_iso,
                      read_json, resolve_run,
                      resolve_signing_tool as _resolve_tool, resolve_waiver_clock,
+                     verify_policy_absence_signature,
                      verify_policy_snapshot_signature,
                      run_signing_tool as _run_tool, sign_fail as _sign_fail,
                      sign_timeout as _sign_timeout, validate_gate_name,
@@ -1452,8 +1453,13 @@ def _aggregate_cli():
         # attesting that no policy governed this run. `not att_err` so this never re-blocks a
         # run already BLOCKED above for the same underlying reason.
         if (gcov["waived"] or gcov["not_applicable"]) and not att_err:
-            if bundle.absence_attested:
-                pass  # already cryptographically verified inside the bundle load above
+            if bundle.absence_raw is not None:
+                sig_err = verify_policy_absence_signature(run, bundle.run_meta,
+                                                           absence_bytes=bundle.absence_raw)
+                if sig_err:
+                    blocked.append(
+                        "run recorded a waived or not-applicable gate but its signed "
+                        f"no-policy attestation is not verifiably signed: {sig_err}")
             elif bundle.raw is not None:
                 sig_err = verify_policy_snapshot_signature(run, bundle.run_meta,
                                                             snap_bytes=bundle.raw)

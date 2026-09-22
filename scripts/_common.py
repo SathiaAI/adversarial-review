@@ -164,6 +164,17 @@ def write_json(path, obj):
 # exactly one place for every caller, instead of drifting between two copies.
 POLICY_SIG_FILENAME = "policy.snapshot.sig"
 
+# GAP A's signed "explicitly checked, found no policy" escape hatch (frontier-gate run
+# pr70-design, 2026-09-21, checklist item 2) — see policy_absence_attest_bytes and
+# load_attested_policy_bundle's "not snap_p.is_file()" branch. A SEPARATE file/signature
+# pair from policy.snapshot.json/.sig, never the same file with an empty body: keeping
+# them distinct means a run can never accidentally satisfy one check by tampering into
+# the shape of the other, and policy_absence_attest_bytes uses a different domain-
+# separation prefix (see below) so an absence signature can never verify as a snapshot
+# signature or vice versa even if the files were swapped.
+POLICY_ABSENCE_FILENAME = "policy.absence.json"
+POLICY_ABSENCE_SIG_FILENAME = "policy.absence.sig"
+
 
 POLICY_ATTEST_VERSION = "3"
 
@@ -272,6 +283,87 @@ def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path=None, ci_co
             + ci_context["run_id"].encode("utf-8") + b"\n"
             + ci_context["run_attempt"].encode("utf-8") + b"\n"
             + snap_bytes)
+
+
+def policy_absence_attest_bytes(run_id, run_nonce, run_name, risk, ci_context=None,
+                                 version=POLICY_ATTEST_VERSION):
+    """The exact bytes signed/verified for the policy-ABSENCE signature (GAP A, frontier-
+    gate run pr70-design, 2026-09-21, checklist item 2) — the signed claim that THIS run,
+    at init, explicitly checked for a repo policy file and found none, as distinct from a
+    run that simply never wrote policy.snapshot.json (which load_attested_policy_bundle's
+    require_signature=True now BLOCKs whenever a verifier is configured — see its
+    docstring). Binds the same identity as policy_attest_bytes (run_id, run_nonce, run
+    directory name, resolved risk tier, live CI-orchestrator identity) for the same
+    replay-closing reasons documented there, but over NO snapshot bytes — there is no
+    policy text to bind, only the fact that init looked and found nothing.
+
+    Uses a DIFFERENT domain-separation prefix (b"ar-policy-absence-attest-v...", never
+    the snapshot's b"ar-policy-attest-v...") so a signature minted for one can never
+    verify as the other even if policy.snapshot.json/.sig and policy.absence.json/.sig
+    were swapped between run directories — the two claims ("this text governed the run"
+    vs "no policy governed the run") must never be interchangeable."""
+    if ci_context is None:
+        ci_context = ci_signing_context()
+    return (b"ar-policy-absence-attest-v" + str(version).encode("ascii") + b"\n"
+            + run_id.encode("utf-8") + b"\n" + run_nonce.encode("utf-8") + b"\n"
+            + str(run_name).encode("utf-8") + b"\n" + str(risk).encode("utf-8") + b"\n"
+            + ci_context["repository"].encode("utf-8") + b"\n"
+            + ci_context["commit"].encode("utf-8") + b"\n"
+            + ci_context["run_id"].encode("utf-8") + b"\n"
+            + ci_context["run_attempt"].encode("utf-8"))
+
+
+def verify_policy_absence_signature(run, meta, *, absence_bytes):
+    """The policy-ABSENCE counterpart to verify_policy_snapshot_signature — same checks,
+    same fail-closed shape (a short BLOCKED-reason string, never raises), same TOCTOU-safe
+    required-keyword `absence_bytes` (the caller's already-read policy.absence.json bytes,
+    normally load_attested_policy_bundle()'s `.absence_raw`), but verifies
+    POLICY_ABSENCE_SIG_FILENAME against policy_absence_attest_bytes(). See
+    verify_policy_snapshot_signature for the full rationale of each check; only the
+    signed-bytes builder and the sidecar filename differ."""
+    run_id = meta.get("run_id")
+    run_nonce = meta.get("run_nonce")
+    risk = meta.get("risk")
+    run_name = Path(run).name
+    if not isinstance(run_id, str) or not run_id:
+        return "run.json has no run_id — cannot verify the policy-absence signature"
+    if run_name != run_id:
+        return (f"run directory name ({run_name!r}) does not match run.json's run_id "
+                f"({run_id!r}) — this run.json does not describe the run being "
+                "verified (possible copy from another run); re-init to get a "
+                "signable, verifiable absence attestation")
+    if not isinstance(run_nonce, str) or not run_nonce:
+        return ("run.json has no run_nonce — the policy-absence signature cannot be "
+                "verified without it (this run predates the nonce fix, or run.json was "
+                "tampered with); re-init this run to get a signable, verifiable "
+                "absence attestation")
+    if not isinstance(risk, str) or not risk:
+        return "run.json has no risk tier — cannot verify the policy-absence signature"
+    sig_p = Path(run) / POLICY_ABSENCE_SIG_FILENAME
+    if not sig_p.is_file():
+        return (f"no {POLICY_ABSENCE_SIG_FILENAME} — the no-policy attestation was not "
+                "signed at init. Configure a signer (AR_SIGNER_CMD, or install cosign "
+                "with AR_ALLOW_KEYLESS=1 and AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned, "
+                "or minisign with AR_MINISIGN_KEY) before `panel.py init` so any run that "
+                "later records a waiver or not-applicable gate can be trusted")
+    argv_tmpl, kind = resolve_signing_tool(
+        "AR_VERIFIER_CMD",
+        [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)])
+    if argv_tmpl is None:
+        return ("no verifier available: set AR_VERIFIER_CMD, or install cosign (with "
+                "AR_ALLOW_KEYLESS=1 and AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned) or "
+                "minisign (with AR_MINISIGN_PUBKEY or AR_MINISIGN_PUBKEY_FILE)")
+    with tempfile.TemporaryDirectory() as td:
+        msg_tmp = Path(td) / "policy.absence.attest"
+        msg_tmp.write_bytes(policy_absence_attest_bytes(run_id, run_nonce, run_name, risk))
+        proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_p, fatal=False)
+    if err:
+        return f"verifier '{kind}' could not run: {err}"
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()[-300:]
+        detail = f" — {stderr}" if stderr else ""
+        return f"signature did not verify (verifier: {kind}, exit {proc.returncode}){detail}"
+    return None
 
 
 def verify_policy_snapshot_signature(run, meta, *, snap_bytes):
@@ -1221,15 +1313,20 @@ class AttestedPolicy:
                          signature is checked over the SAME bytes that were content-
                          validated here, never a second, independently re-read copy (the
                          TOCTOU this closes). None when there is no snapshot.
-      absence_attested  True only for a run whose policy.absence.json + .sig were present
-                         and verified — an authenticated "no policy governed this run"
-                         claim, distinct from the merely-unsigned {} fallback below.
+      absence_raw       policy.absence.json's exact bytes, as read ONCE by this call —
+                         the content-validated (but, under require_signature=False, NOT
+                         yet signature-checked) "this run explicitly found no policy at
+                         init" claim. Mirrors `raw` exactly: pass this to
+                         verify_policy_absence_signature's absence_bytes= so the
+                         signature is checked over the SAME bytes that were content-
+                         validated here. None when there is no absence attestation (either
+                         a snapshot governed the run, or neither file exists).
       run_meta          run.json's already-parsed dict, so callers needing e.g. meta['risk']
                          never re-read run.json themselves."""
     data: dict
     sha256: "str | None"
     raw: "bytes | None"
-    absence_attested: bool
+    absence_raw: "bytes | None"
     run_meta: dict
 
 
@@ -1264,8 +1361,9 @@ def load_attested_policy_bundle(run, *, require_signature):
     authenticated claim, so an attacker (or a broken pipeline) that simply deleted or
     never wrote the snapshot got the same free pass as a genuinely policy-free run. Under
     require_signature=True that same no-file case is now BLOCKED, not passed:
-    policy.absence.json (added in the commit that follows this one) is the signed escape
-    hatch a genuinely no-policy run uses to still pass this check.
+    policy.absence.json is the signed escape hatch a genuinely no-policy run uses to
+    still pass this check — see the "not snap_p.is_file()" branch below and
+    policy_absence_attest_bytes / verify_policy_absence_signature.
 
     Returns (AttestedPolicy, None) on success, (None, error_message) on any failure —
     never raises; every failure mode is a caller-facing BLOCKED-reason string."""
@@ -1292,6 +1390,33 @@ def load_attested_policy_bundle(run, *, require_signature):
             # have rejected.
             return None, ("run.json records a policy at init but policy.snapshot.json is "
                           "missing — the attested policy cannot be recovered; run BLOCKED")
+        # No policy governed this run at init. Before falling through to the verifier-
+        # availability gate below, check for GAP A's signed escape hatch: a
+        # policy.absence.json that explicitly attests "init looked for a policy and found
+        # none." Content-validated here exactly once (mirrors the snapshot's own
+        # read-once-via-read_regular_file_once discipline below); the signature itself is
+        # only checked when require_signature=True, exactly like the snapshot path, so a
+        # require_signature=False content-only caller never needs a verifier installed
+        # just to see that an absence claim exists.
+        absence_p = run / POLICY_ABSENCE_FILENAME
+        if absence_p.is_file():
+            try:
+                absence_raw = read_regular_file_once(absence_p)
+            except (ValueError, OSError) as e:
+                return None, f"policy.absence.json is unreadable/corrupt: {e}"
+            try:
+                absence_data = json.loads(absence_raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError) as e:
+                return None, f"policy.absence.json is not valid JSON/UTF-8: {e}"
+            if not isinstance(absence_data, dict) or absence_data.get("policy_absent") is not True:
+                return None, ("policy.absence.json is malformed (missing "
+                              "'policy_absent: true') — cannot trust this run's no-policy "
+                              "claim; run BLOCKED")
+            if require_signature:
+                sig_err = verify_policy_absence_signature(run, runjson, absence_bytes=absence_raw)
+                if sig_err:
+                    return None, f"policy.absence.json is not verifiably signed: {sig_err}"
+            return AttestedPolicy({}, None, None, absence_raw, runjson), None
         if require_signature:
             # Checklist item 19's explicit alternative ("always-on when signer/verifier
             # configured", frontier-gate run pr70-design, 2026-09-21): whether "no policy
@@ -1321,7 +1446,7 @@ def load_attested_policy_bundle(run, *, require_signature):
                               "re-init this run under a configured signer "
                               "(AR_TRUSTED_SIGNER=1 plus AR_SIGNER_CMD / cosign / "
                               "minisign)")
-        return AttestedPolicy({}, None, None, False, runjson), None
+        return AttestedPolicy({}, None, None, None, runjson), None
 
     try:
         raw = read_regular_file_once(snap_p)
@@ -1374,7 +1499,7 @@ def load_attested_policy_bundle(run, *, require_signature):
         if sig_err:
             return None, f"attested policy snapshot is not verifiably signed: {sig_err}"
 
-    return AttestedPolicy(data, sha, raw, False, runjson), None
+    return AttestedPolicy(data, sha, raw, None, runjson), None
 
 
 def load_attested_policy(run):

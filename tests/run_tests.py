@@ -1628,25 +1628,33 @@ def t_policy_sig_no_policy_at_all_is_exempt():
 def t_policy_sig_no_policy_but_verifier_configured_is_blocked():
     # The other half of GAP A (frontier-gate run pr70-design, 2026-09-21, checklist item
     # 2): t_policy_sig_no_policy_at_all_is_exempt above proved a repo with NO
-    # verification infrastructure at all stays exempt. This proves the opposite: a repo
-    # whose environment DOES have a verifier configured (_stub_signer_env — the same
-    # fixture t_policy_sig_valid_signature_allows_waiver_run_to_pass uses) can no longer
-    # get an unauthenticated free pass on a waiver merely because there is no policy
-    # file at all (so no signer ever ran at init, and neither policy.snapshot.json nor
-    # policy.absence.json was ever written). Before this fix, `gate.py plan --waive`
-    # would have accepted this waiver unconditionally (({}, None) from the old
-    # load_attested_policy with no snapshot) and aggregate.py would never even have
-    # checked a signature for it (gated on `snap_p.is_file()`, which was always False
-    # here). Now BOTH must reject it, at plan time.
-    env = _stub_signer_env()
+    # verification infrastructure at all stays exempt. This proves the opposite: a run
+    # whose OWN init had no signer configured (so neither policy.snapshot.json nor a
+    # signed policy.absence.json was ever written — see _sign_policy_absence_if_possible's
+    # deliberate refusal to write an UNSIGNED absence.json, which would otherwise wrongly
+    # break the no-infrastructure-at-all exemption for every future init) cannot get an
+    # unauthenticated free pass on a waiver merely because `gate.py plan` itself now runs
+    # in an environment that DOES have a verifier configured (_stub_signer_env — the
+    # realistic "this run predates the signed-init fix, or CI was since hardened" case).
+    # Before the TOCTOU/GAP-A fix, `gate.py plan --waive` would have accepted this waiver
+    # unconditionally (({}, None) from the old load_attested_policy with no snapshot) and
+    # aggregate.py would never even have checked a signature for it (gated on
+    # `snap_p.is_file()`, which was always False here). Now it must reject it, at plan
+    # time — see t_aggregate_independently_blocks_no_policy_waiver_when_verifier_
+    # configured_at_aggregate_time below for aggregate.py's OWN independent check of the
+    # same scenario.
     repo = fresh_repo()   # deliberately NO .adversarial-review.json policy file
-    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo, env=env)
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo)
     run = latest_run(repo)
     assert not (run / "policy.snapshot.json").exists()
-    assert not (run / "policy.snapshot.sig").exists()
-    sh(["panel.py", "assign"], repo, env=env)
-    sh(["panel.py", "run", "--context-file", "context.md"], repo, env=env)
-    sh(["panel.py", "rebuttal"], repo, env=env)
+    assert not (run / "policy.absence.json").exists(), (
+        "init had no signer configured -- an UNSIGNED policy.absence.json must never be "
+        "written (it would wrongly force every no-infrastructure repo through a "
+        "verifier check it can never pass)")
+    sh(["panel.py", "assign"], repo)
+    sh(["panel.py", "run", "--context-file", "context.md"], repo)
+    sh(["panel.py", "rebuttal"], repo)
+    env = _stub_signer_env()   # plan runs in a DIFFERENT, verifier-configured environment
     r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
             "--waive", "mutation", "--authorized-by", "Paul",
             "--waive-reason", "mutation runner not wired into CI for this repo yet",
@@ -1655,6 +1663,60 @@ def t_policy_sig_no_policy_but_verifier_configured_is_blocked():
     assert "cannot waive" in r.stderr, r.stderr
     assert "no policy.snapshot.json" in r.stderr, r.stderr
     assert "verifier IS configured" in r.stderr, r.stderr
+
+
+def t_policy_sig_absence_signed_at_init_allows_waiver_run_to_pass():
+    # The positive case GAP A exists to still permit: a repo with genuinely NO policy
+    # file, whose init DID run under a configured, trusted signer, gets an authenticated
+    # policy.absence.json + .sig — and a waiver run against it reaches PASS, not BLOCKED,
+    # exactly like a real signed policy.snapshot.json would. Proves the whole positive
+    # path end-to-end: init writes+signs the absence attestation, `gate.py plan --waive`
+    # accepts it, and `aggregate.py` (in a DIFFERENT process, re-verifying independently)
+    # accepts it too.
+    from _common import policy_absence_attest_bytes
+    env = _stub_signer_env()
+    repo = fresh_repo()   # deliberately NO .adversarial-review.json policy file
+    r = sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
+           repo, env=env)
+    run = latest_run(repo)
+    assert not (run / "policy.snapshot.json").exists()
+    assert "signed:" in r.stdout and "policy.absence.sig" in r.stdout, r.stdout
+    assert (run / "policy.absence.json").exists()
+    sig = (run / "policy.absence.sig").read_bytes()
+    meta = read(run / "run.json")
+    msg = policy_absence_attest_bytes(run.name, meta["run_nonce"], run.name, meta["risk"])
+    assert sig == b"STUBSIG-v1:" + hashlib.sha256(msg).hexdigest().encode(), sig
+    absence = read(run / "policy.absence.json")
+    assert absence["policy_absent"] is True, absence
+    sh(["panel.py", "assign"], repo, env=env)
+    sh(["panel.py", "run", "--context-file", "context.md"], repo, env=env)
+    sh(["panel.py", "rebuttal"], repo, env=env)
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+        "--waive", "mutation", "--authorized-by", "Paul",
+        "--waive-reason", "mutation runner not wired into CI for this repo yet",
+        "--waive-expires", (date.today() + timedelta(days=7)).isoformat()],
+       repo, env=env, expect=0)
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"],
+           repo, env=env)
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0, env=env)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
+
+
+def t_policy_sig_absence_not_written_when_trust_guard_refuses():
+    # _sign_policy_absence_if_possible must be gated on trusted_signer_guard_error() just
+    # like the snapshot signer -- a working AR_SIGNER_CMD is never enough by itself
+    # (mirrors t_trusted_signer_unset_skips_signing_even_with_working_signer for the
+    # snapshot case). Unset AR_TRUSTED_SIGNER on an otherwise-working signer env and
+    # confirm no policy.absence.json/.sig get written at all.
+    env = _stub_signer_env(extra={"AR_TRUSTED_SIGNER": ""})
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
+       repo, env=env)
+    run = latest_run(repo)
+    assert not (run / "policy.absence.json").exists()
+    assert not (run / "policy.absence.sig").exists()
 
 
 def t_policy_sig_missing_blocks_waiver_run():
@@ -2262,20 +2324,30 @@ def t_trusted_signer_opted_in_from_trusted_trigger_signs_normally():
     assert (run / "policy.snapshot.sig").exists()
 
 
-def t_trusted_signer_guard_never_touched_when_no_policy_file_configured():
-    # A repo with NO policy file at all never calls the signer (or the new guard) --
-    # the common no-exception path stays completely infrastructure-free, exactly as
-    # before this fix. Sanity check that the guard is wired into the policy-snapshot
-    # signing call site only, not some earlier/broader code path.
+def t_trusted_signer_guard_refuses_absence_signing_when_no_policy_file_configured():
+    # A repo with NO policy file at all still calls the trust guard -- as of GAP A
+    # (frontier-gate run pr70-design, 2026-09-21, checklist item 2),
+    # _sign_policy_absence_if_possible opportunistically attempts a SIGNED "checked,
+    # found none" attestation for exactly this case, so the guard now legitimately fires
+    # at this call site too (previously it only guarded policy.snapshot.json's signer,
+    # and a no-policy repo never reached any signing call at all -- see
+    # t_policy_sig_absence_not_written_when_trust_guard_refuses for the direct check that
+    # no orphaned, unsigned policy.absence.json gets written). With AR_TRUSTED_SIGNER
+    # unset, init must still succeed (never crash/die), print an explanatory note
+    # (mentioning AR_TRUSTED_SIGNER -- unlike before this fix, this text legitimately
+    # appears now), and write neither a policy.snapshot.json/.sig NOR a
+    # policy.absence.json/.sig.
     env = _stub_signer_env()
     del env["AR_TRUSTED_SIGNER"]
     repo = fresh_repo()  # no .adversarial-review.json written
     r = sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
            repo, env=env)
-    assert "AR_TRUSTED_SIGNER" not in r.stdout, r.stdout
+    assert "AR_TRUSTED_SIGNER is not set" in r.stdout, r.stdout
     run = latest_run(repo)
     assert not (run / "policy.snapshot.json").exists()
     assert not (run / "policy.snapshot.sig").exists()
+    assert not (run / "policy.absence.json").exists()
+    assert not (run / "policy.absence.sig").exists()
 
 
 def t_policy_sig_snapshot_lone_surrogate_blocks_not_crashes():
