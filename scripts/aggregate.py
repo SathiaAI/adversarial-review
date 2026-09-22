@@ -896,7 +896,11 @@ def sign_attestation(run):
         print(f"refusing to sign: run artifacts drifted — recomputed attestation {att['digest']} "
               f"!= recorded {digest}; re-aggregate before signing", file=sys.stderr)
         sys.exit(1)
-    argv_tmpl, kind = _resolve_tool(
+    # fatal=True (default): --sign is a standalone, explicit CLI invocation -- a malformed
+    # AR_SIGNER_CMD here should exit 3 immediately, exactly as before resolve_signing_tool()
+    # grew the fatal= parameter (see t_sign_malformed_command_template_exits_3). `_err` is
+    # unreachable here: sign_fail() inside the resolver exits the process before returning.
+    argv_tmpl, kind, _err = _resolve_tool(
         "AR_SIGNER_CMD",
         [("cosign-keyless", _cosign_sign_argv), ("minisign", _minisign_sign_argv)])
     if argv_tmpl is None:
@@ -959,7 +963,9 @@ def verify_signature(run):
         print(f"signature INVALID: run artifacts drifted — recomputed attestation {att['digest']} "
               f"!= recorded {digest}; the signed verdict no longer describes this run's inputs")
         sys.exit(1)
-    argv_tmpl, kind = _resolve_tool(
+    # fatal=True (default): --verify-signature is a standalone, explicit CLI invocation --
+    # same rationale as the --sign call site above.
+    argv_tmpl, kind, _err = _resolve_tool(
         "AR_VERIFIER_CMD",
         [("cosign-keyless", _cosign_verify_argv), ("minisign", _minisign_verify_argv)])
     if argv_tmpl is None:
@@ -1582,16 +1588,21 @@ def _aggregate_cli():
                 sig_err = verify_policy_absence_signature(run, bundle.run_meta,
                                                            absence_bytes=bundle.absence_raw)
                 if sig_err:
+                    # _oneline(): sig_err may embed a configured verifier's raw, attacker-
+                    # influenceable stderr (see verify_policy_absence_signature's `detail`).
+                    # Collapse/HTML-escape it before it reaches verdict.md, same as every
+                    # other untrusted string this function interpolates into `blocked`.
+                    # Codex r4055706481 (P2).
                     blocked.append(
                         "run recorded a waived or not-applicable gate but its signed "
-                        f"no-policy attestation is not verifiably signed: {sig_err}")
+                        f"no-policy attestation is not verifiably signed: {_oneline(sig_err)}")
             elif bundle.raw is not None:
                 sig_err = verify_policy_snapshot_signature(run, bundle.run_meta,
                                                             snap_bytes=bundle.raw)
                 if sig_err:
                     blocked.append(
                         "run recorded a waived or not-applicable gate but its attested "
-                        f"policy snapshot is not verifiably signed: {sig_err}")
+                        f"policy snapshot is not verifiably signed: {_oneline(sig_err)}")
             else:
                 # No policy.snapshot.json and no policy.absence.json were present at the
                 # content-only (require_signature=False) load above. Re-derive the
@@ -1611,7 +1622,7 @@ def _aggregate_cli():
                 if sig_err:
                     blocked.append(
                         "run recorded a waived or not-applicable gate but there is no "
-                        f"attested policy snapshot for this run: {sig_err}")
+                        f"attested policy snapshot for this run: {_oneline(sig_err)}")
 
         plan_path = run / "panel" / "plan.json"
         plan = read_json(plan_path) if plan_path.exists() else {}

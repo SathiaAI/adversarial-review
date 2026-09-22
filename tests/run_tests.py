@@ -2063,6 +2063,136 @@ def t_policy_sig_directory_identity_forgery_blocks():
     assert "does not match" in r.stdout, r.stdout
 
 
+def t_verify_policy_absence_signature_rejects_unencodable_run_id():
+    # Codex r4055706476 (P2): a tampered run.json.run_id containing a lone UTF-16
+    # surrogate is a valid Python/JSON str (json.loads happily decodes the \ud800
+    # escape sequence) but raises UnicodeEncodeError the moment policy_absence_attest_
+    # bytes()'s raw `.encode("utf-8")` touches it -- uncaught, that crashed the whole
+    # process through aggregate.py's/gate.py's "unexpected error" path instead of
+    # returning a controlled BLOCKED/die reason. _encodable_str() now rejects it before
+    # it ever reaches the attest-bytes builder, from the policyless (policy.absence.sig)
+    # path exercised here via `gate.py plan --waive`, and identically from the
+    # policy.snapshot.sig path (verify_policy_snapshot_signature shares the exact same
+    # helper and check shape).
+    env = _stub_signer_env()
+    repo = fresh_repo()  # no policy file -> policy.absence.json/.sig path
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo, env=env)
+    run = latest_run(repo)
+    assert (run / "policy.absence.sig").exists()
+    rj = read(run / "run.json")
+    rj["run_id"] = "\ud800"  # lone high surrogate: valid str, not valid UTF-8
+    write(run / "run.json", rj)
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI for this repo yet",
+            "--waive-expires", (date.today() + timedelta(days=7)).isoformat()],
+           repo, env=env, expect=1)
+    assert "no valid run_id" in r.stderr, r.stderr
+    assert "Traceback" not in r.stderr and "UnicodeEncodeError" not in r.stderr, (
+        "a malformed run_id must degrade to a controlled error, never an uncaught crash")
+
+
+def t_malformed_verifier_blocks_waiver_not_crashes():
+    # Codex r4055706494 (P2): resolve_signing_tool() used to call sign_fail() (sys.exit(3))
+    # UNCONDITIONALLY the moment AR_VERIFIER_CMD failed shlex.split — including from the
+    # ordinary gate.py plan --waive / aggregate.py verify path, where "unavailable
+    # verifiers are explicitly handled as blocking prerequisites in the adjacent branch"
+    # (the `argv_tmpl is None` "no verifier available" message). A malformed override must
+    # get the SAME controlled treatment (a `die`/BLOCKED reason naming the bad template),
+    # never crash the whole process with exit 3.
+    env = _stub_signer_env()
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo, env=env)
+    run = latest_run(repo)
+    assert (run / "policy.absence.sig").exists()
+    bad_env = {**env, "AR_VERIFIER_CMD": 'verify "oops'}
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI for this repo yet",
+            "--waive-expires", (date.today() + timedelta(days=7)).isoformat()],
+           repo, env=bad_env, expect=1)
+    assert "not a valid command template" in r.stderr, r.stderr
+    assert r.returncode == 1, "a malformed verifier is a controlled BLOCK (die, exit 1), never exit 3"
+    assert "Traceback" not in r.stderr
+
+
+def t_malformed_signer_never_crashes_init():
+    # Same fatal=False fix, the signing side: _sign_policy_snapshot_if_possible /
+    # _sign_policy_absence_if_possible are explicitly documented as "deliberately
+    # best-effort and never fatal to init" -- before this fix, a malformed AR_SIGNER_CMD
+    # broke that contract by crashing resolve_signing_tool() (and therefore `init`)
+    # outright via sign_fail(). Now it degrades to the same unsigned-but-non-fatal note
+    # every other signer-resolution failure in these functions already produces.
+    env = _stub_signer_env(extra={"AR_SIGNER_CMD": 'sign "oops'})
+    repo = fresh_repo()
+    r = sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"],
+           repo, env=env, expect=0)
+    assert "not a valid command template" in r.stdout, r.stdout
+    assert not (latest_run(repo) / "policy.absence.sig").exists(), (
+        "signing must have been skipped (unsigned), not crashed or silently succeeded")
+    assert "Traceback" not in r.stdout and "Traceback" not in r.stderr
+
+
+def t_verifier_diagnostic_html_escaped_in_verdict():
+    # Codex r4055706481 (P2): sig_err can embed a configured verifier's raw, attacker/
+    # verifier-influenceable stderr (see verify_policy_snapshot_signature's `detail`).
+    # aggregate.py's main() interpolated it into `blocked` -- and from there straight into
+    # verdict.md -- WITHOUT the _oneline() HTML-escaping every other untrusted string in
+    # that section already gets (e.g. gate reasons, waiver names). A verifier that writes
+    # HTML to stderr could therefore forge markup in the report.
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.sig").exists()
+    _resolve_open_finding(run)
+
+    evil_dir = Path(tempfile.mkdtemp(prefix="ar-evilverify-"))
+    (evil_dir / "verify.py").write_text(
+        "import sys\n"
+        "sys.stderr.write('<img src=x onerror=alert(1)>')\n"
+        "sys.exit(1)\n")
+    bad_env = {**env, "AR_VERIFIER_CMD": f"{sys.executable} {evil_dir / 'verify.py'} {{sig}} {{msg}}"}
+    r = sh(["aggregate.py"], repo, expect=2, env=bad_env)
+    assert "<img src=x onerror=alert(1)>" not in r.stdout, r.stdout
+    md = (run / "verdict.md").read_text()
+    assert "<img src=x onerror=alert(1)>" not in md, "raw HTML must not reach verdict.md"
+    assert "&lt;img src=x onerror=alert(1)&gt;" in md, md
+
+
+def t_mcp_aggregate_wraps_signing_call_with_margin_not_bare_default():
+    # Codex r4055706491 (P2): h_aggregate's own _run_cli("aggregate", ...) call was left at
+    # the bare 120s default -- the exact mismatch already fixed for h_init/h_gate_plan/
+    # h_gate_record (t_mcp_init_and_gate_wrap_signing_calls_with_margin_not_bare_default) --
+    # so a configured verifier that legitimately takes close to the full AR_SIGN_TIMEOUT
+    # could have the OUTER MCP wrapper kill plain `ar_aggregate` before the INNER signature-
+    # verification subprocess it invokes (via check_gates -> verify_policy_*_signature)
+    # returns its own fail-closed BLOCKED verdict.
+    repo = Path(tempfile.mkdtemp(prefix="ar-aggtimeout-"))
+    run_id = "run-20260101-010101"
+    rundir = repo / ".adversarial-review" / run_id
+    rundir.mkdir(parents=True)
+    calls = []
+
+    def fake(module, argv, timeout=120):
+        calls.append({"module": module, "argv": list(argv), "timeout": timeout})
+        write(rundir / "verdict.json", {"run_id": run_id, "verdict": "PASS"})
+        return 0, "PASS", ""
+
+    cwd0 = os.getcwd()
+    os.chdir(repo)
+    orig = mcpsrv._run_cli
+    mcpsrv._run_cli = fake
+    try:
+        expect = mcpsrv._sign_wrapping_timeout()
+        assert expect > 120, "test is only meaningful if the margin actually exceeds the bare default"
+        r = mcpsrv.h_aggregate({"run": run_id})
+        assert not r.get("isError"), r
+        assert calls and calls[-1]["module"] == "aggregate" and calls[-1]["timeout"] == expect, calls
+    finally:
+        mcpsrv._run_cli = orig
+        os.chdir(cwd0)
+
+
 def t_policy_sig_risk_tamper_blocks():
     # Codex P1 (finding 4, in panel.py): the signed payload did not bind run.json's
     # resolved risk tier, so an actor who can edit run.json could downgrade risk from

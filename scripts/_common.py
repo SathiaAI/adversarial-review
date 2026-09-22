@@ -359,6 +359,28 @@ def policy_absence_attest_bytes(run_id, run_nonce, run_name, risk, ci_context=No
             + ci_context["run_attempt"].encode("utf-8"))
 
 
+def _encodable_str(s):
+    """True iff `s` is a non-surrogate-escaped str -- one that policy_attest_bytes /
+    policy_absence_attest_bytes can safely `.encode("utf-8")`. A plain `isinstance(s,
+    str)` is not enough: JSON permits lone UTF-16 surrogate code points (`\\ud800`
+    etc.) in a string, Python's json module happily decodes them into a `str` that
+    passes isinstance, and THAT str raises UnicodeEncodeError the moment `.encode()`
+    is called on it. Codex r4055706476 (P2): a tampered run.json's run_id containing
+    such a surrogate reached policy_attest_bytes()'s raw `.encode("utf-8")` call
+    uncaught, crashing verification with UnicodeEncodeError instead of returning a
+    controlled BLOCKED reason. Used to validate run_id, run_nonce, and risk here --
+    every field verify_policy_snapshot_signature/verify_policy_absence_signature read
+    straight from run.json and later encode -- before they ever reach the attest-bytes
+    builder."""
+    if not isinstance(s, str):
+        return False
+    try:
+        s.encode("utf-8")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
 def verify_policy_absence_signature(run, meta, *, absence_bytes):
     """The policy-ABSENCE counterpart to verify_policy_snapshot_signature — same checks,
     same fail-closed shape (a short BLOCKED-reason string, never raises), same TOCTOU-safe
@@ -371,20 +393,20 @@ def verify_policy_absence_signature(run, meta, *, absence_bytes):
     run_nonce = meta.get("run_nonce")
     risk = meta.get("risk")
     run_name = Path(run).name
-    if not isinstance(run_id, str) or not run_id:
-        return "run.json has no run_id — cannot verify the policy-absence signature"
+    if not _encodable_str(run_id) or not run_id:
+        return "run.json has no valid run_id — cannot verify the policy-absence signature"
     if run_name != run_id:
         return (f"run directory name ({run_name!r}) does not match run.json's run_id "
                 f"({run_id!r}) — this run.json does not describe the run being "
                 "verified (possible copy from another run); re-init to get a "
                 "signable, verifiable absence attestation")
-    if not isinstance(run_nonce, str) or not run_nonce:
-        return ("run.json has no run_nonce — the policy-absence signature cannot be "
-                "verified without it (this run predates the nonce fix, or run.json was "
-                "tampered with); re-init this run to get a signable, verifiable "
+    if not _encodable_str(run_nonce) or not run_nonce:
+        return ("run.json has no valid run_nonce — the policy-absence signature cannot "
+                "be verified without it (this run predates the nonce fix, or run.json "
+                "was tampered with); re-init this run to get a signable, verifiable "
                 "absence attestation")
-    if not isinstance(risk, str) or not risk:
-        return "run.json has no risk tier — cannot verify the policy-absence signature"
+    if not _encodable_str(risk) or not risk:
+        return "run.json has no valid risk tier — cannot verify the policy-absence signature"
     sig_p = Path(run) / POLICY_ABSENCE_SIG_FILENAME
     if not sig_p.is_file():
         return (f"no {POLICY_ABSENCE_SIG_FILENAME} — the no-policy attestation was not "
@@ -392,10 +414,13 @@ def verify_policy_absence_signature(run, meta, *, absence_bytes):
                 "with AR_ALLOW_KEYLESS=1 and AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned, "
                 "or minisign with AR_MINISIGN_KEY) before `panel.py init` so any run that "
                 "later records a waiver or not-applicable gate can be trusted")
-    argv_tmpl, kind = resolve_signing_tool(
+    argv_tmpl, kind, resolve_err = resolve_signing_tool(
         "AR_VERIFIER_CMD",
-        [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)])
+        [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)],
+        fatal=False)
     if argv_tmpl is None:
+        if resolve_err:
+            return f"verifier configuration error: {resolve_err}"
         return ("no verifier available: set AR_VERIFIER_CMD, or install cosign (with "
                 "AR_ALLOW_KEYLESS=1 and AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned) or "
                 "minisign (with AR_MINISIGN_PUBKEY or AR_MINISIGN_PUBKEY_FILE)")
@@ -475,19 +500,20 @@ def verify_policy_snapshot_signature(run, meta, *, snap_bytes):
     run_nonce = meta.get("run_nonce")
     risk = meta.get("risk")
     run_name = Path(run).name
-    if not isinstance(run_id, str) or not run_id:
-        return "run.json has no run_id — cannot verify the policy-snapshot signature"
+    if not _encodable_str(run_id) or not run_id:
+        return "run.json has no valid run_id — cannot verify the policy-snapshot signature"
     if run_name != run_id:
         return (f"run directory name ({run_name!r}) does not match run.json's run_id "
                 f"({run_id!r}) — this run.json does not describe the run being "
                 "verified (possible copy from another run); re-init to get a "
                 "signable, verifiable snapshot")
-    if not isinstance(run_nonce, str) or not run_nonce:
-        return ("run.json has no run_nonce — the policy-snapshot signature cannot be "
-                "verified without it (this run predates the nonce fix, or run.json was "
-                "tampered with); re-init this run to get a signable, verifiable snapshot")
-    if not isinstance(risk, str) or not risk:
-        return "run.json has no risk tier — cannot verify the policy-snapshot signature"
+    if not _encodable_str(run_nonce) or not run_nonce:
+        return ("run.json has no valid run_nonce — the policy-snapshot signature cannot "
+                "be verified without it (this run predates the nonce fix, or run.json "
+                "was tampered with); re-init this run to get a signable, verifiable "
+                "snapshot")
+    if not _encodable_str(risk) or not risk:
+        return "run.json has no valid risk tier — cannot verify the policy-snapshot signature"
     sig_p = Path(run) / POLICY_SIG_FILENAME
     if not sig_p.is_file():
         return (f"no {POLICY_SIG_FILENAME} — the policy snapshot was not signed at init. "
@@ -495,10 +521,13 @@ def verify_policy_snapshot_signature(run, meta, *, snap_bytes):
                 "and AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned, or minisign with "
                 "AR_MINISIGN_KEY) before `panel.py init` so any run that later records a "
                 "waiver or not-applicable gate can be trusted")
-    argv_tmpl, kind = resolve_signing_tool(
+    argv_tmpl, kind, resolve_err = resolve_signing_tool(
         "AR_VERIFIER_CMD",
-        [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)])
+        [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)],
+        fatal=False)
     if argv_tmpl is None:
+        if resolve_err:
+            return f"verifier configuration error: {resolve_err}"
         return ("no verifier available: set AR_VERIFIER_CMD, or install cosign (with "
                 "AR_ALLOW_KEYLESS=1 and AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned) or "
                 "minisign (with AR_MINISIGN_PUBKEY or AR_MINISIGN_PUBKEY_FILE)")
@@ -537,24 +566,43 @@ def sign_timeout():
     return t if t > 0 else 120
 
 
-def resolve_signing_tool(env_cmd, builders):
+def resolve_signing_tool(env_cmd, builders, fatal=True):
     """Resolve a signing/verifying command as an argv TEMPLATE carrying `{msg}`/`{sig}`
     tokens. Precedence: an explicit env override (`env_cmd`, e.g. AR_SIGNER_CMD) wins;
     otherwise the first auto-detected tool whose builder returns a non-None argv
-    (cosign keyless primary, minisign fallback). Returns (argv, kind) or (None, None)
-    when nothing resolves. The command is only ever executed via subprocess — nothing
-    here imports the signer."""
+    (cosign keyless primary, minisign fallback). Returns (argv, kind, err) — `err` is
+    populated only when `fatal=False` and the explicit env override is present but
+    malformed (unbalanced shell quoting); it is always None on every other path
+    (resolution succeeded, or nothing resolved at all because the override was unset
+    and no builder matched).
+
+    `fatal` (default True) preserves this function's original, unconditional behavior
+    for every pre-existing caller: a malformed override is a hard configuration error
+    that exits the process via sign_fail() (exit 3) and never returns. Codex
+    r4055706494 (P2): some callers — the policy-signature VERIFY path
+    (verify_policy_snapshot_signature / verify_policy_absence_signature /
+    load_attested_policy_bundle's require_signature check in this module) invoked
+    during ordinary `gate.py plan --waive` / `aggregate.py` runs, and panel.py's
+    opportunistic init-time signing, which is documented as "never fatal to init" —
+    must instead report a malformed AR_VERIFIER_CMD/AR_SIGNER_CMD as a normal,
+    controlled failure (a BLOCKED verdict, or an unsigned-but-non-fatal init note) so
+    one operator's typo in a command template cannot crash the whole CI process or
+    silently violate panel.py's own never-fatal contract. Pass `fatal=False` there and
+    surface `err` in the caller's own error/BLOCKED message."""
     cmd = os.environ.get(env_cmd, "").strip()
     if cmd:
         try:
-            return shlex.split(cmd), "custom"
+            return shlex.split(cmd), "custom", None
         except ValueError as e:
-            sign_fail(f"{env_cmd} is not a valid command template ({e}): {cmd!r}")
+            msg = f"{env_cmd} is not a valid command template ({e}): {cmd!r}"
+            if fatal:
+                sign_fail(msg)
+            return None, None, msg
     for kind, build in builders:
         argv = build()
         if argv is not None:
-            return argv, kind
-    return None, None
+            return argv, kind, None
+    return None, None, None
 
 
 def _policy_bool_env(name):
@@ -1560,10 +1608,19 @@ def load_attested_policy_bundle(run, *, require_signature):
             # init never configured a signer while THIS environment nonetheless expects
             # one, that is exactly the ambiguity GAP A closes — re-init under a
             # configured signer to get a verifiable run.
-            argv_tmpl, _kind = resolve_signing_tool(
+            argv_tmpl, _kind, resolve_err = resolve_signing_tool(
                 "AR_VERIFIER_CMD",
-                [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)])
-            if argv_tmpl is not None:
+                [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)],
+                fatal=False)
+            # A malformed AR_VERIFIER_CMD counts as "a verifier IS configured here" for
+            # this decision, not as "none configured" (fail OPEN into the infra-free
+            # exemption would be worse than fail-closed: an operator who clearly
+            # intended verification, but typo'd the command, must not silently lose
+            # protection). Codex r4055706494 (P2) — resolve_signing_tool no longer
+            # exits the process on a malformed override from this non-fatal call, so
+            # this BLOCK path is what reports the misconfiguration instead of a crash.
+            if argv_tmpl is not None or resolve_err:
+                detail = f" ({resolve_err})" if resolve_err else ""
                 return None, ("no policy.snapshot.json and no signed no-policy "
                               "attestation for this run, but a verifier IS configured "
                               "here and a signature is required to accept a waiver or "
@@ -1571,7 +1628,7 @@ def load_attested_policy_bundle(run, *, require_signature):
                               "fix, or no signer was configured at its own init; "
                               "re-init this run under a configured signer "
                               "(AR_TRUSTED_SIGNER=1 plus AR_SIGNER_CMD / cosign / "
-                              "minisign)")
+                              f"minisign){detail}")
         return AttestedPolicy({}, None, None, None, runjson), None
 
     try:

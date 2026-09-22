@@ -586,11 +586,18 @@ def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_path):
         print(f"note: policy-snapshot signing skipped ({trust_err}) — "
               f"policy.snapshot.json is unsigned; {note}")
         return
-    argv_tmpl, kind = resolve_signing_tool(
-        "AR_SIGNER_CMD", [("cosign-keyless", cosign_sign_argv), ("minisign", minisign_sign_argv)])
+    # fatal=False: this function's own docstring/contract is "deliberately best-effort
+    # and never fatal to init" -- a malformed AR_SIGNER_CMD must degrade to this same
+    # unsigned-but-non-fatal note, not crash `init` outright (Codex r4055706494, P2 --
+    # found on the verify-side sibling of this call; the same resolve_signing_tool()
+    # default would have broken this function's own stated contract identically).
+    argv_tmpl, kind, resolve_err = resolve_signing_tool(
+        "AR_SIGNER_CMD", [("cosign-keyless", cosign_sign_argv), ("minisign", minisign_sign_argv)],
+        fatal=False)
     if argv_tmpl is None:
+        detail = f" ({resolve_err})" if resolve_err else ""
         print(f"note: no signer configured (AR_SIGNER_CMD, or install cosign / minisign "
-              f"with AR_MINISIGN_KEY) — policy.snapshot.json is unsigned; {note}")
+              f"with AR_MINISIGN_KEY){detail} — policy.snapshot.json is unsigned; {note}")
         return
     want_sig_out = any("{sig}" in a for a in argv_tmpl)
     with tempfile.TemporaryDirectory() as td:
@@ -658,11 +665,14 @@ def _sign_policy_absence_if_possible(run, run_id, run_nonce, risk):
         print(f"note: no-policy attestation signing skipped ({trust_err}) — "
               f"policy.absence.json was not written; {note}")
         return
-    argv_tmpl, kind = resolve_signing_tool(
-        "AR_SIGNER_CMD", [("cosign-keyless", cosign_sign_argv), ("minisign", minisign_sign_argv)])
+    # fatal=False: same "never fatal to init" contract as _sign_policy_snapshot_if_possible.
+    argv_tmpl, kind, resolve_err = resolve_signing_tool(
+        "AR_SIGNER_CMD", [("cosign-keyless", cosign_sign_argv), ("minisign", minisign_sign_argv)],
+        fatal=False)
     if argv_tmpl is None:
+        detail = f" ({resolve_err})" if resolve_err else ""
         print(f"note: no signer configured (AR_SIGNER_CMD, or install cosign / minisign "
-              f"with AR_MINISIGN_KEY) — policy.absence.json was not written; {note}")
+              f"with AR_MINISIGN_KEY){detail} — policy.absence.json was not written; {note}")
         return
     want_sig_out = any("{sig}" in a for a in argv_tmpl)
     with tempfile.TemporaryDirectory() as td:

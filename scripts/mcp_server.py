@@ -1039,7 +1039,12 @@ def h_aggregate(args):
             if lock_fd is not None and lock_token is not None:
                 os.environ["AR_AGGREGATE_LOCK_TOKEN"] = lock_token
             try:
-                rc, out, err = _run_cli("aggregate", run_args)
+                # timeout=_sign_wrapping_timeout(): plain aggregation can invoke
+                # verify_policy_snapshot_signature/verify_policy_absence_signature (via
+                # check_gates), which is bounded by AR_SIGN_TIMEOUT (120s default) --
+                # the same mismatch h_init/h_gate_plan/h_gate_record were already fixed
+                # for. Codex r4055706491 (P2) found this same bare-120s gap here too.
+                rc, out, err = _run_cli("aggregate", run_args, timeout=_sign_wrapping_timeout())
             finally:
                 if _prev_tok is None:
                     os.environ.pop("AR_AGGREGATE_LOCK_TOKEN", None)
