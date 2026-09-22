@@ -48,6 +48,31 @@ fully compromised runner or a maintainer acting in bad faith.
 | 2 | A validly-signed run's `policy.snapshot.json`/`.sig` could be copied onto a **different run** — different repository, commit, or CI execution — and still verify, as long as the run directory's own name (and therefore `run_id`/`run_nonce`/risk) was forced to match | Batch 2: `ci_signing_context()` bound into `policy_attest_bytes` v3 — repository/commit/CI-run-id/CI-run-attempt, read fresh from the verifying process's **own** environment, never from a copyable file (commit `3e31f4a`) |
 | 3 | Signing was **opportunistic**: any job that happened to have a working signer configured would sign, with no check on *which* job that was — including a `pull_request`-triggered job running alongside the PR author's own code | Batch 3: `AR_TRUSTED_SIGNER` explicit opt-in **and** a refusal when `GITHUB_EVENT_NAME=pull_request` (`trusted_signer_guard_error()`) |
 
+### Cryptographic CI-identity pinning for cosign keyless (post-batch-3 hardening)
+
+`AR_ALLOW_KEYLESS=1` alone does not make keyless verification safe: Sigstore Fulcio issues
+short-lived certificates to *any* OIDC-authenticated signer, so `cosign verify-blob` also needs a
+`--certificate-identity`/`--certificate-oidc-issuer` (or `-regexp`) pin — without one, verification
+would accept a signature from any keyless signer on the internet, not just this repository's own
+CI, which would silently defeat the point of signing at all. Explicit operator configuration
+(`AR_COSIGN_IDENTITY` + `AR_COSIGN_ISSUER`) always wins when both are set — this is unchanged.
+When running under GitHub Actions (`GITHUB_REPOSITORY` set) with **neither** configured,
+`_auto_github_cosign_identity()` now derives an **anchored** identity regexp scoped to that exact
+repository (`^https://github\.com/<owner>/<repo>/`) paired with the GitHub Actions OIDC issuer
+(`https://token.actions.githubusercontent.com`), so the common case is pinned to this repo's own
+CI by default rather than left unpinned. Anchoring (`^...` with the repository name regex-escaped)
+is deliberate: an unanchored substring match would let `SathiaAI/adversarial-review-evil-fork`, or
+any repo whose name merely *contains* the trusted one, also pass. **Partial** explicit
+configuration (exactly one of `AR_COSIGN_IDENTITY`/`AR_COSIGN_ISSUER` set) never falls back to
+auto-derivation and never mixes an operator-set value with an auto-derived one — that would
+silently narrow or drop half of an operator's intended pin. It is instead treated as "no usable
+cosign-keyless config," and resolution falls through to minisign or `no verifier available`, same
+as before this change. GitLab CI has an equivalent OIDC identity
+(`CI_SERVER_URL`/`CI_PROJECT_PATH` via its own token issuer) that is deliberately **not**
+auto-derived here — kept out to keep this a PR-sized, single-platform hardening. GitLab keyless
+users still need to set `AR_COSIGN_IDENTITY`/`AR_COSIGN_ISSUER` explicitly; flagged here as an open
+item, not silently dropped.
+
 ## What remains open after batch 3 — adopter (workflow-configuration) responsibilities
 
 These are guarantees **no library-level code change can make on its own**, because a composite
@@ -116,6 +141,7 @@ into another), not a general trust-topology verifier.
 | A validly-signed run's artifacts replayed onto a different run/commit/repo, directory name forced to match | `ci_signing_context()` in `policy_attest_bytes` v3, read fresh at verify time | **Shipped batch 2** |
 | Signing runs opportunistically in whatever job happens to have a signer configured, including an untrusted `pull_request` job | `AR_TRUSTED_SIGNER` opt-in + `GITHUB_EVENT_NAME` refusal | **Shipped batch 3** |
 | Cosign keyless auto-activates without an explicit decision to use it | `AR_ALLOW_KEYLESS` opt-in | **Shipped batch 1** |
+| Keyless verification accepts a signature from any Sigstore-issued identity, not just this repo's own CI | Explicit `AR_COSIGN_IDENTITY`/`AR_COSIGN_ISSUER`, or (GitHub Actions only) an auto-derived identity anchored to `GITHUB_REPOSITORY` | **Shipped** — explicit pin: batch 1; auto-derivation: post-batch-3 hardening |
 | Trusted job executes a PR-ref (tampered) copy of the scripts instead of a pinned ref | Pin `uses: …@<sha>` in the trusted workflow | Adopter-configured; unenforceable from inside the script |
 | Secrets available to the untrusted review job | GitHub Actions environments / job-scoped secrets | Adopter-configured |
 | Waiver signed without any human approval evidence | Not yet built — candidate follow-up beyond the current 4-batch plan | Open |
