@@ -414,6 +414,48 @@ def _panel_timeout():
     return max(1800, req * (17 + 2 * (hs - 1)) * 6 + 600)
 
 
+def _sign_subprocess_timeout():
+    """AR_SIGN_TIMEOUT budget (seconds) for ONE out-of-process signer/verifier call (cosign,
+    minisign, or a custom AR_SIGNER_CMD/AR_VERIFIER_CMD). Mirrors _common.sign_timeout()'s own
+    parsing exactly (default 120s; a non-positive or non-numeric override falls back to that
+    default) WITHOUT importing _common here — mcp_server.py deliberately runs every pipeline
+    CLI as a separate subprocess (see _run_cli) and never imports _common's signing helpers
+    in-process, so this stays a plain env-var read, same as _panel_timeout() above reads
+    AR_TIMEOUT_S/AR_HIGH_SAMPLES rather than importing panel.py's own resolution logic."""
+    raw = os.environ.get("AR_SIGN_TIMEOUT", "120").strip()
+    try:
+        t = int(raw)
+    except ValueError:
+        return 120
+    return t if t > 0 else 120
+
+
+def _sign_wrapping_timeout():
+    """Subprocess wrapper timeout for an MCP tool call that can attempt AT MOST ONE
+    out-of-process signer/verifier invocation as part of an otherwise-fast CLI command:
+    `panel.py init` (an opportunistic, best-effort policy.snapshot.sig OR policy.absence.sig
+    signing attempt — the two are mutually exclusive per run, see
+    _sign_policy_snapshot_if_possible / _sign_policy_absence_if_possible in panel.py) and
+    `gate.py plan --waive` / `gate.py record` for a NOT_APPLICABLE gate (a fail-closed
+    signature VERIFICATION pre-check, so CLI/MCP automation never sees a false "accepted"
+    signal before aggregate.py's own later, authoritative check).
+
+    Before this, both call sites used _run_cli's/​_cli_result's bare 120s DEFAULT — the exact
+    same 120s _common.sign_timeout() itself defaults to — giving the OUTER MCP subprocess
+    wrapper ZERO margin over the INNER signer/verifier subprocess it wraps. Keyless cosign in
+    particular does a real network round trip to Fulcio/Rekor and can legitimately run close
+    to its own timeout budget under load; a slow-but-would-eventually-succeed attempt could
+    then have the outer wrapper kill the WHOLE tool call first — discarding an otherwise
+    fully-created run at init, or forcing a spurious retry at plan/record — before the
+    inner call's own timeout (and, for init, its surrounding best-effort try/except that only
+    warns and continues on signer failure) ever got a chance to run to completion.
+    security-4 (frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21). The +90s margin
+    covers Python/subprocess startup and the CLI's own (normally fast) surrounding work —
+    generous by design, matching the pattern _panel_timeout() already uses above for a much
+    larger multi-request budget."""
+    return _sign_subprocess_timeout() + 90
+
+
 def _run_cli(module, argv, timeout=120):
     """Invoke a pipeline CLI module as a subprocess (shell=False — no injection).
     Returns (returncode, stdout, stderr). The child inherits this process's environment — h_aggregate uses
@@ -514,7 +556,7 @@ def h_init(args):
         if rp not in ("critical", "contention", "any"):
             raise ToolError("rebuttal_policy must be critical, contention, or any")
         argv += ["--rebuttal-policy", rp]
-    rc, out, err = _run_cli("panel", argv)
+    rc, out, err = _run_cli("panel", argv, timeout=_sign_wrapping_timeout())
     if rc != 0:
         return _result(f"init failed:\n{(out + err).strip()}", is_error=True)
     # Report the EXACT run id init just created by parsing its stdout ("initialized <run-dir
@@ -580,7 +622,10 @@ def h_gate_plan(args):
         argv += ["--waive-reason", reason, "--waive-expires", expires]
     if auth:
         argv += ["--authorized-by", auth]
-    return _cli_result("gate", argv)
+    # A --waive plan verifies the run's policy signature at plan time (fail-closed pre-check,
+    # see _sign_wrapping_timeout's docstring) -- give the wrapper margin over that inner
+    # verifier subprocess's own timeout budget, same as h_init above.
+    return _cli_result("gate", argv, timeout=_sign_wrapping_timeout())
 
 
 def h_gate_record(args):
@@ -604,7 +649,9 @@ def h_gate_record(args):
     auth = _opt_authorizer(args)
     if auth:
         argv += ["--authorized-by", auth]
-    return _cli_result("gate", argv)
+    # A NOT_APPLICABLE record verifies the run's policy signature at record time too (same
+    # fail-closed pre-check as the --waive path above) -- same timeout margin reasoning.
+    return _cli_result("gate", argv, timeout=_sign_wrapping_timeout())
 
 
 def h_panel_assign(args):

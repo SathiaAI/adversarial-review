@@ -30,7 +30,7 @@ from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (POLICY_SIG_FILENAME, _policy_bool,
+from _common import (POLICY_ABSENCE_SIG_FILENAME, POLICY_SIG_FILENAME, _policy_bool,
                      canonical_finding_digest,
                      cosign_sign_argv as _cosign_sign_argv,
                      cosign_verify_argv as _cosign_verify_argv, family_of,
@@ -109,7 +109,14 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
     for g in raw_required:
         nerr = validate_gate_name(g) if isinstance(g, str) else "gate name must be a string"
         if nerr:
-            blocked.append(f"gate plan has a malformed required entry {g!r}: {nerr}")
+            # g is an untrusted, unvalidated manifest entry (that is WHY it is here — it just
+            # failed validate_gate_name) — repr() escapes Python string syntax (quotes,
+            # backslashes, newlines) but never HTML, so a crafted entry like
+            # "<img src=x onerror=alert(1)>" still rendered its tag raw into verdict.md before
+            # this fix (Codex finding #6, "a crafted waiver name renders unescaped into
+            # verdict.md" — security-4, frontier-gate run pr70-design-crypto-ci-identity,
+            # 2026-09-21). _oneline() HTML-escapes the whole repr'd form.
+            blocked.append(f"gate plan has a malformed required entry {_oneline(repr(g))}: {nerr}")
             continue
         required_names.append(g)
     gcov["required"] = list(required_names)
@@ -125,13 +132,14 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
         raw_waived = []
     for w in raw_waived:
         if not isinstance(w, dict):
-            blocked.append(f"gate plan has a malformed waiver entry {w!r} — expected an object "
-                           "with a string 'name'")
+            # Same repr()-is-not-HTML-safe gap as the required-entry loop above.
+            blocked.append(f"gate plan has a malformed waiver entry {_oneline(repr(w))} — expected "
+                           "an object with a string 'name'")
             continue
         wn = w.get("name")
         nerr = validate_gate_name(wn) if isinstance(wn, str) else "gate name must be a string"
         if nerr:
-            blocked.append(f"gate plan has a malformed waiver entry {w!r}: {nerr}")
+            blocked.append(f"gate plan has a malformed waiver entry {_oneline(repr(w))}: {nerr}")
             continue
         manifest_waived[wn] = w
     manifest_waived_names = set(manifest_waived)
@@ -169,7 +177,7 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
                 reason = ("WAIVED record is not authorized by the plan manifest's waived list "
                           "(orphaned or raced waiver) — re-run `gate.py plan`")
                 gcov["blocked"].append({"name": name, "reason": reason})
-                blocked.append(f"gate '{name}': {reason}")
+                blocked.append(f"gate '{name}': {_oneline(reason)}")
                 continue
             # Bind the record to the manifest entry's METADATA, not just the name: gate.py writes
             # the manifest and the record separately, so a concurrent replan could pair a short
@@ -183,7 +191,7 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
                           "(authorizer/reason/expiry mismatch — raced or tampered) — "
                           "re-run `gate.py plan`")
                 gcov["blocked"].append({"name": name, "reason": reason})
-                blocked.append(f"gate '{name}': {reason}")
+                blocked.append(f"gate '{name}': {_oneline(reason)}")
                 continue
             # A waiver's expiry can only be judged against a trustworthy clock — if the
             # CI-provided clock itself could not be parsed, no waiver can be honestly
@@ -194,7 +202,15 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
                                              manifest_planned_at=manifest_planned_at))
             if err:
                 gcov["blocked"].append({"name": name, "reason": err})
-                blocked.append(f"gate '{name}': {err}")
+                # security-4 (frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21,
+                # Codex finding #6): `err` can embed RAW rec-supplied content (e.g.
+                # validate_waived_gate's `expires {rec.get('expires')!r} is missing or not a
+                # valid...` message repr()s the untrusted `expires` field verbatim -- repr()
+                # only escapes Python string syntax, never HTML) -- HTML-escape before this
+                # reaches verdict.md, which renders `blocked` entries raw (unlike the
+                # `notes`/waived/not_applicable display dicts elsewhere in this function,
+                # which are already escaped at md-render time via _oneline).
+                blocked.append(f"gate '{name}': {_oneline(err)}")
             else:
                 who = rec.get("authorized_by").strip()
                 reason = rec.get("reason").strip()
@@ -205,7 +221,12 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
         elif status == "BLOCKED":
             reason = rec.get("summary", "could not verify")
             gcov["blocked"].append({"name": name, "reason": reason})
-            blocked.append(f"gate '{name}' blocked: {reason}")
+            # security-4 (Codex finding #6): `summary` is free-text from an untrusted
+            # gates/<name>.json record (an adversarial run directory can write anything
+            # here) and was previously interpolated into `blocked` -- which verdict.md
+            # renders RAW -- with no escaping at all, letting a crafted summary like
+            # "<img src=x onerror=alert(1)>" render as live markup in the report.
+            blocked.append(f"gate '{name}' blocked: {_oneline(reason)}")
         elif status == "NOT_APPLICABLE":
             # A gate that genuinely does not apply to this stack does NOT restrict the
             # verdict — but it is an accountable, on-record determination, so an invalid
@@ -215,7 +236,7 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
             err = validate_not_applicable_gate(name, tier, rec, pol_data)
             if err:
                 gcov["blocked"].append({"name": name, "reason": err})
-                blocked.append(f"gate '{name}': {err}")
+                blocked.append(f"gate '{name}': {_oneline(err)}")
             else:
                 # Guard against non-string values (JSON null, numbers, objects): a `null`
                 # authorizer must read as absent, not as the string "None" — already
@@ -231,7 +252,10 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
             blocked.append(f"gate '{name}' recorded without an exit code")
         elif status == "FAIL" or rec["exit_code"] != 0:
             gcov["failed"].append(name)
-            fail.append(f"gate '{name}' failed (exit {rec['exit_code']}): {rec.get('summary', '')}")
+            # security-4 (Codex finding #6): same untrusted, unescaped `summary` gap as the
+            # BLOCKED branch above -- a crafted gates/<name>.json FAIL record's summary
+            # previously rendered raw into verdict.md's `- FAIL:` bullet.
+            fail.append(f"gate '{name}' failed (exit {rec['exit_code']}): {_oneline(rec.get('summary', ''))}")
         else:
             gcov["passed"].append(name)
     return results, gcov
@@ -422,7 +446,12 @@ def check_rebuttal(run, meta, plan, reports, blocked, notes):
     missing = [r for r in plan.get("roles", {})
                if not (run / "rebuttal" / f"{r}.json").exists()]
     if missing:
-        blocked.append(f"rebuttal round required (policy '{policy}', risk {meta['risk']}, "
+        # `policy` is meta['rebuttal_policy'] (attacker-editable run.json in an untrusted run
+        # dir) looked up with .get(policy, default) -- no charset restriction -- so it can
+        # carry arbitrary text; escape it before this reaches `blocked`, which verdict.md
+        # renders raw (security-4, same class as Codex finding #6). `missing` role names come
+        # from panel.py's fixed role catalog, not free-form attacker text.
+        blocked.append(f"rebuttal round required (policy '{_oneline(policy)}', risk {meta['risk']}, "
                        f"high/critical findings present); missing for: {', '.join(missing)}")
     return rcov
 
@@ -440,24 +469,42 @@ _MAX_CANON_DEPTH = 200
 
 # Algorithm id stamped into every attestation. It is bumped whenever the canonical-vs-raw REPRESENTATION
 # changes, so --check-digest can date a stored attestation from the id alone (never by re-parsing an
-# artifact, which is runtime-dependent). "v3" additionally folds POLICY_SIG_FILENAME (policy.snapshot.sig)
-# into the digest as a raw-hashed input alongside the *.json artifacts — a delayed Codex review on PR70
-# found that the pre-v3 *.json-only glob made this init-time signature invisible to the attestation, so
-# deleting it (destroying the evidence a PASS with a WAIVED/NOT_APPLICABLE gate relied on) did not change
-# --check-digest's verdict. "v2" marks the byte-based raw policy (depth AND integer-width caps); "v1"
-# verdicts predate it. The id is metadata, NOT folded into the digest, so bumping it does not change any
-# digest for a run that doesn't have the new input — an unchanged shallow run with no policy.snapshot.sig
-# verifies identically under v2 or v3. (Codex r3930239157; PR70 provenance-binding hardening.)
-_ATTESTATION_ALGO = "sha256-canonical-json-v3"
+# artifact, which is runtime-dependent). "v4" additionally folds POLICY_ABSENCE_SIG_FILENAME
+# (policy.absence.sig, GAP A part 2 -- the signed no-policy attestation) into the digest as a raw-hashed
+# input, the same way "v3" already did for POLICY_SIG_FILENAME (policy.snapshot.sig): GAP A introduced a
+# SECOND non-JSON, pre-verdict signature sidecar without ever teaching compute_attestation() to hash it,
+# reintroducing under a new filename the exact gap a delayed Codex review on PR70 found and closed for
+# policy.snapshot.sig (deleting the sidecar destroyed the evidence a PASS with a WAIVED/NOT_APPLICABLE
+# gate relied on, invisibly to --check-digest, because the pre-v3 *.json-only glob never saw it). "v3"
+# covers policy.snapshot.sig; "v2" marks the byte-based raw policy (depth AND integer-width caps); "v1"
+# verdicts predate all of that. The id is metadata, NOT folded into the digest, so bumping it does not
+# change any digest for a run that doesn't have the new input — an unchanged run with no
+# policy.absence.sig verifies identically under v3 or v4. (Codex r3930239157 / security-3 follow-up,
+# frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21.)
+_ATTESTATION_ALGO = "sha256-canonical-json-v4"
 
 # Attestation algorithm ids this version can interpret in --check-digest: the current one plus recognized
 # PREDECESSORS. "sha256-canonical-json-v1" is the pre-byte-cap representation (a deep/wide artifact it
 # canonicalized, this version hashes "raw:"). "sha256-canonical-json-v2" predates policy.snapshot.sig
-# coverage. An id OUTSIDE this set — a newer tool's format, or a malformed/non-string value — is not
-# interpretable, so on a digest mismatch it is cannot-verify, never classified as a legacy transition or
-# as drift. (CodeRabbit r3930631485.)
-_LEGACY_ALGOS = ("sha256-canonical-json-v1", "sha256-canonical-json-v2")
+# coverage. "sha256-canonical-json-v3" predates policy.absence.sig coverage. An id OUTSIDE this set — a
+# newer tool's format, or a malformed/non-string value — is not interpretable, so on a digest mismatch it
+# is cannot-verify, never classified as a legacy transition or as drift. (CodeRabbit r3930631485.)
+_LEGACY_ALGOS = ("sha256-canonical-json-v1", "sha256-canonical-json-v2", "sha256-canonical-json-v3")
 _RECOGNIZED_ALGOS = _LEGACY_ALGOS + (_ATTESTATION_ALGO,)
+
+# Ordering of every algorithm id this version has ever produced or still recognizes, oldest first — used
+# ONLY by _sidecar_newly_covered_transition() below to tell "this predecessor algorithm never covered this
+# sidecar artifact at all" apart from "this predecessor covered it and the hash changed" (real drift).
+_ALGO_ORDER = _LEGACY_ALGOS + (_ATTESTATION_ALGO,)
+
+# The two non-JSON, pre-verdict signature sidecars this tool has ever hashed into the attestation, mapped
+# to the FIRST algorithm id whose compute_attestation() began covering each one. This table only feeds the
+# legacy-transition classifier in check_digest() — compute_attestation() itself always hashes whichever of
+# these exist on disk right now, unconditionally, regardless of this table.
+_SIDECAR_COVERAGE_INTRODUCED_AT = {
+    POLICY_SIG_FILENAME: "sha256-canonical-json-v3",
+    POLICY_ABSENCE_SIG_FILENAME: "sha256-canonical-json-v4",
+}
 
 # A JSON integer literal wider than this many digits is routed to the raw path, for the same
 # version-independence reason as the depth cap: whether json.loads ACCEPTS a very long integer depends on
@@ -546,16 +593,21 @@ def compute_attestation(run):
     Same untouched run in, same digest out — bit for bit, from the BYTES, so the raw-vs-canonical choice
     never depends on a per-runtime parser limit (recursion depth or integer-string width)."""
     files = {}
-    # POLICY_SIG_FILENAME (policy.snapshot.sig) is a non-JSON, PRE-verdict artifact — it is
-    # written by panel.py at init, well before this function ever runs, so hashing it here is
-    # not circular (unlike SIG_FILENAME/attestation.sig below, which signs THIS digest and so
-    # must stay excluded). Hash it as raw bytes, same as any other artifact that can't be
-    # JSON-canonicalized, so deleting it (destroying the evidence a WAIVED/NOT_APPLICABLE PASS
-    # relied on) changes the digest instead of being invisible to it. (Codex, PR70 review,
-    # frontier-gate run pr70-provenance-2.)
-    sig_p = run / POLICY_SIG_FILENAME
-    if sig_p.is_file():
-        files[POLICY_SIG_FILENAME] = "raw:" + hashlib.sha256(sig_p.read_bytes()).hexdigest()
+    # POLICY_SIG_FILENAME (policy.snapshot.sig) and POLICY_ABSENCE_SIG_FILENAME
+    # (policy.absence.sig) are non-JSON, PRE-verdict artifacts — both are written by panel.py
+    # at init, well before this function ever runs, so hashing them here is not circular
+    # (unlike SIG_FILENAME/attestation.sig below, which signs THIS digest and so must stay
+    # excluded). Hash each as raw bytes, same as any other artifact that can't be
+    # JSON-canonicalized, so deleting either one (destroying the evidence a WAIVED/
+    # NOT_APPLICABLE PASS, or a no-policy PASS, relied on) changes the digest instead of being
+    # invisible to it. (Codex, PR70 review, frontier-gate run pr70-provenance-2 for
+    # policy.snapshot.sig; the same gap reappeared for policy.absence.sig when GAP A introduced
+    # it without extending this coverage, closed here — frontier-gate run
+    # pr70-design-crypto-ci-identity, 2026-09-21.)
+    for sig_filename in (POLICY_SIG_FILENAME, POLICY_ABSENCE_SIG_FILENAME):
+        sig_p = run / sig_filename
+        if sig_p.is_file():
+            files[sig_filename] = "raw:" + hashlib.sha256(sig_p.read_bytes()).hexdigest()
     for p in sorted(run.rglob("*.json")):
         rel = p.relative_to(run).as_posix()
         if rel == "verdict.json":
@@ -596,6 +648,39 @@ def _canon_to_raw_transition(stored_hash, recomputed_hash):
     an artifact's CONTENT while it stays canonical (canonical->different-canonical) is not this shape, so
     it is never mistaken for the benign transition. (Codex r3930239157 / CodeRabbit r3930172612.)"""
     return (isinstance(stored_hash, str) and not stored_hash.startswith("raw:")
+            and isinstance(recomputed_hash, str) and recomputed_hash.startswith("raw:"))
+
+
+def _sidecar_newly_covered_transition(rel, stored_algo, stored_hash, recomputed_hash):
+    """True iff one attestation entry differs in exactly the shape of "a known non-JSON
+    signature sidecar that the CURRENT algorithm hashes was not tracked as an input AT ALL
+    under stored_algo" -- i.e. `rel` is a key in _SIDECAR_COVERAGE_INTRODUCED_AT, stored_algo
+    predates the algorithm version that introduced that sidecar's coverage, the artifact was
+    simply ABSENT from the OLD manifest (stored_hash is None -- never hashed under that
+    algorithm, not hashed-and-then-different), and the recompute now has a raw: hash for it.
+
+    Deliberately narrow, same shape as _canon_to_raw_transition above: never true for an
+    existing key whose hash changed, and never true for a key stored_algo already knew to
+    hash (a genuine change there is real drift, exit 1, exactly as before this function
+    exists). Real tampering that DELETES a sidecar stored_algo already covered, or that
+    modifies one while keeping the filename, is not this shape.
+
+    Codex finding #7 (frontier-gate run pr70-design, 2026-09-21 status-correction review): a
+    legitimate algorithm-version transition that starts covering an artifact which simply did
+    not exist as a tracked input under the old algorithm was misreported as tampering ("DRIFT
+    added policy.snapshot.sig", exit 1) instead of cannot-verify (exit 2) -- the exact same
+    class of false positive _canon_to_raw_transition already prevents for the byte-cap
+    representation change, generalized here to cover "a whole new tracked artifact" rather
+    than only "an existing one's hash format changed"."""
+    introduced_at = _SIDECAR_COVERAGE_INTRODUCED_AT.get(rel)
+    if introduced_at is None:
+        return False
+    try:
+        stored_idx = _ALGO_ORDER.index(stored_algo)
+        introduced_idx = _ALGO_ORDER.index(introduced_at)
+    except ValueError:
+        return False
+    return (stored_idx < introduced_idx and stored_hash is None
             and isinstance(recomputed_hash, str) and recomputed_hash.startswith("raw:"))
 
 
@@ -696,17 +781,32 @@ def check_digest(run):
     # fix), and a runtime-independent re-canonicalization of a deep artifact does not exist. A CURRENT
     # -algorithm verdict is NEVER routed here: a canonical->raw mismatch on it is real DRIFT (exit 1).
     # (Codex r3930666148 / CodeRabbit r3930631493, <FIX21>; corrects fix-20's "unchanged" overstatement.)
+    #
+    # A SECOND, independent legacy shape is checked alongside it: _sidecar_newly_covered_transition
+    # (Codex finding #7, frontier-gate run pr70-design, 2026-09-21) — a differing artifact that is a known
+    # signature sidecar the CURRENT algorithm hashes, but that stored_algo never tracked as an input at
+    # all (added, not hash-format-changed). Both shapes are per-artifact and mutually exclusive by
+    # construction (one requires an existing old hash, the other requires none), so `any()` per item is
+    # correct — but EVERY differing artifact must match one shape or the other for the whole record to be
+    # legacy-unverifiable; a single artifact outside both shapes still routes the entire record to DRIFT.
     if (drifted and stored_algo in _LEGACY_ALGOS
-            and all(_canon_to_raw_transition(a, b) for _rel, a, b in drifted)):
-        for rel, _a, _b in drifted:
-            print(f"  LEGACY   {rel} (canonical->raw transition from a pre-{_ATTESTATION_ALGO} "
-                  "attestation; unverifiable from the recorded hashes)")
+            and all(_canon_to_raw_transition(a, b) or _sidecar_newly_covered_transition(rel, stored_algo, a, b)
+                    for rel, a, b in drifted)):
+        for rel, a, b in drifted:
+            if _sidecar_newly_covered_transition(rel, stored_algo, a, b):
+                print(f"  LEGACY   {rel} (not covered by the attestation algorithm that produced this "
+                      "record; unverifiable from the recorded hashes)")
+            else:
+                print(f"  LEGACY   {rel} (canonical->raw transition from a pre-{_ATTESTATION_ALGO} "
+                      "attestation; unverifiable from the recorded hashes)")
         print("attestation CANNOT BE VERIFIED: the stored attestation was produced by an earlier "
-              "algorithm and every differing artifact is a canonical->raw representation transition. The "
+              "algorithm and every differing artifact is either a canonical->raw representation "
+              "transition or a signature sidecar that algorithm never tracked as an input at all. The "
               "recorded hashes cannot establish whether the content is unchanged (a benign version "
-              "transition) or was modified while staying beyond the cap — this tool cannot tell them apart "
-              "without a runtime-dependent re-parse. Re-aggregate under the current algorithm to obtain a "
-              "verifiable verdict, then re-check.", file=sys.stderr)
+              "transition) or was modified — this tool cannot tell them apart without a runtime-dependent "
+              "re-parse, or (for a newly-covered sidecar) without ever having hashed it in the first "
+              "place. Re-aggregate under the current algorithm to obtain a verifiable verdict, then "
+              "re-check.", file=sys.stderr)
         sys.exit(2)
     for rel, a, b in drifted:
         tag = "added" if a is None else ("removed" if b is None else "modified")
@@ -968,12 +1068,20 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
     dev = set(meta.get("dev_providers", []))
     sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     for name, rec in records:
+        # security-4 (frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21, same class
+        # as Codex finding #6): `name` is a raw FILESYSTEM filename under validation/ in an
+        # untrusted run directory — nothing validates it against a safe charset the way
+        # validate_gate_name() does for gate names — and every message below interpolates it
+        # into `fail`/`blocked`, which verdict.md renders RAW. HTML-escape it once, here, and
+        # use the escaped form in every message; `name` itself is never used as a path or key
+        # anywhere else in this loop, so this changes only what gets displayed.
+        ename = _oneline(name)
         if not isinstance(rec, dict):
-            blocked.append(f"validation/{name}: malformed record (not an object)")
+            blocked.append(f"validation/{ename}: malformed record (not an object)")
             continue
         ids = rec.get("finding_ids")
         if not isinstance(ids, list):
-            blocked.append(f"validation/{name}: finding_ids is malformed (not a list)")
+            blocked.append(f"validation/{ename}: finding_ids is malformed (not a list)")
             continue
         # A non-string member was previously filtered silently. That is fail-SAFE (a dropped id
         # leaves its finding uncovered, which itself BLOCKs) — not the fail-open the reviewer
@@ -981,7 +1089,7 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
         # BLOCK uniform so a garbled record is surfaced, never quietly reinterpreted (4th-panel
         # correctness-3).
         if not all(isinstance(i, str) for i in ids):
-            blocked.append(f"validation/{name}: finding_ids has a non-string member — malformed")
+            blocked.append(f"validation/{ename}: finding_ids has a non-string member — malformed")
             continue
         cls = rec.get("classification")
         sev = rec.get("severity") or min(
@@ -989,46 +1097,61 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
             key=lambda s: sev_rank.get(s, 9), default="low")
         covered.update(ids)
         if cls not in ("confirmed", "false_positive", "unresolved", "accepted_risk"):
-            blocked.append(f"validation/{name}: invalid classification '{cls}'")
+            # cls is untrusted rec content too (any JSON value/string) — escape before display.
+            blocked.append(f"validation/{ename}: invalid classification '{_oneline(cls)}'")
             continue
         is_high = sev in HIGH or any(findings.get(i, {}).get("severity") in HIGH for i in ids)
         if cls == "unresolved" and is_high:
-            fail.append(f"validation/{name}: high/critical finding unresolved ({', '.join(ids)})")
+            # ids are reviewer-supplied finding identifiers — same untrusted-string concern,
+            # escaped as a whole (this list is display-only here; the raw `ids` list, never this
+            # joined string, is what still drives covered/is_high/etc. above and below).
+            fail.append(f"validation/{ename}: high/critical finding unresolved "
+                       f"({_oneline(', '.join(ids))})")
             counts["unresolved"] += 1
         elif cls == "confirmed":
             counts["confirmed"] += 1
             res = rec.get("resolution") or {}
             if not (res.get("fixed") is True and res.get("gates_rerun")):
-                fail.append(f"validation/{name}: confirmed finding not fixed with gates rerun")
+                fail.append(f"validation/{ename}: confirmed finding not fixed with gates rerun")
         elif cls == "false_positive" and is_high:
             conc = rec.get("concurrence") or {}
             if not rec.get("evidence"):
-                blocked.append(f"validation/{name}: false_positive without evidence")
+                blocked.append(f"validation/{ename}: false_positive without evidence")
             if conc.get("agrees_false_positive") is not True:
-                blocked.append(f"validation/{name}: false_positive on high/critical "
+                blocked.append(f"validation/{ename}: false_positive on high/critical "
                                "without an agreeing concurrence from an uninvolved model")
             else:
+                # family_of() falls back to echoing the untrusted model_id's own prefix
+                # verbatim when it is not a recognized alias — so cfam itself can carry
+                # attacker-chosen text, same as cls/ids above.
                 cfam = family_of(conc.get("model_id", "unknown/unknown"))
                 bad = author_families(ids, plan) | dev
                 if cfam in bad:
-                    blocked.append(f"validation/{name}: concurrence model family "
-                                   f"'{cfam}' is not independent of the finding/dev")
+                    blocked.append(f"validation/{ename}: concurrence model family "
+                                   f"'{_oneline(cfam)}' is not independent of the finding/dev")
         elif cls == "accepted_risk":
             today = date.today().isoformat()
             for fid in ids:
+                # fid stays RAW for the suppressions dict lookup (its key namespace is
+                # independent of display safety); only the rendered message is escaped.
+                efid = _oneline(fid)
                 s = suppressions.get(fid)
                 if not s:
-                    fail.append(f"validation/{name}: accepted_risk '{fid}' has no suppression entry")
+                    fail.append(f"validation/{ename}: accepted_risk '{efid}' has no suppression entry")
                 elif not all(s.get(k) for k in ("evidence", "owner", "expires")):
-                    fail.append(f"suppression for '{fid}' incomplete (needs evidence, owner, expires)")
+                    fail.append(f"suppression for '{efid}' incomplete (needs evidence, owner, expires)")
                 elif s["expires"] < today:
-                    fail.append(f"suppression for '{fid}' expired {s['expires']}")
+                    # s["expires"] is likewise an untrusted suppressions.json field.
+                    fail.append(f"suppression for '{efid}' expired {_oneline(s['expires'])}")
 
     uncovered = [i for i, f in findings.items()
                  if f["severity"] in HIGH and i not in covered]
     if uncovered:
+        # Finding ids are reviewer-supplied (untrusted) — escape the joined display list, same
+        # concern as the validation/{name} block above; `uncovered`/`sorted()` themselves are
+        # unaffected (they sort/compare the raw ids, only the rendered string is escaped).
         blocked.append("high/critical findings with no validation record: "
-                       + ", ".join(sorted(uncovered)))
+                       + _oneline(", ".join(sorted(uncovered))))
     # A reviewer explicitly flagged these as release-blocking; severity alone does not
     # exempt them from triage. Untriaged = verification incomplete = BLOCKED.
     flagged = [i for i, f in findings.items()
@@ -1036,7 +1159,7 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
                and i not in covered]
     if flagged:
         blocked.append("reviewer-flagged release-blocking findings without triage: "
-                       + ", ".join(sorted(flagged)))
+                       + _oneline(", ".join(sorted(flagged))))
     untriaged = [i for i, f in findings.items()
                  if f["severity"] not in HIGH and i not in covered]
     if untriaged:
@@ -1557,10 +1680,13 @@ def _aggregate_cli():
         md = [f"# Release verdict: {verdict}", "",
               f"Run `{meta['run_id']}`, risk {meta['risk']}, computed {out['computed_at']}.", ""]
         # fail/blocked reasons are already escaped where they interpolate untrusted text (reviewer
-        # strings via _snippet; tampered gate names are rejected by validate_gate_name, and a
-        # malformed manifest entry is shown via repr, which escapes newlines) — so they are NOT
-        # re-escaped here (that would double-escape, e.g. &lt; -> &amp;lt;). Notes are raw, so
-        # they are escaped at render.
+        # strings via _snippet; tampered gate names are rejected by validate_gate_name; a malformed
+        # manifest entry is shown via repr, which escapes newlines; and, as of security-4/Codex
+        # finding #6, every gates/<name>.json-sourced summary/validation-error text check_gates()
+        # appends to `fail`/`blocked` is now _oneline()-escaped at that append site, closing the gap
+        # where a crafted BLOCKED/FAIL record summary rendered raw markup into this report) — so
+        # they are NOT re-escaped here (that would double-escape, e.g. &lt; -> &amp;lt;). Notes are
+        # raw, so they are escaped at render.
         md += [f"- FAIL: {r}" for r in fail]
         md += [f"- BLOCKED: {r}" for r in blocked]
         md += [f"- note: {_oneline(n)}" for n in notes]

@@ -655,7 +655,7 @@ def t_attestation_reproducible():
     sh(["aggregate.py"], repo, expect=0)
     v1 = read(run / "verdict.json")
     att1 = v1["attestation"]
-    assert att1["algorithm"] == "sha256-canonical-json-v3"
+    assert att1["algorithm"] == "sha256-canonical-json-v4"
     assert att1["inputs"] == len(att1["files"]) > 0
     assert "verdict.json" not in att1["files"]
     assert "run.json" in att1["files"] and "gates/unit.json" in att1["files"]
@@ -795,7 +795,7 @@ def t_attestation_wide_integer_raw_hashed_deterministically():
     sh(["aggregate.py"], repo, expect=0)
     att = read(run / "verdict.json")["attestation"]
     assert att["files"]["wide.json"].startswith("raw:"), att["files"]["wide.json"]
-    assert att["algorithm"] == "sha256-canonical-json-v3", att["algorithm"]
+    assert att["algorithm"] == "sha256-canonical-json-v4", att["algorithm"]
     sh(["aggregate.py", "--check-digest"], repo, expect=0)          # recomputed digest matches -> intact
 
 
@@ -815,10 +815,10 @@ def t_check_digest_legacy_deep_artifact_is_cannot_verify_not_drift():
         "severity": "high", "evidence": "reproduced", "reproduced": True,
         "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
     (run / "deep.json").write_bytes(("[" * 100000 + "]" * 100000).encode("utf-8"))  # re-parse RecursionErrors
-    sh(["aggregate.py"], repo, expect=0)                            # v3 verdict: deep.json -> "raw:"
+    sh(["aggregate.py"], repo, expect=0)                            # v4 verdict: deep.json -> "raw:"
     v = read(run / "verdict.json")
     att = v["attestation"]
-    assert att["algorithm"] == "sha256-canonical-json-v3", att["algorithm"]
+    assert att["algorithm"] == "sha256-canonical-json-v4", att["algorithm"]
     assert att["files"]["deep.json"].startswith("raw:"), att["files"]["deep.json"]
     # (1) Forge a LEGACY verdict: stamp the PREVIOUS algorithm id and store a plain (non-"raw:") canonical
     # hash for the deep artifact, as the old tool on a high-recursion-limit runtime did. (Its true canonical
@@ -1421,7 +1421,7 @@ def t_sign_verify_require_current_attestation_algorithm():
     good_sig = (run / "attestation.sig").read_bytes()
     v = read(run / "verdict.json")
     assert v["attestation"]["algorithm"] == aggregate._ATTESTATION_ALGO, v["attestation"].get("algorithm")
-    v["attestation"]["algorithm"] = "sha256-canonical-json-v4"                    # unrecognized future id
+    v["attestation"]["algorithm"] = "sha256-canonical-json-v5"                    # unrecognized future id
     write(run / "verdict.json", v)
     # sign refuses at the algorithm gate (exit 1), before any signer work, leaving the sidecar untouched
     rs = sh(["aggregate.py", "--sign"], repo, expect=1, env=env)
@@ -5330,7 +5330,7 @@ def _write_run(path, verdict="PASS", risk="NORMAL", run_id="run-x", reports=None
         (d / "panel" / (role + ".json")).write_text(json.dumps({"role": role, "findings": findings}))
     for i, rec in enumerate(validations or []):
         (d / "validation" / ("v%d.json" % i)).write_text(json.dumps(rec))
-    att = compute_attestation(d)  # sha256-canonical-json-v3 over every .json (+ policy.snapshot.sig raw) except verdict.json
+    att = compute_attestation(d)  # sha256-canonical-json-v4 over every .json (+ policy.snapshot.sig/policy.absence.sig raw) except verdict.json
     (d / "verdict.json").write_text(json.dumps({
         "verdict": verdict, "risk": risk, "run_id": run_id, "computed_at": "2026-08-20T00:00:00Z",
         "counts": {"findings_high_critical": 0, "findings_medium_low": 0, "confirmed": 0, "unresolved": 0},
@@ -9839,6 +9839,75 @@ def t_mcp_panel_timeout_budgets_the_substitution_catalog_fetch():
                 os.environ[_k] = _v
 
 
+def t_mcp_sign_wrapping_timeout_margin():
+    # security-4 (frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21): the MCP
+    # subprocess wrapper around `panel.py init` / `gate.py plan --waive` / `gate.py record`
+    # (NOT_APPLICABLE) can invoke ONE out-of-process signer/verifier call bounded by
+    # AR_SIGN_TIMEOUT (_common.sign_timeout(), default 120s). Before this fix those three MCP
+    # tool handlers used _run_cli's/_cli_result's bare 120s DEFAULT -- the exact same 120s the
+    # inner subprocess itself defaults to -- giving the outer wrapper ZERO margin over the
+    # inner call it wraps. _sign_subprocess_timeout() mirrors _common.sign_timeout()'s parsing
+    # exactly (without importing _common — mcp_server.py deliberately runs every pipeline CLI
+    # as a separate subprocess); _sign_wrapping_timeout() adds a fixed margin on top.
+    old = os.environ.get("AR_SIGN_TIMEOUT")
+    try:
+        os.environ.pop("AR_SIGN_TIMEOUT", None)
+        assert mcpsrv._sign_subprocess_timeout() == 120
+        assert mcpsrv._sign_wrapping_timeout() == 210
+        assert mcpsrv._sign_wrapping_timeout() > 120, (
+            "the wrapper timeout must exceed the bare 120s default it used to use, even when "
+            "AR_SIGN_TIMEOUT is unset -- the whole point of this fix")
+        os.environ["AR_SIGN_TIMEOUT"] = "300"
+        assert mcpsrv._sign_subprocess_timeout() == 300
+        assert mcpsrv._sign_wrapping_timeout() == 390
+        assert mcpsrv._sign_wrapping_timeout() > mcpsrv._sign_subprocess_timeout(), (
+            "the wrapper must always exceed the inner subprocess timeout it wraps, at any "
+            "AR_SIGN_TIMEOUT setting")
+        for bad in ("garbage", "-5", "0", ""):
+            os.environ["AR_SIGN_TIMEOUT"] = bad
+            assert mcpsrv._sign_subprocess_timeout() == 120, bad  # bad/non-positive -> default
+            assert mcpsrv._sign_wrapping_timeout() == 210, bad
+    finally:
+        if old is None:
+            os.environ.pop("AR_SIGN_TIMEOUT", None)
+        else:
+            os.environ["AR_SIGN_TIMEOUT"] = old
+
+
+def t_mcp_init_and_gate_wrap_signing_calls_with_margin_not_bare_default():
+    # h_init (ar_init -> panel.py init) and h_gate_plan/h_gate_record (ar_gate_plan/ar_gate_record
+    # -> gate.py plan/record) must each pass _sign_wrapping_timeout() to the underlying
+    # _run_cli/_cli_result call, not silently fall back to the bare 120s default those functions
+    # use when no timeout is given. Monkeypatch _run_cli itself (the lower-level primitive
+    # _cli_result also calls) so this is a pure unit test of what timeout each handler REQUESTS
+    # -- no real signer, run directory, or subprocess involved.
+    calls = []
+    orig_run_cli = mcpsrv._run_cli
+
+    def fake_run_cli(module, argv, timeout=120):
+        calls.append((module, argv, timeout))
+        if module == "panel" and argv[:1] == ["init"]:
+            return 0, "initialized run-20260921-000000 (risk=NORMAL)\n", ""
+        return 0, "{}", ""
+
+    mcpsrv._run_cli = fake_run_cli
+    try:
+        expect = mcpsrv._sign_wrapping_timeout()
+        assert expect > 120, "test is only meaningful if the margin actually exceeds the bare default"
+        r = mcpsrv.h_init({"risk": "NORMAL", "dev_providers": ["anthropic"]})
+        assert calls[-1][0] == "panel" and calls[-1][2] == expect, calls[-1]
+        assert not r.get("isError"), r
+        mcpsrv.h_gate_plan({"run": "run-20260921-000000", "require": ["unit"]})
+        assert calls[-1][0] == "gate" and calls[-1][2] == expect, calls[-1]
+        mcpsrv.h_gate_record({"run": "run-20260921-000000", "name": "unit", "summary": "ok",
+                              "status": "PASS", "exit_code": 0})
+        assert calls[-1][0] == "gate" and calls[-1][2] == expect, calls[-1]
+        # Every captured call used the margin, never the bare 120s default this fix replaces.
+        assert all(c[2] == expect for c in calls), calls
+    finally:
+        mcpsrv._run_cli = orig_run_cli
+
+
 def t_mcp_panel_run_validates_catalog_before_writing_context():
     # A rejected ar_panel_run (escaping catalog_file) must NOT mutate the run's audit record:
     # catalog_file is validated BEFORE context.md is overwritten, so completed reviewer reports are
@@ -11265,10 +11334,10 @@ def t_check_digest_unrecognized_algorithm_id_matching_digest_is_cannot_verify():
         "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
     sh(["aggregate.py"], repo, expect=0)
     base = read(run / "verdict.json")
-    assert base["attestation"]["algorithm"] == "sha256-canonical-json-v3", base["attestation"]["algorithm"]
+    assert base["attestation"]["algorithm"] == "sha256-canonical-json-v4", base["attestation"]["algorithm"]
     # Change ONLY the algorithm id (unknown string, then malformed non-string); leave files + digest exactly
     # as written so the recompute still equals the stored digest -- the digest-match path would exit 0.
-    for algo in ("sha256-canonical-json-v4", 2):
+    for algo in ("sha256-canonical-json-v5", 2):
         base["attestation"]["algorithm"] = algo
         (run / "verdict.json").write_text(json.dumps(base))
         r = sh(["aggregate.py", "--check-digest"], repo, expect=2)
@@ -11622,8 +11691,8 @@ def t_mcp_rebuttal_tool_description_covers_any_policy():
 
 def t_check_digest_unrecognized_algorithm_id_is_cannot_verify():
     # CodeRabbit r3930631485: --check-digest must validate the stored `algorithm` id BEFORE any legacy
-    # handling. Only the current sha256-canonical-json-v3 and recognized predecessors (...-v1, -v2) are
-    # interpretable; a NEWER, unknown, or malformed (non-string) id means this version cannot interpret the
+    # handling. Only the current sha256-canonical-json-v4 and recognized predecessors (...-v1, -v2, -v3)
+    # are interpretable; a NEWER, unknown, or malformed (non-string) id means this version cannot interpret the
     # representation, so a digest mismatch is cannot-verify (exit 2) -- never the legacy canonical->raw path
     # and never DRIFT (exit 1). Fails on the pre-fix source, which had no id whitelist: an unknown id whose
     # drift is not a canonical->raw transition fell through to DRIFT (exit 1).
@@ -11636,7 +11705,7 @@ def t_check_digest_unrecognized_algorithm_id_is_cannot_verify():
     sh(["aggregate.py"], repo, expect=0)
     v = read(run / "verdict.json")
     att = v["attestation"]
-    assert att["algorithm"] == "sha256-canonical-json-v3", att["algorithm"]
+    assert att["algorithm"] == "sha256-canonical-json-v4", att["algorithm"]
     some = sorted(att["files"])[0]                                  # any recorded artifact
     assert not att["files"][some].startswith("raw:"), \
         "the tampered file's recompute must be a PLAIN hash so the drift is not a canonical->raw transition"
@@ -11651,11 +11720,11 @@ def t_check_digest_unrecognized_algorithm_id_is_cannot_verify():
         (run / "verdict.json").write_text(json.dumps(doc))
 
     # (a) a NEWER/unknown string id this version does not know
-    forge("sha256-canonical-json-v4")
+    forge("sha256-canonical-json-v5")
     r = sh(["aggregate.py", "--check-digest"], repo, expect=2)
     blob = r.stdout + r.stderr
     assert "CANNOT BE VERIFIED" in blob, blob
-    assert "sha256-canonical-json-v4" in blob, "message must name the unrecognized id"
+    assert "sha256-canonical-json-v5" in blob, "message must name the unrecognized id"
     assert "recognize" in blob, blob
     assert "MISMATCH" not in r.stdout and "DRIFT" not in r.stdout, \
         "an unrecognized id is cannot-verify, never DRIFT"
