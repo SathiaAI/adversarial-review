@@ -675,14 +675,57 @@ def minisign_sign_argv():
     return ["minisign", "-S", "-s", key, "-m", "{msg}", "-x", "{sig}"]
 
 
+_GITHUB_ACTIONS_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
+
+
+def _auto_github_cosign_identity():
+    """Derive (certificate_identity_regexp, issuer) scoped to the current GitHub
+    repository from GITHUB_REPOSITORY (e.g. "octo-org/octo-repo"), for use ONLY as a
+    fallback when the operator has set NEITHER AR_COSIGN_IDENTITY NOR AR_COSIGN_ISSUER
+    (see cosign_verify_argv). Returns (None, None) when GITHUB_REPOSITORY is unset/blank
+    -- nothing to scope to, and auto-derivation must not guess.
+
+    security-3 (frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21, Paul:
+    "Yes to stronger cryptographic CI Identity check"): before this, AR_COSIGN_IDENTITY /
+    AR_COSIGN_ISSUER were purely operator-typed strings with ZERO cross-validation
+    against ci_signing_context()'s live CI-context binding -- WHO cosign will accept as
+    the signer (the certificate identity) and WHAT the payload itself claims about its CI
+    context (repository/commit/run_id/run_attempt, bound into policy_attest_bytes /
+    policy_absence_attest_bytes via ci_signing_context) were two independently-configured
+    checks that could silently drift apart: an operator could paste in the wrong issuer,
+    or an identity regexp scoped to a different repository than the one actually running,
+    and nothing would catch the mismatch. Deriving the issuer and an ANCHORED identity
+    regexp from the SAME GITHUB_REPOSITORY value ci_signing_context() itself reads closes
+    that gap for the common case (GitHub Actions, no custom OIDC federation) without
+    requiring the operator to hand-copy a federation URL, while an explicit
+    AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pair (both set) still always wins unchanged --
+    this is a fallback, never an override.
+
+    The regexp is anchored with a leading ^ and a trailing / specifically so
+    "octo-org/octo-repo" cannot match a workflow identity for "octo-org/octo-repo-evil"
+    or any other repository/org -- re.escape() further neutralizes any regex
+    metacharacter the repository slug itself might contain.
+
+    GitLab's OIDC keyless-signing equivalent is deliberately NOT extended here --
+    GitLab's cosign keyless flow uses a different, CI_SERVER_URL-relative OIDC issuer
+    shape this PR does not derive (kept PR-sized; see GAP B for what WAS extended to
+    GitLab, the CI-identity payload binding in ci_signing_context/trusted_signer_guard).
+    A GitLab operator using cosign keyless must still set AR_COSIGN_IDENTITY/
+    AR_COSIGN_ISSUER explicitly, exactly as before this change."""
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if not repo:
+        return None, None
+    return "^https://github\\.com/" + re.escape(repo) + "/", _GITHUB_ACTIONS_OIDC_ISSUER
+
+
 def cosign_verify_argv():
     # Keyless verification is only meaningful against an expected signer identity +
     # issuer: `cosign verify-blob` WITHOUT --certificate-identity/--certificate-oidc-issuer
     # accepts ANY valid Fulcio certificate, so it must not be auto-selected as the
-    # verifier unless BOTH are set. When they are missing we return None and fall
-    # through (to minisign, or to a loud "no verifier available" naming
-    # AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER) rather than silently verifying against an
-    # unconstrained identity (panel finding security-1).
+    # verifier unless both are resolved -- explicitly by the operator, or auto-derived
+    # below. When neither resolves we return None and fall through (to minisign, or to a
+    # loud "no verifier available" naming AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER) rather than
+    # silently verifying against an unconstrained identity (panel finding security-1).
     #
     # EXPLICIT OPT-IN ONLY (frontier-gate run pr70-architecture-review, 2026-09-20) --
     # same AR_ALLOW_KEYLESS gate as cosign_sign_argv above, and for the same reason:
@@ -694,10 +737,25 @@ def cosign_verify_argv():
         return None
     ident = os.environ.get("AR_COSIGN_IDENTITY", "").strip()
     issuer = os.environ.get("AR_COSIGN_ISSUER", "").strip()
-    if not (ident and issuer):
-        return None
-    return ["cosign", "verify-blob", "--bundle", "{sig}",
-            "--certificate-identity", ident, "--certificate-oidc-issuer", issuer, "{msg}"]
+    if ident and issuer:
+        # Operator-specified exact identity always wins, unchanged from before this
+        # change -- an explicit pair is never second-guessed or replaced by the
+        # auto-derived regexp below, even when GITHUB_REPOSITORY also happens to be set.
+        return ["cosign", "verify-blob", "--bundle", "{sig}",
+                "--certificate-identity", ident, "--certificate-oidc-issuer", issuer, "{msg}"]
+    if not ident and not issuer:
+        # Neither set explicitly: fall back to an auto-derived, anchored identity
+        # (security-3, see _auto_github_cosign_identity docstring). A PARTIAL explicit
+        # config (exactly one of the two set) is left alone here and falls through to
+        # None below -- silently combining one operator-chosen value with one
+        # auto-derived value could pair an intentional custom issuer with an identity
+        # regexp scoped to the wrong OIDC federation, or vice versa.
+        auto_regexp, auto_issuer = _auto_github_cosign_identity()
+        if auto_regexp and auto_issuer:
+            return ["cosign", "verify-blob", "--bundle", "{sig}",
+                    "--certificate-identity-regexp", auto_regexp,
+                    "--certificate-oidc-issuer", auto_issuer, "{msg}"]
+    return None
 
 
 def minisign_verify_argv():

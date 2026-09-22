@@ -864,7 +864,9 @@ def verify_signature(run):
         [("cosign-keyless", _cosign_verify_argv), ("minisign", _minisign_verify_argv)])
     if argv_tmpl is None:
         _sign_fail("no verifier available: set AR_VERIFIER_CMD (using the {msg} and {sig} tokens), "
-                   "or install cosign (keyless; set AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER) or minisign "
+                   "or install cosign (keyless; set AR_ALLOW_KEYLESS -- on GitHub Actions "
+                   "AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER then auto-derive from GITHUB_REPOSITORY, "
+                   "otherwise set them explicitly) or minisign "
                    "(with AR_MINISIGN_PUBKEY inline or AR_MINISIGN_PUBKEY_FILE set).")
     with tempfile.TemporaryDirectory() as td:
         msg = Path(td) / "verdict.canonical.json"

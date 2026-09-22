@@ -2589,9 +2589,49 @@ def t_cosign_keyless_auto_detect_requires_explicit_allow_keyless():
 def t_cosign_keyless_opt_in_does_not_relax_identity_pinning():
     # AR_ALLOW_KEYLESS is a separate, additive gate -- it must not weaken the pre-existing
     # security-1 protection (never verify keyless without BOTH AR_COSIGN_IDENTITY and
-    # AR_COSIGN_ISSUER pinned). Opting in to keyless with an unpinned identity must still
-    # fall through to "no verifier available", not to an unconstrained verify.
+    # AR_COSIGN_ISSUER pinned, OR a resolvable GITHUB_REPOSITORY to auto-derive from --
+    # see security-3 / t_cosign_keyless_auto_derives_identity_from_github_repository
+    # below). Opting in to keyless with an unpinned identity AND no GITHUB_REPOSITORY to
+    # auto-derive from must still fall through to "no verifier available", not to an
+    # unconstrained verify.
+    #
+    # GITHUB_REPOSITORY is explicitly neutralized here, not just relied on being absent --
+    # this test calls cosign_verify_argv() in-process (not via sh()/subprocess), so it
+    # reads the REAL ambient os.environ rather than the ENV dict's baseline, and this
+    # repo's own CI runs on GitHub Actions where GITHUB_REPOSITORY is genuinely set. Same
+    # "true by construction, not true by accident" reasoning this codebase adopted after
+    # being bitten once already by an ambient-env leak (GITHUB_EVENT_NAME, run
+    # 35525947669) -- frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21.
     from _common import cosign_verify_argv
+    saved_which = shutil.which
+    saved_env = dict(os.environ)
+    try:
+        shutil.which = lambda name: ("/usr/bin/cosign" if name == "cosign" else saved_which(name))
+        os.environ["AR_ALLOW_KEYLESS"] = "1"
+        for k in ("AR_COSIGN_IDENTITY", "AR_COSIGN_ISSUER", "GITHUB_REPOSITORY"):
+            os.environ.pop(k, None)
+        assert cosign_verify_argv() is None, "opting into keyless must not itself relax identity pinning"
+        os.environ["AR_COSIGN_IDENTITY"] = "someone"
+        assert cosign_verify_argv() is None, "issuer alone is still not enough"
+        os.environ.pop("AR_COSIGN_IDENTITY", None)
+        os.environ["AR_COSIGN_ISSUER"] = "https://token.actions.githubusercontent.com"
+        assert cosign_verify_argv() is None, ("identity alone is still not enough, even with "
+                                               "GITHUB_REPOSITORY unset")
+    finally:
+        shutil.which = saved_which
+        os.environ.clear()
+        os.environ.update(saved_env)
+
+
+def t_cosign_keyless_auto_derives_identity_from_github_repository():
+    # security-3 (frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21, Paul:
+    # "Yes to stronger cryptographic CI Identity check"): with AR_ALLOW_KEYLESS set and
+    # NEITHER AR_COSIGN_IDENTITY NOR AR_COSIGN_ISSUER explicitly configured, a live
+    # GITHUB_REPOSITORY must now auto-derive a working, correctly-scoped verifier --
+    # closing the gap where certificate-identity pinning and the payload's CI-context
+    # binding (ci_signing_context()'s own read of GITHUB_REPOSITORY) were previously two
+    # unrelated, independently-configured checks.
+    from _common import cosign_verify_argv, _auto_github_cosign_identity
     saved_which = shutil.which
     saved_env = dict(os.environ)
     try:
@@ -2599,9 +2639,88 @@ def t_cosign_keyless_opt_in_does_not_relax_identity_pinning():
         os.environ["AR_ALLOW_KEYLESS"] = "1"
         for k in ("AR_COSIGN_IDENTITY", "AR_COSIGN_ISSUER"):
             os.environ.pop(k, None)
-        assert cosign_verify_argv() is None, "opting into keyless must not itself relax identity pinning"
-        os.environ["AR_COSIGN_IDENTITY"] = "someone"
-        assert cosign_verify_argv() is None, "issuer alone is still not enough"
+        os.environ["GITHUB_REPOSITORY"] = "SathiaAI/adversarial-review"
+        argv = cosign_verify_argv()
+        assert argv is not None, "GITHUB_REPOSITORY must be enough to auto-derive a verifier"
+        assert argv[:2] == ["cosign", "verify-blob"], argv
+        assert "--certificate-identity-regexp" in argv, argv
+        assert "--certificate-identity" not in argv[argv.index("--certificate-identity-regexp") + 2:], (
+            "must use the regexp flag, never the exact-match flag, for an auto-derived identity")
+        assert "--certificate-oidc-issuer" in argv, argv
+        issuer = argv[argv.index("--certificate-oidc-issuer") + 1]
+        assert issuer == "https://token.actions.githubusercontent.com", issuer
+        regexp = argv[argv.index("--certificate-identity-regexp") + 1]
+        # The regexp must match a genuine workflow identity for THIS repo...
+        assert re.match(regexp, "https://github.com/SathiaAI/adversarial-review/.github/workflows/ci.yml@refs/heads/main")
+        # ...but never a different, merely-prefix-colliding repository or org, thanks to
+        # the anchored ^...github\.com/<repo>/ shape (panel finding security-1's
+        # "unconstrained identity" failure mode, applied here to the auto-derived case).
+        assert not re.match(regexp, "https://github.com/SathiaAI/adversarial-review-evil/.github/workflows/ci.yml@refs/heads/main")
+        assert not re.match(regexp, "https://github.com/someone-else/adversarial-review/.github/workflows/ci.yml@refs/heads/main")
+        assert not re.match(regexp, "https://evil.example.com/https://github.com/SathiaAI/adversarial-review/x")
+        # Exercise the helper directly too, including its re.escape() neutralization of a
+        # repository slug's own regex metacharacters (defensive; GitHub repo slugs cannot
+        # actually contain most of these, but the derivation must not assume that).
+        regexp2, issuer2 = _auto_github_cosign_identity()
+        assert issuer2 == "https://token.actions.githubusercontent.com"
+        assert regexp2 == regexp
+        os.environ["GITHUB_REPOSITORY"] = ""
+        assert cosign_verify_argv() is None, "a blank GITHUB_REPOSITORY must not auto-derive"
+        assert _auto_github_cosign_identity() == (None, None)
+        os.environ.pop("GITHUB_REPOSITORY", None)
+        assert cosign_verify_argv() is None, "an unset GITHUB_REPOSITORY must not auto-derive"
+    finally:
+        shutil.which = saved_which
+        os.environ.clear()
+        os.environ.update(saved_env)
+
+
+def t_cosign_keyless_explicit_identity_wins_over_github_repository_auto_derive():
+    # Backward compatibility + "fallback, never an override" (security-3): an operator's
+    # explicit AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pair must be used exactly as before
+    # this change, unchanged, even when GITHUB_REPOSITORY is ALSO present and would
+    # otherwise auto-derive a different verifier.
+    from _common import cosign_verify_argv
+    saved_which = shutil.which
+    saved_env = dict(os.environ)
+    try:
+        shutil.which = lambda name: ("/usr/bin/cosign" if name == "cosign" else saved_which(name))
+        os.environ["AR_ALLOW_KEYLESS"] = "1"
+        os.environ["GITHUB_REPOSITORY"] = "SathiaAI/adversarial-review"
+        os.environ["AR_COSIGN_IDENTITY"] = "ci@example.com"
+        os.environ["AR_COSIGN_ISSUER"] = "https://token.actions.githubusercontent.com"
+        argv = cosign_verify_argv()
+        assert argv == ["cosign", "verify-blob", "--bundle", "{sig}",
+                         "--certificate-identity", "ci@example.com",
+                         "--certificate-oidc-issuer", "https://token.actions.githubusercontent.com",
+                         "{msg}"], argv
+        assert "--certificate-identity-regexp" not in argv, (
+            "an explicit exact-match identity must never be silently upgraded to a regexp")
+    finally:
+        shutil.which = saved_which
+        os.environ.clear()
+        os.environ.update(saved_env)
+
+
+def t_cosign_keyless_partial_explicit_identity_does_not_auto_derive_the_other_half():
+    # A PARTIAL explicit config (exactly one of AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER set)
+    # must fall through to None even when GITHUB_REPOSITORY is present -- silently
+    # combining one operator-chosen value with one auto-derived value could pair an
+    # intentional custom issuer with an identity regexp scoped to the wrong OIDC
+    # federation, or vice versa (security-3 design note).
+    from _common import cosign_verify_argv
+    saved_which = shutil.which
+    saved_env = dict(os.environ)
+    try:
+        shutil.which = lambda name: ("/usr/bin/cosign" if name == "cosign" else saved_which(name))
+        os.environ["AR_ALLOW_KEYLESS"] = "1"
+        os.environ["GITHUB_REPOSITORY"] = "SathiaAI/adversarial-review"
+        os.environ.pop("AR_COSIGN_ISSUER", None)
+        os.environ["AR_COSIGN_IDENTITY"] = "ci@example.com"
+        assert cosign_verify_argv() is None, "identity set alone must not pull in an auto-derived issuer"
+        os.environ.pop("AR_COSIGN_IDENTITY", None)
+        os.environ["AR_COSIGN_ISSUER"] = "https://some-other-issuer.example.com"
+        assert cosign_verify_argv() is None, "issuer set alone must not pull in an auto-derived identity regexp"
     finally:
         shutil.which = saved_which
         os.environ.clear()
