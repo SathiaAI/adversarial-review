@@ -39,7 +39,16 @@ ENV = {**os.environ, "AR_BASE_URL": f"http://127.0.0.1:{PORT}/v1",
        # established for the CI-identity surface.
        "AR_VERIFIER_CMD": "", "AR_SIGNER_CMD": "", "AR_ALLOW_KEYLESS": "",
        "AR_COSIGN_IDENTITY": "", "AR_COSIGN_ISSUER": "",
-       "AR_MINISIGN_PUBKEY": "", "AR_MINISIGN_PUBKEY_FILE": "", "AR_MINISIGN_KEY": ""}
+       "AR_MINISIGN_PUBKEY": "", "AR_MINISIGN_PUBKEY_FILE": "", "AR_MINISIGN_KEY": "",
+       # GAP B (frontier-gate run pr70-design, 2026-09-21): ci_signing_context() and
+       # trusted_signer_guard_error() now branch on GITLAB_CI=="true" the same way they
+       # already branch on GitHub's ambient vars -- neutralize GitLab's whole detection
+       # surface here too, same "true by construction" reasoning as the AR_* block above.
+       # This repo's own CI runs on GitHub Actions, not GitLab, so none of these leak in
+       # practice today, but a test that wants the GitLab path opts in explicitly via
+       # `extra=` rather than relying on an absence that isn't structurally guaranteed.
+       "GITLAB_CI": "", "CI_PROJECT_PATH": "", "CI_COMMIT_SHA": "",
+       "CI_PIPELINE_ID": "", "CI_PIPELINE_SOURCE": ""}
 
 PASSED, FAILED = [], []
 
@@ -2247,6 +2256,149 @@ def t_policy_sig_ci_context_consistent_real_ci_env_still_passes():
     r = sh(["aggregate.py"], repo, expect=0, env=env)
     v = read(run / "verdict.json")
     assert v["verdict"] == "PASS", v
+
+
+# ------------------------------------------------- GAP B: GitLab CI-identity binding
+# (frontier-gate run pr70-design, 2026-09-21) -- the same v3 CI-context binding the
+# batch above proved for GitHub Actions, now extended to GitLab CI's own predefined
+# CI/CD variables (GITLAB_CI, CI_PROJECT_PATH, CI_COMMIT_SHA, CI_PIPELINE_ID), plus a
+# fixed marker in place of a per-attempt counter GitLab does not expose. See
+# ci_signing_context()'s docstring in _common.py for the full design rationale.
+
+def _gitlab_ci_env(*, project="group/adversarial-review",
+                   commit="a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+                   pipeline_id="900000001", source="push"):
+    """A realistic GitLab CI/CD variable set for _stub_signer_env(extra=...). `source`
+    defaults to "push" (trusted) rather than "merge_request_event" so callers that don't
+    care about the trust-guard trigger check get a working signer env by default."""
+    return {"GITLAB_CI": "true", "CI_PROJECT_PATH": project, "CI_COMMIT_SHA": commit,
+            "CI_PIPELINE_ID": pipeline_id, "CI_PIPELINE_SOURCE": source}
+
+
+def t_policy_sig_ci_context_gitlab_consistent_real_ci_env_still_passes():
+    # Happy-path: a run signed AND verified under a full, consistent, realistic GitLab
+    # CI/CD variable set verifies cleanly -- the GitLab branch of ci_signing_context()
+    # round-trips exactly like the GitHub branch already proven above.
+    env = _stub_signer_env(extra=_gitlab_ci_env())
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0, env=env)
+    v = read(run / "verdict.json")
+    assert v["verdict"] == "PASS", v
+
+
+def t_policy_sig_ci_context_gitlab_project_mismatch_blocks():
+    # Isolated to CI_PROJECT_PATH (GitLab's GITHUB_REPOSITORY counterpart): a policy
+    # signed under one project must fail verification from a process reporting a
+    # different one, same directory/run_id/run_nonce/run_name/risk unchanged.
+    env = _stub_signer_env(extra=_gitlab_ci_env())
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    sh(["aggregate.py"], repo, expect=0, env=env)  # sanity: same CI context still verifies
+
+    verify_env = {**env, "CI_PROJECT_PATH": "someone-else/adversarial-review-fork"}
+    r = sh(["aggregate.py"], repo, expect=2, env=verify_env)
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "did not verify" in r.stdout, r.stdout
+
+
+def t_policy_sig_ci_context_gitlab_pipeline_id_mismatch_blocks():
+    # Isolated to CI_PIPELINE_ID (GitLab's GITHUB_RUN_ID counterpart, globally unique
+    # across the whole instance): a policy signed during pipeline N must not verify as
+    # signed during a different pipeline N+1, even on the same project/commit.
+    env = _stub_signer_env(extra=_gitlab_ci_env())
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    sh(["aggregate.py"], repo, expect=0, env=env)
+
+    verify_env = {**env, "CI_PIPELINE_ID": "900000002"}
+    r = sh(["aggregate.py"], repo, expect=2, env=verify_env)
+    assert "not verifiably signed" in r.stdout, r.stdout
+    assert "did not verify" in r.stdout, r.stdout
+
+
+def t_policy_sig_ci_context_gitlab_fixed_run_attempt_marker_is_what_gets_signed():
+    # GitLab has no per-attempt counter (see _GITLAB_NO_RUN_ATTEMPT's rationale in
+    # _common.py) -- ci_signing_context() binds a FIXED marker instead of one, distinct
+    # from "local" so a genuinely-identified GitLab run is never confused with an
+    # unidentified one. Prove the marker is actually what gets signed (not silently
+    # dropped, not "local") by reconstructing the exact signed message with it and
+    # matching the real signature byte-for-byte -- mirrors
+    # t_policy_sig_signed_at_init_when_signer_configured's reconstruction pattern.
+    from _common import _GITLAB_NO_RUN_ATTEMPT, policy_attest_bytes
+    env = _stub_signer_env(extra=_gitlab_ci_env(pipeline_id="900000003"))
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0, env=env)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
+    meta = read(run / "run.json")
+    sig = (run / "policy.snapshot.sig").read_bytes()
+    gl_ctx = {"repository": env["CI_PROJECT_PATH"], "commit": env["CI_COMMIT_SHA"],
+              "run_id": env["CI_PIPELINE_ID"], "run_attempt": _GITLAB_NO_RUN_ATTEMPT}
+    msg = policy_attest_bytes(run.name, meta["run_nonce"], run.name, meta["risk"],
+                              run / "policy.snapshot.json", ci_context=gl_ctx)
+    assert sig == b"STUBSIG-v1:" + hashlib.sha256(msg).hexdigest().encode(), sig
+    # Retrying the same pipeline reuses the same CI_PIPELINE_ID -- re-verifying under the
+    # identical env (what a real retry would report) must still pass, since nothing about
+    # the fixed marker or the rest of the context actually changed.
+    r2 = sh(["aggregate.py"], repo, expect=0, env=env)
+    assert "VERDICT: PASS" in r2.stdout, r2.stdout
+
+
+def t_policy_sig_ci_context_gitlab_vars_ignored_unless_gitlab_ci_true():
+    # Fail-closed platform selection (GAP A/B design principle): CI_PROJECT_PATH etc.
+    # being SET is not by itself enough to activate the GitLab branch -- only
+    # GITLAB_CI=="true" does. A stray CI_PROJECT_PATH (e.g. leaked from an unrelated
+    # tool, or simply left over from a previous env dict) with GITLAB_CI unset/false
+    # must be silently ignored, falling through to the GitHub branch (and from there to
+    # "local", since no GITHUB_* vars are set either) -- never a partial/mixed context
+    # built from whichever platform's variables happen to be present.
+    # This THIS process's own os.environ is mutated in-process (ci_signing_context()
+    # reads os.environ directly, not a subprocess env dict), so -- exactly like
+    # t_toctou_single_read_of_policy_snapshot_for_full_bundle_load's own save/restore --
+    # every key that could carry a REAL ambient value from the suite's own CI
+    # environment (this repo's ci.yml runs on GitHub Actions) must be explicitly
+    # neutralized here too, not just the GitLab keys under test, or this assertion would
+    # spuriously fail (or spuriously pass for the wrong reason) whenever the suite
+    # itself happens to run inside real GitHub Actions.
+    from _common import ci_signing_context
+    stray = {**ENV, "CI_PROJECT_PATH": "group/should-be-ignored",
+             "CI_COMMIT_SHA": "f" * 40, "CI_PIPELINE_ID": "999",
+             "GITLAB_CI": "",  # explicitly NOT "true"
+             "GITHUB_REPOSITORY": "", "GITHUB_SHA": "",
+             "GITHUB_RUN_ID": "", "GITHUB_RUN_ATTEMPT": ""}
+    old = {k: os.environ.get(k) for k in stray}
+    try:
+        os.environ.update(stray)
+        ctx = ci_signing_context()
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert ctx == {"repository": "local", "commit": "local",
+                   "run_id": "local", "run_attempt": "local"}, ctx
+
+
+def t_trusted_signer_refuses_under_gitlab_merge_request_event_even_when_opted_in():
+    # GAP B extends trusted_signer_guard_error()'s untrusted-trigger refusal to GitLab:
+    # CI_PIPELINE_SOURCE=="merge_request_event" is GitLab's counterpart to GitHub's
+    # pull_request refusal (t_trusted_signer_refuses_under_pull_request_event_even_when_
+    # opted_in) -- runs with contributor-controlled code checked out must never sign,
+    # even with AR_TRUSTED_SIGNER explicitly set and a working signer configured.
+    env = _stub_signer_env(extra=_gitlab_ci_env(source="merge_request_event"))
+    repo = fresh_repo()  # deliberately NO .adversarial-review.json policy file
+    r = sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
+           repo, env=env)
+    assert "CI_PIPELINE_SOURCE" in r.stdout and "merge_request_event" in r.stdout, r.stdout
+    run = latest_run(repo)
+    assert not (run / "policy.absence.json").exists()
+    assert not (run / "policy.absence.sig").exists()
 
 
 # ------------------------------------------------- PR70 architecture hardening v3b

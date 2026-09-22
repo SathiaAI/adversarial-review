@@ -184,24 +184,70 @@ POLICY_ATTEST_VERSION = "3"
 # signed payload rather than something that could collide with a blank/missing field.
 _NO_CI_CONTEXT = "local"
 
+# GAP B (frontier-gate run pr70-design, 2026-09-21, checklist item unresolved-GitLab):
+# GitLab Runner exposes no first-class counterpart to GitHub Actions' GITHUB_RUN_ATTEMPT
+# -- retrying a job (or a whole pipeline via "Retry") reuses the SAME CI_PIPELINE_ID,
+# never bumping any predefined variable exposed to the job. Rather than fabricate a
+# counter GitLab doesn't provide (fragile: GitLab could add/rename one, or a self-hosted
+# runner could set something misleadingly similar), this binds a FIXED, clearly-named
+# marker instead of GitHub's real per-attempt value. That is not a weaker binding than
+# GitHub's: replay protection across pipelines still comes from CI_PROJECT_PATH,
+# CI_COMMIT_SHA, and CI_PIPELINE_ID (globally unique, never reused, unlike GitHub's
+# per-repository-scoped run id) -- a retry of the SAME pipeline reusing the SAME
+# CI_PIPELINE_ID is intentionally treated as the SAME identity, which is correct: nothing
+# about the change under review differs between a job and its retry. Distinct from
+# _NO_CI_CONTEXT ("local") so a genuinely-identified GitLab run is never confused with an
+# unidentified/local one in the signed payload.
+_GITLAB_NO_RUN_ATTEMPT = "gitlab-ci-no-run-attempt-counter"
+
 
 def ci_signing_context():
     """The CI-orchestrator-assigned identity to bind into a v3 policy-attest payload,
     read fresh from THIS process's own environment every time -- never from run.json or
-    any other file a copied/replayed run directory could carry along. On GitHub Actions
-    these four are runner-provided ambient values that a job's own code cannot choose or
-    rewrite (unlike a value read from a config file or CLI flag): GITHUB_REPOSITORY
-    ("owner/repo"), GITHUB_SHA (the commit under test), GITHUB_RUN_ID (unique per
-    workflow execution, never reused), GITHUB_RUN_ATTEMPT (increments per re-run of that
-    same execution). Outside GitHub Actions (local dev, a different CI system) all four
-    fall back to "local" -- this still round-trips correctly (sign and verify agree,
-    since both read the same live environment) but provides NO cross-run identity in
-    that shape, only the pre-existing run_name/run_nonce/risk binding does. See
-    docs/THREAT-MODEL.md for what this can and cannot prove on its own, in particular
-    that these values only protect against REPLAY (an old, validly-signed run's files
-    copied elsewhere) -- they do not stop code running in the SAME job that performs the
-    signing from choosing its own policy content to sign; that is what the isolated
-    trusted-signer job (see action.yml / ci.yml) is for."""
+    any other file a copied/replayed run directory could carry along.
+
+    GitLab CI (GAP B, frontier-gate run pr70-design, 2026-09-21): when GITLAB_CI is
+    exactly "true" -- GitLab Runner's own, reliably-set indicator, never incidentally
+    true by accident -- the four fields come from GitLab's predefined CI/CD variables:
+    CI_PROJECT_PATH ("namespace/project", GitHub's GITHUB_REPOSITORY counterpart),
+    CI_COMMIT_SHA, CI_PIPELINE_ID (globally unique across the whole GitLab instance,
+    never reused -- the correct run-identity counterpart to GITHUB_RUN_ID; CI_PIPELINE_IID
+    is only unique WITHIN one project and is deliberately not used here), and the fixed
+    _GITLAB_NO_RUN_ATTEMPT marker in place of a per-attempt counter GitLab does not
+    expose (see the module-level comment above). CI_JOB_ID (the specific job within the
+    pipeline) is deliberately NOT bound here -- it is informational only, since a
+    pipeline can retry an individual job without that constituting a different execution
+    of the reviewed change; CI_PIPELINE_ID is what actually identifies "this run."
+
+    Fail-closed platform selection: GitLab's fields are read ONLY when GITLAB_CI=="true"
+    -- never merely because a GitLab-named variable happens to be present (e.g. stray
+    env inheritance from an unrelated build image, or a local shell where someone set
+    CI_PIPELINE_ID for an unrelated reason). This keeps the four fields coming from ONE
+    coherent, actually-identified platform rather than an unintentional mix of two
+    unrelated CI systems' variables, which would weaken what "this specific pipeline"
+    even means. When GITLAB_CI is not "true", behavior is completely unchanged from
+    before GAP B: GitHub Actions' GITHUB_REPOSITORY ("owner/repo"), GITHUB_SHA (the
+    commit under test), GITHUB_RUN_ID (unique per workflow execution, never reused),
+    GITHUB_RUN_ATTEMPT (increments per re-run of that same execution) -- runner-provided
+    ambient values a job's own code cannot choose or rewrite (unlike a value read from a
+    config file or CLI flag). Neither platform identified (local dev, a different CI
+    system) -- all four fall back to "local": this still round-trips correctly (sign and
+    verify agree, since both read the same live environment) but provides NO cross-run
+    identity in that shape, only the pre-existing run_name/run_nonce/risk binding does.
+
+    See docs/THREAT-MODEL.md for what this can and cannot prove on its own, in
+    particular that these values only protect against REPLAY (an old, validly-signed
+    run's files copied elsewhere) -- they do not stop code running in the SAME job that
+    performs the signing from choosing its own policy content to sign; that is what the
+    isolated trusted-signer job (see action.yml / ci.yml / examples/.gitlab-ci.yml) is
+    for."""
+    if os.environ.get("GITLAB_CI", "").strip().lower() == "true":
+        return {
+            "repository": os.environ.get("CI_PROJECT_PATH", "").strip() or _NO_CI_CONTEXT,
+            "commit": os.environ.get("CI_COMMIT_SHA", "").strip() or _NO_CI_CONTEXT,
+            "run_id": os.environ.get("CI_PIPELINE_ID", "").strip() or _NO_CI_CONTEXT,
+            "run_attempt": _GITLAB_NO_RUN_ATTEMPT,
+        }
     return {
         "repository": os.environ.get("GITHUB_REPOSITORY", "").strip() or _NO_CI_CONTEXT,
         "commit": os.environ.get("GITHUB_SHA", "").strip() or _NO_CI_CONTEXT,
@@ -521,6 +567,16 @@ def _policy_bool_env(name):
 
 _UNTRUSTED_GITHUB_EVENTS = frozenset({"pull_request"})
 
+# GAP B (frontier-gate run pr70-design, 2026-09-21): GitLab's counterpart to GitHub
+# Actions' `pull_request` event -- a pipeline whose CI_PIPELINE_SOURCE is
+# "merge_request_event" runs against merge-request-author-controlled code (including,
+# for an MR from a fork, code the repository's own maintainers did not write), the same
+# risk profile GitHub's pull_request refusal exists to catch. GitLab's own two-job
+# template (examples/.gitlab-ci.yml) keeps the keyed ar-panel job's trust independent of
+# this check by never checking out MR-author-controlled refs for the signing step in the
+# first place, but this guard stays defense-in-depth for any adopter's own topology.
+_UNTRUSTED_GITLAB_PIPELINE_SOURCES = frozenset({"merge_request_event"})
+
 
 def trusted_signer_guard_error():
     """Best-effort, defense-in-depth check that the CURRENT process is not obviously
@@ -529,7 +585,8 @@ def trusted_signer_guard_error():
     review and signature verification must keep working everywhere, unsigned included).
     Returns a short reason string to refuse signing, or None to allow it. (frontier-gate
     run pr70-architecture-review, 2026-09-20, batch 3 of the redesign_signing_boundary
-    decision -- checklist items 6/9.)
+    decision -- checklist items 6/9; extended to GitLab by GAP B, frontier-gate run
+    pr70-design, 2026-09-21.)
 
     Two checks, both fail-closed:
 
@@ -542,16 +599,20 @@ def trusted_signer_guard_error():
          shape, different gap: that one closed an accidental auto-activation of ONE
          signer kind; this one closes ALL signer kinds being invoked in the wrong job.
 
-      2. GITHUB_EVENT_NAME must not be a trigger whose job runs with PR-author-
-         controlled code checked out and (for a fork) a read-only GITHUB_TOKEN --
-         `pull_request` is that trigger on GitHub Actions. A trusted signer job should
-         instead run from `workflow_run` (triggered by completion of the untrusted
-         review job, checking out the BASE ref), `push`, `schedule`, or
-         `workflow_dispatch` -- see docs/THREAT-MODEL.md and the worked example in
-         docs/ci-integration.md. Unset (local dev, a non-GitHub-Actions CI, or this
-         test suite) passes this check -- it cannot protect what it cannot see, and
-         refusing all local/offline signing outright would break every existing
-         signer-configured workflow and test that predates this fix.
+      2. The CI orchestrator's own trigger must not be one whose job runs with
+         contributor-controlled code checked out and (for a fork) a read-only/scoped
+         token. On GitHub Actions that trigger is GITHUB_EVENT_NAME=="pull_request"; a
+         trusted signer job should instead run from `workflow_run` (triggered by
+         completion of the untrusted review job, checking out the BASE ref), `push`,
+         `schedule`, or `workflow_dispatch` -- see docs/THREAT-MODEL.md and the worked
+         example in docs/ci-integration.md. On GitLab CI (GITLAB_CI=="true") the
+         equivalent trigger is CI_PIPELINE_SOURCE=="merge_request_event" -- a trusted
+         signer job should instead run from `push`, `schedule`, `web`, or
+         `pipeline`/`trigger`, per examples/.gitlab-ci.yml. Neither variable set to its
+         platform's "untrusted" value (local dev, a non-GitHub/GitLab CI, or this test
+         suite) passes this check -- it cannot protect what it cannot see, and refusing
+         all local/offline signing outright would break every existing signer-configured
+         workflow and test that predates this fix.
 
     NOT a substitute for actual job/workflow separation -- see docs/THREAT-MODEL.md for
     what this can and cannot prove on its own. In particular: this cannot detect a
@@ -571,6 +632,13 @@ def trusted_signer_guard_error():
                 "the trusted signer must run from workflow_run, push, schedule, or "
                 "workflow_dispatch instead, in a job the PR cannot modify; see "
                 "docs/THREAT-MODEL.md")
+    if os.environ.get("GITLAB_CI", "").strip().lower() == "true":
+        source = os.environ.get("CI_PIPELINE_SOURCE", "").strip()
+        if source in _UNTRUSTED_GITLAB_PIPELINE_SOURCES:
+            return (f"CI_PIPELINE_SOURCE={source!r} is a merge-request-author-controlled "
+                    "trigger -- the trusted signer must run from push, schedule, web, or "
+                    "pipeline/trigger instead, in a job the MR cannot modify; see "
+                    "docs/THREAT-MODEL.md")
     return None
 
 
