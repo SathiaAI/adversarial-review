@@ -851,6 +851,63 @@ def t_check_digest_legacy_deep_artifact_is_cannot_verify_not_drift():
     assert "DRIFT" in r.stdout and "extra.json" in r.stdout, r.stdout
 
 
+def t_check_digest_v2_stored_sidecar_newly_covered_is_cannot_verify_not_drift():
+    # Codex finding #7 (dbId 4056066455, frontier-gate run pr70-design, 2026-09-21 status-correction
+    # review): _SIDECAR_COVERAGE_INTRODUCED_AT says policy.snapshot.sig coverage began at
+    # sha256-canonical-json-v3 -- a verdict stored under v2 never tracked it as an input AT ALL (not
+    # "hashed differently": simply absent from the old manifest). check_digest's recompute now folds
+    # policy.snapshot.sig in unconditionally (compute_attestation hashes it "raw:" whenever the file
+    # exists on disk, regardless of what algorithm produced the STORED verdict), so a v2-stored verdict
+    # whose run directory has since acquired a policy.snapshot.sig sidecar looks like it "gained" a
+    # tracked artifact. _sidecar_newly_covered_transition() classifies that shape as legacy/cannot-verify
+    # (exit 2, re-aggregate) rather than DRIFT (exit 1) -- the runtime fix already lands via
+    # _SIDECAR_COVERAGE_INTRODUCED_AT + _sidecar_newly_covered_transition (commit 6245098); this is the
+    # regression test the finding asked for and that fix landed without.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    write(run / "validation" / "idor.json", {                       # triage the high finding -> PASS
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced", "reproduced": True,
+        "regression_test": "t", "resolution": {"fixed": True, "gates_rerun": ["unit"]}})
+    (run / "policy.snapshot.sig").write_bytes(b"not a real signature, just needs to exist on disk")
+    sh(["aggregate.py"], repo, expect=0)                            # v4 verdict: sig -> tracked, "raw:"
+    v = read(run / "verdict.json")
+    att = v["attestation"]
+    assert att["algorithm"] == "sha256-canonical-json-v4", att["algorithm"]
+    assert att["files"]["policy.snapshot.sig"].startswith("raw:"), att["files"]["policy.snapshot.sig"]
+    # Forge a LEGACY v2 verdict: same digest/files as a real v2 tool would have produced -- i.e. WITHOUT
+    # policy.snapshot.sig in the manifest at all (v2 predates v3, the version that introduced its
+    # coverage), matching stored_hash is None in _sidecar_newly_covered_transition.
+    legacy = dict(att)
+    legacy_files = dict(att["files"])
+    del legacy_files["policy.snapshot.sig"]
+    legacy["files"] = legacy_files
+    legacy["algorithm"] = "sha256-canonical-json-v2"
+    manifest = "\n".join(f"{sha}  {rel}" for rel, sha in sorted(legacy_files.items()))
+    legacy["digest"] = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+    v["attestation"] = legacy
+    (run / "verdict.json").write_text(json.dumps(v))
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=2)      # cannot-verify, NOT drift
+    blob = r.stdout + r.stderr
+    assert "CANNOT BE VERIFIED" in blob, (r.stdout, r.stderr)
+    assert "policy.snapshot.sig" in blob, blob
+    assert "MISMATCH" not in r.stdout, "newly-covered sidecar must not be reported as definitive drift"
+    # Security preserved: a stored v2 verdict whose files DOES already list policy.snapshot.sig (i.e. it
+    # was somehow recorded despite v2 predating coverage -- a malformed/hand-edited record) with a
+    # DIFFERENT hash than the recompute must NOT be excused by this classifier: that has a stored_hash,
+    # so _sidecar_newly_covered_transition is false by construction and it falls through to real DRIFT.
+    legacy2 = dict(legacy)
+    legacy2_files = dict(legacy["files"])
+    legacy2_files["policy.snapshot.sig"] = "raw:" + "0" * 64        # present but wrong -> not "absent"
+    legacy2["files"] = legacy2_files
+    manifest2 = "\n".join(f"{sha}  {rel}" for rel, sha in sorted(legacy2_files.items()))
+    legacy2["digest"] = hashlib.sha256(manifest2.encode("utf-8")).hexdigest()
+    v["attestation"] = legacy2
+    (run / "verdict.json").write_text(json.dumps(v))
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=1)      # real drift, not excused
+    assert "DRIFT" in r.stdout and "policy.snapshot.sig" in r.stdout, r.stdout
+
+
 def t_mcp_aggregate_refuses_when_run_lock_is_held():
     # Codex r3924189590: two independently launched ar-mcp processes aggregating the SAME run are not
     # serialized by the process-wide HTTP dispatch lock, so both move the prior verdict to the one
