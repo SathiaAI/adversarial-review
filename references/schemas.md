@@ -285,7 +285,7 @@ still inspects the patch and still updates `validation/<slug>.json` by hand; not
    "cost_usd": 0.0, "cost_aborted": false, "cost_cap_usd": 20.0, "cost_cap_source": "default",
    "policy_snapshot_sha256": "hex or null (sha256 of the policy attested at init whose waiver limits governed this verdict; null when the run had no policy file or the snapshot was rejected)",
    "areas_not_reviewed": ["union of reviewer attestations"]},
- "attestation": {"algorithm": "sha256-canonical-json-v3", "inputs": 0,
+ "attestation": {"algorithm": "sha256-canonical-json-v4", "inputs": 0,
    "digest": "hex", "files": {"run.json": "hex", "gates/unit.json": "hex"}},
  "computed_at": "ISO-8601"}
 ```
@@ -317,11 +317,19 @@ path by whichever process created it; a process never unlinks a lock it did not 
 The `attestation` block makes the audit record tamper-evident. Every `*.json` file in
 the run directory except `verdict.json` (the output) is canonicalized — sorted keys,
 compact separators, so cosmetic re-serialization is not tampering — and hashed, **plus
-one explicit non-JSON exception: `policy.snapshot.json`'s detached signature sidecar,
-`policy.snapshot.sig`, is hashed as a raw-bytes input whenever it exists** (v3; it is a
-required, pre-verdict input for any policy-backed exception, so deleting or corrupting
-it now changes the digest — v2 and earlier missed this, since `compute_attestation`
-only globbed `*.json`). The unrelated, post-verdict `attestation.sig` (the standalone
+two explicit non-JSON exceptions, each hashed as a raw-bytes input whenever it
+exists: `policy.snapshot.json`'s detached signature sidecar, `policy.snapshot.sig`
+(v3 — a required, pre-verdict input for any policy-backed exception, so deleting or
+corrupting it now changes the digest; v2 and earlier missed this, since
+`compute_attestation` only globbed `*.json`), and `policy.absence.json`'s detached
+signature sidecar, `policy.absence.sig` (v4 — GAP A's signed no-policy attestation,
+folded into the attestation coverage the same way v3 already covered
+`policy.snapshot.sig`, closing the same gap for a policyless exception run)**. Both
+sidecars are read the hardened way — no-follow at the leaf, size-capped — so a symlink
+planted in place of either one hashes as a distinct refusal marker rather than being
+read through or silently skipped. A verdict computed under v3 (no `policy.absence.sig`
+in scope yet) is a recognized legacy algorithm for `--check-digest`, not a current one;
+see the legacy-transition handling below. The unrelated, post-verdict `attestation.sig` (the standalone
 `--sign` feature's detached signature *over* `verdict.json` itself) stays excluded —
 including it would be circular. A `.json` file that fails UTF-8 decoding or JSON
 parsing, **or whose bytes exceed a fixed,

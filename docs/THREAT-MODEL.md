@@ -166,8 +166,8 @@ mutation testing, milestone M4, is not yet built). `authenticate_risk_tier()` in
   governs this run. Risk tier is the cryptographically-backed value. No stamp needed.
 - **UNSIGNED EXEMPT** (`RISK TIER UNSIGNED EXEMPT`) — no verifier resolves in this
   environment AND `AR_SIGNING_REQUIRED` is not set for this repository. Risk tier is
-  self-reported, non-blocking — the pre-existing infrastructure-free exemption
-  (`reviews/pr70-provenance-binding-decision.md`), unchanged.
+  self-reported, non-blocking — the pre-existing infrastructure-free exemption for the
+  common no-waiver path (see "What this mechanism is (and is not)" above), unchanged.
 - **UNAUTHENTICATED** (`RISK TIER UNAUTHENTICATED`) — signing WAS expected (a verifier
   resolves here, or the repository's own `AR_SIGNING_REQUIRED` anchor says so) but
   could not be cryptographically verified. Risk is forced to CRITICAL and the run is
@@ -244,10 +244,29 @@ the separate, pre-existing GAP-A check further down `aggregate.py`, unaffected b
 A repository with **no** signing infrastructure at all (no verifier resolvable, no
 `AR_SIGNING_REQUIRED` anchor set) stays exempt — the literal panel wording's full
 intent (treat ANY unauthenticated risk claim as untrustworthy) is only half-closed by
-design. This is a deliberate, disclosed deferral, not an oversight: see
-`roadmap/pr70-round5-signing-hardening-and-keyless-onboarding.md`'s "M4-dependent
-follow-up" section for the trigger condition (real CRITICAL-tier mutation testing, M4)
-and what revisiting this should involve.
+design. This is a deliberate, disclosed deferral, not an oversight — tracked here
+rather than silently dropped:
+
+- **What's deferred:** extending CRITICAL-default treatment to cover "no signing
+  configured at all," not just "signing was configured, then broke or was stripped"
+  (the half this file's round 5 section above already closes).
+- **Why:** at the time this was scoped (2026-09-22), 0 of 40 repositories across both
+  connected GitHub accounts — including `viaid`, the one confirmed production
+  consumer — had signing configured. Forcing CRITICAL (whose `mutation` gate can never
+  be waived) on every one of those runs would be an undisclosed breaking change /
+  outage, not a hardening, and real CRITICAL-tier mutation testing (milestone **M4**
+  in `gate.py`'s own roadmap) isn't built yet to give such a repo any way to pass.
+- **Trigger to revisit:** when M4 actually ships.
+- **What revisiting should mean:** re-run the item-6 question through a fresh
+  frontier-gate brief rather than just flipping a flag — M4's actual design may change
+  what "CRITICAL-default" should even mean; re-check the then-current signed/unsigned
+  repo count (it will likely have moved, especially once the keyless-default
+  onboarding work below has shipped and `AR_SIGNING_REQUIRED` has seen real adoption);
+  then decide, with real data, whether to extend CRITICAL-default to the
+  no-signing-at-all case or keep the infrastructure-free exemption permanently as the
+  final, intentional design.
+- **Owner:** whoever picks up `gate.py`'s M4 work should read this section first,
+  before touching risk-tier defaulting.
 
 ## Batch 4 — adoption/consumer coverage and remaining documentation
 

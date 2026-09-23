@@ -181,19 +181,29 @@ plan --waive` / `gate.py record --status NOT_APPLICABLE` **and** `aggregate.py`
 independently require a verifiably-signed snapshot, and BLOCK (or refuse outright at
 plan/record time) without one — so a repo that wants to use waivers or NOT_APPLICABLE
 must configure a signer AND set `AR_TRUSTED_SIGNER` from a trusted job before `panel.py init`, or those exceptions will never pass. A
-repo with **no** policy file at all is exempt — waiver limits fall back to strict
-built-in defaults, which are not a mutable attested artifact, so there is nothing to
-sign. The signed payload binds the run's id, a random per-run nonce, the run
-directory's own (immutable) name, and the run's resolved risk tier, in addition to the
-policy text itself, so a signature cannot be replayed onto a different run, a
-colliding run id, a copied run directory, or a run whose risk was edited after
-signing. It also binds the live CI-orchestrator identity (`GITHUB_REPOSITORY`,
-`GITHUB_SHA`, `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT` on GitHub Actions; `local` for all
-four outside CI), read fresh from the process's own environment at both sign and
-verify time — never from a file a copied run directory could carry along — so a
-directory copied wholesale between repos, commits, or CI runs still fails to verify
-even when its name, id, nonce, and risk all match. These are ordinary GitHub
-Actions-provided variables, not something you configure; see `docs/THREAT-MODEL.md`.
+repo with **no** policy file at all — waiver limits fall back to strict built-in
+defaults, which are not a mutable attested artifact — is exempt **only when no
+verifier resolves for this run** (no `AR_VERIFIER_CMD`, and no auto-detected cosign/
+minisign). The moment a verifier IS configured (GAP A, closing the ambiguity between
+"genuinely no policy" and "policy.snapshot.json simply never got written or was
+deleted"), a policyless run instead needs a signed `policy.absence.json` — the explicit,
+signed claim that `init` looked for a policy and found none — from the same
+`AR_TRUSTED_SIGNER`-gated signer used for a real policy snapshot; without it, any later
+waiver or NOT_APPLICABLE command is refused the same way a missing `policy.snapshot.sig`
+would be. The signed payload (for either artifact) binds the run's id, a random per-run
+nonce, the run directory's own (immutable) name, and the run's resolved risk tier, in
+addition to the policy text itself for a real snapshot, so a signature cannot be
+replayed onto a different run, a colliding run id, a copied run directory, or a run
+whose risk was edited after signing. It also binds the live CI-orchestrator identity —
+on GitHub Actions, `GITHUB_REPOSITORY`, `GITHUB_SHA`, `GITHUB_RUN_ID`,
+`GITHUB_RUN_ATTEMPT`; on GitLab CI (when `GITLAB_CI=true`), `CI_PROJECT_PATH`,
+`CI_COMMIT_SHA`, `CI_PIPELINE_ID`, and a fixed marker in place of a per-attempt counter
+GitLab does not expose; `local` for all four outside a recognized CI provider (see
+`AR_ALLOW_LOCAL_CI_IDENTITY` below) — read fresh from the process's own environment at
+both sign and verify time — never from a file a copied run directory could carry along —
+so a directory copied wholesale between repos, commits, or CI runs still fails to verify
+even when its name, id, nonce, and risk all match. These are ordinary CI-provided
+variables, not something you configure; see `docs/THREAT-MODEL.md`.
 
 Precedence, everywhere: **CLI flag > env var > policy file > built-in default** —
 explicit beats ambient. The resolution is recorded in the run's artifacts so the
@@ -355,7 +365,7 @@ keyless `panel.py prepare` + `ingest` (MCP) transport does **not** take corrobor
 | `AR_ALLOW_KEYLESS` | — | Explicit opt-in required before cosign keyless is even attempted for auto-detected signing/verification (both `policy.snapshot.sig` and `--sign`/`--verify-signature`). Without it, cosign keyless is never auto-selected even if the `cosign` binary and `AR_COSIGN_IDENTITY`/`AR_COSIGN_ISSUER` are all present — see `docs/THREAT-MODEL.md`. Minisign (or an explicit `AR_SIGNER_CMD`/`AR_VERIFIER_CMD`) is the only thing that auto-activates without this set |
 | `AR_COSIGN_IDENTITY` | — | Expected signer identity (SAN) for cosign keyless `--verify-signature`; ignored unless `AR_ALLOW_KEYLESS` is also set |
 | `AR_COSIGN_ISSUER` | — | Expected OIDC issuer for cosign keyless `--verify-signature`; ignored unless `AR_ALLOW_KEYLESS` is also set |
-| `AR_TRUSTED_SIGNER` | — | Explicit opt-in required before `panel.py init` will even attempt to sign `policy.snapshot.json` (any signer kind) — signing is never opportunistic based on a configured signer alone. Additionally refused outright when `GITHUB_EVENT_NAME=pull_request` (the GitHub Actions trigger whose job runs with the PR author's own code checked out), regardless of this being set. Verification is unaffected — `gate.py`/`aggregate.py` verify a signature from any job. See `docs/THREAT-MODEL.md` |
+| `AR_TRUSTED_SIGNER` | — | Explicit opt-in required before `panel.py init` will even attempt to sign `policy.snapshot.json` or `policy.absence.json` (any signer kind) — signing is never opportunistic based on a configured signer alone. Additionally refused outright when the job runs under a PR-author-controlled trigger — `GITHUB_EVENT_NAME=pull_request` on GitHub Actions, or `CI_PIPELINE_SOURCE=merge_request_event` on GitLab CI (both are triggers whose job runs with the PR/MR author's own code checked out) — regardless of this being set. Verification is unaffected — `gate.py`/`aggregate.py` verify a signature from any job. See `docs/THREAT-MODEL.md` |
 | `AR_ALLOW_LOCAL_CI_IDENTITY` | — | Explicit opt-in accepting a "local" CI-context placeholder (no recognized CI provider detected) as a real identity when a signature is actually present and being checked — for a genuine local/offline signing setup. Without it, `verify_policy_snapshot_signature`/`verify_policy_absence_signature` refuse to trust a signature whose sign-time and verify-time CI identity both fell back to the same unidentified placeholder. See `docs/THREAT-MODEL.md` |
 | `AR_SIGNING_REQUIRED` | — | Explicit, repository-level declaration that this repo's runs MUST be signed. When set, a run with no `policy.snapshot.json` and no signed absence attestation is BLOCKED (risk forced to CRITICAL, `mutation` unwaivable) even if no verifier happens to resolve in the current job — **except** for a `pull_request`/merge-request-triggered run, which is always exempt from this (no hand-off exists yet for those to be signed at all; see `docs/THREAT-MODEL.md`). Setting this via a plain repository secret referenced from this repo's own workflow file does **not** close the downgrade-to-exempt gap it exists for — a same-repo PR can delete the line that wires the secret into the job env just as easily as it can delete a signed policy file. Closing the gap for real needs the value's *wiring* to come from outside this repo's PR-editable surface — a SHA-pinned reusable workflow in a separate repository (protected by branch rules on which SHA the caller may reference) or an organization "required workflow" ruleset. See `docs/THREAT-MODEL.md`'s "unauthenticated risk-tier fallback" section for the full, corrected explanation |
 | `AR_JEV_MODEL` | `typesafe/jev-1.13` | Model slug `jev_triage.py` calls at OpenRouter's `/alpha/decisions` endpoint (see `references/jev.md`) |

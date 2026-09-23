@@ -37,7 +37,8 @@ from _common import (MAX_HIGH_SAMPLES, POLICY_ABSENCE_FILENAME, POLICY_ABSENCE_S
                      minisign_sign_argv, now_iso, policy_absence_attest_bytes,
                      policy_attest_bytes, read_json,
                      resolve_run, resolve_setting, resolve_signing_tool,
-                     run_signing_tool, trusted_signer_guard_error, write_json)
+                     run_signing_tool, trusted_signer_guard_error, write_bytes_atomic,
+                     write_json)
 
 DEFAULT_BASE = "https://openrouter.ai/api/v1"
 
@@ -543,7 +544,7 @@ def validate_obj(obj, schema, path="$"):
 
 # ---------------------------------------------------------------- subcommands
 
-def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_path):
+def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_bytes):
     """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
     Paul's decision, frontier-gate run pr70-provenance, 2026-09-19; hardened per
     frontier-gate run pr70-provenance-2, 2026-09-19, closing 6 Codex-found bypasses;
@@ -602,7 +603,19 @@ def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_path):
     want_sig_out = any("{sig}" in a for a in argv_tmpl)
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.snapshot.attest"
-        msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, run.name, risk, snap_path))
+        # Codex 4082681134 (P1, valid): sign the exact bytes write_json already put on
+        # disk for policy.snapshot.json, passed in by the caller (snap_bytes) — never
+        # reread the path here. A reread is a TOCTOU window: an actor with concurrent
+        # write access to the run directory could swap in a more permissive snapshot
+        # between write_json's write and this function running, let the trusted signer
+        # authenticate THAT swapped content, then restore the original bytes before
+        # anyone reads run.json's recorded digest — the signature would verify against
+        # the digest that was in place at read time, while a wider policy had briefly
+        # been the one actually signed. This is the same TOCTOU class
+        # policy_attest_bytes's own `snap_bytes` parameter exists to close (see its
+        # docstring); this call site just wasn't using it.
+        msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, run.name, risk,
+                                                 snap_bytes=snap_bytes))
         sig_tmp = Path(td) / "sig.out"
         proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_tmp, fatal=False)
         if err:
@@ -626,7 +639,13 @@ def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_path):
         print(f"note: policy-snapshot signer '{kind}' produced an empty signature — "
               f"policy.snapshot.json is unsigned; {note}")
         return
-    (run / POLICY_SIG_FILENAME).write_bytes(sig)
+    # Codex 4082681153 (P1, valid): write_bytes_atomic (mkstemp + os.replace, never
+    # opens the destination) instead of Path.write_bytes (open(path, "wb"), which
+    # follows a symlink planted at that path) — an actor with concurrent write access
+    # to the run directory could otherwise pre-plant policy.snapshot.sig as a symlink
+    # to any file this signer process can write, and have it overwritten with the
+    # signature bytes instead of a real sidecar being created here.
+    write_bytes_atomic(run / POLICY_SIG_FILENAME, sig)
     print(f"signed: {run / POLICY_SIG_FILENAME} attests policy.snapshot.json (signer: {kind})")
 
 
@@ -702,7 +721,9 @@ def _sign_policy_absence_if_possible(run, run_id, run_nonce, risk):
               f"policy.absence.json was not written; {note}")
         return
     write_json(run / POLICY_ABSENCE_FILENAME, {"policy_absent": True, "captured_at": now_iso()})
-    (run / POLICY_ABSENCE_SIG_FILENAME).write_bytes(sig)
+    # Codex 4082681153 (P1, valid) — same symlink-safe write as the snapshot-signature
+    # sidecar just above; see that call site's comment.
+    write_bytes_atomic(run / POLICY_ABSENCE_SIG_FILENAME, sig)
     print(f"signed: {run / POLICY_ABSENCE_SIG_FILENAME} attests {POLICY_ABSENCE_FILENAME} "
           f"(signer: {kind})")
 
@@ -746,12 +767,13 @@ def cmd_init(args):
     if pol is not None:
         policy_rec = {"file": pol["path"].name, "sha256": pol["sha256"]}
         # Snapshot the exact policy text into the run as a JSON artifact so the
-        # attestation digest covers what the run actually resolved against.
-        write_json(run / "policy.snapshot.json", {
+        # attestation digest covers what the run actually resolved against. write_json
+        # returns the exact bytes it just wrote, which get signed below instead of
+        # rereading the path back (Codex 4082681134 — see _sign_policy_snapshot_if_possible).
+        snap_bytes = write_json(run / "policy.snapshot.json", {
             "file": pol["path"].name, "sha256": pol["sha256"],
             "captured_at": now_iso(), "text": pol["text"]})
-        _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk,
-                                          run / "policy.snapshot.json")
+        _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_bytes)
     else:
         # GAP A (frontier-gate run pr70-design, 2026-09-21, checklist item 2): no repo
         # policy file was found. Opportunistically sign an explicit "checked, found none"

@@ -37,7 +37,7 @@ from _common import (POLICY_ABSENCE_SIG_FILENAME, POLICY_SIG_FILENAME, _policy_b
                      load_attested_policy_bundle, meta_cost,
                      minisign_sign_argv as _minisign_sign_argv,
                      minisign_verify_argv as _minisign_verify_argv, now_iso,
-                     read_json, resolve_run,
+                     read_json, read_regular_file_once, resolve_run,
                      resolve_signing_tool as _resolve_tool, resolve_waiver_clock,
                      verify_policy_absence_signature,
                      verify_policy_snapshot_signature,
@@ -451,8 +451,14 @@ def check_rebuttal(run, meta, plan, reports, blocked, notes):
         # carry arbitrary text; escape it before this reaches `blocked`, which verdict.md
         # renders raw (security-4, same class as Codex finding #6). `missing` role names come
         # from panel.py's fixed role catalog, not free-form attacker text.
-        blocked.append(f"rebuttal round required (policy '{_oneline(policy)}', risk {meta['risk']}, "
-                       f"high/critical findings present); missing for: {', '.join(missing)}")
+        # CodeRabbit 4077668514 (Minor, valid): `meta['risk']` is the same class of
+        # attacker-editable run.json value as `policy` right above it, but was rendered
+        # raw here — repr() escapes Python syntax, not HTML, so a crafted risk value
+        # could forge markup in verdict.md exactly like the un-escaped `policy` case
+        # this comment already guards against. _oneline() it the same way.
+        blocked.append(f"rebuttal round required (policy '{_oneline(policy)}', risk "
+                       f"{_oneline(repr(meta['risk']))}, high/critical findings present); "
+                       f"missing for: {', '.join(missing)}")
     return rcov
 
 
@@ -604,15 +610,36 @@ def compute_attestation(run):
     # policy.snapshot.sig; the same gap reappeared for policy.absence.sig when GAP A introduced
     # it without extending this coverage, closed here — frontier-gate run
     # pr70-design-crypto-ci-identity, 2026-09-21.)
+    #
+    # Codex 4077803884 (P2, valid): Path.is_file()/.read_bytes() both follow a symlink at
+    # the leaf, with no size cap — an actor with concurrent write access to the run
+    # directory could replace either sidecar with a symlink to an arbitrary large regular
+    # file this process can read, and this loop would hash (and, for --check-digest,
+    # accept) that external content with no bound on how much it reads. Read it the
+    # hardened way instead (read_regular_file_once: no-follow at the leaf, size-capped,
+    # the same reader every other artifact in this codebase already uses) — a symlinked/
+    # oversized sidecar then raises NotRegularFileError (an OSError), which this
+    # function's own caller already treats as "cannot verify" (exit 2), exactly like any
+    # other artifact it cannot safely read; only a genuinely MISSING sidecar (the
+    # ordinary case for most runs) is still silently skipped, same as before this fix.
     for sig_filename in (POLICY_SIG_FILENAME, POLICY_ABSENCE_SIG_FILENAME):
-        sig_p = run / sig_filename
-        if sig_p.is_file():
-            files[sig_filename] = "raw:" + hashlib.sha256(sig_p.read_bytes()).hexdigest()
+        try:
+            raw = read_regular_file_once(run / sig_filename)
+        except FileNotFoundError:
+            continue
+        files[sig_filename] = "raw:" + hashlib.sha256(raw).hexdigest()
     for p in sorted(run.rglob("*.json")):
         rel = p.relative_to(run).as_posix()
         if rel == "verdict.json":
             continue
-        raw = p.read_bytes()
+        # Same hardening as the sidecar loop above, for the same reason — a symlinked
+        # tracked-JSON artifact must not be read through, and reading it the hardened way
+        # here also closes a second symlink bypass beyond what Codex 4077803884 named:
+        # rglob("*.json") matches by name, so it can list a symlink too, and the previous
+        # plain p.read_bytes() would have followed it exactly like the two sidecars did. A
+        # refusal here is an OSError, which propagates to this function's own caller and is
+        # already treated as "cannot verify," never silently absorbed or misread as drift.
+        raw = read_regular_file_once(p)
         if _json_nesting_depth(raw) > _MAX_CANON_DEPTH or _max_int_digit_run(raw) > _MAX_INT_DIGITS:
             # Nested beyond the depth cap, OR carrying an integer literal wider than the digit cap:
             # whether json.loads accepts either hinges on a PER-RUNTIME limit (the RecursionError
@@ -1592,12 +1619,16 @@ def _aggregate_cli():
                 # verdict rendering normally, never an uncaught KeyError crash.
                 meta.setdefault("risk", "UNKNOWN")
             elif b_risk != meta.get("risk"):
+                # CodeRabbit 4077668514 (Minor, valid): both values come straight from
+                # attacker-editable run.json; repr() (!r) does not HTML-escape, so
+                # _oneline(repr(...)) them the same way every other untrusted string this
+                # function interpolates into `blocked` already is.
                 blocked.append(
                     f"risk tier mismatch: load_attested_policy_bundle's read of "
-                    f"run.json saw risk {b_risk!r}, but a separate read in this "
-                    f"function saw {meta.get('risk')!r} — this run's risk tier is not "
-                    "internally consistent (possible tampering between two reads of "
-                    "run.json, or a concurrent write); re-run aggregate")
+                    f"run.json saw risk {_oneline(repr(b_risk))}, but a separate read in "
+                    f"this function saw {_oneline(repr(meta.get('risk')))} — this run's "
+                    "risk tier is not internally consistent (possible tampering between "
+                    "two reads of run.json, or a concurrent write); re-run aggregate")
             else:
                 meta["risk"] = b_risk
         else:
@@ -1639,11 +1670,16 @@ def _aggregate_cli():
             # reads a few lines up — this is the same TOCTOU class, just against the
             # signature-backed reading instead of the unsigned one.
             if auth.risk != meta.get("risk"):
+                # Same _oneline(repr(...)) treatment as the require_signature=False
+                # mismatch block above (CodeRabbit 4077668514, Minor, valid, caught here
+                # too on review — this branch is this session's own new code and had the
+                # same unescaped-repr gap).
                 blocked.append(
-                    f"risk tier mismatch: authenticated read saw {auth.risk!r}, but an "
-                    f"earlier unsigned read of run.json saw {meta.get('risk')!r} — this "
-                    "run's risk tier is not internally consistent (possible tampering "
-                    "between reads of run.json, or a concurrent write); re-run aggregate")
+                    f"risk tier mismatch: authenticated read saw "
+                    f"{_oneline(repr(auth.risk))}, but an earlier unsigned read of "
+                    f"run.json saw {_oneline(repr(meta.get('risk')))} — this run's risk "
+                    "tier is not internally consistent (possible tampering between reads "
+                    "of run.json, or a concurrent write); re-run aggregate")
             meta["risk"] = auth.risk
         elif auth.status == "UNSIGNED_EXEMPT":
             notes.append(f"{auth.label}: {auth.detail}")
@@ -1653,7 +1689,11 @@ def _aggregate_cli():
         # than silently falling back to today (see check_gates/resolve_waiver_clock).
         clock = resolve_waiver_clock()
         if clock[1]:
-            blocked.append(clock[1])
+            # Codex 4082681166 (P2, valid): clock[1]'s error text embeds the raw,
+            # attacker-influenceable GITHUB_RUN_STARTED_AT env value (see
+            # resolve_waiver_clock's docstring in _common.py); _oneline() it before it
+            # reaches `blocked`, same as every other untrusted string appended here.
+            blocked.append(_oneline(clock[1]))
 
         gates, gcov = check_gates(run, meta["risk"], fail, blocked, notes, pol_data, clock)
         counts["gates"] = len(gates)
@@ -1795,7 +1835,11 @@ def _aggregate_cli():
                f"({len(gcov['missing'])} missing, {len(gcov['blocked'])} blocked, "
                f"{len(gcov['not_applicable'])} n/a, {len(gcov['waived'])} waived); "
                f"panel {len(pcov['roles_filled'])}/{len(pcov['roles_required'])} roles; "
-               f"rebuttal policy '{rcov['policy']}' {reb}; "
+               # CodeRabbit 4077668514 (Minor, valid): rcov['policy'] is the same
+               # attacker-editable meta['rebuttal_policy'] string that's already
+               # _oneline()'d when it reaches `blocked` above — this summary line
+               # rendered it raw instead.
+               f"rebuttal policy '{_oneline(rcov['policy'])}' {reb}; "
                f"findings {fcov['triaged']}/{fcov['raised']} triaged; "
                f"{len(coverage['areas_not_reviewed'])} reviewer-attested unreviewed areas"]
         # Surface every not-applicable determination and its authorizer distinctly — a

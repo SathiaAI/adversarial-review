@@ -54,7 +54,7 @@ jobs:
           AR_SIGNER_CMD: ${{ secrets.AR_SIGNER_CMD }}  # set on THIS job's secrets only, never the
                                                         # review job in examples/adversarial-review.yml
         run: |
-          python3 panel.py init --risk "${AR_RISK:-}" --dev-providers "${AR_DEV_PROVIDERS:-}"
+          python3 scripts/panel.py init --risk "${AR_RISK:-}" --dev-providers "${AR_DEV_PROVIDERS:-}"
           # Produces a signed policy.snapshot.sig under THIS job's own, freshly-created run
           # directory -- correctly isolated, correctly signed, but not yet connected to any
           # specific untrusted review run. See the file header.

@@ -141,15 +141,62 @@ def write_json(path, obj):
          is atomically replaced, never written through or blocked on.
       2. No reader can ever observe a partially-written file, and a destination that is
          a symlink is replaced as that directory entry rather than followed and written
-         through to wherever it points (the old open(path, "w") would follow it)."""
+         through to wherever it points (the old open(path, "w") would follow it).
+
+    Returns the exact encoded bytes written, so a caller that needs to sign/hash them
+    (e.g. panel.py's policy-snapshot signing at init) can do so without a second,
+    independent read of `path` — see write_bytes_atomic's docstring / Codex 4082681134
+    for why re-reading the path back is a TOCTOU gap the return value closes."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     data = (json.dumps(obj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    _atomic_replace(path, data)
+    return data
+
+
+def write_bytes_atomic(path, data):
+    """The raw-bytes counterpart to write_json — same atomic-replace, no-follow-safe
+    semantics (see write_json's docstring for the two properties this gets for free),
+    for callers writing non-JSON artifacts (e.g. a detached signature) into a run
+    directory an attacker may have write access to. CodeRabbit r4082557528-class fix,
+    Codex 4082681153 (P1, valid): the trusted signer used to publish detached signature
+    sidecars via Path.write_bytes(), which opens the DESTINATION in truncate mode and
+    therefore follows a symlink planted there — an attacker who can write into the run
+    directory concurrently with the trusted signer could pre-plant policy.snapshot.sig
+    (or policy.absence.sig) as a symlink to any file the signer process can write, and
+    have the signer overwrite that target with the signature bytes instead of creating
+    the sidecar. Routing the write through the same mkstemp+os.replace pattern write_json
+    already uses closes this the same way: the destination path is never opened, so
+    whatever is there (including a symlink) is atomically replaced as a directory entry,
+    never written through."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_replace(path, data)
+
+
+def _atomic_replace(path, data):
+    """Shared by write_json/write_bytes_atomic: write `data` to a fresh temp file in
+    `path`'s own directory and os.replace() it into place. `os.fdopen(fd, "wb")` returns
+    a buffered stream whose .write() is guaranteed to write the COMPLETE buffer in one
+    call (unlike the raw os.write(fd, data) this replaced, which can return a short
+    count under disk/quota pressure with no exception — CodeRabbit 4077668503 / Codex
+    4077803900, both valid, both reporting the same underlying short-write gap: a
+    truncated temp file silently os.replace()'d over a gate manifest, run.json, or
+    verdict-adjacent artifact as if the write had fully succeeded). fsync before close so
+    the bytes are durable on disk before the rename is visible, not just buffered in the
+    OS page cache."""
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
     try:
-        os.write(fd, data)
-    finally:
-        os.close(fd)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     os.replace(tmp, path)
 
 
@@ -242,18 +289,36 @@ def ci_signing_context():
     isolated trusted-signer job (see action.yml / ci.yml / examples/.gitlab-ci.yml) is
     for."""
     if os.environ.get("GITLAB_CI", "").strip().lower() == "true":
-        return {
+        return _sanitize_ci_context({
             "repository": os.environ.get("CI_PROJECT_PATH", "").strip() or _NO_CI_CONTEXT,
             "commit": os.environ.get("CI_COMMIT_SHA", "").strip() or _NO_CI_CONTEXT,
             "run_id": os.environ.get("CI_PIPELINE_ID", "").strip() or _NO_CI_CONTEXT,
             "run_attempt": _GITLAB_NO_RUN_ATTEMPT,
-        }
-    return {
+        })
+    return _sanitize_ci_context({
         "repository": os.environ.get("GITHUB_REPOSITORY", "").strip() or _NO_CI_CONTEXT,
         "commit": os.environ.get("GITHUB_SHA", "").strip() or _NO_CI_CONTEXT,
         "run_id": os.environ.get("GITHUB_RUN_ID", "").strip() or _NO_CI_CONTEXT,
         "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "").strip() or _NO_CI_CONTEXT,
-    }
+    })
+
+
+def _sanitize_ci_context(ctx):
+    """Codex 4077803892 (P2, valid): os.environ decodes a non-UTF-8 env-var byte string
+    with surrogateescape, so a field read straight from the environment can be an
+    `isinstance(x, str)` value that still raises UnicodeEncodeError the moment
+    policy_attest_bytes/policy_absence_attest_bytes .encode("utf-8") it — reproduced with
+    GITHUB_REPOSITORY='owner/\\udcff'. Rather than validate this at every one of
+    ci_signing_context()'s four call sites (two sign paths in panel.py, two verify paths
+    here), sanitize once, centrally, where the values are first read from the live
+    environment: a field that fails _encodable_str() is replaced with _NO_CI_CONTEXT
+    ("local"), the same value ci_signing_context() already returns for a platform it
+    can't identify at all. That is the correct fail-closed shape, not a crash and not a
+    silent pass-through of unencodable input — a corrupted CI-reported identity gets
+    exactly the same reduced (no-real-identity) trust _ci_identity_established() already
+    forces AR_ALLOW_LOCAL_CI_IDENTITY to cover for a genuinely-unidentified platform, so
+    a garbled value can never round-trip as if it were a real one."""
+    return {k: (v if _encodable_str(v) else _NO_CI_CONTEXT) for k, v in ctx.items()}
 
 
 def _ci_identity_established(ci_context):
@@ -2026,7 +2091,7 @@ def authenticate_risk_tier(run):
                       "repository (no verifier resolves here, and "
                       "AR_SIGNING_REQUIRED is not set) — risk tier is "
                       "self-reported under the infrastructure-free exemption "
-                      "(reviews/pr70-provenance-binding-decision.md)")
+                      "(see docs/THREAT-MODEL.md)")
         return AuthResult(AUTH_STATUS_UNSIGNED_EXEMPT, self_risk,
                            RISK_LABEL_UNSIGNED_EXEMPT, detail, None)
     # Signing IS expected here — demand full cryptographic authentication. This is the

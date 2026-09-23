@@ -15025,10 +15025,18 @@ def t_gate_plan_fifo_in_gates_dir_no_hang():
     sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
     run = latest_run(repo)
     os.mkfifo(run / "gates" / "stale-fifo-gate.json")
+    # CodeRabbit 4077668524 (Minor, valid): the waiver clock is UTC
+    # (datetime.now(timezone.utc).date(), resolve_waiver_clock's fallback), not
+    # date.today()'s local date -- on a machine whose local date is a day behind UTC
+    # (e.g. UTC-5 in the evening), "local tomorrow" can equal "UTC today", making this
+    # expiry not strictly later than the clock date and failing for a reason unrelated
+    # to the FIFO behavior under test. Same fix already applied to the boundary tests
+    # this comment refers to (c05023).
     r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation",
             "--waive", "mutation", "--authorized-by", "tester",
             "--waive-reason", "fifo test to check no hang",
-            "--waive-expires", (date.today() + timedelta(days=1)).isoformat()], repo)
+            "--waive-expires",
+            (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()], repo)
     assert r.returncode == 0, r.stdout + r.stderr
     # The stale FIFO itself is left alone (cleanup only unlinks its OWN prior WAIVED
     # records, source=="plan" -- a FIFO never parses as that dict shape, so it is
@@ -15052,14 +15060,171 @@ def t_gate_plan_fifo_as_active_waiver_target_no_hang():
     run = latest_run(repo)
     gate_path = run / "gates" / "mutation.json"
     os.mkfifo(gate_path)
+    # CodeRabbit 4077668524 (Minor, valid) — same UTC-vs-local waiver-clock fix as
+    # t_gate_plan_fifo_in_gates_dir_no_hang above.
     r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast,mutation",
             "--waive", "mutation", "--authorized-by", "tester",
             "--waive-reason", "fifo test to check no hang",
-            "--waive-expires", (date.today() + timedelta(days=1)).isoformat()], repo)
+            "--waive-expires",
+            (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()], repo)
     assert r.returncode == 0, r.stdout + r.stderr
     import stat as _stat
     assert _stat.S_ISREG(gate_path.stat().st_mode), "FIFO must be atomically replaced by a regular file"
     assert read(gate_path)["status"] == "WAIVED"
+
+
+# ---------------------------------------------------------------- PR70 round 5.1 follow-up
+# (post-9b280ba/8290ecf review: 4 valid, code-verified CodeRabbit/Codex findings)
+
+def t_write_json_returns_written_bytes():
+    # Contract other code (panel.py's TOCTOU sign fix, below) now depends on: write_json
+    # returns the exact encoded bytes it just wrote, so a caller that needs to sign/hash
+    # them never has to re-read the path back.
+    sys.path.insert(0, str(SKILL / "scripts"))
+    import _common
+    d = Path(tempfile.mkdtemp(prefix="ar-wjb-"))
+    p = d / "x.json"
+    returned = _common.write_json(p, {"a": 1, "b": [1, 2, 3]})
+    assert returned == p.read_bytes(), "write_json's return value must match what it wrote"
+    assert json.loads(returned.decode("utf-8")) == {"a": 1, "b": [1, 2, 3]}
+
+
+def t_write_bytes_atomic_refuses_to_follow_symlink():
+    # Codex 4082681153 (P1, valid): the trusted signer used to publish
+    # policy.snapshot.sig/policy.absence.sig via Path.write_bytes(), which opens the
+    # destination in truncate mode and follows a symlink planted there. write_bytes_atomic
+    # (mkstemp + os.replace, same no-follow-safe shape as write_json) must instead replace
+    # the symlink itself as a directory entry, never write through it to wherever it points.
+    if not hasattr(os, "symlink"):
+        return  # platform without symlink support; documented gap, not a silent one
+    sys.path.insert(0, str(SKILL / "scripts"))
+    import _common
+    d = Path(tempfile.mkdtemp(prefix="ar-wba-"))
+    outside_target = d / "outside.bin"
+    outside_target.write_bytes(b"untouched")
+    link = d / "sig.bin"
+    os.symlink(outside_target, link)
+    _common.write_bytes_atomic(link, b"signature-bytes")
+    assert outside_target.read_bytes() == b"untouched", \
+        "a symlink's target must never be written through"
+    assert not link.is_symlink(), "the symlink itself must be replaced, not followed"
+    assert link.read_bytes() == b"signature-bytes"
+
+
+def t_toctou_sign_uses_caller_supplied_bytes_never_rereads():
+    # Codex 4082681134 (P1, valid): the sign-side counterpart to
+    # t_toctou_verify_uses_caller_supplied_bytes_never_rereads above.
+    # _sign_policy_snapshot_if_possible used to sign policy_attest_bytes(..., snap_path=...),
+    # which re-reads policy.snapshot.json off disk -- a second, independent read of a file
+    # an actor with concurrent write access to the run directory could have swapped between
+    # write_json's write and this reread, then swapped back before anyone else reads
+    # run.json's recorded digest. panel.py's cmd_init now passes write_json's own return
+    # value straight through as snap_bytes instead. Proves both that (a) the produced
+    # signature verifies against the bytes actually supplied, and (b) it does NOT re-open
+    # policy.snapshot.json at all during signing, and (c) it does not verify against
+    # different bytes later found at that path.
+    import panel, _common
+    env = _stub_signer_env()
+    touched = list(env.keys())
+    saved = {k: os.environ.get(k) for k in touched}
+    for k, v in env.items():
+        os.environ[k] = v
+    try:
+        repo = fresh_repo()
+        run = repo / ".adversarial-review" / "run-toctou-sign"
+        (run / "gates").mkdir(parents=True)
+        run_id, run_nonce, risk = run.name, "n" * 32, "SENSITIVE"
+        intended_bytes = b'{"file": "policy.yml", "sha256": "intended", "text": "intended"}'
+        # A DIFFERENT, "attacker-swapped" file already sitting at the path signing would
+        # otherwise reread from -- if the fix regresses to reading the path again, it
+        # would sign THIS content instead of intended_bytes, and the assertions below
+        # would catch it either via the AssertionError from refusing_open or via the
+        # tampered-bytes verification wrongly succeeding.
+        (run / "policy.snapshot.json").write_bytes(
+            b'{"file": "policy.yml", "sha256": "swapped", "text": "swapped"}')
+        orig_open = _common.os.open
+        def refusing_open(path, *a, **kw):
+            if str(path).endswith("policy.snapshot.json"):
+                raise AssertionError(
+                    "policy.snapshot.json was reread during signing -- TOCTOU regression")
+            return orig_open(path, *a, **kw)
+        _common.os.open = refusing_open
+        try:
+            panel._sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk,
+                                                      intended_bytes)
+        finally:
+            _common.os.open = orig_open
+        sig_p = run / _common.POLICY_SIG_FILENAME
+        assert sig_p.exists(), "signer stub should have produced a signature"
+        meta = {"run_id": run_id, "run_nonce": run_nonce, "risk": risk}
+        assert _common.verify_policy_snapshot_signature(run, meta,
+                                                          snap_bytes=intended_bytes) is None
+        tampered = b'{"file": "policy.yml", "sha256": "tampered", "text": "tampered"}'
+        assert _common.verify_policy_snapshot_signature(run, meta,
+                                                          snap_bytes=tampered) is not None
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def t_compute_attestation_symlinked_sidecar_is_cannot_verify_not_silent_accept():
+    # Codex 4077803884 (P2, valid): compute_attestation's sidecar loop used
+    # Path.is_file()/.read_bytes(), which follow a symlink at the leaf with no size cap.
+    # It now reads via read_regular_file_once (no-follow, size-capped); a symlinked
+    # sidecar raises NotRegularFileError, which --check-digest's own existing `except
+    # OSError` wrapper already turns into "cannot verify" (exit 2) -- never a silent
+    # accept of whatever the symlink points to, and never a crash.
+    if not hasattr(os, "symlink"):
+        return
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.sig").exists()
+    _resolve_open_finding(run)
+    sh(["aggregate.py"], repo, env=env)                              # real verdict.json + attestation
+    sh(["aggregate.py", "--check-digest"], repo, env=env, expect=0)  # baseline: intact
+    outside = Path(tempfile.mkdtemp(prefix="ar-evilsig-")) / "big.bin"
+    outside.write_bytes(b"x" * 1024)
+    sig_p = run / "policy.snapshot.sig"
+    sig_p.unlink()
+    os.symlink(outside, sig_p)
+    r = sh(["aggregate.py", "--check-digest"], repo, env=env, expect=2)
+    assert "cannot recompute attestation" in (r.stdout + r.stderr), (r.stdout, r.stderr)
+
+
+def t_ci_signing_context_sanitizes_unencodable_env_value():
+    # Codex 4077803892 (P2, valid): os.environ decodes a non-UTF-8 env-var byte string
+    # with surrogateescape, so ci_signing_context() could return a field that is an
+    # isinstance(x, str) value that still raises UnicodeEncodeError the moment
+    # policy_attest_bytes/policy_absence_attest_bytes .encode("utf-8") it -- reproduced
+    # here with the exact GITHUB_REPOSITORY value from the original report. It must now
+    # sanitize to _NO_CI_CONTEXT ("local") instead of propagating the unencodable value
+    # or crashing.
+    sys.path.insert(0, str(SKILL / "scripts"))
+    import _common
+    saved = {k: os.environ.get(k) for k in
+             ("GITLAB_CI", "GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_RUN_ID",
+              "GITHUB_RUN_ATTEMPT")}
+    os.environ.pop("GITLAB_CI", None)
+    os.environ["GITHUB_REPOSITORY"] = "owner/\udcff"
+    os.environ["GITHUB_SHA"] = "deadbeef"
+    os.environ["GITHUB_RUN_ID"] = "123"
+    os.environ["GITHUB_RUN_ATTEMPT"] = "1"
+    try:
+        ctx = _common.ci_signing_context()
+        assert ctx["repository"] == _common._NO_CI_CONTEXT, ctx
+        assert ctx["commit"] == "deadbeef", ctx  # untouched fields pass through unchanged
+        # Must not raise, and must actually be encodable now.
+        ctx["repository"].encode("utf-8")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 if __name__ == "__main__":
