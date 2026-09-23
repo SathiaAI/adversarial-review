@@ -1764,7 +1764,28 @@ def t_policy_sig_absence_signed_at_init_allows_waiver_run_to_pass():
     assert (run / "policy.absence.json").exists()
     sig = (run / "policy.absence.sig").read_bytes()
     meta = read(run / "run.json")
-    msg = policy_absence_attest_bytes(run.name, meta["run_nonce"], run.name, meta["risk"])
+    # Pre-existing bug, unrelated to checklist item 6 (found while diagnosing a real CI
+    # failure on this PR, gh run 35676262016 and others going back to headSha b8df8fb --
+    # first observed failing well before this round's changes): this test SUITE itself
+    # may be running inside real CI (this repo's own ci.yml triggers on pull_request), so
+    # this process's own os.environ can carry real GITHUB_REPOSITORY/SHA/RUN_ID/
+    # RUN_ATTEMPT/EVENT_NAME values that _stub_signer_env() deliberately neutralizes in
+    # the SUBPROCESS env (what panel.py init actually signed under) but cannot reach into
+    # THIS process's own environment to also neutralize -- the exact CI leak
+    # _stub_signer_env()'s own docstring describes and the sibling snapshot test just
+    # above (t_policy_sig_ci_identity_established_needs_no_opt_in) already works around
+    # the same way. Recomputing ci_context from `env` (the neutralized dict actually
+    # handed to the subprocess) instead of the ambient process environment keeps this
+    # test's expected message correct regardless of what environment the suite itself
+    # happens to run in.
+    ci_context = {
+        "repository": env.get("GITHUB_REPOSITORY", "").strip() or "local",
+        "commit": env.get("GITHUB_SHA", "").strip() or "local",
+        "run_id": env.get("GITHUB_RUN_ID", "").strip() or "local",
+        "run_attempt": env.get("GITHUB_RUN_ATTEMPT", "").strip() or "local",
+    }
+    msg = policy_absence_attest_bytes(run.name, meta["run_nonce"], run.name, meta["risk"],
+                                       ci_context=ci_context)
     assert sig == b"STUBSIG-v1:" + hashlib.sha256(msg).hexdigest().encode(), sig
     absence = read(run / "policy.absence.json")
     assert absence["policy_absent"] is True, absence
@@ -1906,7 +1927,17 @@ def t_item6_signing_required_anchor_blocks_even_without_local_verifier():
     # repository's signing requirement portable across environments (plan on a laptop
     # with no cosign installed, aggregate in CI) rather than dependent on which
     # machine happens to have a verifier on PATH.
-    env = {**ENV, "AR_SIGNING_REQUIRED": "1"}
+    # GITHUB_EVENT_NAME must be pinned away from the ambient value: this test SUITE
+    # itself may be running inside real CI (this repo's own ci.yml triggers on
+    # pull_request), and ENV = {**os.environ, ...} inherits that real value unless
+    # overridden -- since checklist item 6's pull_request exemption (CodeRabbit
+    # r4082557512) means a leaked GITHUB_EVENT_NAME=pull_request would make THIS
+    # scenario no longer force CRITICAL, this test would otherwise pass locally but
+    # flip to failing the moment it runs inside this repo's own PR-triggered CI (the
+    # same class of leak t_policy_sig_absence_signed_at_init_allows_waiver_run_to_pass
+    # was just fixed for). "workflow_dispatch" is a real, signing-capable GitHub Actions
+    # trigger, matching what this test actually means to exercise.
+    env = {**ENV, "AR_SIGNING_REQUIRED": "1", "GITHUB_EVENT_NAME": "workflow_dispatch"}
     assert not env.get("AR_VERIFIER_CMD"), "ENV's own neutralized baseline (see its def)"
     repo = fresh_repo()
     sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo, env=env)
@@ -1934,7 +1965,14 @@ def t_item6_downgrade_to_exempt_attack_blocked_by_anchor():
     assert (run / "policy.snapshot.sig").exists()
     (run / "policy.snapshot.json").unlink()
     (run / "policy.snapshot.sig").unlink()
-    attacker_env = {**ENV, "AR_SIGNING_REQUIRED": "1"}
+    # GITHUB_EVENT_NAME pinned away from the ambient value for the same reason as
+    # t_item6_signing_required_anchor_blocks_even_without_local_verifier just above --
+    # this attack is specifically against a signing-capable (non-PR-triggered) job; a
+    # leaked GITHUB_EVENT_NAME=pull_request from this suite's own real CI environment
+    # would make the run exempt rather than BLOCKED under checklist item 6's
+    # pull_request exemption, flipping this test's outcome depending on what environment
+    # the suite itself happens to run in.
+    attacker_env = {**ENV, "AR_SIGNING_REQUIRED": "1", "GITHUB_EVENT_NAME": "workflow_dispatch"}
     assert not attacker_env.get("AR_VERIFIER_CMD"), "ENV's own neutralized baseline"
     r = sh(["aggregate.py"], repo, expect=2, env=attacker_env)
     assert "RISK TIER UNAUTHENTICATED" in r.stdout, r.stdout
@@ -2004,6 +2042,63 @@ def t_item6_verifier_timeout_fails_closed_as_unauthenticated_not_crash():
     assert "Traceback" not in r.stdout, r.stdout
     assert "RISK TIER UNAUTHENTICATED" in r.stdout, r.stdout
     assert "risk=CRITICAL" in r.stdout, r.stdout
+
+
+def t_item6_pull_request_triggered_run_exempt_even_with_verifier_and_anchor():
+    # CodeRabbit r4082557512 (Major, valid, "Do not force unsigned pull_request runs to
+    # CRITICAL"): panel.py init already refuses to sign under GITHUB_EVENT_NAME=
+    # pull_request (trusted_signer_guard_error) -- so a repo whose runner happens to
+    # have a working verifier AND has AR_SIGNING_REQUIRED set would otherwise have
+    # EVERY pull_request-triggered run permanently forced to UNAUTHENTICATED/CRITICAL,
+    # with no way to ever clear it (no hand-off mechanism exists for a trusted job to
+    # sign on this run's behalf). Both signals present here -- a resolvable verifier
+    # AND AR_SIGNING_REQUIRED=1 -- yet the run must still reach PASS on its
+    # self-reported risk, exactly like a never-signed repo would.
+    env = {**_stub_signer_env(), "AR_SIGNING_REQUIRED": "1",
+           "GITHUB_EVENT_NAME": "pull_request"}
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo, env=env)
+    run = latest_run(repo)
+    assert not (run / "policy.snapshot.sig").exists(), \
+        "must NOT have signed -- init refuses under pull_request regardless"
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast"], repo, env=env)
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo, env=env)
+    sh(["panel.py", "assign"], repo, env=env)
+    sh(["panel.py", "run", "--context-file", "context.md"], repo, env=env)
+    sh(["panel.py", "rebuttal"], repo, env=env)
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0, env=env)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
+    assert "RISK TIER UNSIGNED EXEMPT" in r.stdout, r.stdout
+    assert "RISK TIER UNAUTHENTICATED" not in r.stdout, r.stdout
+    assert "PR/MR-author-controlled" in r.stdout, r.stdout
+
+
+def t_item6_pull_request_exemption_does_not_reach_waived_gate_signature_check():
+    # Companion to the test above: the pull_request exemption is scoped to
+    # authenticate_risk_tier's own unconditional, no-waiver-required check ONLY. A
+    # WAIVED gate on the SAME pull_request-triggered run must still independently
+    # require a valid signature via the separate, pre-existing GAP-A check -- proving
+    # this fix didn't accidentally widen the exemption into the waiver path too. That
+    # check runs at PLAN time (gate.py, not aggregate.py) -- `gate.py plan --waive`
+    # refuses outright, before a waiver is even recorded, exactly as it already does
+    # for any other unsigned run attempting to waive a gate.
+    env = {**_stub_signer_env(), "AR_SIGNING_REQUIRED": "1",
+           "GITHUB_EVENT_NAME": "pull_request"}
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo, env=env)
+    run = latest_run(repo)
+    assert not (run / "policy.snapshot.sig").exists(), \
+        "must NOT have signed -- init refuses under pull_request regardless"
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI for this repo yet",
+            "--waive-expires", (date.today() + timedelta(days=7)).isoformat()],
+           repo, env=env, expect=1)
+    assert "cannot waive" in r.stderr, r.stderr
+    assert "not verifiably signed" in r.stderr, r.stderr
 
 
 def t_policy_sig_valid_signature_allows_waiver_run_to_pass():

@@ -738,6 +738,30 @@ _UNTRUSTED_GITHUB_EVENTS = frozenset({"pull_request"})
 _UNTRUSTED_GITLAB_PIPELINE_SOURCES = frozenset({"merge_request_event"})
 
 
+def _pr_author_controlled_trigger():
+    """True iff THIS process is running inside a job whose trigger is one
+    trusted_signer_guard_error() would refuse to sign under (GitHub Actions
+    GITHUB_EVENT_NAME=='pull_request', or GitLab CI_PIPELINE_SOURCE==
+    'merge_request_event' when GITLAB_CI=='true') -- i.e. a job an adversarial PR/MR's
+    own code controls, checked out at HEAD. Factored out of trusted_signer_guard_error
+    so it and authenticate_risk_tier's own pre-check (Codex/CodeRabbit r4082557512, "Do
+    not force unsigned pull_request runs to CRITICAL") can never drift out of sync --
+    same shape as _verifier_configured_here's own extraction from GAP-A's file-absence
+    branch. Deliberately does NOT check AR_TRUSTED_SIGNER (unlike
+    trusted_signer_guard_error) -- that flag decides whether THIS job may attempt to
+    sign; this function answers a narrower, purely factual question (can a job with
+    this trigger structurally sign AT ALL, regardless of what it's opted into) that
+    authenticate_risk_tier needs independently of any signing intent."""
+    event = os.environ.get("GITHUB_EVENT_NAME", "").strip()
+    if event in _UNTRUSTED_GITHUB_EVENTS:
+        return True
+    if os.environ.get("GITLAB_CI", "").strip().lower() == "true":
+        source = os.environ.get("CI_PIPELINE_SOURCE", "").strip()
+        if source in _UNTRUSTED_GITLAB_PIPELINE_SOURCES:
+            return True
+    return False
+
+
 def trusted_signer_guard_error():
     """Best-effort, defense-in-depth check that the CURRENT process is not obviously
     running inside a job an adversarial PR's own code controls, called immediately
@@ -786,19 +810,18 @@ def trusted_signer_guard_error():
                 "explicitly opted into from the job you have designated as the trusted "
                 "signer (never opportunistically just because a signer happens to be "
                 "configured); see docs/THREAT-MODEL.md")
-    event = os.environ.get("GITHUB_EVENT_NAME", "").strip()
-    if event in _UNTRUSTED_GITHUB_EVENTS:
-        return (f"GITHUB_EVENT_NAME={event!r} is a PR-author-controlled trigger -- "
-                "the trusted signer must run from workflow_run, push, schedule, or "
-                "workflow_dispatch instead, in a job the PR cannot modify; see "
-                "docs/THREAT-MODEL.md")
-    if os.environ.get("GITLAB_CI", "").strip().lower() == "true":
-        source = os.environ.get("CI_PIPELINE_SOURCE", "").strip()
-        if source in _UNTRUSTED_GITLAB_PIPELINE_SOURCES:
-            return (f"CI_PIPELINE_SOURCE={source!r} is a merge-request-author-controlled "
-                    "trigger -- the trusted signer must run from push, schedule, web, or "
-                    "pipeline/trigger instead, in a job the MR cannot modify; see "
+    if _pr_author_controlled_trigger():
+        event = os.environ.get("GITHUB_EVENT_NAME", "").strip()
+        if event in _UNTRUSTED_GITHUB_EVENTS:
+            return (f"GITHUB_EVENT_NAME={event!r} is a PR-author-controlled trigger -- "
+                    "the trusted signer must run from workflow_run, push, schedule, or "
+                    "workflow_dispatch instead, in a job the PR cannot modify; see "
                     "docs/THREAT-MODEL.md")
+        source = os.environ.get("CI_PIPELINE_SOURCE", "").strip()
+        return (f"CI_PIPELINE_SOURCE={source!r} is a merge-request-author-controlled "
+                "trigger -- the trusted signer must run from push, schedule, web, or "
+                "pipeline/trigger instead, in a job the MR cannot modify; see "
+                "docs/THREAT-MODEL.md")
     return None
 
 
@@ -1934,12 +1957,31 @@ def authenticate_risk_tier(run):
     only escalates to CRITICAL when signing was actually EXPECTED for this repository:
     a verifier resolves in this environment (_verifier_configured_here — the
     pre-existing GAP-A signal), or the repository's own out-of-band AR_SIGNING_REQUIRED
-    anchor says so (_signing_required_anchor — the new checklist item 1 addition that
+    anchor says so (_signing_required_anchor — the checklist item 1 addition that
     closes the downgrade-to-exempt gap the panel's own reviewers flagged: an attacker
     who can strip a verifier out of the job env must not be able to make a signed
-    repository look exactly like one that was never signed).
+    repository look exactly like one that was never signed) -- AND signing was actually
+    POSSIBLE for this specific run (_pr_author_controlled_trigger being false).
 
-    A repository where NEITHER signal is present takes a fast, infrastructure-free path
+    CodeRabbit r4082557512 (Major, valid, "Do not force unsigned pull_request runs to
+    CRITICAL"): panel.py init already refuses to sign under a PR/MR-author-controlled
+    trigger (trusted_signer_guard_error) -- there is no production hand-off mechanism
+    yet for a separate trusted job to sign on behalf of a PR-triggered run's own
+    directory (see docs/THREAT-MODEL.md's open items). Forcing CRITICAL on every such
+    run regardless would close no actual gap -- that job can never produce the
+    signature being demanded, no matter how it's configured -- while permanently
+    blocking PR-gating CI for any repository whose runner happens to have a verifier
+    binary on PATH or that sets AR_SIGNING_REQUIRED. That is exactly the silent,
+    undisclosed breaking change Option A exists to avoid, just relocated from "any
+    unsigned repo" to "any PR-triggered run of a repo with a verifier available." A
+    WAIVED or NOT_APPLICABLE gate on a PR-triggered run is still independently required
+    to carry a valid signature by the separate, pre-existing GAP-A check further down
+    aggregate.py -- unaffected by this exemption, which only concerns the unconditional,
+    no-waiver-required check this function performs.
+
+    A repository where NONE of the three signals is present -- no verifier resolves, no
+    AR_SIGNING_REQUIRED anchor, or (regardless of the other two) this run's own trigger
+    could never have signed in the first place -- takes a fast, infrastructure-free path
     that never calls load_attested_policy_bundle(require_signature=True) at all — this
     is deliberate, not an optimization: calling that with require_signature=True would
     re-coathe the ordinary no-signing path to policy.snapshot.json's content validity,
@@ -1951,7 +1993,8 @@ def authenticate_risk_tier(run):
 
     Returns an AuthResult (see its own docstring). Never raises."""
     self_risk, self_err = read_run_risk(run)
-    if not (_verifier_configured_here() or _signing_required_anchor()):
+    pr_triggered = _pr_author_controlled_trigger()
+    if pr_triggered or not (_verifier_configured_here() or _signing_required_anchor()):
         # Fast, infrastructure-free path — see the docstring above for why this must
         # not touch load_attested_policy_bundle(require_signature=True) at all.
         #
@@ -1967,14 +2010,25 @@ def authenticate_risk_tier(run):
                                RISK_LABEL_UNAUTHENTICATED,
                                f"cannot determine risk tier for this run: {self_err}",
                                None)
+        if pr_triggered:
+            detail = ("this run's own trigger is PR/MR-author-controlled "
+                      "(GITHUB_EVENT_NAME=pull_request or GitLab's "
+                      "merge_request_event) — panel.py init refuses to sign under "
+                      "such triggers by design (trusted_signer_guard_error), and no "
+                      "hand-off exists yet for a separate trusted job to sign on this "
+                      "run's behalf, so this run is exempt from the signing-expected "
+                      "escalation even if a verifier resolves or AR_SIGNING_REQUIRED "
+                      "is set for this repository; risk tier is self-reported. A "
+                      "WAIVED or NOT_APPLICABLE gate on this run still independently "
+                      "requires a valid signature (see docs/THREAT-MODEL.md)")
+        else:
+            detail = ("no signing infrastructure is configured for this "
+                      "repository (no verifier resolves here, and "
+                      "AR_SIGNING_REQUIRED is not set) — risk tier is "
+                      "self-reported under the infrastructure-free exemption "
+                      "(reviews/pr70-provenance-binding-decision.md)")
         return AuthResult(AUTH_STATUS_UNSIGNED_EXEMPT, self_risk,
-                           RISK_LABEL_UNSIGNED_EXEMPT,
-                           "no signing infrastructure is configured for this "
-                           "repository (no verifier resolves here, and "
-                           "AR_SIGNING_REQUIRED is not set) — risk tier is "
-                           "self-reported under the infrastructure-free exemption "
-                           "(reviews/pr70-provenance-binding-decision.md)",
-                           None)
+                           RISK_LABEL_UNSIGNED_EXEMPT, detail, None)
     # Signing IS expected here — demand full cryptographic authentication. This is the
     # existing require_signature=True failure branch (checklist item 13): the anchor
     # check above only widens WHEN this branch is reached, never what happens inside it.

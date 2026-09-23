@@ -1625,6 +1625,26 @@ def _aggregate_cli():
             # it reaches verdict.md, same as every other untrusted string this function
             # interpolates into `blocked` (see the sig_err handling just below).
             blocked.append(f"{auth.label}: {_oneline(auth.detail)}")
+        elif auth.status == "AUTHENTICATED":
+            # CodeRabbit r4082557528 (Major, valid): auth.risk here is the CRYPTOGRAPHICALLY
+            # AUTHENTICATED tier (verified against the signed bundle inside
+            # authenticate_risk_tier itself), but meta["risk"] at this point still holds
+            # whatever the EARLIER, require_signature=False read above (lines ~1559-1602)
+            # saw — unsigned content only. An attacker with concurrent write access to the
+            # run directory could lower run.json's risk between that first read and this
+            # one, then restore it, so the two reads disagree and only the unsigned one
+            # would otherwise reach check_gates/check_rebuttal below. Prefer the
+            # authenticated value and BLOCK (not silently overwrite) on any disagreement,
+            # exactly like the require_signature=False block already does for its own two
+            # reads a few lines up — this is the same TOCTOU class, just against the
+            # signature-backed reading instead of the unsigned one.
+            if auth.risk != meta.get("risk"):
+                blocked.append(
+                    f"risk tier mismatch: authenticated read saw {auth.risk!r}, but an "
+                    f"earlier unsigned read of run.json saw {meta.get('risk')!r} — this "
+                    "run's risk tier is not internally consistent (possible tampering "
+                    "between reads of run.json, or a concurrent write); re-run aggregate")
+            meta["risk"] = auth.risk
         elif auth.status == "UNSIGNED_EXEMPT":
             notes.append(f"{auth.label}: {auth.detail}")
 

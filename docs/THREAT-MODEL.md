@@ -147,7 +147,7 @@ into another), not a general trust-topology verifier.
 | Waiver signed without any human approval evidence | Not yet built — candidate follow-up beyond the current 4-batch plan | Open |
 | A trusted job's signature cannot reach the untrusted review job's own run directory (cross-job hand-off) | Not yet designed — candidate approaches sketched above; needs its own frontier-gate panel run before implementation | Open |
 | A signed repo's policy.snapshot.json/signature is deleted or its verification starts failing (rotated key, tampered artifact), and the run self-reports a low risk tier so it slips through with reduced gates | `authenticate_risk_tier()` forces risk to CRITICAL and BLOCKS whenever signing was expected (a verifier resolves, or `AR_SIGNING_REQUIRED` says so) but cannot be verified — CRITICAL's `mutation` gate can never be waived | **Shipped round 5** (`AR_SIGNING_REQUIRED` anchor + `RISK TIER UNAUTHENTICATED`) |
-| Downgrade-to-exempt: an attacker deletes BOTH `policy.snapshot.json` and any signed absence attestation, AND strips the verifier from the job env, making a previously-signed repo look exactly like one that was never signed | `AR_SIGNING_REQUIRED`, anchored outside the run directory and outside this job's own verifier config (a repository secret / protected Action input) | **Shipped round 5** — see the new section below |
+| Downgrade-to-exempt: an attacker deletes BOTH `policy.snapshot.json` and any signed absence attestation, AND strips the verifier from the job env, making a previously-signed repo look exactly like one that was never signed | `AR_SIGNING_REQUIRED`, but only when its source is one a same-repo PR genuinely cannot edit | **Partially shipped round 5** — the mechanism (a forced anchor) shipped; closing the gap for real requires an anchor source outside the calling repo's own workflow file, which most adopters have not yet configured. See the corrected section below |
 | A repository with no signing infrastructure at all gets forced to CRITICAL on every run once `mutation` is checked | Deliberately NOT built this round — see "What round 5 deliberately did not build" below | **Open, tracked** (roadmap `pr70-round5-signing-hardening-and-keyless-onboarding.md`, M4-dependent) |
 
 ## Round 5 — unauthenticated risk-tier fallback (checklist item 6, refined)
@@ -174,7 +174,7 @@ mutation testing, milestone M4, is not yet built). `authenticate_risk_tier()` in
   BLOCKED. `mutation` can never be waived at CRITICAL, which is what actually makes
   this un-bypassable rather than merely a printed warning.
 
-### `AR_SIGNING_REQUIRED` — closing the downgrade-to-exempt gap
+### `AR_SIGNING_REQUIRED` — closing the downgrade-to-exempt gap (partially — see caveat)
 
 The frontier panel's own reviewers (all four, most explicitly Astra) flagged a real gap
 in the first version of this option: inferring "signing was configured" only from
@@ -185,16 +185,59 @@ same-repo PR editing `.github/workflows/*`, or simply removing `AR_VERIFIER_CMD`
 at which point a previously-signed repository looks exactly like one that was never
 signed and falls through to the exemption instead of BLOCKING.
 
-`AR_SIGNING_REQUIRED=1` closes this: it is meant to be set **exactly once**, out of
-band, as a repository secret or an Action `with:` input on the calling reusable
-workflow (the same place `action.yml`'s `signing: keyless` input already wires
-`AR_ALLOW_KEYLESS` — see the roadmap's Phase 2 item 10) or an environment-protection-
-rule variable — **never** inside a workflow file a same-repo PR's own diff can edit,
-and never inside anything read from the run directory itself. Once set, a run whose
-`policy.snapshot.json`/absence attestation are both missing is BLOCKED regardless of
-whether a local verifier happens to resolve. Adopters who have not yet configured this
-anchor are no worse off than before this change — the pre-existing "verifier resolves
-here" check still applies on its own, unchanged.
+`AR_SIGNING_REQUIRED=1` is the mechanism that closes this — **but only when its value
+reaches the job from a source a same-repo PR genuinely cannot edit.** CodeRabbit
+r4082557491 (Major, valid) correctly caught that the original wording here overstated
+this: a "repository secret or Action `with:` input on the calling reusable workflow" is
+not, by itself, safe when that calling workflow lives in the SAME repository as the
+one being protected. GitHub Actions runs a `pull_request`-triggered job using the
+workflow file from the PR's own head ref, so a same-repo PR can simply delete the line
+that maps the secret into `AR_SIGNING_REQUIRED` (`env: AR_SIGNING_REQUIRED:
+${{ secrets.AR_SIGNING_REQUIRED }}`) from its own copy of that file — the secret's
+*value* is safe from the PR, but the *wiring* that exposes it to the job is not, if
+that wiring lives in a file the PR controls.
+
+What actually closes the gap is an anchor whose **wiring**, not just its value, sits
+outside the protected repo's own PR-editable surface. Two setups qualify:
+
+1. **A SHA-pinned reusable workflow hosted in a separate repository**, whose own file
+   (not a `with:` input passed in from the calling repo) sets `AR_SIGNING_REQUIRED`
+   directly — combined with branch protection on the calling repo that prevents a PR
+   from changing which reusable workflow (or which pinned SHA) that calling file
+   invokes. If the calling file's `uses: org/other-repo/...@<sha>` line is itself
+   unprotected, a PR can simply repoint it at a workflow that doesn't set the anchor,
+   so the SHA pin alone is not sufficient without that protection.
+2. **An organization-level "required workflow" ruleset** (GitHub's own feature for
+   exactly this problem) — configured by an org owner, defined and pinned outside the
+   target repository, and enforced regardless of what the target repo's own workflow
+   files say.
+
+A plain repository secret referenced from this repo's own `.github/workflows/*.yml`
+does **not** close the gap on its own — it only raises the bar from "delete two files"
+to "also delete one line," which is not a meaningfully higher bar for a same-repo PR.
+Adopters who have configured neither of the two setups above are, honestly, still
+exposed to the downgrade-to-exempt attack this section describes; they are no worse off
+than before this change (the pre-existing "verifier resolves here" check still applies
+on its own, unchanged), but `AR_SIGNING_REQUIRED` has not yet closed anything for them
+in practice. This gap in adopter guidance — not the mechanism itself — is why the table
+row above reads "partially shipped": the code faithfully honors whatever
+`AR_SIGNING_REQUIRED` says, but most adopters do not yet have a way to set it that the
+threat model actually defends.
+
+**`pull_request`-triggered runs are exempt from this escalation entirely, regardless of
+`AR_SIGNING_REQUIRED` or a resolvable verifier.** `panel.py init` already refuses to
+sign under `GITHUB_EVENT_NAME=pull_request` / GitLab's `CI_PIPELINE_SOURCE=
+merge_request_event` (`trusted_signer_guard_error()`, above) — no production hand-off
+mechanism exists yet for a trusted job to sign on behalf of a PR-triggered run's own
+directory. Forcing CRITICAL on every such run regardless would not close any gap (there
+is no way for that job to ever produce the signature being demanded) — it would just
+permanently block PR-gating CI for any repository that has a verifier binary on its
+runner's `PATH` or sets `AR_SIGNING_REQUIRED`, which is precisely the kind of silent,
+undisclosed breaking change Option A was chosen specifically to avoid. `authenticate_
+risk_tier()` detects this the same way `trusted_signer_guard_error()` does and takes
+the ordinary self-reported/exempt path for these runs; a WAIVED or NOT_APPLICABLE gate
+on a `pull_request` run is still independently required to carry a valid signature by
+the separate, pre-existing GAP-A check further down `aggregate.py`, unaffected by this.
 
 ### What round 5 deliberately did not build
 
