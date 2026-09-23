@@ -683,6 +683,48 @@ def _policy_bool_env(name):
     return bool(v) and v not in ("0", "false", "no")
 
 
+def _signing_required_anchor():
+    """True iff this repository has declared, via a source its own working tree (and
+    therefore a same-repo PR's own diff) cannot control, that signing is mandatory.
+
+    Checklist item 1 (frontier-gate run pr70-item6-scope, 2026-09-23, refined Option A /
+    scope_down_never_break_unsigned): relying solely on "does a verifier resolve in this
+    process's own environment" (_verifier_configured_here, the pre-existing GAP-A check)
+    is not enough on its own to close the downgrade-to-exempt gap the panel flagged --
+    an attacker able to influence the workflow file that launches this process (e.g. a
+    same-repo PR editing .github/workflows/*, or simply removing AR_VERIFIER_CMD/
+    AR_ALLOW_KEYLESS from the job env) could make the verifier silently fail to resolve,
+    which would make a previously-signed repository look exactly like one that was never
+    signed and fall through to the infrastructure-free exemption instead of BLOCKING.
+
+    AR_SIGNING_REQUIRED is meant to be set exactly once, out of band, as a repository
+    secret / Action input on the CALLING reusable workflow (the same place action.yml's
+    `signing: keyless` input already wires AR_ALLOW_KEYLESS -- see roadmap Phase 2 item
+    10) or an environment-protection-rule variable -- NOT inside a workflow file a
+    same-repo PR's own diff can edit, and never inside anything read from the run
+    directory itself. Same explicit-opt-in _policy_bool_env() shape as
+    AR_ALLOW_KEYLESS/AR_ALLOW_LOCAL_CI_IDENTITY. Operators who cannot yet anchor this
+    outside their own workflow file are no worse off than before this change -- the
+    pre-existing _verifier_configured_here() check still applies on its own."""
+    return _policy_bool_env("AR_SIGNING_REQUIRED")
+
+
+def _verifier_configured_here():
+    """True iff a signature verifier resolves in THIS process's own environment (cosign
+    keyless via AR_VERIFIER_CMD or its defaults, or minisign). Factored out of
+    load_attested_policy_bundle's GAP-A file-absence branch so that branch and
+    authenticate_risk_tier's own pre-check (checklist item 1) can never drift out of
+    sync with each other by each re-implementing this resolution differently. Never
+    invokes the verifier itself, only resolves its argv template -- offline, cheap, no
+    network or subprocess call, safe to call on every `gate.py plan`/`aggregate.py`
+    invocation regardless of whether this repository signs anything."""
+    argv_tmpl, _kind, resolve_err = resolve_signing_tool(
+        "AR_VERIFIER_CMD",
+        [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)],
+        fatal=False)
+    return argv_tmpl is not None or bool(resolve_err)
+
+
 _UNTRUSTED_GITHUB_EVENTS = frozenset({"pull_request"})
 
 # GAP B (frontier-gate run pr70-design, 2026-09-21): GitLab's counterpart to GitHub
@@ -1715,10 +1757,6 @@ def load_attested_policy_bundle(run, *, require_signature):
             # init never configured a signer while THIS environment nonetheless expects
             # one, that is exactly the ambiguity GAP A closes — re-init under a
             # configured signer to get a verifiable run.
-            argv_tmpl, _kind, resolve_err = resolve_signing_tool(
-                "AR_VERIFIER_CMD",
-                [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)],
-                fatal=False)
             # A malformed AR_VERIFIER_CMD counts as "a verifier IS configured here" for
             # this decision, not as "none configured" (fail OPEN into the infra-free
             # exemption would be worse than fail-closed: an operator who clearly
@@ -1726,16 +1764,33 @@ def load_attested_policy_bundle(run, *, require_signature):
             # protection). Codex r4055706494 (P2) — resolve_signing_tool no longer
             # exits the process on a malformed override from this non-fatal call, so
             # this BLOCK path is what reports the misconfiguration instead of a crash.
-            if argv_tmpl is not None or resolve_err:
+            #
+            # Checklist item 1 (frontier-gate run pr70-item6-scope, 2026-09-23): ALSO
+            # block when this repository's own out-of-band AR_SIGNING_REQUIRED anchor
+            # says signing is mandatory, even if no verifier happens to resolve in this
+            # particular environment right now (e.g. cosign was uninstalled, or
+            # AR_VERIFIER_CMD was stripped from the job env by a same-repo PR editing
+            # the workflow file) — see _signing_required_anchor()'s docstring for why
+            # this closes the downgrade-to-exempt gap the frontier panel flagged.
+            verifier_here = _verifier_configured_here()
+            signing_required = _signing_required_anchor()
+            if verifier_here or signing_required:
+                resolve_err = None
+                if verifier_here:
+                    _argv_tmpl, _kind, resolve_err = resolve_signing_tool(
+                        "AR_VERIFIER_CMD",
+                        [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)],
+                        fatal=False)
                 detail = f" ({resolve_err})" if resolve_err else ""
+                reason = ("a verifier IS configured here" if verifier_here
+                          else "AR_SIGNING_REQUIRED is set for this repository")
                 return None, ("no policy.snapshot.json and no signed no-policy "
-                              "attestation for this run, but a verifier IS configured "
-                              "here and a signature is required to accept a waiver or "
-                              "NOT_APPLICABLE gate — this run predates the signed-init "
-                              "fix, or no signer was configured at its own init; "
-                              "re-init this run under a configured signer "
-                              "(AR_TRUSTED_SIGNER=1 plus AR_SIGNER_CMD / cosign / "
-                              f"minisign){detail}")
+                              f"attestation for this run, but {reason} and a signature "
+                              "is required to accept a waiver or NOT_APPLICABLE gate — "
+                              "this run predates the signed-init fix, or no signer was "
+                              "configured at its own init; re-init this run under a "
+                              "configured signer (AR_TRUSTED_SIGNER=1 plus "
+                              f"AR_SIGNER_CMD / cosign / minisign){detail}")
         return AttestedPolicy({}, None, None, None, runjson), None
 
     try:
@@ -1804,6 +1859,148 @@ def load_attested_policy(run):
     if err:
         return None, err
     return bundle.data, None
+
+
+# Checklist item 7 (frontier-gate run pr70-item6-scope, 2026-09-23): two distinct
+# stamps, never conflated. UNSIGNED EXEMPT means "nothing to check, self-reported tier
+# stands, non-blocking" (the pre-existing infrastructure-free exemption). UNAUTHENTICATED
+# means "signing was expected here and could not be verified — CRITICAL, unwaivable,
+# BLOCKED" (the literal item-6 fallback, now correctly scoped — see
+# authenticate_risk_tier's docstring for what "expected here" means).
+RISK_LABEL_UNSIGNED_EXEMPT = "RISK TIER UNSIGNED EXEMPT"
+RISK_LABEL_UNAUTHENTICATED = "RISK TIER UNAUTHENTICATED"
+
+AUTH_STATUS_AUTHENTICATED = "AUTHENTICATED"
+AUTH_STATUS_UNSIGNED_EXEMPT = "UNSIGNED_EXEMPT"
+AUTH_STATUS_UNAUTHENTICATED = "UNAUTHENTICATED"
+
+
+@dataclass(frozen=True)
+class AuthResult:
+    """authenticate_risk_tier()'s return value.
+
+      status  one of AUTH_STATUS_AUTHENTICATED / AUTH_STATUS_UNSIGNED_EXEMPT /
+              AUTH_STATUS_UNAUTHENTICATED.
+      risk    the risk tier callers should actually use. Authoritative
+              (cryptographically-backed) for AUTHENTICATED; self-reported for
+              UNSIGNED_EXEMPT; "CRITICAL" for UNAUTHENTICATED when signing genuinely was
+              expected and failed — callers must never fall back to a self-reported
+              value in that case. None for UNAUTHENTICATED specifically when run.json's
+              risk tier itself could not be determined at all (a data-integrity
+              problem, not a signing event) and no crypto signal is available to fail
+              closed to — callers must die()/BLOCK on risk is None exactly as they did
+              before this function existed.
+      label   the exact verdict stamp to record/print (RISK_LABEL_*), or None for
+              AUTHENTICATED, which needs no stamp.
+      detail  plain-English explanation. For UNAUTHENTICATED this includes a recovery
+              instruction (checklist item 6) — how to re-sign/rotate keys/re-init under
+              a configured signer to clear the block.
+      bundle  the AttestedPolicy on AUTHENTICATED, else None."""
+    status: str
+    risk: "str | None"
+    label: "str | None"
+    detail: str
+    bundle: "AttestedPolicy | None"
+
+
+def _unauthenticated_recovery_detail(att_err):
+    """Wraps a load_attested_policy_bundle failure with a plain-English, actionable
+    recovery instruction (checklist item 6) — the raw error already says what failed;
+    this adds what to DO about it, matching the "re-init this run under a configured
+    signer" phrasing load_attested_policy_bundle itself already uses elsewhere in this
+    module for consistency."""
+    return (f"{att_err}. To clear this: re-run this repository's init step "
+            "(panel.py init) under a working, correctly-configured signer "
+            "(AR_TRUSTED_SIGNER=1 plus AR_SIGNER_CMD, or cosign with AR_ALLOW_KEYLESS=1 "
+            "and AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER pinned, or minisign) so this run "
+            "produces a freshly signed policy.snapshot.json or policy.absence.json — "
+            "see docs/THREAT-MODEL.md.")
+
+
+def authenticate_risk_tier(run):
+    """The single entry point gate.py and aggregate.py both call to learn (a) whether
+    this run's risk tier can be trusted, and (b) what tier to actually use for gate
+    planning and the final verdict.
+
+    Checklist items 1-5/13 (frontier-gate run pr70-item6-scope, 2026-09-23, refined
+    Option A / scope_down_never_break_unsigned, panel consensus 0.97): this is the
+    narrowed, non-breaking form of the original trust-model panel's item 6
+    ("unauthenticated risk tier defaults to CRITICAL, mutation waivers disabled"). The
+    original wording would CRITICAL-default every repository with no signing
+    infrastructure configured at all — as of 2026-09-22, 0 of 40 repositories across
+    Paul's two GitHub accounts, including the confirmed production consumer `viaid` —
+    which would permanently block them all on CRITICAL's unwaivable `mutation` gate
+    (M4, real CRITICAL-tier mutation testing, is not yet built). This function instead
+    only escalates to CRITICAL when signing was actually EXPECTED for this repository:
+    a verifier resolves in this environment (_verifier_configured_here — the
+    pre-existing GAP-A signal), or the repository's own out-of-band AR_SIGNING_REQUIRED
+    anchor says so (_signing_required_anchor — the new checklist item 1 addition that
+    closes the downgrade-to-exempt gap the panel's own reviewers flagged: an attacker
+    who can strip a verifier out of the job env must not be able to make a signed
+    repository look exactly like one that was never signed).
+
+    A repository where NEITHER signal is present takes a fast, infrastructure-free path
+    that never calls load_attested_policy_bundle(require_signature=True) at all — this
+    is deliberate, not an optimization: calling that with require_signature=True would
+    re-coathe the ordinary no-signing path to policy.snapshot.json's content validity,
+    exactly the regression Finding #11's read_run_risk() fix (frontier-gate run
+    pr70-trust-model2, 2026-09-22) was written to avoid. A repository with a stray or
+    corrupt policy.snapshot.json left over from an unrelated experiment, but no
+    verifier configured and no AR_SIGNING_REQUIRED anchor, must stay exactly as
+    infrastructure-free as it always has been.
+
+    Returns an AuthResult (see its own docstring). Never raises."""
+    self_risk, self_err = read_run_risk(run)
+    if not (_verifier_configured_here() or _signing_required_anchor()):
+        # Fast, infrastructure-free path — see the docstring above for why this must
+        # not touch load_attested_policy_bundle(require_signature=True) at all.
+        #
+        # A missing/corrupt risk tier here is a plain data-integrity problem (run.json
+        # itself is broken), not a signing-authentication event — there is no crypto
+        # signal available on this path to fail closed TO, so risk is None (distinct
+        # from the "CRITICAL" this function returns when signing genuinely was expected
+        # and failed below): callers must die()/BLOCK on risk is None exactly as they
+        # did before this function existed, rather than silently treating "we don't
+        # know the tier" the same as "we know it must be the strictest tier."
+        if self_err:
+            return AuthResult(AUTH_STATUS_UNAUTHENTICATED, None,
+                               RISK_LABEL_UNAUTHENTICATED,
+                               f"cannot determine risk tier for this run: {self_err}",
+                               None)
+        return AuthResult(AUTH_STATUS_UNSIGNED_EXEMPT, self_risk,
+                           RISK_LABEL_UNSIGNED_EXEMPT,
+                           "no signing infrastructure is configured for this "
+                           "repository (no verifier resolves here, and "
+                           "AR_SIGNING_REQUIRED is not set) — risk tier is "
+                           "self-reported under the infrastructure-free exemption "
+                           "(reviews/pr70-provenance-binding-decision.md)",
+                           None)
+    # Signing IS expected here — demand full cryptographic authentication. This is the
+    # existing require_signature=True failure branch (checklist item 13): the anchor
+    # check above only widens WHEN this branch is reached, never what happens inside it.
+    bundle, att_err = load_attested_policy_bundle(run, require_signature=True)
+    if att_err:
+        return AuthResult(AUTH_STATUS_UNAUTHENTICATED, "CRITICAL",
+                           RISK_LABEL_UNAUTHENTICATED,
+                           _unauthenticated_recovery_detail(att_err), None)
+    b_risk = bundle.run_meta.get("risk")
+    if not b_risk:
+        return AuthResult(AUTH_STATUS_UNAUTHENTICATED, "CRITICAL",
+                           RISK_LABEL_UNAUTHENTICATED,
+                           _unauthenticated_recovery_detail(
+                               "run.json has no risk tier recorded even though "
+                               "signing is expected for this repository"),
+                           bundle)
+    if self_err or b_risk != self_risk:
+        return AuthResult(AUTH_STATUS_UNAUTHENTICATED, "CRITICAL",
+                           RISK_LABEL_UNAUTHENTICATED,
+                           _unauthenticated_recovery_detail(
+                               "risk tier is not internally consistent between two "
+                               f"reads of run.json ({b_risk!r} vs {self_risk!r}) — "
+                               "possible tampering or a concurrent write"),
+                           bundle)
+    return AuthResult(AUTH_STATUS_AUTHENTICATED, b_risk, None,
+                       "risk tier is cryptographically authenticated", bundle)
 
 
 def resolve_setting(cli_value, env_var, pol, key, default=None):

@@ -146,6 +146,65 @@ into another), not a general trust-topology verifier.
 | Secrets available to the untrusted review job | GitHub Actions environments / job-scoped secrets | Adopter-configured |
 | Waiver signed without any human approval evidence | Not yet built — candidate follow-up beyond the current 4-batch plan | Open |
 | A trusted job's signature cannot reach the untrusted review job's own run directory (cross-job hand-off) | Not yet designed — candidate approaches sketched above; needs its own frontier-gate panel run before implementation | Open |
+| A signed repo's policy.snapshot.json/signature is deleted or its verification starts failing (rotated key, tampered artifact), and the run self-reports a low risk tier so it slips through with reduced gates | `authenticate_risk_tier()` forces risk to CRITICAL and BLOCKS whenever signing was expected (a verifier resolves, or `AR_SIGNING_REQUIRED` says so) but cannot be verified — CRITICAL's `mutation` gate can never be waived | **Shipped round 5** (`AR_SIGNING_REQUIRED` anchor + `RISK TIER UNAUTHENTICATED`) |
+| Downgrade-to-exempt: an attacker deletes BOTH `policy.snapshot.json` and any signed absence attestation, AND strips the verifier from the job env, making a previously-signed repo look exactly like one that was never signed | `AR_SIGNING_REQUIRED`, anchored outside the run directory and outside this job's own verifier config (a repository secret / protected Action input) | **Shipped round 5** — see the new section below |
+| A repository with no signing infrastructure at all gets forced to CRITICAL on every run once `mutation` is checked | Deliberately NOT built this round — see "What round 5 deliberately did not build" below | **Open, tracked** (roadmap `pr70-round5-signing-hardening-and-keyless-onboarding.md`, M4-dependent) |
+
+## Round 5 — unauthenticated risk-tier fallback (checklist item 6, refined)
+
+(frontier-gate run pr70-item6-scope, 2026-09-23, panel consensus 0.97, Paul's decision:
+refined Option A / `scope_down_never_break_unsigned`.) The original trust-model panel's
+item 6 said: "unauthenticated risk tier defaults to CRITICAL, mutation waivers
+disabled." Built literally, this would CRITICAL-default every repository with no
+signing infrastructure at all — as of 2026-09-22, 0 of 40 repositories across Paul's
+two GitHub accounts, including the confirmed production consumer `viaid` — which would
+permanently block them all on CRITICAL's unwaivable `mutation` gate (real CRITICAL-tier
+mutation testing, milestone M4, is not yet built). `authenticate_risk_tier()` in
+`_common.py` is the narrowed, shipped version:
+
+- **AUTHENTICATED** — a verifiably-signed policy snapshot or absence attestation
+  governs this run. Risk tier is the cryptographically-backed value. No stamp needed.
+- **UNSIGNED EXEMPT** (`RISK TIER UNSIGNED EXEMPT`) — no verifier resolves in this
+  environment AND `AR_SIGNING_REQUIRED` is not set for this repository. Risk tier is
+  self-reported, non-blocking — the pre-existing infrastructure-free exemption
+  (`reviews/pr70-provenance-binding-decision.md`), unchanged.
+- **UNAUTHENTICATED** (`RISK TIER UNAUTHENTICATED`) — signing WAS expected (a verifier
+  resolves here, or the repository's own `AR_SIGNING_REQUIRED` anchor says so) but
+  could not be cryptographically verified. Risk is forced to CRITICAL and the run is
+  BLOCKED. `mutation` can never be waived at CRITICAL, which is what actually makes
+  this un-bypassable rather than merely a printed warning.
+
+### `AR_SIGNING_REQUIRED` — closing the downgrade-to-exempt gap
+
+The frontier panel's own reviewers (all four, most explicitly Astra) flagged a real gap
+in the first version of this option: inferring "signing was configured" only from
+whether a verifier happens to resolve in the CURRENT environment is not enough — an
+attacker who can also influence the workflow file that launches that environment (a
+same-repo PR editing `.github/workflows/*`, or simply removing `AR_VERIFIER_CMD`/
+`AR_ALLOW_KEYLESS` from the job env) could make the verifier silently fail to resolve,
+at which point a previously-signed repository looks exactly like one that was never
+signed and falls through to the exemption instead of BLOCKING.
+
+`AR_SIGNING_REQUIRED=1` closes this: it is meant to be set **exactly once**, out of
+band, as a repository secret or an Action `with:` input on the calling reusable
+workflow (the same place `action.yml`'s `signing: keyless` input already wires
+`AR_ALLOW_KEYLESS` — see the roadmap's Phase 2 item 10) or an environment-protection-
+rule variable — **never** inside a workflow file a same-repo PR's own diff can edit,
+and never inside anything read from the run directory itself. Once set, a run whose
+`policy.snapshot.json`/absence attestation are both missing is BLOCKED regardless of
+whether a local verifier happens to resolve. Adopters who have not yet configured this
+anchor are no worse off than before this change — the pre-existing "verifier resolves
+here" check still applies on its own, unchanged.
+
+### What round 5 deliberately did not build
+
+A repository with **no** signing infrastructure at all (no verifier resolvable, no
+`AR_SIGNING_REQUIRED` anchor set) stays exempt — the literal panel wording's full
+intent (treat ANY unauthenticated risk claim as untrustworthy) is only half-closed by
+design. This is a deliberate, disclosed deferral, not an oversight: see
+`roadmap/pr70-round5-signing-hardening-and-keyless-onboarding.md`'s "M4-dependent
+follow-up" section for the trigger condition (real CRITICAL-tier mutation testing, M4)
+and what revisiting this should involve.
 
 ## Batch 4 — adoption/consumer coverage and remaining documentation
 

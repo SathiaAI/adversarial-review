@@ -1846,8 +1846,164 @@ def t_aggregate_independently_blocks_no_policy_waiver_when_verifier_configured_a
         sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
     _resolve_open_finding(run)
     r = sh(["aggregate.py"], repo, expect=2, env=_stub_signer_env())
-    assert "no attested policy snapshot" in r.stdout, r.stdout
+    # Checklist item 6 (frontier-gate run pr70-item6-scope, 2026-09-23) sharpened this:
+    # a repo that predates signing but is now aggregated in an environment where a
+    # verifier resolves is no longer just BLOCKED-for-lack-of-signature -- its risk is
+    # forced to CRITICAL (authenticate_risk_tier), whose `mutation` floor can never be
+    # waived at all, so the previously-recorded waiver is independently rejected too.
+    assert "RISK TIER UNAUTHENTICATED" in r.stdout, r.stdout
     assert "no policy.snapshot.json" in r.stdout, r.stdout
+    assert "risk=CRITICAL" in r.stdout, r.stdout
+    assert "cannot be waived or marked NOT_APPLICABLE on CRITICAL tier" in r.stdout, r.stdout
+
+
+# --- Checklist item 6, refined Option A / scope_down_never_break_unsigned ------------
+# (frontier-gate run pr70-item6-scope, 2026-09-23, panel consensus 0.97): the narrowed
+# form of the original trust-model panel's "unauthenticated risk tier defaults to
+# CRITICAL" item. authenticate_risk_tier() in _common.py is the shared state machine;
+# these tests exercise its three outcomes (AUTHENTICATED / UNSIGNED_EXEMPT /
+# UNAUTHENTICATED) from both gate.py plan and aggregate.py, plus the specific
+# downgrade-to-exempt gap (Astra's finding, checklist item 1) the AR_SIGNING_REQUIRED
+# anchor exists to close.
+
+def t_item6_never_signed_repo_exempt_at_plan_time():
+    # No verifier configured anywhere, no AR_SIGNING_REQUIRED anchor -- the ordinary,
+    # infrastructure-free path. gate.py plan must succeed, keep the self-reported tier
+    # (NORMAL here, so no mutation floor), and print the non-blocking exempt stamp.
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast"], repo)
+    assert "RISK TIER UNSIGNED EXEMPT" in r.stdout, r.stdout
+    assert "required gates (NORMAL):" in r.stdout, r.stdout
+    assert "mutation" not in r.stdout, r.stdout
+
+
+def t_item6_never_signed_repo_exempt_end_to_end_passes():
+    # The zero-blast-radius guarantee itself: a repo with NO signing infrastructure at
+    # all, self-reporting NORMAL, with every ordinary gate passing, must still reach
+    # VERDICT: PASS -- exactly today's behavior, unaffected by this round's changes.
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo)
+    run = latest_run(repo)
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast"], repo)
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    sh(["panel.py", "assign"], repo)
+    sh(["panel.py", "run", "--context-file", "context.md"], repo)
+    sh(["panel.py", "rebuttal"], repo)
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
+    assert "RISK TIER UNSIGNED EXEMPT" in r.stdout, r.stdout
+    assert "RISK TIER UNAUTHENTICATED" not in r.stdout, r.stdout
+
+
+def t_item6_signing_required_anchor_blocks_even_without_local_verifier():
+    # The core new capability (checklist item 1): AR_SIGNING_REQUIRED forces the
+    # missing-artifacts case closed EVEN WHEN NO verifier resolves in this environment
+    # at all -- the pre-existing GAP-A check alone could not do this, since it only
+    # fires when a verifier happens to be configured here. This is what makes a
+    # repository's signing requirement portable across environments (plan on a laptop
+    # with no cosign installed, aggregate in CI) rather than dependent on which
+    # machine happens to have a verifier on PATH.
+    env = {**ENV, "AR_SIGNING_REQUIRED": "1"}
+    assert not env.get("AR_VERIFIER_CMD"), "ENV's own neutralized baseline (see its def)"
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo, env=env)
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast"], repo, env=env)
+    assert "RISK TIER UNAUTHENTICATED" in r.stderr, r.stderr
+    assert "AR_SIGNING_REQUIRED is set for this repository" in r.stderr, r.stderr
+    assert "required gates (CRITICAL):" in r.stdout, r.stdout
+    assert "mutation" in r.stdout, r.stdout
+
+
+def t_item6_downgrade_to_exempt_attack_blocked_by_anchor():
+    # THE gap the frontier panel's own reviewers flagged (Astra, production_ready=false
+    # on the un-anchored version of this option; echoed by all four in
+    # risks_in_prod_or_review): an attacker who can delete BOTH policy.snapshot.json
+    # and any signed absence attestation makes a previously-signed repo look exactly
+    # like one that was never signed -- and, without the anchor, that falls through to
+    # the infrastructure-free exemption instead of BLOCKING. Simulates the attacker
+    # ALSO stripping AR_VERIFIER_CMD from the job env (so the pre-existing GAP-A check
+    # alone cannot save this run either) -- only AR_SIGNING_REQUIRED, anchored outside
+    # the run directory and outside this env's verifier config, closes it.
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=False)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.json").exists()
+    assert (run / "policy.snapshot.sig").exists()
+    (run / "policy.snapshot.json").unlink()
+    (run / "policy.snapshot.sig").unlink()
+    attacker_env = {**ENV, "AR_SIGNING_REQUIRED": "1"}
+    assert not attacker_env.get("AR_VERIFIER_CMD"), "ENV's own neutralized baseline"
+    r = sh(["aggregate.py"], repo, expect=2, env=attacker_env)
+    assert "RISK TIER UNAUTHENTICATED" in r.stdout, r.stdout
+    assert "risk=CRITICAL" in r.stdout, r.stdout
+
+
+def t_item6_signed_repo_broken_signature_forces_critical_unwaivable_mutation():
+    # The narrow, real attack this option DOES close today, independent of the anchor:
+    # a repo that had signing configured has its signature verification start failing
+    # (tampered artifact, rotated key the verifier no longer trusts, etc.) -- must force
+    # CRITICAL and make the mutation floor unwaivable, not merely BLOCK-and-move-on.
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.sig").exists()
+    # Corrupt the SIGNATURE, not the content -- content-only (require_signature=False)
+    # loads still succeed unchanged; only a require_signature=True verification fails,
+    # exactly the "signing was configured, then broke" scenario this test names.
+    (run / "policy.snapshot.sig").write_bytes(b"TAMPERED-NOT-A-REAL-SIGNATURE")
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=2, env=env)
+    assert "RISK TIER UNAUTHENTICATED" in r.stdout, r.stdout
+    assert "risk=CRITICAL" in r.stdout, r.stdout
+    assert "cannot be waived or marked NOT_APPLICABLE on CRITICAL tier" in r.stdout, r.stdout
+
+
+def t_item6_authenticated_signed_repo_unaffected_reaches_pass():
+    # The happy path must show zero new friction: a repo with real signing AND a real
+    # (non-waived) mutation gate result reaches PASS with neither new stamp present --
+    # AUTHENTICATED needs no stamp at all (checklist item 7).
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=False)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    r = sh(["aggregate.py"], repo, expect=0, env=env)
+    assert "VERDICT: PASS" in r.stdout, r.stdout
+    assert "RISK TIER UNSIGNED EXEMPT" not in r.stdout, r.stdout
+    assert "RISK TIER UNAUTHENTICATED" not in r.stdout, r.stdout
+
+
+def t_item6_local_identity_opt_in_alone_does_not_force_critical():
+    # Checklist item 13: AR_ALLOW_LOCAL_CI_IDENTITY (a legitimate local/offline signing
+    # opt-in) must never, by itself, make a repo with no signing artifacts and no
+    # AR_SIGNING_REQUIRED anchor look CRITICAL -- that flag is about accepting a "local"
+    # CI-context placeholder as a real identity WHEN A SIGNATURE IS ACTUALLY PRESENT and
+    # being checked, not a signal that signing is expected in the first place.
+    env = {**ENV, "AR_ALLOW_LOCAL_CI_IDENTITY": "1"}
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo, env=env)
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast"], repo, env=env)
+    assert "RISK TIER UNSIGNED EXEMPT" in r.stdout, r.stdout
+    assert "required gates (NORMAL):" in r.stdout, r.stdout
+
+
+def t_item6_verifier_timeout_fails_closed_as_unauthenticated_not_crash():
+    # Checklist item 9: a verifier that hangs (network stall, e.g.) must resolve to the
+    # SAME fail-closed UNAUTHENTICATED/CRITICAL outcome as a verifier that cleanly
+    # rejects a bad signature -- never crash, and never be silently treated as "missing
+    # file, exempt" just because the subprocess didn't return the ordinary way.
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=False)
+    run = latest_run(repo)
+    _resolve_open_finding(run)
+    hang_env = {**env, "AR_SIGN_TIMEOUT": "1",
+               "AR_VERIFIER_CMD": sys.executable + ' -c "import time;time.sleep(5)" {sig} {msg}'}
+    r = sh(["aggregate.py"], repo, expect=2, env=hang_env)
+    assert "Traceback" not in r.stdout, r.stdout
+    assert "RISK TIER UNAUTHENTICATED" in r.stdout, r.stdout
+    assert "risk=CRITICAL" in r.stdout, r.stdout
 
 
 def t_policy_sig_valid_signature_allows_waiver_run_to_pass():

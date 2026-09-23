@@ -16,9 +16,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (die, load_attested_policy_bundle, load_policy, now_iso, read_json,
-                     read_run_risk, resolve_run, resolve_waiver_clock, validate_gate_name,
-                     validate_not_applicable_gate, validate_waived_gate, write_json)
+from _common import (authenticate_risk_tier, die, load_attested_policy_bundle,
+                     load_policy, now_iso, read_json, resolve_run, resolve_waiver_clock,
+                     validate_gate_name, validate_not_applicable_gate,
+                     validate_waived_gate, write_json)
 
 # Floors per tier: these cannot be silently omitted, only waived on the record with a
 # named authorizer (surfaced in the verdict reasons and the report). A waived floor gate
@@ -38,20 +39,39 @@ MINIMUM_GATES = {
 def cmd_plan(args):
     run = resolve_run(args.run)
     # Finding #11 / checklist items 5 & 9 (frontier-gate run pr70-trust-model2,
-    # 2026-09-22): source the risk tier from read_run_risk()'s single, TOCTOU-safe read
-    # of run.json rather than a second, independent read here. Before this fix,
-    # MINIMUM_GATES[tier]/policy required_gates lookups below trusted whichever value a
-    # SEPARATE `read_json()` call happened to see -- and this determines the required
-    # GATE SET itself (item 9: not just whether a waiver is honored), so an attacker who
-    # could make that second read see a lower tier could shrink required gates with no
-    # waiver needed at all. read_run_risk() deliberately does NOT touch
-    # policy.snapshot.json (unlike load_attested_policy_bundle) -- a corrupt/tampered
-    # snapshot must not block the ordinary no-waiver path, which stays exactly as
-    # infrastructure-free as it always has been; a run that actually waives something
-    # loads the full attested bundle further down, as before.
-    tier, tier_err = read_run_risk(run)
-    if tier_err:
-        die(f"cannot determine risk tier for this run: {tier_err}")
+    # 2026-09-22): source the risk tier from a single, TOCTOU-safe authentication check
+    # rather than a second, independent read here. Before that fix, MINIMUM_GATES[tier]/
+    # policy required_gates lookups below trusted whichever value a SEPARATE
+    # `read_json()` call happened to see -- and this determines the required GATE SET
+    # itself, so an attacker who could make that second read see a lower tier could
+    # shrink required gates with no waiver needed at all.
+    #
+    # Checklist item 6 (frontier-gate run pr70-item6-scope, 2026-09-23, refined Option A):
+    # authenticate_risk_tier() is the ONE place this decision is made -- see its own
+    # docstring for the full state machine. A repository with no signing infrastructure
+    # configured at all (no verifier resolvable, no AR_SIGNING_REQUIRED anchor) stays
+    # exactly as infrastructure-free as it always has been: it never calls
+    # load_attested_policy_bundle(require_signature=True), so a stray/corrupt
+    # policy.snapshot.json cannot block this ordinary no-waiver path (the regression
+    # Finding #11's original read_run_risk() fix exists to prevent). A repository where
+    # signing WAS expected but cannot be verified is forced to CRITICAL here, before the
+    # required-gate SET is computed below -- CRITICAL's floor always includes the
+    # unwaivable `mutation` gate (MINIMUM_GATES), which is what actually makes this
+    # un-bypassable, not merely a printed warning.
+    auth = authenticate_risk_tier(run)
+    if auth.status == "UNAUTHENTICATED" and auth.risk is None:
+        # A data-integrity problem (run.json's own risk tier is missing/corrupt), not a
+        # signing event -- no crypto signal to fail closed to, so this dies exactly as
+        # the pre-item-6 code always has.
+        die(auth.detail)
+    if auth.status == "UNAUTHENTICATED":
+        # Checklist item 14: loud, unambiguous audit trail in the CI log itself -- this
+        # print is the only place a human watching a CI run sees WHY a run that
+        # self-reported e.g. NORMAL is suddenly requiring a mutation gate it cannot pass.
+        print(f"{auth.label}: {auth.detail}", file=sys.stderr)
+    elif auth.status == "UNSIGNED_EXEMPT":
+        print(f"{auth.label}: {auth.detail}")
+    tier = auth.risk
     # Requested-gate precedence: CLI flag > AR_REQUIRE env > policy file. The
     # policy's required_gates is a per-tier map; a missing tier entry is simply
     # "not provided" (tier keys themselves are validated at policy load).

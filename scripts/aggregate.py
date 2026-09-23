@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (POLICY_ABSENCE_SIG_FILENAME, POLICY_SIG_FILENAME, _policy_bool,
-                     canonical_finding_digest,
+                     authenticate_risk_tier, canonical_finding_digest,
                      cosign_sign_argv as _cosign_sign_argv,
                      cosign_verify_argv as _cosign_verify_argv, family_of,
                      load_attested_policy_bundle, meta_cost,
@@ -1602,6 +1602,32 @@ def _aggregate_cli():
                 meta["risk"] = b_risk
         else:
             meta.setdefault("risk", "UNKNOWN")
+
+        # Checklist item 6 (frontier-gate run pr70-item6-scope, 2026-09-23, refined
+        # Option A / scope_down_never_break_unsigned, panel consensus 0.97): the checks
+        # above are unchanged and still govern policy CONTENT (pol_data/
+        # attested_policy_sha) and, further below, a waived/NOT_APPLICABLE gate's
+        # signature specifically. This check is broader and runs UNCONDITIONALLY,
+        # whether or not this run recorded any waiver at all — it must run BEFORE
+        # check_gates() below so a forced CRITICAL escalation actually changes which
+        # gates are required (MINIMUM_GATES), not just adds a note after the fact. See
+        # authenticate_risk_tier's own docstring for the full state machine; in short: a
+        # repository where signing was expected (a verifier resolves here, or its own
+        # AR_SIGNING_REQUIRED anchor says so) but cannot be cryptographically verified is
+        # forced to CRITICAL and BLOCKED here, regardless of what tier it self-reported
+        # — CRITICAL's `mutation` floor gate can never be waived, which is what actually
+        # makes this un-bypassable. A never-configured repository is unaffected.
+        auth = authenticate_risk_tier(run)
+        if auth.status == "UNAUTHENTICATED":
+            meta["risk"] = auth.risk or "CRITICAL"
+            # auth.detail may embed a configured verifier's raw, attacker-influenceable
+            # stderr (via load_attested_policy_bundle's att_err) — _oneline() it before
+            # it reaches verdict.md, same as every other untrusted string this function
+            # interpolates into `blocked` (see the sig_err handling just below).
+            blocked.append(f"{auth.label}: {_oneline(auth.detail)}")
+        elif auth.status == "UNSIGNED_EXEMPT":
+            notes.append(f"{auth.label}: {auth.detail}")
+
         # Resolved once per aggregate run: GITHUB_RUN_STARTED_AT's date if set (else today
         # UTC). A set-but-unparseable value is fail-closed — every waiver is BLOCKED rather
         # than silently falling back to today (see check_gates/resolve_waiver_clock).
