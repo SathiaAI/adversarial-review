@@ -15288,5 +15288,69 @@ def t_sign_verify_reject_symlinked_artifact_as_cannot_verify_not_crash():
     assert "cannot recompute attestation" in (rs.stdout + rs.stderr), (rs.stdout, rs.stderr)
 
 
+# ---------------------------------------------------------------- PR70 round 5.3 follow-up
+
+
+def t_aggregate_unreadable_gate_record_blocks_not_crash():
+    # Codex 4089137612 (P2, valid): check_gates()'s `rec = read_json(p)` for each required
+    # gate's recorded result was the one remaining call in this file that did not catch
+    # read_regular_file_once's OSError (a symlinked or oversized gates/<name>.json) or a
+    # ValueError (invalid JSON) -- unlike the _required.json read a few lines above it,
+    # which already does. Uncaught, it only surfaces via main()'s outer
+    # `except Exception: sys.exit(3)`, which runs BEFORE verdict.json is written -- so a
+    # single tampered gate record could make ordinary aggregation exit non-zero with no
+    # verdict recorded at all, the exact failure mode this module's own design rule
+    # forbids ("an unreadable/untrusted input is a blocker, never a crash"). Plant a
+    # symlinked gate record after a normal SENSITIVE run has recorded everything, then
+    # confirm aggregation now BLOCKS cleanly instead of crashing.
+    if not hasattr(os, "symlink"):
+        return
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=False)
+    run = latest_run(repo)
+    outside = Path(tempfile.mkdtemp(prefix="ar-evilgate-")) / "big.bin"
+    outside.write_bytes(b"x" * 1024)
+    build_p = run / "gates" / "build.json"
+    build_p.unlink()
+    os.symlink(outside, build_p)
+    r = sh(["aggregate.py"], repo, expect=2, env=env)  # BLOCKED (exit 2), never a crash
+    assert "Traceback" not in r.stderr, (r.stdout, r.stderr)
+    verdict = read(run / "verdict.json")
+    assert verdict["verdict"] == "BLOCKED", verdict
+    assert any("build" in b and "unreadable" in b for b in verdict["reasons"]), verdict["reasons"]
+
+
+def t_aggregate_manifest_omitting_floor_gate_blocks_not_silently_passes():
+    # Codex 4089137619 (P1, valid): check_gates() only re-validates gates that ARE listed
+    # in _required.json's `required` -- it never re-derives what the tier's floor
+    # (gate.py's MINIMUM_GATES) actually requires. gate.py's own `cmd_plan` bakes the
+    # floor into a freshly-written manifest (`base_required = requested |
+    # MINIMUM_GATES[tier]`), but _required.json is written by the same untrusted job that
+    # runs the rest of a review (see examples/policy-signer-workflow.yml's header), so an
+    # attacker with run-directory write access -- exactly what every WAIVED/BLOCKED check
+    # in this function already defends against for gates that ARE recorded -- could simply
+    # delete CRITICAL/SENSITIVE's unwaivable `mutation` from `required` outright: no
+    # waiver record needed, no NOT_APPLICABLE record needed, because nothing ever looked
+    # for a gate it was never told to require. Build a normal SENSITIVE run (mutation
+    # legitimately waived), then tamper _required.json to drop mutation from BOTH
+    # `required` and `waived` entirely (simulating that omission, not a legacy/orphaned
+    # waiver -- a different, already-handled case), and confirm aggregation BLOCKS instead
+    # of silently reaching a PASS with no mutation coverage at all.
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    req_path = run / "gates" / "_required.json"
+    gplan = read(req_path)
+    assert "mutation" in gplan["required"], gplan  # sanity: floor was present before tampering
+    gplan["required"] = [g for g in gplan["required"] if g != "mutation"]
+    gplan["waived"] = [w for w in gplan["waived"] if w.get("name") != "mutation"]
+    write(req_path, gplan)
+    r = sh(["aggregate.py"], repo, expect=2, env=env)  # BLOCKED (exit 2), never a silent PASS
+    assert "Traceback" not in r.stderr, (r.stdout, r.stderr)
+    verdict = read(run / "verdict.json")
+    assert verdict["verdict"] == "BLOCKED", verdict
+    assert any("omits" in b and "mutation" in b for b in verdict["reasons"]), verdict["reasons"]
+
+
 if __name__ == "__main__":
     main()

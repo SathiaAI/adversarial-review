@@ -44,6 +44,11 @@ from _common import (POLICY_ABSENCE_SIG_FILENAME, POLICY_SIG_FILENAME, _policy_b
                      run_signing_tool as _run_tool, sign_fail as _sign_fail,
                      sign_timeout as _sign_timeout, validate_gate_name,
                      validate_not_applicable_gate, validate_waived_gate, write_json)
+# Codex 4089137619: the tier-floor set check_gates() enforces below must be the SAME
+# floor gate.py's own `plan` command bakes into a fresh _required.json — imported, not
+# duplicated, so the two can never silently drift apart. gate.py imports only from
+# _common (never from this module), so this import is one-directional and safe.
+from gate import MINIMUM_GATES
 
 HIGH = ("critical", "high")
 
@@ -121,6 +126,37 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
         required_names.append(g)
     gcov["required"] = list(required_names)
     required_set = set(required_names)
+    # Codex 4089137619 (P1, valid): everything below this point only re-validates what
+    # IS in `required_names` (waiver authenticity, expiry, CRITICAL restrictions, etc.)
+    # — nothing re-derives what SHOULD be in it. gate.py's `cmd_plan` computes
+    # `base_required = requested | MINIMUM_GATES[tier]` before writing _required.json
+    # (see gate.py:24-36's own docstring: "CRITICAL's `mutation` can never be waived or
+    # marked NOT_APPLICABLE"), but _required.json is written by the same untrusted
+    # review job that runs the rest of this run (examples/policy-signer-workflow.yml's
+    # header names `gate.py plan --waive` as explicitly the untrusted job's own step) —
+    # the exact class of run-directory tampering every WAIVED/BLOCKED check below this
+    # point already defends against for records that ARE listed. Before this fix, simply
+    # omitting e.g. "mutation" from _required.json's `required` list bypassed that
+    # "never waived or NOT_APPLICABLE" guarantee outright: no waiver record needed, no
+    # NOT_APPLICABLE record needed, because this function never looked for a gate it was
+    # never told to require. Recompute the tier's floor independently and BLOCK (never
+    # fabricate or silently add a gate result) if the manifest is missing any of it. An
+    # unrecognized tier is reported here rather than raised, matching this file's
+    # fail-closed-not-crash contract; it is already a BLOCKed condition upstream via
+    # authenticate_risk_tier's own reporting, so this only adds a clear, specific reason.
+    floor = MINIMUM_GATES.get(tier)
+    if floor is None:
+        blocked.append(
+            "cannot verify required gates against tier floor: unrecognized risk tier "
+            f"{_oneline(repr(tier))}")
+    else:
+        missing_floor = sorted(set(floor) - required_set)
+        if missing_floor:
+            blocked.append(
+                f"gate plan (_required.json) omits {tier}'s floor gate(s) "
+                f"{', '.join(missing_floor)} entirely — not present, not waived, not "
+                "marked NOT_APPLICABLE; re-run `gate.py plan` for the current tier "
+                "(a manifest missing a floor gate outright is not honored)")
     # The manifest's `waived` list must be well-formed before anything is built from it — a
     # non-list, or an entry that is not an object with a safe string `name` (an unhashable value
     # such as {"name": []}, or a newline/markdown name that could forge output, would otherwise
@@ -162,7 +198,26 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
             gcov["missing"].append(name)
             blocked.append(f"required gate '{name}' has no recorded result")
             continue
-        rec = read_json(p)
+        # Codex 4089137612 (P2, valid): every other read_json() call on an untrusted,
+        # run-directory artifact in this file (the _required.json read above,
+        # collect_jev_priors' per-file read) is wrapped so a symlinked/oversized/
+        # non-regular gates/<name>.json (read_regular_file_once's hardening, see
+        # _common.py) or invalid JSON becomes a BLOCKED gate, never an uncaught
+        # exception. This call was the one remaining unguarded instance -- caught only
+        # by main()'s outer `except Exception: sys.exit(3)`, which happens BEFORE
+        # verdict.json is written, so a single tampered gate record could make
+        # aggregation exit non-zero with no verdict recorded at all (the same failure
+        # mode the compute_attestation() caller fixes above this round closed for the
+        # attestation path). Fold it into `blocked` like every other unreadable-gate
+        # case in this loop (missing/BLOCKED/orphaned-waiver), matching this file's own
+        # stated contract: an unreadable/untrusted input is a BLOCKER, never a crash.
+        try:
+            rec = read_json(p)
+        except (ValueError, OSError) as e:
+            reason = f"recorded gate result is unreadable or not valid JSON: {e}"
+            gcov["blocked"].append({"name": name, "reason": reason})
+            blocked.append(f"gate '{name}': {_oneline(reason)}")
+            continue
         results[name] = rec
         gcov["recorded"].append(name)
         # Tri-state: BLOCKED means the check could not be run/verified — unknown, not
