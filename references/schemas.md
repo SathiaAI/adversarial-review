@@ -325,9 +325,14 @@ corrupting it now changes the digest; v2 and earlier missed this, since
 signature sidecar, `policy.absence.sig` (v4 — GAP A's signed no-policy attestation,
 folded into the attestation coverage the same way v3 already covered
 `policy.snapshot.sig`, closing the same gap for a policyless exception run)**. Both
-sidecars are read the hardened way — no-follow at the leaf, size-capped — so a symlink
-planted in place of either one hashes as a distinct refusal marker rather than being
-read through or silently skipped. A verdict computed under v3 (no `policy.absence.sig`
+sidecars — and every tracked `*.json` artifact — are read the hardened way (`read_regular_file_once`:
+no-follow at the leaf, size-capped), so a symlink planted in place of any of them is refused rather
+than read through or silently skipped. That refusal raises `NotRegularFileError` (an `OSError`), which
+every caller of `compute_attestation` (`--check-digest`, `--sign`, `--verify-signature`, and ordinary
+aggregation) treats as **cannot verify**, never as a hashed value and never as detected drift: it is
+not a `raw:`-prefixed digest entry, `--check-digest` exits 2 (not 1), `--sign`/`--verify-signature`
+refuse with exit 2, and ordinary aggregation folds it into a `BLOCKED` verdict rather than crashing
+before `verdict.json` is written. A verdict computed under v3 (no `policy.absence.sig`
 in scope yet) is a recognized legacy algorithm for `--check-digest`, not a current one;
 see the legacy-transition handling below. The unrelated, post-verdict `attestation.sig` (the standalone
 `--sign` feature's detached signature *over* `verdict.json` itself) stays excluded —

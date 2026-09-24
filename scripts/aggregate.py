@@ -918,7 +918,21 @@ def sign_attestation(run):
               f"{_ATTESTATION_ALGO!r} — re-aggregate under the current algorithm before signing",
               file=sys.stderr)
         sys.exit(1)
-    att = compute_attestation(run)
+    try:
+        att = compute_attestation(run)
+    except OSError as e:
+        # CodeRabbit 4088318850 / Codex 4088467040 (P2, valid): compute_attestation can now
+        # raise OSError (a symlinked/oversized/non-regular sidecar or tracked *.json — see its
+        # docstring) where it used to follow the link or crash the process with an uncaught
+        # exception. check_digest already catches this as cannot-verify (exit 2); this call
+        # site did not. A symlinked sidecar planted after aggregation would otherwise make
+        # --sign exit 1 via an unhandled traceback, which the documented exit code (1 = a
+        # definitive drift comparison) does not actually describe — nothing was compared.
+        # Treat it the same as "nothing verifiable to sign," exit 2, never 1 or an uncaught
+        # crash.
+        print(f"cannot recompute attestation ({e}) — a recorded artifact could not be read "
+              "safely; re-aggregate before signing", file=sys.stderr)
+        sys.exit(2)
     if att["digest"] != digest:
         print(f"refusing to sign: run artifacts drifted — recomputed attestation {att['digest']} "
               f"!= recorded {digest}; re-aggregate before signing", file=sys.stderr)
@@ -985,7 +999,19 @@ def verify_signature(run):
     if not sigpath.exists():
         print(f"no signature sidecar ({SIG_FILENAME}) — run `aggregate.py --sign` first")
         sys.exit(2)
-    att = compute_attestation(run)
+    try:
+        att = compute_attestation(run)
+    except OSError as e:
+        # CodeRabbit 4088318850 / Codex 4088467040 (P2, valid): same gap as sign_attestation
+        # above. A symlinked/oversized/non-regular sidecar or tracked *.json means the CURRENT
+        # artifacts cannot even be read, so nothing was compared — that is a missing
+        # prerequisite (exit 2, this function's own "cannot re-check" family, see the
+        # algorithm-mismatch branch just above), never "not verified" (exit 1, which the CLI
+        # contract and downstream consumers read as a detected tamper) and never an uncaught
+        # crash.
+        print(f"signature CANNOT BE VERIFIED: a recorded artifact could not be read safely "
+              f"({e}) — re-aggregate before re-verifying", file=sys.stderr)
+        sys.exit(2)
     if att["digest"] != digest:
         print(f"signature INVALID: run artifacts drifted — recomputed attestation {att['digest']} "
               f"!= recorded {digest}; the signed verdict no longer describes this run's inputs")
@@ -1784,6 +1810,32 @@ def _aggregate_cli():
         # shows which cap actually applied, not just total spend.
         cpol = read_json(run / "cost_policy.json") if (run / "cost_policy.json").exists() else None
         cpol = cpol if isinstance(cpol, dict) else {}
+        # Tamper-evident attestation over every recorded input, computed before the verdict
+        # file exists so re-aggregating an untouched run reproduces it (#5). Computed here,
+        # ahead of the verdict/steps decision below (not right before write_json as before),
+        # so a read failure can actually BLOCK rather than crash past it.
+        #
+        # CodeRabbit 4088318850 / Codex 4088467040 (P2, valid): compute_attestation can raise
+        # OSError (a symlinked/oversized/non-regular sidecar or tracked *.json — see its
+        # docstring) since the Codex-4077803884 hardening. check_digest already catches this as
+        # cannot-verify (exit 2); this, the MAIN aggregate path, did not — an attacker with
+        # write access to the run directory could plant such a file and crash aggregation with
+        # an uncaught traceback before verdict.json is ever written, exiting 1 (which the exit
+        # map reads as FAIL) with no verdict recorded at all. That breaks this module's own
+        # design rule (see the AGENTS.md-documented contract and the comment on `blocked`
+        # above): ordinary aggregation always writes a verdict, and an unreadable/untrusted
+        # input is a BLOCKER, never a crash. Fold it into `blocked` like every other
+        # attacker-reachable failure this function already handles, and fall back to a
+        # digest-less attestation record (digest=None mirrors the existing "computed before #5 /
+        # malformed" shape check_digest and verify_signature already treat as unverifiable,
+        # never as a false PASS or false drift).
+        try:
+            attestation = compute_attestation(run)
+        except OSError as e:
+            blocked.append(
+                "run artifacts could not be attested safely — a recorded artifact is a "
+                f"symlink, not a regular file, or exceeds the size cap: {_oneline(e)}")
+            attestation = {"algorithm": _ATTESTATION_ALGO, "inputs": 0, "digest": None, "files": {}}
         coverage = {"risk": meta["risk"], "gates": gcov, "panel": pcov,
                     "rebuttal": rcov, "findings": fcov,
                     "cost_usd": round(panel_cost_usd, 6), "cost_aborted": bool(cost_abort),
@@ -1802,9 +1854,6 @@ def _aggregate_cli():
         # so the guidance can never suggest an action the gate above it already rejected.
         steps = next_steps(verdict, fail, blocked, gcov, fcov, counts, risk=meta["risk"],
                            allow_critical_waivers=_policy_bool(pol_data.get("allow_critical_waivers")) or False)
-        # Tamper-evident attestation over every recorded input, computed before the
-        # verdict file exists so re-aggregating an untouched run reproduces it (#5).
-        attestation = compute_attestation(run)
         out = {"verdict": verdict, "reasons": fail + blocked, "notes": notes,
                "next_steps": steps,
                "counts": counts, "coverage": coverage, "attestation": attestation,

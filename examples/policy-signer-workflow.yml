@@ -54,7 +54,15 @@ jobs:
           AR_SIGNER_CMD: ${{ secrets.AR_SIGNER_CMD }}  # set on THIS job's secrets only, never the
                                                         # review job in examples/adversarial-review.yml
         run: |
-          python3 scripts/panel.py init --risk "${AR_RISK:-}" --dev-providers "${AR_DEV_PROVIDERS:-}"
+          # CodeRabbit 4088318836 (Minor, valid): --risk has a fixed choices=[...] list, so an
+          # empty AR_RISK/AR_DEV_PROVIDERS value (unset in the calling workflow) would fail
+          # panel.py's argument validation before it could resolve either one's default. Build
+          # the argv array so an unset env var omits its flag entirely, letting panel.py apply
+          # its own defaults, instead of always passing both flags with a possibly-empty value.
+          args=()
+          [ -n "${AR_RISK:-}" ] && args+=(--risk "$AR_RISK")
+          [ -n "${AR_DEV_PROVIDERS:-}" ] && args+=(--dev-providers "$AR_DEV_PROVIDERS")
+          python3 scripts/panel.py init "${args[@]}"
           # Produces a signed policy.snapshot.sig under THIS job's own, freshly-created run
           # directory -- correctly isolated, correctly signed, but not yet connected to any
           # specific untrusted review run. See the file header.

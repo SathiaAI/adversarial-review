@@ -15227,5 +15227,66 @@ def t_ci_signing_context_sanitizes_unencodable_env_value():
                 os.environ[k] = v
 
 
+# ---------------------------------------------------------------- PR70 round 5.2 follow-up
+
+
+def t_aggregate_main_path_blocks_on_symlinked_sidecar_not_crash():
+    # CodeRabbit 4088318850 / Codex 4088467040 (P2, valid): compute_attestation's hardened read
+    # (Codex 4077803884, round 5.1) raises OSError (NotRegularFileError) on a symlinked sidecar
+    # or tracked *.json artifact. check_digest already caught this as cannot-verify (exit 2),
+    # but the MAIN aggregate path (ordinary `aggregate.py`, no flags) called compute_attestation
+    # with no exception handling at all -- an attacker with write access to the run directory
+    # could crash aggregation with an uncaught traceback BEFORE verdict.json was ever written,
+    # instead of the required BLOCKED verdict this module's own design rule promises ("ordinary
+    # aggregation always writes a verdict; an unreadable/untrusted input is a blocker, never a
+    # crash"). Plant the symlink before the very first aggregate run and confirm it BLOCKS
+    # cleanly, with a digest-less attestation record, not a traceback.
+    if not hasattr(os, "symlink"):
+        return
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.sig").exists()
+    _resolve_open_finding(run)
+    outside = Path(tempfile.mkdtemp(prefix="ar-evilsig2-")) / "big.bin"
+    outside.write_bytes(b"x" * 1024)
+    sig_p = run / "policy.snapshot.sig"
+    sig_p.unlink()
+    os.symlink(outside, sig_p)
+    r = sh(["aggregate.py"], repo, expect=2, env=env)  # BLOCKED (exit 2), never a crash
+    assert "Traceback" not in r.stderr, (r.stdout, r.stderr)
+    verdict = read(run / "verdict.json")
+    assert verdict["verdict"] == "BLOCKED", verdict
+    assert any("could not be attested safely" in b for b in verdict["reasons"]), verdict["reasons"]
+    assert verdict["attestation"]["digest"] is None, verdict["attestation"]
+
+
+def t_sign_verify_reject_symlinked_artifact_as_cannot_verify_not_crash():
+    # CodeRabbit 4088318850 / Codex 4088467040 (P2, valid): same gap as the main-path test above,
+    # for the two standalone post-verdict modes. --sign's own docstring promises exit 2 for
+    # "nothing to sign" and --verify-signature's promises exit 2 for "a missing prerequisite";
+    # neither call site caught compute_attestation's OSError, so each crashed with an uncaught
+    # traceback instead. Sign+verify cleanly first (a real signature to attempt
+    # --verify-signature against), then plant a symlinked tracked-*.json artifact and confirm
+    # both modes now cleanly report cannot-verify (exit 2), not a crash and not a false "tamper
+    # detected" (exit 1).
+    if not hasattr(os, "symlink"):
+        return
+    env = _stub_signer_env()
+    repo, run = _pass_run_for_signing(policy_env=env)
+    sh(["aggregate.py"], repo, expect=0, env=env)
+    sh(["aggregate.py", "--sign"], repo, expect=0, env=env)
+    outside = Path(tempfile.mkdtemp(prefix="ar-eviljson-")) / "big.bin"
+    outside.write_bytes(b"x" * 1024)
+    evil = run / "evil.json"
+    os.symlink(outside, evil)
+    rv = sh(["aggregate.py", "--verify-signature"], repo, expect=2, env=env)
+    assert "Traceback" not in rv.stderr, (rv.stdout, rv.stderr)
+    assert "CANNOT BE VERIFIED" in (rv.stdout + rv.stderr), (rv.stdout, rv.stderr)
+    rs = sh(["aggregate.py", "--sign"], repo, expect=2, env=env)
+    assert "Traceback" not in rs.stderr, (rs.stdout, rs.stderr)
+    assert "cannot recompute attestation" in (rs.stdout + rs.stderr), (rs.stdout, rs.stderr)
+
+
 if __name__ == "__main__":
     main()
