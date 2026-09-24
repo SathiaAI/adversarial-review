@@ -1618,6 +1618,30 @@ def _sensitive_repo_with_policy(env=None, waive=True):
     return repo
 
 
+def absence_pass_repo(env):
+    """A genuinely policy-free SENSITIVE run (mirrors
+    t_policy_sig_absence_signed_at_init_allows_waiver_run_to_pass's own build) that
+    reaches PASS under a signed policy.absence.json/.sig -- unlike
+    _sensitive_repo_with_policy, `fresh_repo()` here has NO .adversarial-review.json, so
+    `panel.py init` writes+signs the GAP-A absence attestation instead of a policy
+    snapshot. Used by round-5.4 tests that need a real signed policy.absence.json to
+    tamper with (round-trip through a genuine run rather than hand-writing one, so the
+    fixture matches exactly what a real repo produces)."""
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"], repo, env=env)
+    sh(["panel.py", "assign"], repo, env=env)
+    sh(["panel.py", "run", "--context-file", "context.md"], repo, env=env)
+    sh(["panel.py", "rebuttal"], repo, env=env)
+    sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+        "--waive", "mutation", "--authorized-by", "Paul",
+        "--waive-reason", "mutation runner not wired into CI for this repo yet",
+        "--waive-expires", (date.today() + timedelta(days=7)).isoformat()], repo, env=env)
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo, env=env)
+    _resolve_open_finding(latest_run(repo))   # mock panel.py run/rebuttal raises a high finding
+    return repo
+
+
 def _resolve_open_finding(run):
     write(run / "validation" / "idor.json", {
         "finding_ids": ["security-1"], "classification": "confirmed",
@@ -15350,6 +15374,145 @@ def t_aggregate_manifest_omitting_floor_gate_blocks_not_silently_passes():
     verdict = read(run / "verdict.json")
     assert verdict["verdict"] == "BLOCKED", verdict
     assert any("omits" in b and "mutation" in b for b in verdict["reasons"]), verdict["reasons"]
+
+
+# ---------------------------------------------------------------- round 5.4 (2026-09-24)
+
+def t_aggregate_non_dict_gate_record_blocks_not_crash():
+    # CodeRabbit 4089643905 (Major, valid, against round 5.3's own t_aggregate_unreadable_
+    # gate_record_blocks_not_crash fix above): read_json() succeeds on any valid JSON
+    # VALUE, not just an object -- a gate record file containing `null` parses cleanly (no
+    # ValueError/OSError), so it was not caught by that fix's except clause at all. The
+    # very next line's `rec.get("status")` then raises AttributeError on the non-dict,
+    # which only surfaces via main()'s outer `except Exception: sys.exit(3)` -- the exact
+    # crash-instead-of-BLOCKED failure mode round 5.3 was written to close, on an input
+    # its own fix didn't cover. Plant a gate record containing bare `null` and confirm
+    # aggregation now BLOCKS cleanly instead of crashing.
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=False)
+    run = latest_run(repo)
+    (run / "gates" / "build.json").write_text("null")
+    r = sh(["aggregate.py"], repo, expect=2, env=env)  # BLOCKED (exit 2), never a crash
+    assert "Traceback" not in r.stderr, (r.stdout, r.stderr)
+    verdict = read(run / "verdict.json")
+    assert verdict["verdict"] == "BLOCKED", verdict
+    assert any("build" in b and "not a JSON object" in b for b in verdict["reasons"]), verdict["reasons"]
+
+
+def t_check_digest_legacy_stored_absence_claim_with_sidecar_deleted_is_cannot_verify():
+    # Codex 4089779545 (P1, valid): _sidecar_newly_covered_transition only catches the
+    # ADDED direction of a sidecar's algorithm-versioned coverage (sidecar exists today,
+    # stored manifest never had it) -- not the opposite, silent direction: the sidecar
+    # existed at verdict time (authenticating a real policy.absence.json claim), was
+    # DELETED since, and because a LEGACY stored_algo never tracked that sidecar's
+    # coverage either way, its disappearance changes nothing observable in the digest
+    # comparison -- check_digest would report "attestation OK" for a run whose signed
+    # no-policy evidence has been destroyed. The fix anchors on the claim file
+    # (policy.absence.json), which IS hashed at every algorithm version (compute_
+    # attestation's *.json glob is unconditional): if the STORED legacy manifest already
+    # shows that claim present, a currently-missing sidecar for it is unverifiable, not a
+    # clean pass.
+    from _common import POLICY_ABSENCE_SIG_FILENAME, POLICY_ABSENCE_FILENAME
+    env = _stub_signer_env()
+    repo = absence_pass_repo(env)
+    run = latest_run(repo)
+    sh(["aggregate.py"], repo, env=env, expect=0)                    # real v4 PASS verdict
+    v = read(run / "verdict.json")
+    att = v["attestation"]
+    assert att["algorithm"] == "sha256-canonical-json-v4", att["algorithm"]
+    assert POLICY_ABSENCE_FILENAME in att["files"], att["files"]
+    assert POLICY_ABSENCE_SIG_FILENAME in att["files"], att["files"]
+    # Forge a LEGACY v3 verdict: v3 predates policy.absence.sig's coverage (introduced at
+    # v4), so a real v3 tool's manifest would never have listed it -- but v3 DOES already
+    # hash policy.absence.json itself (the unconditional *.json glob predates this whole
+    # versioning scheme), so that claim file stays in the forged manifest unchanged.
+    legacy = dict(att)
+    legacy_files = dict(att["files"])
+    del legacy_files[POLICY_ABSENCE_SIG_FILENAME]
+    legacy["files"] = legacy_files
+    legacy["algorithm"] = "sha256-canonical-json-v3"
+    manifest = "\n".join(f"{sha}  {rel}" for rel, sha in sorted(legacy_files.items()))
+    legacy["digest"] = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+    v["attestation"] = legacy
+    (run / "verdict.json").write_text(json.dumps(v))
+    # Simulate deletion: the sidecar that authenticated this run's no-policy claim is
+    # gone from disk (unlike the sibling "newly covered" test, where it's ADDED).
+    (run / POLICY_ABSENCE_SIG_FILENAME).unlink()
+    r = sh(["aggregate.py", "--check-digest"], repo, expect=2)      # cannot-verify, NOT a silent pass
+    blob = r.stdout + r.stderr
+    assert "CANNOT BE VERIFIED" in blob, (r.stdout, r.stderr)
+    assert POLICY_ABSENCE_FILENAME in blob and POLICY_ABSENCE_SIG_FILENAME in blob, blob
+    assert "attestation OK" not in r.stdout, r.stdout
+
+
+def t_verifier_configured_here_detects_partial_cosign_keyless_identity():
+    # Codex 4089779550 (P2, valid): cosign_verify_argv() falls through to a bare `None`
+    # when AR_ALLOW_KEYLESS=1 but only ONE of AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER is set --
+    # indistinguishable, to _verifier_configured_here()'s caller, from "keyless was never
+    # attempted at all" (resolve_signing_tool's `err` channel only fires for a malformed
+    # AR_VERIFIER_CMD override, never for this builder-level partial config). That let an
+    # operator who had clearly started configuring cosign keyless -- but pinned only one
+    # of the two identity constraints -- silently fall into the infrastructure-free
+    # exemption (authenticate_risk_tier, load_attested_policy_bundle's GAP-A branch)
+    # instead of being blocked/escalated, exactly the shape the pre-existing "a malformed
+    # AR_VERIFIER_CMD counts as 'a verifier IS configured here'" handling already closes
+    # for the env-override path. Unit-tests _verifier_configured_here() directly against
+    # every combination, matching t_sign_cosign_verify_requires_identity's own
+    # shutil.which monkeypatch pattern for exercising cosign-availability branches
+    # offline.
+    import _common
+    orig_which = _common.shutil.which
+    _common.shutil.which = lambda name: "/usr/bin/cosign" if name == "cosign" else orig_which(name)
+    keys = ("AR_COSIGN_IDENTITY", "AR_COSIGN_ISSUER", "AR_ALLOW_KEYLESS",
+            "AR_VERIFIER_CMD", "AR_MINISIGN_PUBKEY", "AR_MINISIGN_PUBKEY_FILE",
+            "GITHUB_REPOSITORY")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        # Neither set, keyless on: falls to auto-derive (no GITHUB_REPOSITORY -> None) ->
+        # no verifier resolves and no partial config -> False.
+        os.environ["AR_ALLOW_KEYLESS"] = "1"
+        assert _common._verifier_configured_here() is False, "neither set must stay unconfigured"
+        # Exactly one set (identity only) -> the reported gap: must now report True.
+        os.environ["AR_COSIGN_IDENTITY"] = "https://github.com/octo/repo/"
+        assert _common._verifier_configured_here() is True, "partial identity must count as configured"
+        # Exactly one set (issuer only) -> same, the other direction.
+        os.environ.pop("AR_COSIGN_IDENTITY")
+        os.environ["AR_COSIGN_ISSUER"] = "https://token.actions.githubusercontent.com"
+        assert _common._verifier_configured_here() is True, "partial issuer must count as configured"
+        # Both set -> a real verifier resolves (pre-existing path, unaffected).
+        os.environ["AR_COSIGN_IDENTITY"] = "https://github.com/octo/repo/"
+        assert _common._verifier_configured_here() is True
+        # AR_ALLOW_KEYLESS off entirely -> partial identity vars must NOT matter (the
+        # explicit opt-in gate still governs first, unchanged).
+        os.environ.pop("AR_ALLOW_KEYLESS")
+        assert _common._verifier_configured_here() is False, "AR_ALLOW_KEYLESS=0 must stay unconfigured"
+    finally:
+        _common.shutil.which = orig_which
+        for k, val in saved.items():
+            os.environ.pop(k, None) if val is None else os.environ.__setitem__(k, val)
+
+
+def t_absence_deeply_nested_json_blocks_not_recursion_crash():
+    # Codex 4089779557 (P2, valid): json.loads() is a recursive-descent parser -- a
+    # policy.absence.json nested tens of thousands of levels deep ("[[[[...]]]]", ~2
+    # bytes/level, trivially under read_regular_file_once's 16 MiB cap) exceeds Python's
+    # recursion limit with a RecursionError, which the pre-existing `except (ValueError,
+    # UnicodeDecodeError)` around this parse does not catch (RecursionError is a
+    # RuntimeError subclass). Uncaught, it propagates past load_attested_policy_bundle's
+    # own documented "never raises" contract and crashes aggregation (main()'s outer
+    # `except Exception: sys.exit(3)`, no verdict.json written) instead of the graceful
+    # BLOCKED verdict every other malformed-input case in this function produces.
+    env = _stub_signer_env()
+    repo = absence_pass_repo(env)
+    run = latest_run(repo)
+    deep = "[" * 60000 + "]" * 60000
+    (run / "policy.absence.json").write_text(deep)
+    r = sh(["aggregate.py"], repo, env=env, expect=2)   # BLOCKED (exit 2), never a crash
+    assert "Traceback" not in r.stderr, (r.stdout, r.stderr)
+    verdict = read(run / "verdict.json")
+    assert verdict["verdict"] == "BLOCKED", verdict
 
 
 if __name__ == "__main__":

@@ -787,7 +787,11 @@ def _verifier_configured_here():
         "AR_VERIFIER_CMD",
         [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)],
         fatal=False)
-    return argv_tmpl is not None or bool(resolve_err)
+    # Codex 4089779550 (P2): a partially-pinned cosign keyless identity resolves to
+    # bare None above (no resolve_err) -- treat it as "configured" too, for the same
+    # reason a malformed AR_VERIFIER_CMD already is (see docstring).
+    return (argv_tmpl is not None or bool(resolve_err)
+            or _cosign_keyless_partially_configured())
 
 
 _UNTRUSTED_GITHUB_EVENTS = frozenset({"pull_request"})
@@ -1004,6 +1008,36 @@ def cosign_verify_argv():
                     "--certificate-identity-regexp", auto_regexp,
                     "--certificate-oidc-issuer", auto_issuer, "{msg}"]
     return None
+
+
+def _cosign_keyless_partially_configured():
+    """True iff the operator has taken a concrete step toward cosign keyless
+    verification (AR_ALLOW_KEYLESS set and the cosign binary present) but pinned only
+    ONE of the two identity constraints cosign_verify_argv requires (AR_COSIGN_IDENTITY
+    XOR AR_COSIGN_ISSUER) -- distinct from BOTH unset (cosign_verify_argv's own
+    auto-derive fallback) and BOTH set (fully pinned), neither of which is a
+    misconfiguration.
+
+    Codex 4089779550 (P2, valid): cosign_verify_argv() has no error channel for this
+    case -- a partial pair makes it fall through to a bare `None`, indistinguishable
+    from "keyless was never attempted at all." That made _verifier_configured_here()
+    report False for an operator who had clearly started configuring a verifier, the
+    same silent-degrade-to-exempt shape the pre-existing "a malformed AR_VERIFIER_CMD
+    counts as 'a verifier IS configured here'" handling (see resolve_signing_tool's
+    `err`, consumed just below) already closes for the env-override path. Without this,
+    AR_ALLOW_KEYLESS=1 plus e.g. only AR_COSIGN_IDENTITY set let a SENSITIVE/CRITICAL
+    run with no policy.snapshot.json and no signed policy.absence.json take the
+    infrastructure-free exemption (load_attested_policy_bundle's GAP-A branch,
+    authenticate_risk_tier's own pre-check) instead of being BLOCKED/escalated -- an
+    operator's incomplete config silently bought the same pass as never configuring
+    verification at all."""
+    if not _policy_bool_env("AR_ALLOW_KEYLESS"):
+        return False
+    if not shutil.which("cosign"):
+        return False
+    ident = bool(os.environ.get("AR_COSIGN_IDENTITY", "").strip())
+    issuer = bool(os.environ.get("AR_COSIGN_ISSUER", "").strip())
+    return ident != issuer
 
 
 def minisign_verify_argv():
@@ -1784,8 +1818,18 @@ def load_attested_policy_bundle(run, *, require_signature):
     except (ValueError, OSError) as e:
         return None, f"run.json is unreadable — cannot determine the attested policy; run BLOCKED ({e})"
     try:
+        # RecursionError included alongside ValueError/UnicodeDecodeError: a JSON decoder
+        # is a recursive-descent parser, so a file inside the size cap but nested tens of
+        # thousands of levels deep (e.g. "[[[[...]]]]" at ~2 bytes/level, far under
+        # _MAX_RUN_FILE_BYTES) exceeds Python's recursion limit -- not a syntax error, so
+        # ValueError alone does not catch it. Left uncaught, this function's own
+        # docstring promise ("never raises; every failure mode is a caller-facing
+        # BLOCKED-reason string") would be broken by a crash instead of a controlled
+        # BLOCKED verdict (Codex 4089779557, P2, reported against the sibling
+        # policy.absence.json parse just below -- this file is read by the same
+        # function under the same "never raises" contract, so it gets the same guard).
         runjson = json.loads(runjson_bytes.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as e:
+    except (ValueError, UnicodeDecodeError, RecursionError) as e:
         return None, (f"run.json is not valid JSON/UTF-8 — cannot determine the attested "
                       f"policy; run BLOCKED ({e})")
     if not isinstance(runjson, dict):
@@ -1816,8 +1860,16 @@ def load_attested_policy_bundle(run, *, require_signature):
             except (ValueError, OSError) as e:
                 return None, f"policy.absence.json is unreadable/corrupt: {e}"
             try:
+                # Codex 4089779557 (P2, valid): a policy.absence.json nested tens of
+                # thousands of levels deep (e.g. "[[[[...]]]]", well under the 16 MiB
+                # read_regular_file_once cap at ~2 bytes/level) exceeds Python's json
+                # decoder's recursion limit -- RecursionError, not a ValueError this
+                # except clause already caught -- and would otherwise propagate past
+                # aggregate.py's normal BLOCKED-verdict path and crash the run (exit 3,
+                # no verdict.json written) instead of failing closed the way every other
+                # malformed-input case in this function does.
                 absence_data = json.loads(absence_raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError) as e:
+            except (ValueError, UnicodeDecodeError, RecursionError) as e:
                 return None, f"policy.absence.json is not valid JSON/UTF-8: {e}"
             if not isinstance(absence_data, dict) or absence_data.get("policy_absent") is not True:
                 return None, ("policy.absence.json is malformed (missing "
@@ -1869,6 +1921,17 @@ def load_attested_policy_bundle(run, *, require_signature):
                         "AR_VERIFIER_CMD",
                         [("cosign-keyless", cosign_verify_argv), ("minisign", minisign_verify_argv)],
                         fatal=False)
+                    # Codex 4089779550 (P2): the partial-keyless-identity signal has no
+                    # resolve_err of its own (see _cosign_keyless_partially_configured) --
+                    # name it explicitly here so the BLOCKED message is actionable rather
+                    # than a generic "a verifier IS configured here" for a run where no
+                    # verifier tool actually resolved.
+                    if resolve_err is None and _cosign_keyless_partially_configured():
+                        resolve_err = ("AR_ALLOW_KEYLESS is set and cosign is on PATH, "
+                                       "but only one of AR_COSIGN_IDENTITY/"
+                                       "AR_COSIGN_ISSUER is set -- cosign verify-blob "
+                                       "requires both, or neither (to auto-derive); set "
+                                       "the missing one or unset both")
                 detail = f" ({resolve_err})" if resolve_err else ""
                 reason = ("a verifier IS configured here" if verifier_here
                           else "AR_SIGNING_REQUIRED is set for this repository")
@@ -1886,8 +1949,11 @@ def load_attested_policy_bundle(run, *, require_signature):
     except (ValueError, OSError) as e:
         return None, f"policy.snapshot.json is unreadable/corrupt: {e}"
     try:
+        # Same RecursionError gap as run.json/policy.absence.json above (Codex
+        # 4089779557) -- this is the third of load_attested_policy_bundle's three
+        # untrusted-file JSON parses, under the same "never raises" contract.
         snap = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as e:
+    except (ValueError, UnicodeDecodeError, RecursionError) as e:
         return None, f"policy.snapshot.json is not valid JSON/UTF-8: {e}"
     if not isinstance(snap, dict):
         return None, "policy.snapshot.json is not a JSON object"
@@ -1919,10 +1985,12 @@ def load_attested_policy_bundle(run, *, require_signature):
         return None, ("policy.snapshot.json sha256 does not match the policy digest recorded in "
                       "run.json at init — the snapshot was replaced")
     try:
+        # Fourth and last of this function's untrusted-file JSON parses (Codex
+        # 4089779557) -- the captured policy TEXT itself, when fname is a .json file.
         data = (json.loads(text) if fname.endswith(".json")
                 else _parse_policy_yaml(text, "policy.snapshot.json"))
         _validate_policy(data, "policy.snapshot.json")
-    except (ValueError, SystemExit):
+    except (ValueError, SystemExit, RecursionError):
         return None, "policy.snapshot.json failed to parse/validate against the current schema"
     if not isinstance(data, dict):
         return None, "policy.snapshot.json did not parse to a mapping"

@@ -30,7 +30,8 @@ from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (POLICY_ABSENCE_SIG_FILENAME, POLICY_SIG_FILENAME, _policy_bool,
+from _common import (POLICY_ABSENCE_FILENAME, POLICY_ABSENCE_SIG_FILENAME,
+                     POLICY_SIG_FILENAME, _policy_bool,
                      authenticate_risk_tier, canonical_finding_digest,
                      cosign_sign_argv as _cosign_sign_argv,
                      cosign_verify_argv as _cosign_verify_argv, family_of,
@@ -212,9 +213,30 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
         # case in this loop (missing/BLOCKED/orphaned-waiver), matching this file's own
         # stated contract: an unreadable/untrusted input is a BLOCKER, never a crash.
         try:
+            # RecursionError alongside ValueError/OSError: a gate record file this deep
+            # ("[[[[...]]]]", well under _MAX_RUN_FILE_BYTES) exceeds json.loads's
+            # recursion limit without being a ValueError -- and since gate.py record has
+            # no authentication of its own (see docs/THREAT-MODEL.md), any code in the
+            # job can write this file directly, bypassing gate.py record's own
+            # fixed-shape CLI entirely (Codex 4089779557, reported against the sibling
+            # policy.absence.json parse in _common.py; identical gap, same file-reading
+            # contract stated in this loop's own comment above).
             rec = read_json(p)
-        except (ValueError, OSError) as e:
+        except (ValueError, OSError, RecursionError) as e:
             reason = f"recorded gate result is unreadable or not valid JSON: {e}"
+            gcov["blocked"].append({"name": name, "reason": reason})
+            blocked.append(f"gate '{name}': {_oneline(reason)}")
+            continue
+        # CodeRabbit 4089643905 (Major, valid, against this session's own fix above):
+        # read_json() succeeds on any valid JSON value, not just an object -- a gate
+        # record file containing `null`, `[]`, a number, or a string is not caught by
+        # the except above (no ValueError/OSError), but the very next line's
+        # rec.get("status") raises AttributeError on anything that isn't a dict. That
+        # reaches main()'s outer sys.exit(3) handler exactly like the unreadable case
+        # this fix was meant to close, before verdict.json is written. Same malformed-
+        # manifest guard the _required.json read above already applies to `gplan`.
+        if not isinstance(rec, dict):
+            reason = f"recorded gate result is not a JSON object (got {type(rec).__name__})"
             gcov["blocked"].append({"name": name, "reason": reason})
             blocked.append(f"gate '{name}': {_oneline(reason)}")
             continue
@@ -381,7 +403,7 @@ def collect_jev_priors(run, reports):
                 continue
             try:
                 rec = read_json(p)
-            except (OSError, ValueError):
+            except (OSError, ValueError, RecursionError):
                 continue
             if not (isinstance(rec, dict) and isinstance(rec.get("jev"), dict)):
                 continue
@@ -565,6 +587,16 @@ _ALGO_ORDER = _LEGACY_ALGOS + (_ATTESTATION_ALGO,)
 _SIDECAR_COVERAGE_INTRODUCED_AT = {
     POLICY_SIG_FILENAME: "sha256-canonical-json-v3",
     POLICY_ABSENCE_SIG_FILENAME: "sha256-canonical-json-v4",
+}
+
+# Each sidecar above paired with the ordinary *.json "claim" file it authenticates — unlike the sidecar
+# itself, the claim file is hashed at EVERY algorithm version (compute_attestation's *.json glob is
+# unconditional), so its presence in a LEGACY stored manifest is a version-independent signal that this
+# run genuinely had that claim in play at verdict time, not merely "the sidecar happens to exist today."
+# Used ONLY by check_digest()'s legacy-sidecar-deletion guard just below.
+_SIDECAR_CLAIM_FILE = {
+    POLICY_SIG_FILENAME: "policy.snapshot.json",
+    POLICY_ABSENCE_SIG_FILENAME: POLICY_ABSENCE_FILENAME,
 }
 
 # A JSON integer literal wider than this many digits is routed to the raw path, for the same
@@ -841,6 +873,38 @@ def check_digest(run):
               "a different (newer or unknown) tool version, so this tool cannot interpret its "
               "representation. Re-aggregate under the current algorithm, then re-check.", file=sys.stderr)
         sys.exit(2)
+    # Codex 4089779545 (P1, valid): a LEGACY stored_algo never tracked a sidecar introduced by a later
+    # algorithm at all -- not "hashed differently," simply absent from that algorithm's manifest, by
+    # construction (see _SIDECAR_COVERAGE_INTRODUCED_AT). _sidecar_newly_covered_transition (below, in the
+    # drifted-artifact path) already catches the ADDED direction: the sidecar exists today but the stored
+    # manifest never had it. It does NOT catch the opposite, silent direction: the sidecar existed at
+    # verdict time (authenticating a real policy/absence claim), was DELETED since, and because the legacy
+    # algorithm's manifest never tracked it either way, its disappearance changes nothing observable in the
+    # manifest comparison -- the recomputed digest matches the stored one exactly and this function would
+    # otherwise report "attestation OK" for a run whose signed evidence has been destroyed. Distinguishing
+    # "never existed" from "existed, then deleted" is impossible from the sidecar's own (untracked) history
+    # alone, so this checks the one thing that IS tracked at every version: the sidecar's companion claim
+    # file (policy.snapshot.json / policy.absence.json), hashed by the unconditional *.json glob regardless
+    # of algorithm. If the STORED manifest already shows that claim file present, this run genuinely had
+    # that claim in play at verdict time -- so a currently-missing sidecar for it is unverifiable, not a
+    # clean pass. Scoped to the exit-0 fast path only (never downgrades an already-detected exit-1 DRIFT
+    # elsewhere in this function into a vaguer exit-2): if some OTHER artifact already differs, the normal
+    # drifted-artifact analysis below already surfaces that as a definitive finding on its own.
+    if stored_algo in _LEGACY_ALGOS and att["digest"] == stored.get("digest"):
+        old_files = stored.get("files", {})
+        for sig_name, introduced_at in _SIDECAR_COVERAGE_INTRODUCED_AT.items():
+            if _ALGO_ORDER.index(stored_algo) >= _ALGO_ORDER.index(introduced_at):
+                continue   # this sidecar's coverage predates or matches stored_algo; not this gap
+            claim_name = _SIDECAR_CLAIM_FILE[sig_name]
+            if claim_name in old_files and sig_name not in att["files"]:
+                print(f"attestation CANNOT BE VERIFIED: this run's recorded manifest shows a "
+                      f"{claim_name} claim, but its authenticating {sig_name} sidecar is missing "
+                      f"today and the stored attestation's algorithm ({stored_algo!r}) predates that "
+                      "sidecar's coverage -- this tool cannot tell whether the signature was recorded "
+                      "and later deleted, or never existed, from the recorded hashes alone. "
+                      "Re-aggregate under the current algorithm to obtain a verifiable verdict, then "
+                      "re-check.", file=sys.stderr)
+                sys.exit(2)
     if att["digest"] == stored.get("digest"):
         print(f"attestation OK: sha256 {att['digest']} over {att['inputs']} artifacts")
         sys.exit(0)
