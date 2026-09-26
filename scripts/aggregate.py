@@ -24,17 +24,33 @@ import html
 import json
 import os
 import re
-import shlex
-import shutil
-import subprocess
 import sys
 import tempfile
 from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import (canonical_finding_digest, family_of, meta_cost, now_iso, read_json,
-                     resolve_run, write_json)
+from _common import (POLICY_ABSENCE_FILENAME, POLICY_ABSENCE_SIG_FILENAME,
+                     POLICY_SIG_FILENAME, TIER_ROLES, _policy_bool,
+                     authenticate_risk_tier, canonical_finding_digest,
+                     cosign_sign_argv as _cosign_sign_argv,
+                     cosign_verify_argv as _cosign_verify_argv, family_of,
+                     load_attested_policy_bundle, meta_cost,
+                     minisign_sign_argv as _minisign_sign_argv,
+                     minisign_verify_argv as _minisign_verify_argv, now_iso,
+                     read_json, read_regular_file_once, resolve_run,
+                     resolve_signing_tool as _resolve_tool, resolve_waiver_clock,
+                     safe_degraded_missing_roles,
+                     verify_policy_absence_signature,
+                     verify_policy_snapshot_signature,
+                     run_signing_tool as _run_tool, sign_fail as _sign_fail,
+                     sign_timeout as _sign_timeout, validate_gate_name,
+                     validate_not_applicable_gate, validate_waived_gate, write_json)
+# Codex 4089137619: the tier-floor set check_gates() enforces below must be the SAME
+# floor gate.py's own `plan` command bakes into a fresh _required.json — imported, not
+# duplicated, so the two can never silently drift apart. gate.py imports only from
+# _common (never from this module), so this import is one-directional and safe.
+from gate import MINIMUM_GATES
 
 HIGH = ("critical", "high")
 
@@ -44,13 +60,36 @@ def load_reports(run, plan):
     for role in plan.get("roles", {}):
         p = run / "panel" / f"{role}.json"
         if p.exists():
-            reports[role] = read_json(p)
+            try:
+                parsed = read_json(p)
+            except (OSError, ValueError, RecursionError):
+                continue  # unreadable/malformed report -> treated as missing; check_panel()
+                          # already reports "reviewer reports missing for: ..." for this
+            # CodeRabbit r4112007447 (Major, valid): read_json succeeds -- no exception --
+            # for any valid JSON value, not just an object; a hand-edited report.json of
+            # `null` or `[]` is valid JSON that is not a report. Every downstream reader
+            # (check_rebuttal, check_findings, collect_jev_priors, etc.) calls `.get(...)`
+            # on each reports.values() entry expecting a dict, so storing a non-dict here
+            # crashed those callers instead of being treated as "missing" like any other
+            # malformed report.
+            if isinstance(parsed, dict):
+                reports[role] = parsed
     return reports
 
 
-def check_gates(run, tier, fail, blocked, notes):
+def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, None)):
     """Returns (results, gates_coverage). Coverage is derived from the same records
-    the verdict uses — an unrecorded fact stays invisible in both."""
+    the verdict uses — an unrecorded fact stays invisible in both.
+
+    A waived gate stays a member of `required` (it is never dropped from the set this
+    checks) and is represented as its own gates/<name>.json record with status WAIVED,
+    exactly like a NOT_APPLICABLE record — so both are independently re-validated here
+    from what is actually on disk (expiry, cap, authorizer, reason, CRITICAL rules),
+    never trusted just because gate.py's own plan-time checks passed. `pol_data` is the
+    loaded repo policy's data mapping (or {} when there is none); `clock` is the
+    (clock_date, error) pair from resolve_waiver_clock, resolved once by the caller."""
+    pol_data = pol_data or {}
+    clock_date, clock_err = clock
     gcov = {"plan_recorded": False, "required": [], "recorded": [], "passed": [],
             "failed": [], "blocked": [], "not_applicable": [], "missing": [],
             "waived": []}
@@ -58,51 +97,278 @@ def check_gates(run, tier, fail, blocked, notes):
     if not req_path.exists():
         blocked.append("gate plan missing — run `gate.py plan` after detecting the stack")
         return {}, gcov
-    gplan = read_json(req_path)
+    # Reject a malformed manifest document itself before treating it as a mapping: invalid
+    # JSON (ValueError from json.load) or valid JSON that isn't an object (null/number/string/
+    # array — read_json returns whatever json.load parses to, with no type restriction) would
+    # otherwise raise AttributeError on the very next line's gplan.get(...), which check_gates'
+    # caller (aggregate.py's main()) only catches at the top level as an unexpected exit-3
+    # crash — never reaching the code that writes a BLOCKED verdict.json (CodeRabbit,
+    # aggregate.py:73-75, "Handle malformed _required.json as BLOCKED").
+    try:
+        gplan = read_json(req_path)
+    except (ValueError, OSError) as e:
+        blocked.append(f"gate plan (_required.json) is unreadable or not valid JSON: {e}")
+        return {}, gcov
+    if not isinstance(gplan, dict):
+        blocked.append(
+            f"gate plan (_required.json) is not a JSON object (got {type(gplan).__name__}) — "
+            "malformed or tampered manifest")
+        return {}, gcov
     gcov["plan_recorded"] = True
-    gcov["required"] = list(gplan.get("required", []))
-    for w in gplan.get("waived", []):
-        gcov["waived"].append({"name": w.get("name"), "authorized_by": w.get("authorized_by")})
-        if not w.get("authorized_by"):
-            blocked.append(f"gate '{w['name']}' waived without an authorizer")
-        else:
-            notes.append(f"gate '{w['name']}' waived by {w['authorized_by']}")
+    manifest_planned_at = gplan.get("planned_at")
+    # The manifest `required` must be a list of safe string gate names before it is turned into
+    # a list/set — a non-list ("required": 1) or an unhashable member ("required": [[]]) would
+    # otherwise raise a TypeError before a BLOCKED verdict is written. Malformed entries become
+    # blocking reasons; each surviving name is validated (so a tampered path/newline name is
+    # rejected here, not used to build a gates/<name>.json path later).
+    raw_required = gplan.get("required", [])
+    if not isinstance(raw_required, list):
+        blocked.append("gate plan 'required' is not a list — malformed or tampered manifest")
+        raw_required = []
+    required_names = []
+    for g in raw_required:
+        nerr = validate_gate_name(g) if isinstance(g, str) else "gate name must be a string"
+        if nerr:
+            # g is an untrusted, unvalidated manifest entry (that is WHY it is here — it just
+            # failed validate_gate_name) — repr() escapes Python string syntax (quotes,
+            # backslashes, newlines) but never HTML, so a crafted entry like
+            # "<img src=x onerror=alert(1)>" still rendered its tag raw into verdict.md before
+            # this fix (Codex finding #6, "a crafted waiver name renders unescaped into
+            # verdict.md" — security-4, frontier-gate run pr70-design-crypto-ci-identity,
+            # 2026-09-21). _oneline() HTML-escapes the whole repr'd form.
+            blocked.append(f"gate plan has a malformed required entry {_oneline(repr(g))}: {nerr}")
+            continue
+        required_names.append(g)
+    gcov["required"] = list(required_names)
+    required_set = set(required_names)
+    # Codex 4089137619 (P1, valid): everything below this point only re-validates what
+    # IS in `required_names` (waiver authenticity, expiry, CRITICAL restrictions, etc.)
+    # — nothing re-derives what SHOULD be in it. gate.py's `cmd_plan` computes
+    # `base_required = requested | MINIMUM_GATES[tier]` before writing _required.json
+    # (see gate.py:24-36's own docstring: "CRITICAL's `mutation` can never be waived or
+    # marked NOT_APPLICABLE"), but _required.json is written by the same untrusted
+    # review job that runs the rest of this run (examples/policy-signer-workflow.yml's
+    # header names `gate.py plan --waive` as explicitly the untrusted job's own step) —
+    # the exact class of run-directory tampering every WAIVED/BLOCKED check below this
+    # point already defends against for records that ARE listed. Before this fix, simply
+    # omitting e.g. "mutation" from _required.json's `required` list bypassed that
+    # "never waived or NOT_APPLICABLE" guarantee outright: no waiver record needed, no
+    # NOT_APPLICABLE record needed, because this function never looked for a gate it was
+    # never told to require. Recompute the tier's floor independently and BLOCK (never
+    # fabricate or silently add a gate result) if the manifest is missing any of it. An
+    # unrecognized tier is reported here rather than raised, matching this file's
+    # fail-closed-not-crash contract; it is already a BLOCKed condition upstream via
+    # authenticate_risk_tier's own reporting, so this only adds a clear, specific reason.
+    floor = MINIMUM_GATES.get(tier)
+    if floor is None:
+        blocked.append(
+            "cannot verify required gates against tier floor: unrecognized risk tier "
+            f"{_oneline(repr(tier))}")
+    else:
+        missing_floor = sorted(set(floor) - required_set)
+        if missing_floor:
+            blocked.append(
+                f"gate plan (_required.json) omits {tier}'s floor gate(s) "
+                f"{', '.join(missing_floor)} entirely — not present, not waived, not "
+                "marked NOT_APPLICABLE; re-run `gate.py plan` for the current tier "
+                "(a manifest missing a floor gate outright is not honored)")
+    # Codex 4099660066 (P1, valid): everything above this point only reconstructs
+    # MINIMUM_GATES[tier] -- the tier's baseline floor. It says nothing about a gate the
+    # ATTESTED POLICY itself additionally requires for this tier via required_gates.<tier>
+    # (shape validated at policy load by _common.py's _validate_policy: a mapping of
+    # tier -> list of non-empty gate-name strings). At plan time, gate.py's cmd_plan reads
+    # required_gates.<tier> as the policy source of `requested` and folds it directly into
+    # `base_required = requested | MINIMUM_GATES[tier]` (gate.py:83-84,101) -- i.e. once a
+    # policy adds a gate for this tier, that gate is exactly as required as a floor gate,
+    # with no distinction anywhere else in the system. But _required.json is written by
+    # the same untrusted review job the floor check above already distrusts, so a
+    # tampered/replanned manifest that just drops a policy-specific requirement (e.g. a
+    # policy that adds "integration" for NORMAL, on top of build/unit/secrets/deps/sast)
+    # sailed through unnoticed -- the floor reconstruction has nothing to say about a gate
+    # that was never part of MINIMUM_GATES to begin with. `pol_data` here is the same
+    # attested policy bundle this function already uses for waiver limits above (never the
+    # mutable working-tree policy), so this reuses an already-authenticated value rather
+    # than reading anything new. A repo with no required_gates key, or none for this tier,
+    # has nothing extra to enforce -- {}/[] is a legitimate "policy adds nothing beyond the
+    # floor" configuration, not a gap to report.
+    policy_required_map = pol_data.get("required_gates")
+    if isinstance(policy_required_map, dict):
+        policy_tier_required = policy_required_map.get(tier)
+        if isinstance(policy_tier_required, list):
+            missing_policy = sorted(
+                g for g in set(policy_tier_required) - required_set
+                if isinstance(g, str) and g.strip())
+            if missing_policy:
+                blocked.append(
+                    "gate plan (_required.json) omits gate(s) the attested policy "
+                    f"requires for {_oneline(repr(tier))} via required_gates: "
+                    f"{_oneline(', '.join(missing_policy))} — not present, not waived, "
+                    "not marked NOT_APPLICABLE; re-run `gate.py plan` for the current "
+                    "policy and tier (a manifest missing a policy-required gate outright "
+                    "is not honored)")
+    # The manifest's `waived` list must be well-formed before anything is built from it — a
+    # non-list, or an entry that is not an object with a safe string `name` (an unhashable value
+    # such as {"name": []}, or a newline/markdown name that could forge output, would otherwise
+    # raise or leak), is a malformed/tampered manifest that must BLOCK, never crash aggregation.
+    raw_waived = gplan.get("waived", [])
+    manifest_waived = {}   # gate name -> its manifest waiver entry (bound against the record)
+    if not isinstance(raw_waived, list):
+        blocked.append("gate plan 'waived' is not a list — malformed or tampered manifest")
+        raw_waived = []
+    for w in raw_waived:
+        if not isinstance(w, dict):
+            # Same repr()-is-not-HTML-safe gap as the required-entry loop above.
+            blocked.append(f"gate plan has a malformed waiver entry {_oneline(repr(w))} — expected "
+                           "an object with a string 'name'")
+            continue
+        wn = w.get("name")
+        nerr = validate_gate_name(wn) if isinstance(wn, str) else "gate name must be a string"
+        if nerr:
+            blocked.append(f"gate plan has a malformed waiver entry {_oneline(repr(w))}: {nerr}")
+            continue
+        manifest_waived[wn] = w
+    manifest_waived_names = set(manifest_waived)
+    # Legacy/tampered-plan guard: pre-M1 plans DROPPED a waived gate from `required` and
+    # recorded it only in the manifest's `waived` list, so the loop below never checked it —
+    # a SENSITIVE run could pass with no mutation gate at all. Any waived entry whose gate is
+    # absent from `required` means the manifest predates the waiver-hardening (or was edited
+    # to drop a gate); BLOCK and require re-planning rather than honoring it.
+    for wname in manifest_waived_names:
+        if wname not in required_set:
+            blocked.append(
+                f"legacy or tampered gate plan: gate '{wname}' is waived but missing from the "
+                "required set — pre-M1 waivers that drop the gate are not honored; re-run "
+                "`gate.py plan` with the current version to migrate (waived gates now stay "
+                "required and are independently re-validated)")
     results = {}
-    for name in gplan.get("required", []):
+    for name in required_names:   # already validated as safe gate-name strings above
         p = run / "gates" / f"{name}.json"
         if not p.exists():
             gcov["missing"].append(name)
             blocked.append(f"required gate '{name}' has no recorded result")
             continue
-        rec = read_json(p)
+        # Codex 4089137612 (P2, valid): every other read_json() call on an untrusted,
+        # run-directory artifact in this file (the _required.json read above,
+        # collect_jev_priors' per-file read) is wrapped so a symlinked/oversized/
+        # non-regular gates/<name>.json (read_regular_file_once's hardening, see
+        # _common.py) or invalid JSON becomes a BLOCKED gate, never an uncaught
+        # exception. This call was the one remaining unguarded instance -- caught only
+        # by main()'s outer `except Exception: sys.exit(3)`, which happens BEFORE
+        # verdict.json is written, so a single tampered gate record could make
+        # aggregation exit non-zero with no verdict recorded at all (the same failure
+        # mode the compute_attestation() caller fixes above this round closed for the
+        # attestation path). Fold it into `blocked` like every other unreadable-gate
+        # case in this loop (missing/BLOCKED/orphaned-waiver), matching this file's own
+        # stated contract: an unreadable/untrusted input is a BLOCKER, never a crash.
+        try:
+            # RecursionError alongside ValueError/OSError: a gate record file this deep
+            # ("[[[[...]]]]", well under _MAX_RUN_FILE_BYTES) exceeds json.loads's
+            # recursion limit without being a ValueError -- and since gate.py record has
+            # no authentication of its own (see docs/THREAT-MODEL.md), any code in the
+            # job can write this file directly, bypassing gate.py record's own
+            # fixed-shape CLI entirely (Codex 4089779557, reported against the sibling
+            # policy.absence.json parse in _common.py; identical gap, same file-reading
+            # contract stated in this loop's own comment above).
+            rec = read_json(p)
+        except (ValueError, OSError, RecursionError) as e:
+            reason = f"recorded gate result is unreadable or not valid JSON: {e}"
+            gcov["blocked"].append({"name": name, "reason": reason})
+            blocked.append(f"gate '{name}': {_oneline(reason)}")
+            continue
+        # CodeRabbit 4089643905 (Major, valid, against this session's own fix above):
+        # read_json() succeeds on any valid JSON value, not just an object -- a gate
+        # record file containing `null`, `[]`, a number, or a string is not caught by
+        # the except above (no ValueError/OSError), but the very next line's
+        # rec.get("status") raises AttributeError on anything that isn't a dict. That
+        # reaches main()'s outer sys.exit(3) handler exactly like the unreadable case
+        # this fix was meant to close, before verdict.json is written. Same malformed-
+        # manifest guard the _required.json read above already applies to `gplan`.
+        if not isinstance(rec, dict):
+            reason = f"recorded gate result is not a JSON object (got {type(rec).__name__})"
+            gcov["blocked"].append({"name": name, "reason": reason})
+            blocked.append(f"gate '{name}': {_oneline(reason)}")
+            continue
         results[name] = rec
         gcov["recorded"].append(name)
         # Tri-state: BLOCKED means the check could not be run/verified — unknown, not
         # pass and not fail. Absent status falls back to the exit code (older records).
         status = rec.get("status")
-        if status == "BLOCKED":
+        if status == "WAIVED":
+            # A WAIVED record must be authorized by the plan manifest's `waived` list. A record
+            # present without a matching manifest entry is an orphan — e.g. a stale record a
+            # concurrent replan failed to revoke, or one dropped from the final manifest — and
+            # honoring it would be a hollow-green result, so BLOCK.
+            if name not in manifest_waived_names:
+                reason = ("WAIVED record is not authorized by the plan manifest's waived list "
+                          "(orphaned or raced waiver) — re-run `gate.py plan`")
+                gcov["blocked"].append({"name": name, "reason": reason})
+                blocked.append(f"gate '{name}': {_oneline(reason)}")
+                continue
+            # Bind the record to the manifest entry's METADATA, not just the name: gate.py writes
+            # the manifest and the record separately, so a concurrent replan could pair a short
+            # manifest entry with a longer stale record. Its authorizer/reason/expiry must match
+            # what the final manifest authorized, or the record is raced/tampered → BLOCK.
+            m = manifest_waived.get(name, {})
+            if (rec.get("expires") != m.get("expires")
+                    or rec.get("authorized_by") != m.get("authorized_by")
+                    or rec.get("reason") != m.get("reason")):
+                reason = ("WAIVED record does not match the plan manifest's waiver entry "
+                          "(authorizer/reason/expiry mismatch — raced or tampered) — "
+                          "re-run `gate.py plan`")
+                gcov["blocked"].append({"name": name, "reason": reason})
+                blocked.append(f"gate '{name}': {_oneline(reason)}")
+                continue
+            # A waiver's expiry can only be judged against a trustworthy clock — if the
+            # CI-provided clock itself could not be parsed, no waiver can be honestly
+            # evaluated, so every waived gate is BLOCKED rather than silently guessing
+            # 'today' (fail closed; see resolve_waiver_clock).
+            err = (f"cannot verify waiver expiry: {clock_err}" if clock_date is None
+                   else validate_waived_gate(name, tier, rec, pol_data, clock_date,
+                                             manifest_planned_at=manifest_planned_at))
+            if err:
+                gcov["blocked"].append({"name": name, "reason": err})
+                # security-4 (frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21,
+                # Codex finding #6): `err` can embed RAW rec-supplied content (e.g.
+                # validate_waived_gate's `expires {rec.get('expires')!r} is missing or not a
+                # valid...` message repr()s the untrusted `expires` field verbatim -- repr()
+                # only escapes Python string syntax, never HTML) -- HTML-escape before this
+                # reaches verdict.md, which renders `blocked` entries raw (unlike the
+                # `notes`/waived/not_applicable display dicts elsewhere in this function,
+                # which are already escaped at md-render time via _oneline).
+                blocked.append(f"gate '{name}': {_oneline(err)}")
+            else:
+                who = rec.get("authorized_by").strip()
+                reason = rec.get("reason").strip()
+                expires = rec.get("expires")
+                gcov["waived"].append({"name": name, "authorized_by": who, "reason": reason,
+                                       "expires": expires, "tier": tier})
+                notes.append(f"gate '{name}' waived by {who} until {expires}: {reason}")
+        elif status == "BLOCKED":
             reason = rec.get("summary", "could not verify")
             gcov["blocked"].append({"name": name, "reason": reason})
-            blocked.append(f"gate '{name}' blocked: {reason}")
+            # security-4 (Codex finding #6): `summary` is free-text from an untrusted
+            # gates/<name>.json record (an adversarial run directory can write anything
+            # here) and was previously interpolated into `blocked` -- which verdict.md
+            # renders RAW -- with no escaping at all, letting a crafted summary like
+            # "<img src=x onerror=alert(1)>" render as live markup in the report.
+            blocked.append(f"gate '{name}' blocked: {_oneline(reason)}")
         elif status == "NOT_APPLICABLE":
             # A gate that genuinely does not apply to this stack does NOT restrict the
-            # verdict — but it is an accountable, on-record determination, so an N/A
-            # without a named authorizer and a reason is itself a BLOCK (unaccountable
-            # skips are exactly what this pipeline exists to prevent).
-            # Guard against non-string values (JSON null, numbers, objects): a
-            # `null` authorizer must read as absent, not as the string "None". Only a
-            # non-empty *string* counts as accountable.
-            who = rec.get("authorized_by")
-            reason = rec.get("summary")
-            who = who.strip() if isinstance(who, str) else ""
-            reason = reason.strip() if isinstance(reason, str) else ""
-            if not who or not reason:
-                gcov["blocked"].append(
-                    {"name": name, "reason": "NOT_APPLICABLE without an authorizer and reason"})
-                blocked.append(f"gate '{name}' marked NOT_APPLICABLE without a named "
-                               "authorizer and reason — an inapplicable gate must still "
-                               "be accountable")
+            # verdict — but it is an accountable, on-record determination, so an invalid
+            # N/A record (missing authorizer/reason, or one of the CRITICAL restrictions)
+            # is itself a BLOCK (unaccountable skips are exactly what this pipeline exists
+            # to prevent).
+            err = validate_not_applicable_gate(name, tier, rec, pol_data)
+            if err:
+                gcov["blocked"].append({"name": name, "reason": err})
+                blocked.append(f"gate '{name}': {_oneline(err)}")
             else:
+                # Guard against non-string values (JSON null, numbers, objects): a `null`
+                # authorizer must read as absent, not as the string "None" — already
+                # enforced by validate_not_applicable_gate, re-derived here only to build
+                # the coverage entry from the same (now known-good) strings.
+                who = rec.get("authorized_by").strip()
+                reason = rec.get("summary").strip()
                 gcov["not_applicable"].append(
                     {"name": name, "authorized_by": who, "reason": reason})
                 notes.append(f"gate '{name}' not applicable (authorized by {who}): {reason}")
@@ -111,18 +377,55 @@ def check_gates(run, tier, fail, blocked, notes):
             blocked.append(f"gate '{name}' recorded without an exit code")
         elif status == "FAIL" or rec["exit_code"] != 0:
             gcov["failed"].append(name)
-            fail.append(f"gate '{name}' failed (exit {rec['exit_code']}): {rec.get('summary', '')}")
+            # security-4 (Codex finding #6): same untrusted, unescaped `summary` gap as the
+            # BLOCKED branch above -- a crafted gates/<name>.json FAIL record's summary
+            # previously rendered raw into verdict.md's `- FAIL:` bullet.
+            fail.append(f"gate '{name}' failed (exit {rec['exit_code']}): {_oneline(rec.get('summary', ''))}")
         else:
             gcov["passed"].append(name)
     return results, gcov
 
 
 def check_panel(run, meta, plan, reports, blocked):
-    """Returns panel coverage. roles_required is reconstructed from artifacts only:
-    the assigned roles plus any roles a recorded degraded authorization dropped."""
+    """Returns panel coverage. roles_required comes from the run's AUTHENTICATED risk
+    tier (TIER_ROLES[meta['risk']] -- meta['risk'] is already the cryptographically-
+    authenticated value by the time this runs; see this file's own authenticate_
+    risk_tier() call earlier in the same aggregation, which overwrites meta['risk'] in
+    place), never from the plan's own already-assigned role list. Checklist item 4
+    (frontier-gate run pr70-round8-riskauth, 2026-09-26, panel consensus 0.97): trusting
+    the plan's roles as proof of what was REQUIRED is exactly what a flip-risk-to-
+    NORMAL-then-restore attack between `panel.py assign` and this aggregation defeats --
+    the plan would legitimately only contain NORMAL's 4 roles by the time this
+    authenticated CRITICAL/SENSITIVE re-check runs, so treating "assigned roles" and
+    "required roles" as the same list makes the shortfall invisible. A recorded
+    degraded authorization's own missing_roles are still added to roles_required (its
+    pre-existing, legitimate meaning is unchanged), and is also excluded from the new
+    under-provisioned check below -- a degraded panel with recorded authorization is not
+    "missing roles from the plan," it is explicitly allowed to be short those roles;
+    "degraded panel without recorded authorization" (further below) already catches an
+    unauthorized degrade.
+
+    CodeRabbit r4112007456 (Major, valid): plan.json is untrusted, hand-editable input --
+    a `degraded` value that is present but not a dict, or a `missing_roles` list
+    containing an unhashable item (e.g. a hand-edited `[[]]`), used to crash `set(...)`
+    here. safe_degraded_missing_roles() validates the shape instead of raising; a
+    malformed `degraded` is treated as if no degraded authorization were recorded at all
+    (deg_missing stays empty), which is itself fail-closed -- it widens nothing, so any
+    real shortfall the malformed field was supposed to explain still surfaces via
+    under_provisioned below. Flagged explicitly as its own blocked reason anyway, so the
+    audit trail names the actual problem (malformed metadata) rather than only the
+    downstream role-shortfall symptom."""
     roles = list(plan.get("roles", {}))
     deg = plan.get("degraded")
-    pcov = {"roles_required": roles + list((deg or {}).get("missing_roles", [])),
+    if deg is not None and not isinstance(deg, dict):
+        blocked.append("panel plan's 'degraded' field is malformed (not an object) — "
+                        "cannot honor it as a degraded-panel authorization")
+    elif isinstance(deg, dict) and not isinstance(deg.get("missing_roles"), (list, type(None))):
+        blocked.append("panel plan's degraded.missing_roles is malformed (not a list) — "
+                        "cannot honor it as a degraded-panel authorization")
+    deg_missing = safe_degraded_missing_roles(plan)
+    required = sorted(set(TIER_ROLES.get(meta.get("risk"), [])) | deg_missing)
+    pcov = {"roles_required": required,
             "roles_filled": [r for r in roles if r in reports],
             "substitutions": len(plan.get("substitutions", [])),
             "degraded": deg,
@@ -130,6 +433,13 @@ def check_panel(run, meta, plan, reports, blocked):
     if not roles:
         blocked.append("panel plan missing or empty — run `panel.py assign`")
         return pcov
+    under_provisioned = set(required) - set(roles) - deg_missing
+    if under_provisioned:
+        blocked.append(
+            f"panel plan does not meet this run's authenticated risk tier "
+            f"({meta.get('risk')!r})'s role floor — missing from the plan itself: "
+            f"{', '.join(sorted(under_provisioned))} (re-run `panel.py assign` under "
+            "the current risk tier)")
     dev = set(meta.get("dev_providers", []))
     fams = [plan["roles"][r]["family"] for r in roles]
     if len(set(fams)) != len(fams):
@@ -140,7 +450,11 @@ def check_panel(run, meta, plan, reports, blocked):
     missing = [r for r in roles if r not in reports]
     if missing:
         blocked.append(f"reviewer reports missing for: {', '.join(missing)}")
-    if deg and not deg.get("authorized_by"):
+    # `not isinstance(deg, dict)` first: this pre-existing check predates round 8's
+    # malformed-shape guard above and had the exact same crash (CodeRabbit r4112007456)
+    # on a non-dict `deg` -- a truthy non-dict value can never carry a valid
+    # authorized_by either way, so it is correctly "without recorded authorization" too.
+    if deg and (not isinstance(deg, dict) or not deg.get("authorized_by")):
         blocked.append("degraded panel without recorded authorization")
     return pcov
 
@@ -182,7 +496,7 @@ def collect_jev_priors(run, reports):
                 continue
             try:
                 rec = read_json(p)
-            except (OSError, ValueError):
+            except (OSError, ValueError, RecursionError):
                 continue
             if not (isinstance(rec, dict) and isinstance(rec.get("jev"), dict)):
                 continue
@@ -302,8 +616,19 @@ def check_rebuttal(run, meta, plan, reports, blocked, notes):
     missing = [r for r in plan.get("roles", {})
                if not (run / "rebuttal" / f"{r}.json").exists()]
     if missing:
-        blocked.append(f"rebuttal round required (policy '{policy}', risk {meta['risk']}, "
-                       f"high/critical findings present); missing for: {', '.join(missing)}")
+        # `policy` is meta['rebuttal_policy'] (attacker-editable run.json in an untrusted run
+        # dir) looked up with .get(policy, default) -- no charset restriction -- so it can
+        # carry arbitrary text; escape it before this reaches `blocked`, which verdict.md
+        # renders raw (security-4, same class as Codex finding #6). `missing` role names come
+        # from panel.py's fixed role catalog, not free-form attacker text.
+        # CodeRabbit 4077668514 (Minor, valid): `meta['risk']` is the same class of
+        # attacker-editable run.json value as `policy` right above it, but was rendered
+        # raw here — repr() escapes Python syntax, not HTML, so a crafted risk value
+        # could forge markup in verdict.md exactly like the un-escaped `policy` case
+        # this comment already guards against. _oneline() it the same way.
+        blocked.append(f"rebuttal round required (policy '{_oneline(policy)}', risk "
+                       f"{_oneline(repr(meta['risk']))}, high/critical findings present); "
+                       f"missing for: {', '.join(missing)}")
     return rcov
 
 
@@ -320,18 +645,52 @@ _MAX_CANON_DEPTH = 200
 
 # Algorithm id stamped into every attestation. It is bumped whenever the canonical-vs-raw REPRESENTATION
 # changes, so --check-digest can date a stored attestation from the id alone (never by re-parsing an
-# artifact, which is runtime-dependent). "v2" marks the byte-based raw policy (depth AND integer-width
-# caps); "v1" verdicts predate it. The id is metadata, NOT folded into the digest, so bumping it does not
-# change any digest — an unchanged shallow run verifies identically under either id. (Codex r3930239157.)
-_ATTESTATION_ALGO = "sha256-canonical-json-v2"
+# artifact, which is runtime-dependent). "v4" additionally folds POLICY_ABSENCE_SIG_FILENAME
+# (policy.absence.sig, GAP A part 2 -- the signed no-policy attestation) into the digest as a raw-hashed
+# input, the same way "v3" already did for POLICY_SIG_FILENAME (policy.snapshot.sig): GAP A introduced a
+# SECOND non-JSON, pre-verdict signature sidecar without ever teaching compute_attestation() to hash it,
+# reintroducing under a new filename the exact gap a delayed Codex review on PR70 found and closed for
+# policy.snapshot.sig (deleting the sidecar destroyed the evidence a PASS with a WAIVED/NOT_APPLICABLE
+# gate relied on, invisibly to --check-digest, because the pre-v3 *.json-only glob never saw it). "v3"
+# covers policy.snapshot.sig; "v2" marks the byte-based raw policy (depth AND integer-width caps); "v1"
+# verdicts predate all of that. The id is metadata, NOT folded into the digest, so bumping it does not
+# change any digest for a run that doesn't have the new input — an unchanged run with no
+# policy.absence.sig verifies identically under v3 or v4. (Codex r3930239157 / security-3 follow-up,
+# frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21.)
+_ATTESTATION_ALGO = "sha256-canonical-json-v4"
 
 # Attestation algorithm ids this version can interpret in --check-digest: the current one plus recognized
 # PREDECESSORS. "sha256-canonical-json-v1" is the pre-byte-cap representation (a deep/wide artifact it
-# canonicalized, this version hashes "raw:"). An id OUTSIDE this set — a newer tool's format, or a
-# malformed/non-string value — is not interpretable, so on a digest mismatch it is cannot-verify, never
-# classified as a legacy transition or as drift. (CodeRabbit r3930631485.)
-_LEGACY_ALGOS = ("sha256-canonical-json-v1",)
+# canonicalized, this version hashes "raw:"). "sha256-canonical-json-v2" predates policy.snapshot.sig
+# coverage. "sha256-canonical-json-v3" predates policy.absence.sig coverage. An id OUTSIDE this set — a
+# newer tool's format, or a malformed/non-string value — is not interpretable, so on a digest mismatch it
+# is cannot-verify, never classified as a legacy transition or as drift. (CodeRabbit r3930631485.)
+_LEGACY_ALGOS = ("sha256-canonical-json-v1", "sha256-canonical-json-v2", "sha256-canonical-json-v3")
 _RECOGNIZED_ALGOS = _LEGACY_ALGOS + (_ATTESTATION_ALGO,)
+
+# Ordering of every algorithm id this version has ever produced or still recognizes, oldest first — used
+# ONLY by _sidecar_newly_covered_transition() below to tell "this predecessor algorithm never covered this
+# sidecar artifact at all" apart from "this predecessor covered it and the hash changed" (real drift).
+_ALGO_ORDER = _LEGACY_ALGOS + (_ATTESTATION_ALGO,)
+
+# The two non-JSON, pre-verdict signature sidecars this tool has ever hashed into the attestation, mapped
+# to the FIRST algorithm id whose compute_attestation() began covering each one. This table only feeds the
+# legacy-transition classifier in check_digest() — compute_attestation() itself always hashes whichever of
+# these exist on disk right now, unconditionally, regardless of this table.
+_SIDECAR_COVERAGE_INTRODUCED_AT = {
+    POLICY_SIG_FILENAME: "sha256-canonical-json-v3",
+    POLICY_ABSENCE_SIG_FILENAME: "sha256-canonical-json-v4",
+}
+
+# Each sidecar above paired with the ordinary *.json "claim" file it authenticates — unlike the sidecar
+# itself, the claim file is hashed at EVERY algorithm version (compute_attestation's *.json glob is
+# unconditional), so its presence in a LEGACY stored manifest is a version-independent signal that this
+# run genuinely had that claim in play at verdict time, not merely "the sidecar happens to exist today."
+# Used ONLY by check_digest()'s legacy-sidecar-deletion guard just below.
+_SIDECAR_CLAIM_FILE = {
+    POLICY_SIG_FILENAME: "policy.snapshot.json",
+    POLICY_ABSENCE_SIG_FILENAME: POLICY_ABSENCE_FILENAME,
+}
 
 # A JSON integer literal wider than this many digits is routed to the raw path, for the same
 # version-independence reason as the depth cap: whether json.loads ACCEPTS a very long integer depends on
@@ -406,7 +765,7 @@ def _json_nesting_depth(raw):
     return maxd
 
 
-def compute_attestation(run):
+def compute_attestation(run, *, pinned_bytes=None):
     """Reproducible SHA-256 over every recorded JSON artifact that can feed the
     verdict — everything except verdict.json, which is the output (#5).
 
@@ -418,13 +777,83 @@ def compute_attestation(run):
     per-file hashes are folded into one manifest digest, and returned alongside it
     so --check-digest can name exactly which artifact drifted.
     Same untouched run in, same digest out — bit for bit, from the BYTES, so the raw-vs-canonical choice
-    never depends on a per-runtime parser limit (recursion depth or integer-string width)."""
+    never depends on a per-runtime parser limit (recursion depth or integer-string width).
+
+    `pinned_bytes` (Codex 4099660083, P2, valid): optional {relative_path: bytes} map,
+    default None — every existing caller (--check-digest, --sign, --verify-signature, all
+    STANDALONE commands re-checking an EXISTING verdict.json against whatever is
+    currently on disk, with no bundle/signature-verification call in scope) is
+    unaffected and keeps reading everything fresh, exactly as before. The ONE caller
+    that computes this digest for the FIRST time within the SAME invocation that also
+    verified a policy-snapshot/absence signature (aggregate.py's main aggregation path)
+    passes the exact bytes that verification already read and content-validated —
+    policy.snapshot.json/.sig and policy.absence.json/.sig, sourced from
+    load_attested_policy_bundle()'s `.raw`/`.absence_raw` and verify_policy_*_signature's
+    `capture_sig_bytes` — instead of this function independently re-reading those same
+    paths moments later. Without this, an actor with concurrent write access to the run
+    directory could swap any of the four between the earlier verification and this
+    later, independent read, so the digest baked into verdict.json (and anything signed
+    over it afterward via --sign) would silently reflect different bytes than the ones
+    actually verified — the same TOCTOU class this module's other `snap_bytes`/
+    `absence_bytes` parameters already close for verification itself, just not yet for
+    the attestation digest. A path with no entry in `pinned_bytes` is read fresh exactly
+    as before; this only ever narrows what gets re-read, never widens it."""
+    pinned_bytes = pinned_bytes or {}
     files = {}
+    # POLICY_SIG_FILENAME (policy.snapshot.sig) and POLICY_ABSENCE_SIG_FILENAME
+    # (policy.absence.sig) are non-JSON, PRE-verdict artifacts — both are written by panel.py
+    # at init, well before this function ever runs, so hashing them here is not circular
+    # (unlike SIG_FILENAME/attestation.sig below, which signs THIS digest and so must stay
+    # excluded). Hash each as raw bytes, same as any other artifact that can't be
+    # JSON-canonicalized, so deleting either one (destroying the evidence a WAIVED/
+    # NOT_APPLICABLE PASS, or a no-policy PASS, relied on) changes the digest instead of being
+    # invisible to it. (Codex, PR70 review, frontier-gate run pr70-provenance-2 for
+    # policy.snapshot.sig; the same gap reappeared for policy.absence.sig when GAP A introduced
+    # it without extending this coverage, closed here — frontier-gate run
+    # pr70-design-crypto-ci-identity, 2026-09-21.)
+    #
+    # Codex 4077803884 (P2, valid): Path.is_file()/.read_bytes() both follow a symlink at
+    # the leaf, with no size cap — an actor with concurrent write access to the run
+    # directory could replace either sidecar with a symlink to an arbitrary large regular
+    # file this process can read, and this loop would hash (and, for --check-digest,
+    # accept) that external content with no bound on how much it reads. Read it the
+    # hardened way instead (read_regular_file_once: no-follow at the leaf, size-capped,
+    # the same reader every other artifact in this codebase already uses) — a symlinked/
+    # oversized sidecar then raises NotRegularFileError (an OSError), which this
+    # function's own caller already treats as "cannot verify" (exit 2), exactly like any
+    # other artifact it cannot safely read; only a genuinely MISSING sidecar (the
+    # ordinary case for most runs) is still silently skipped, same as before this fix.
+    for sig_filename in (POLICY_SIG_FILENAME, POLICY_ABSENCE_SIG_FILENAME):
+        if sig_filename in pinned_bytes:
+            # Codex 4099660083: reuse the exact bytes verify_policy_*_signature already
+            # read and checked, never a second independent read of the live path — see
+            # this function's own docstring paragraph on `pinned_bytes`.
+            raw = pinned_bytes[sig_filename]
+        else:
+            try:
+                raw = read_regular_file_once(run / sig_filename)
+            except FileNotFoundError:
+                continue
+        files[sig_filename] = "raw:" + hashlib.sha256(raw).hexdigest()
     for p in sorted(run.rglob("*.json")):
         rel = p.relative_to(run).as_posix()
         if rel == "verdict.json":
             continue
-        raw = p.read_bytes()
+        if rel in pinned_bytes:
+            # Codex 4099660083: same reuse as the sidecar loop above, for
+            # policy.snapshot.json/policy.absence.json — the bytes load_attested_policy_
+            # bundle() already read once and content-validated (bundle.raw/.absence_raw),
+            # never re-read independently here.
+            raw = pinned_bytes[rel]
+        else:
+            # Same hardening as the sidecar loop above, for the same reason — a symlinked
+            # tracked-JSON artifact must not be read through, and reading it the hardened way
+            # here also closes a second symlink bypass beyond what Codex 4077803884 named:
+            # rglob("*.json") matches by name, so it can list a symlink too, and the previous
+            # plain p.read_bytes() would have followed it exactly like the two sidecars did. A
+            # refusal here is an OSError, which propagates to this function's own caller and is
+            # already treated as "cannot verify," never silently absorbed or misread as drift.
+            raw = read_regular_file_once(p)
         if _json_nesting_depth(raw) > _MAX_CANON_DEPTH or _max_int_digit_run(raw) > _MAX_INT_DIGITS:
             # Nested beyond the depth cap, OR carrying an integer literal wider than the digit cap:
             # whether json.loads accepts either hinges on a PER-RUNTIME limit (the RecursionError
@@ -460,6 +889,39 @@ def _canon_to_raw_transition(stored_hash, recomputed_hash):
     an artifact's CONTENT while it stays canonical (canonical->different-canonical) is not this shape, so
     it is never mistaken for the benign transition. (Codex r3930239157 / CodeRabbit r3930172612.)"""
     return (isinstance(stored_hash, str) and not stored_hash.startswith("raw:")
+            and isinstance(recomputed_hash, str) and recomputed_hash.startswith("raw:"))
+
+
+def _sidecar_newly_covered_transition(rel, stored_algo, stored_hash, recomputed_hash):
+    """True iff one attestation entry differs in exactly the shape of "a known non-JSON
+    signature sidecar that the CURRENT algorithm hashes was not tracked as an input AT ALL
+    under stored_algo" -- i.e. `rel` is a key in _SIDECAR_COVERAGE_INTRODUCED_AT, stored_algo
+    predates the algorithm version that introduced that sidecar's coverage, the artifact was
+    simply ABSENT from the OLD manifest (stored_hash is None -- never hashed under that
+    algorithm, not hashed-and-then-different), and the recompute now has a raw: hash for it.
+
+    Deliberately narrow, same shape as _canon_to_raw_transition above: never true for an
+    existing key whose hash changed, and never true for a key stored_algo already knew to
+    hash (a genuine change there is real drift, exit 1, exactly as before this function
+    exists). Real tampering that DELETES a sidecar stored_algo already covered, or that
+    modifies one while keeping the filename, is not this shape.
+
+    Codex finding #7 (frontier-gate run pr70-design, 2026-09-21 status-correction review): a
+    legitimate algorithm-version transition that starts covering an artifact which simply did
+    not exist as a tracked input under the old algorithm was misreported as tampering ("DRIFT
+    added policy.snapshot.sig", exit 1) instead of cannot-verify (exit 2) -- the exact same
+    class of false positive _canon_to_raw_transition already prevents for the byte-cap
+    representation change, generalized here to cover "a whole new tracked artifact" rather
+    than only "an existing one's hash format changed"."""
+    introduced_at = _SIDECAR_COVERAGE_INTRODUCED_AT.get(rel)
+    if introduced_at is None:
+        return False
+    try:
+        stored_idx = _ALGO_ORDER.index(stored_algo)
+        introduced_idx = _ALGO_ORDER.index(introduced_at)
+    except ValueError:
+        return False
+    return (stored_idx < introduced_idx and stored_hash is None
             and isinstance(recomputed_hash, str) and recomputed_hash.startswith("raw:"))
 
 
@@ -538,6 +1000,38 @@ def check_digest(run):
               "a different (newer or unknown) tool version, so this tool cannot interpret its "
               "representation. Re-aggregate under the current algorithm, then re-check.", file=sys.stderr)
         sys.exit(2)
+    # Codex 4089779545 (P1, valid): a LEGACY stored_algo never tracked a sidecar introduced by a later
+    # algorithm at all -- not "hashed differently," simply absent from that algorithm's manifest, by
+    # construction (see _SIDECAR_COVERAGE_INTRODUCED_AT). _sidecar_newly_covered_transition (below, in the
+    # drifted-artifact path) already catches the ADDED direction: the sidecar exists today but the stored
+    # manifest never had it. It does NOT catch the opposite, silent direction: the sidecar existed at
+    # verdict time (authenticating a real policy/absence claim), was DELETED since, and because the legacy
+    # algorithm's manifest never tracked it either way, its disappearance changes nothing observable in the
+    # manifest comparison -- the recomputed digest matches the stored one exactly and this function would
+    # otherwise report "attestation OK" for a run whose signed evidence has been destroyed. Distinguishing
+    # "never existed" from "existed, then deleted" is impossible from the sidecar's own (untracked) history
+    # alone, so this checks the one thing that IS tracked at every version: the sidecar's companion claim
+    # file (policy.snapshot.json / policy.absence.json), hashed by the unconditional *.json glob regardless
+    # of algorithm. If the STORED manifest already shows that claim file present, this run genuinely had
+    # that claim in play at verdict time -- so a currently-missing sidecar for it is unverifiable, not a
+    # clean pass. Scoped to the exit-0 fast path only (never downgrades an already-detected exit-1 DRIFT
+    # elsewhere in this function into a vaguer exit-2): if some OTHER artifact already differs, the normal
+    # drifted-artifact analysis below already surfaces that as a definitive finding on its own.
+    if stored_algo in _LEGACY_ALGOS and att["digest"] == stored.get("digest"):
+        old_files = stored.get("files", {})
+        for sig_name, introduced_at in _SIDECAR_COVERAGE_INTRODUCED_AT.items():
+            if _ALGO_ORDER.index(stored_algo) >= _ALGO_ORDER.index(introduced_at):
+                continue   # this sidecar's coverage predates or matches stored_algo; not this gap
+            claim_name = _SIDECAR_CLAIM_FILE[sig_name]
+            if claim_name in old_files and sig_name not in att["files"]:
+                print(f"attestation CANNOT BE VERIFIED: this run's recorded manifest shows a "
+                      f"{claim_name} claim, but its authenticating {sig_name} sidecar is missing "
+                      f"today and the stored attestation's algorithm ({stored_algo!r}) predates that "
+                      "sidecar's coverage -- this tool cannot tell whether the signature was recorded "
+                      "and later deleted, or never existed, from the recorded hashes alone. "
+                      "Re-aggregate under the current algorithm to obtain a verifiable verdict, then "
+                      "re-check.", file=sys.stderr)
+                sys.exit(2)
     if att["digest"] == stored.get("digest"):
         print(f"attestation OK: sha256 {att['digest']} over {att['inputs']} artifacts")
         sys.exit(0)
@@ -560,17 +1054,32 @@ def check_digest(run):
     # fix), and a runtime-independent re-canonicalization of a deep artifact does not exist. A CURRENT
     # -algorithm verdict is NEVER routed here: a canonical->raw mismatch on it is real DRIFT (exit 1).
     # (Codex r3930666148 / CodeRabbit r3930631493, <FIX21>; corrects fix-20's "unchanged" overstatement.)
+    #
+    # A SECOND, independent legacy shape is checked alongside it: _sidecar_newly_covered_transition
+    # (Codex finding #7, frontier-gate run pr70-design, 2026-09-21) — a differing artifact that is a known
+    # signature sidecar the CURRENT algorithm hashes, but that stored_algo never tracked as an input at
+    # all (added, not hash-format-changed). Both shapes are per-artifact and mutually exclusive by
+    # construction (one requires an existing old hash, the other requires none), so `any()` per item is
+    # correct — but EVERY differing artifact must match one shape or the other for the whole record to be
+    # legacy-unverifiable; a single artifact outside both shapes still routes the entire record to DRIFT.
     if (drifted and stored_algo in _LEGACY_ALGOS
-            and all(_canon_to_raw_transition(a, b) for _rel, a, b in drifted)):
-        for rel, _a, _b in drifted:
-            print(f"  LEGACY   {rel} (canonical->raw transition from a pre-{_ATTESTATION_ALGO} "
-                  "attestation; unverifiable from the recorded hashes)")
+            and all(_canon_to_raw_transition(a, b) or _sidecar_newly_covered_transition(rel, stored_algo, a, b)
+                    for rel, a, b in drifted)):
+        for rel, a, b in drifted:
+            if _sidecar_newly_covered_transition(rel, stored_algo, a, b):
+                print(f"  LEGACY   {rel} (not covered by the attestation algorithm that produced this "
+                      "record; unverifiable from the recorded hashes)")
+            else:
+                print(f"  LEGACY   {rel} (canonical->raw transition from a pre-{_ATTESTATION_ALGO} "
+                      "attestation; unverifiable from the recorded hashes)")
         print("attestation CANNOT BE VERIFIED: the stored attestation was produced by an earlier "
-              "algorithm and every differing artifact is a canonical->raw representation transition. The "
+              "algorithm and every differing artifact is either a canonical->raw representation "
+              "transition or a signature sidecar that algorithm never tracked as an input at all. The "
               "recorded hashes cannot establish whether the content is unchanged (a benign version "
-              "transition) or was modified while staying beyond the cap — this tool cannot tell them apart "
-              "without a runtime-dependent re-parse. Re-aggregate under the current algorithm to obtain a "
-              "verifiable verdict, then re-check.", file=sys.stderr)
+              "transition) or was modified — this tool cannot tell them apart without a runtime-dependent "
+              "re-parse, or (for a newly-covered sidecar) without ever having hashed it in the first "
+              "place. Re-aggregate under the current algorithm to obtain a verifiable verdict, then "
+              "re-check.", file=sys.stderr)
         sys.exit(2)
     for rel, a, b in drifted:
         tag = "added" if a is None else ("removed" if b is None else "modified")
@@ -596,99 +1105,15 @@ def check_digest(run):
 # state; the verdict never depends on whether a signature exists.
 SIG_FILENAME = "attestation.sig"
 
-
-def _sign_fail(msg):
-    """Loud, non-zero failure for the signing/verifying TOOLING path (no signer configured, a
-    malformed command template, or the external tool could not start / timed out / errored). Exit 3
-    keeps it distinct from the verdict codes (0 PASS / 1 FAIL / 2 BLOCKED) and from a verify mismatch
-    (1). Never a silent skip."""
-    print(f"ERROR: {msg}", file=sys.stderr)
-    sys.exit(3)
-
-
-def _sign_timeout():
-    """Bounded subprocess timeout (seconds) for signer/verifier calls; AR_SIGN_TIMEOUT overrides.
-    A non-positive or non-numeric override falls back to the default rather than crashing the gate."""
-    raw = os.environ.get("AR_SIGN_TIMEOUT", "120").strip()
-    try:
-        t = int(raw)
-    except ValueError:
-        return 120
-    return t if t > 0 else 120
-
-
-def _resolve_tool(env_cmd, builders):
-    """Resolve a signing/verifying command as an argv TEMPLATE carrying `{msg}`/`{sig}` tokens.
-    Precedence: an explicit env override (`env_cmd`, e.g. AR_SIGNER_CMD) wins; otherwise the first
-    auto-detected tool whose builder returns a non-None argv (cosign keyless primary, minisign
-    fallback). Returns (argv, kind) or (None, None) when nothing resolves. The command is only ever
-    executed via subprocess — nothing here imports the signer."""
-    cmd = os.environ.get(env_cmd, "").strip()
-    if cmd:
-        try:
-            return shlex.split(cmd), "custom"
-        except ValueError as e:
-            _sign_fail(f"{env_cmd} is not a valid command template ({e}): {cmd!r}")
-    for kind, build in builders:
-        argv = build()
-        if argv is not None:
-            return argv, kind
-    return None, None
-
-
-def _cosign_sign_argv():
-    # Primary: sigstore/cosign KEYLESS. An ephemeral Fulcio certificate (from an ambient OIDC
-    # identity) plus a Rekor transparency-log entry; no long-lived private key. `--yes` suppresses
-    # the confirmation prompt; `--bundle` packs signature + certificate + log proof into ONE
-    # self-contained sidecar an outside verifier consumes with `verify-blob --bundle`.
-    if not shutil.which("cosign"):
-        return None
-    return ["cosign", "sign-blob", "--yes", "--bundle", "{sig}", "{msg}"]
-
-
-def _minisign_sign_argv():
-    # Fallback: minisign (Ed25519). Requires a configured secret key (AR_MINISIGN_KEY); `-x` writes
-    # the detached signature to the given path. Use a password-less key for non-interactive runs.
-    key = os.environ.get("AR_MINISIGN_KEY", "").strip()
-    if not (shutil.which("minisign") and key):
-        return None
-    return ["minisign", "-S", "-s", key, "-m", "{msg}", "-x", "{sig}"]
-
-
-def _cosign_verify_argv():
-    # Keyless verification is only meaningful against an expected signer identity + issuer:
-    # `cosign verify-blob` WITHOUT --certificate-identity/--certificate-oidc-issuer accepts ANY
-    # valid Fulcio certificate, so it must not be auto-selected as the verifier unless BOTH are
-    # set. When they are missing we return None and fall through (to minisign, or to a loud
-    # "no verifier available" naming AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER) rather than silently
-    # verifying against an unconstrained identity (panel finding security-1).
-    if not shutil.which("cosign"):
-        return None
-    ident = os.environ.get("AR_COSIGN_IDENTITY", "").strip()
-    issuer = os.environ.get("AR_COSIGN_ISSUER", "").strip()
-    if not (ident and issuer):
-        return None
-    return ["cosign", "verify-blob", "--bundle", "{sig}",
-            "--certificate-identity", ident, "--certificate-oidc-issuer", issuer, "{msg}"]
-
-
-def _minisign_verify_argv():
-    # AR_MINISIGN_PUBKEY_FILE names a public-key FILE (minisign `-p`); AR_MINISIGN_PUBKEY carries an
-    # INLINE key value (minisign `-P`). They are SEPARATE vars by design: choosing `-p` vs `-P` by
-    # whether the value happens to name an existing file (an earlier os.path.exists heuristic) let an
-    # attacker who can drop a file into the verifier's working directory — named exactly the operator's
-    # PUBLIC inline key — make minisign read an attacker-chosen key file, so a verdict signed with the
-    # attacker's key would verify (panel finding security-1). Filesystem state must never select the
-    # verification key. An explicit key file wins when both are set.
-    if not shutil.which("minisign"):
-        return None
-    keyfile = os.environ.get("AR_MINISIGN_PUBKEY_FILE", "").strip()
-    if keyfile:
-        return ["minisign", "-V", "-p", keyfile, "-m", "{msg}", "-x", "{sig}"]
-    inline = os.environ.get("AR_MINISIGN_PUBKEY", "").strip()
-    if inline:
-        return ["minisign", "-V", "-P", inline, "-m", "{msg}", "-x", "{sig}"]
-    return None
+# _sign_fail, _sign_timeout, _resolve_tool, _cosign_sign_argv, _minisign_sign_argv,
+# _cosign_verify_argv, _minisign_verify_argv, and _run_tool (below) are the generic
+# out-of-process signing/verification primitives — nothing in them is specific to
+# verdict.json. They now live in _common.py (as sign_fail / sign_timeout /
+# resolve_signing_tool / cosign_sign_argv / minisign_sign_argv / cosign_verify_argv /
+# minisign_verify_argv / run_signing_tool) so panel.py's opportunistic policy-snapshot
+# signature at init (PR70 provenance-binding fix, Option B) reuses the exact same
+# identity-pinning logic instead of a second, potentially-drifting copy. Imported above
+# under their original underscore names so every call site below is unchanged.
 
 
 def _load_verdict(run):
@@ -716,23 +1141,6 @@ def _canonical_verdict_bytes(verdict):
                       ensure_ascii=False).encode("utf-8")
 
 
-def _run_tool(argv_tmpl, msg_path, sig_path):
-    """Substitute `{msg}`/`{sig}` in the argv template and run the external tool. When the template
-    references `{msg}` the canonical verdict.json (the signed bytes) is substituted there, else it is
-    appended as the final arg.
-    Returns the completed process; exits 3 (loud) if the tool cannot even be started."""
-    argv = [a.replace("{msg}", str(msg_path)).replace("{sig}", str(sig_path)) for a in argv_tmpl]
-    if not any("{msg}" in a for a in argv_tmpl):
-        argv.append(str(msg_path))
-    try:
-        return subprocess.run(argv, capture_output=True, timeout=_sign_timeout())
-    except OSError as e:
-        _sign_fail(f"could not start signer/verifier {argv[0]!r}: {e}")
-    except subprocess.TimeoutExpired:
-        _sign_fail(f"signer/verifier {argv[0]!r} timed out after {_sign_timeout()}s "
-                   "(set AR_SIGN_TIMEOUT to adjust)")
-
-
 def sign_attestation(run):
     """Write a DETACHED signature sidecar (`attestation.sig`) over the run's EXISTING, canonical
     verdict.json, out-of-process. STANDALONE: it does not re-aggregate (a prior `aggregate.py` must
@@ -756,12 +1164,30 @@ def sign_attestation(run):
               f"{_ATTESTATION_ALGO!r} — re-aggregate under the current algorithm before signing",
               file=sys.stderr)
         sys.exit(1)
-    att = compute_attestation(run)
+    try:
+        att = compute_attestation(run)
+    except OSError as e:
+        # CodeRabbit 4088318850 / Codex 4088467040 (P2, valid): compute_attestation can now
+        # raise OSError (a symlinked/oversized/non-regular sidecar or tracked *.json — see its
+        # docstring) where it used to follow the link or crash the process with an uncaught
+        # exception. check_digest already catches this as cannot-verify (exit 2); this call
+        # site did not. A symlinked sidecar planted after aggregation would otherwise make
+        # --sign exit 1 via an unhandled traceback, which the documented exit code (1 = a
+        # definitive drift comparison) does not actually describe — nothing was compared.
+        # Treat it the same as "nothing verifiable to sign," exit 2, never 1 or an uncaught
+        # crash.
+        print(f"cannot recompute attestation ({e}) — a recorded artifact could not be read "
+              "safely; re-aggregate before signing", file=sys.stderr)
+        sys.exit(2)
     if att["digest"] != digest:
         print(f"refusing to sign: run artifacts drifted — recomputed attestation {att['digest']} "
               f"!= recorded {digest}; re-aggregate before signing", file=sys.stderr)
         sys.exit(1)
-    argv_tmpl, kind = _resolve_tool(
+    # fatal=True (default): --sign is a standalone, explicit CLI invocation -- a malformed
+    # AR_SIGNER_CMD here should exit 3 immediately, exactly as before resolve_signing_tool()
+    # grew the fatal= parameter (see t_sign_malformed_command_template_exits_3). `_err` is
+    # unreachable here: sign_fail() inside the resolver exits the process before returning.
+    argv_tmpl, kind, _err = _resolve_tool(
         "AR_SIGNER_CMD",
         [("cosign-keyless", _cosign_sign_argv), ("minisign", _minisign_sign_argv)])
     if argv_tmpl is None:
@@ -773,7 +1199,8 @@ def sign_attestation(run):
         msg = Path(td) / "verdict.canonical.json"
         msg.write_bytes(_canonical_verdict_bytes(verdict))
         sig_tmp = Path(td) / "sig.out"
-        proc = _run_tool(argv_tmpl, msg, sig_tmp)
+        proc, _err = _run_tool(argv_tmpl, msg, sig_tmp)  # fatal=True default: a tooling
+        # failure already exited via sign_fail(), so proc is never None here.
         if proc.returncode != 0:
             _sign_fail(f"signer '{kind}' exited {proc.returncode}: "
                        + (proc.stderr or b"").decode("utf-8", "replace").strip()[-500:])
@@ -818,22 +1245,39 @@ def verify_signature(run):
     if not sigpath.exists():
         print(f"no signature sidecar ({SIG_FILENAME}) — run `aggregate.py --sign` first")
         sys.exit(2)
-    att = compute_attestation(run)
+    try:
+        att = compute_attestation(run)
+    except OSError as e:
+        # CodeRabbit 4088318850 / Codex 4088467040 (P2, valid): same gap as sign_attestation
+        # above. A symlinked/oversized/non-regular sidecar or tracked *.json means the CURRENT
+        # artifacts cannot even be read, so nothing was compared — that is a missing
+        # prerequisite (exit 2, this function's own "cannot re-check" family, see the
+        # algorithm-mismatch branch just above), never "not verified" (exit 1, which the CLI
+        # contract and downstream consumers read as a detected tamper) and never an uncaught
+        # crash.
+        print(f"signature CANNOT BE VERIFIED: a recorded artifact could not be read safely "
+              f"({e}) — re-aggregate before re-verifying", file=sys.stderr)
+        sys.exit(2)
     if att["digest"] != digest:
         print(f"signature INVALID: run artifacts drifted — recomputed attestation {att['digest']} "
               f"!= recorded {digest}; the signed verdict no longer describes this run's inputs")
         sys.exit(1)
-    argv_tmpl, kind = _resolve_tool(
+    # fatal=True (default): --verify-signature is a standalone, explicit CLI invocation --
+    # same rationale as the --sign call site above.
+    argv_tmpl, kind, _err = _resolve_tool(
         "AR_VERIFIER_CMD",
         [("cosign-keyless", _cosign_verify_argv), ("minisign", _minisign_verify_argv)])
     if argv_tmpl is None:
         _sign_fail("no verifier available: set AR_VERIFIER_CMD (using the {msg} and {sig} tokens), "
-                   "or install cosign (keyless; set AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER) or minisign "
+                   "or install cosign (keyless; set AR_ALLOW_KEYLESS -- on GitHub Actions "
+                   "AR_COSIGN_IDENTITY/AR_COSIGN_ISSUER then auto-derive from GITHUB_REPOSITORY, "
+                   "otherwise set them explicitly) or minisign "
                    "(with AR_MINISIGN_PUBKEY inline or AR_MINISIGN_PUBKEY_FILE set).")
     with tempfile.TemporaryDirectory() as td:
         msg = Path(td) / "verdict.canonical.json"
         msg.write_bytes(_canonical_verdict_bytes(verdict))
-        proc = _run_tool(argv_tmpl, msg, sigpath)
+        proc, _err = _run_tool(argv_tmpl, msg, sigpath)  # fatal=True: never returns with
+        # an error unresolved, so proc is never None here.
     if proc.returncode == 0:
         print(f"signature OK: {SIG_FILENAME} verifies the verdict.json of run "
               f"{verdict.get('run_id')} (attestation sha256 {digest}, verifier: {kind})")
@@ -897,7 +1341,21 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
         for p in sorted(vdir.glob("*.json")):
             if p.name.startswith("concur-request"):
                 continue
-            records.append((p.name, read_json(p)))
+            # validation/*.json is written by whoever ran validation and is untrusted in the
+            # same FIFO/symlink/oversized-file sense as run.json and panel/<role>.json --
+            # read_json() -> read_regular_file_once() raises OSError for those, and ValueError
+            # for content that isn't valid JSON. Uncaught, that propagated past this loop to
+            # main()'s outer `except Exception: sys.exit(3)` (Codex r4112073820, round 8):
+            # aggregation crashed instead of writing a BLOCKED verdict.json, same bug class
+            # load_reports() was already fixed for on the panel-report side this round.
+            try:
+                rec = read_json(p)
+            except (OSError, ValueError, RecursionError) as e:
+                blocked.append(f"validation/{_oneline(p.name)}: could not be read "
+                                f"(rejected as unsafe or not valid JSON: {_oneline(e)}) — "
+                                "cannot assess it")
+                continue
+            records.append((p.name, rec))
 
     suppressions = {}
     spath = run / "suppressions.json"
@@ -929,12 +1387,20 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
     dev = set(meta.get("dev_providers", []))
     sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     for name, rec in records:
+        # security-4 (frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21, same class
+        # as Codex finding #6): `name` is a raw FILESYSTEM filename under validation/ in an
+        # untrusted run directory — nothing validates it against a safe charset the way
+        # validate_gate_name() does for gate names — and every message below interpolates it
+        # into `fail`/`blocked`, which verdict.md renders RAW. HTML-escape it once, here, and
+        # use the escaped form in every message; `name` itself is never used as a path or key
+        # anywhere else in this loop, so this changes only what gets displayed.
+        ename = _oneline(name)
         if not isinstance(rec, dict):
-            blocked.append(f"validation/{name}: malformed record (not an object)")
+            blocked.append(f"validation/{ename}: malformed record (not an object)")
             continue
         ids = rec.get("finding_ids")
         if not isinstance(ids, list):
-            blocked.append(f"validation/{name}: finding_ids is malformed (not a list)")
+            blocked.append(f"validation/{ename}: finding_ids is malformed (not a list)")
             continue
         # A non-string member was previously filtered silently. That is fail-SAFE (a dropped id
         # leaves its finding uncovered, which itself BLOCKs) — not the fail-open the reviewer
@@ -942,7 +1408,7 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
         # BLOCK uniform so a garbled record is surfaced, never quietly reinterpreted (4th-panel
         # correctness-3).
         if not all(isinstance(i, str) for i in ids):
-            blocked.append(f"validation/{name}: finding_ids has a non-string member — malformed")
+            blocked.append(f"validation/{ename}: finding_ids has a non-string member — malformed")
             continue
         cls = rec.get("classification")
         sev = rec.get("severity") or min(
@@ -950,46 +1416,61 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
             key=lambda s: sev_rank.get(s, 9), default="low")
         covered.update(ids)
         if cls not in ("confirmed", "false_positive", "unresolved", "accepted_risk"):
-            blocked.append(f"validation/{name}: invalid classification '{cls}'")
+            # cls is untrusted rec content too (any JSON value/string) — escape before display.
+            blocked.append(f"validation/{ename}: invalid classification '{_oneline(cls)}'")
             continue
         is_high = sev in HIGH or any(findings.get(i, {}).get("severity") in HIGH for i in ids)
         if cls == "unresolved" and is_high:
-            fail.append(f"validation/{name}: high/critical finding unresolved ({', '.join(ids)})")
+            # ids are reviewer-supplied finding identifiers — same untrusted-string concern,
+            # escaped as a whole (this list is display-only here; the raw `ids` list, never this
+            # joined string, is what still drives covered/is_high/etc. above and below).
+            fail.append(f"validation/{ename}: high/critical finding unresolved "
+                       f"({_oneline(', '.join(ids))})")
             counts["unresolved"] += 1
         elif cls == "confirmed":
             counts["confirmed"] += 1
             res = rec.get("resolution") or {}
             if not (res.get("fixed") is True and res.get("gates_rerun")):
-                fail.append(f"validation/{name}: confirmed finding not fixed with gates rerun")
+                fail.append(f"validation/{ename}: confirmed finding not fixed with gates rerun")
         elif cls == "false_positive" and is_high:
             conc = rec.get("concurrence") or {}
             if not rec.get("evidence"):
-                blocked.append(f"validation/{name}: false_positive without evidence")
+                blocked.append(f"validation/{ename}: false_positive without evidence")
             if conc.get("agrees_false_positive") is not True:
-                blocked.append(f"validation/{name}: false_positive on high/critical "
+                blocked.append(f"validation/{ename}: false_positive on high/critical "
                                "without an agreeing concurrence from an uninvolved model")
             else:
+                # family_of() falls back to echoing the untrusted model_id's own prefix
+                # verbatim when it is not a recognized alias — so cfam itself can carry
+                # attacker-chosen text, same as cls/ids above.
                 cfam = family_of(conc.get("model_id", "unknown/unknown"))
                 bad = author_families(ids, plan) | dev
                 if cfam in bad:
-                    blocked.append(f"validation/{name}: concurrence model family "
-                                   f"'{cfam}' is not independent of the finding/dev")
+                    blocked.append(f"validation/{ename}: concurrence model family "
+                                   f"'{_oneline(cfam)}' is not independent of the finding/dev")
         elif cls == "accepted_risk":
             today = date.today().isoformat()
             for fid in ids:
+                # fid stays RAW for the suppressions dict lookup (its key namespace is
+                # independent of display safety); only the rendered message is escaped.
+                efid = _oneline(fid)
                 s = suppressions.get(fid)
                 if not s:
-                    fail.append(f"validation/{name}: accepted_risk '{fid}' has no suppression entry")
+                    fail.append(f"validation/{ename}: accepted_risk '{efid}' has no suppression entry")
                 elif not all(s.get(k) for k in ("evidence", "owner", "expires")):
-                    fail.append(f"suppression for '{fid}' incomplete (needs evidence, owner, expires)")
+                    fail.append(f"suppression for '{efid}' incomplete (needs evidence, owner, expires)")
                 elif s["expires"] < today:
-                    fail.append(f"suppression for '{fid}' expired {s['expires']}")
+                    # s["expires"] is likewise an untrusted suppressions.json field.
+                    fail.append(f"suppression for '{efid}' expired {_oneline(s['expires'])}")
 
     uncovered = [i for i, f in findings.items()
                  if f["severity"] in HIGH and i not in covered]
     if uncovered:
+        # Finding ids are reviewer-supplied (untrusted) — escape the joined display list, same
+        # concern as the validation/{name} block above; `uncovered`/`sorted()` themselves are
+        # unaffected (they sort/compare the raw ids, only the rendered string is escaped).
         blocked.append("high/critical findings with no validation record: "
-                       + ", ".join(sorted(uncovered)))
+                       + _oneline(", ".join(sorted(uncovered))))
     # A reviewer explicitly flagged these as release-blocking; severity alone does not
     # exempt them from triage. Untriaged = verification incomplete = BLOCKED.
     flagged = [i for i, f in findings.items()
@@ -997,7 +1478,7 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
                and i not in covered]
     if flagged:
         blocked.append("reviewer-flagged release-blocking findings without triage: "
-                       + ", ".join(sorted(flagged)))
+                       + _oneline(", ".join(sorted(flagged))))
     untriaged = [i for i, f in findings.items()
                  if f["severity"] not in HIGH and i not in covered]
     if untriaged:
@@ -1170,13 +1651,16 @@ def _snippet(s, n=80):
     return html.escape(s, quote=False)
 
 
-def next_steps(verdict, fail, blocked, gcov, fcov, counts):
+def next_steps(verdict, fail, blocked, gcov, fcov, counts, risk=None, allow_critical_waivers=False):
     """Plain-language 'what this means and what to do next', for someone who did not write
     the pipeline. DERIVED ONLY from the already-computed verdict and coverage — it reads
     them and never writes them, so it cannot change a gate, threshold, or verdict. Coverage
     shapes are normalized defensively so malformed/None input degrades rather than crashing
     (the verdict file must still be written), and every fail/blocked reason not rephrased as
-    a specific gate line is passed through verbatim (one-lined) so a blocker is never hidden."""
+    a specific gate line is passed through verbatim (one-lined) so a blocker is never hidden.
+    `allow_critical_waivers` mirrors the SAME attested-policy flag _common.py's
+    _validate_gate_exception_common() enforces — it must never be sourced from anywhere
+    else, or this guidance could recommend an action the gate will actually reject."""
     fail = [r for r in (fail or []) if isinstance(r, str)]
     blocked = [r for r in (blocked or []) if isinstance(r, str)]
     # Normalize by TYPE, not truthiness: a truthy-but-wrong-typed shape (gcov a list, or a
@@ -1189,8 +1673,28 @@ def next_steps(verdict, fail, blocked, gcov, fcov, counts):
         return x if isinstance(x, list) else []
     steps = []
     if verdict == "PASS":
-        steps.append("Cleared: every required check passed and independent review ran with its blocking "
-                     "findings resolved. A human still owns the actual merge decision.")
+        waived = [w for w in _list(gcov.get("waived")) if isinstance(w, dict)]
+        na = [x for x in _list(gcov.get("not_applicable")) if isinstance(x, dict)]
+        if waived or na:
+            # Name BOTH kinds of exception — a waived gate and a not-applicable gate each did
+            # not "pass", so the guidance must not claim every remaining check passed.
+            parts = []
+            if waived:
+                parts.append("waived: " + ", ".join(str(w.get("name", "?")) for w in waived))
+            if na:
+                parts.append("not applicable: " + ", ".join(str(x.get("name", "?")) for x in na))
+            steps.append("Cleared, with accountable exception(s): every required check passed except "
+                         + "; ".join(parts) + " — each authorized and on record, not a pass or a "
+                         "silent skip. Independent review ran with its blocking findings resolved. "
+                         "A human still owns the actual merge decision.")
+            for w in waived:
+                steps.append(f"Waived gate '{w.get('name', '?')}' — authorized by "
+                             f"{_oneline(w.get('authorized_by', '?'))}, expires "
+                             f"{_oneline(w.get('expires', '?'))}: {_oneline(w.get('reason', ''))}. "
+                             "It expires; do not treat it as permanently green.")
+        else:
+            steps.append("Cleared: every required check passed and independent review ran with its blocking "
+                         "findings resolved. A human still owns the actual merge decision.")
         if counts.get("confirmed"):
             steps.append(f"{counts['confirmed']} issue(s) were caught during review and already fixed before "
                          "this passed — see the Findings section of the report for what changed.")
@@ -1225,8 +1729,23 @@ def next_steps(verdict, fail, blocked, gcov, fcov, counts):
         if g in seen:
             continue
         proves = GATE_HELP.get(g, ("a required check", ""))[0]
-        steps.append(f"The '{_oneline(g)}' check could not be verified. Passing it proves {proves}. It must "
-                     "run and pass (or be recorded as not-applicable, with a reason) before release.")
+        if risk == "CRITICAL" and g == "mutation":
+            # N/A (and waiving) is forbidden for mutation on CRITICAL regardless of policy —
+            # don't recommend an action the gate will reject; it must actually run and pass.
+            steps.append(f"The 'mutation' check could not be verified. Passing it proves {proves}. On "
+                         "CRITICAL tier it must actually run and pass — it cannot be waived or marked "
+                         "not-applicable — before release.")
+        elif risk == "CRITICAL" and not allow_critical_waivers:
+            # Every OTHER gate on CRITICAL is waivable/N-A-able only when policy opts in
+            # (allow_critical_waivers: true); the default is false, so by default the gate
+            # will reject a NOT_APPLICABLE record here too — the guidance must not suggest it.
+            steps.append(f"The '{_oneline(g)}' check could not be verified. Passing it proves {proves}. On "
+                         "CRITICAL tier, with this policy, it must actually run and pass — waiving or "
+                         "marking it not-applicable requires policy allow_critical_waivers: true "
+                         "(currently not set) before release.")
+        else:
+            steps.append(f"The '{_oneline(g)}' check could not be verified. Passing it proves {proves}. It must "
+                         "run and pass (or be recorded as not-applicable, with a reason) before release.")
         seen.add(g)
     if counts.get("unresolved"):
         steps.append(f"{counts['unresolved']} serious (high/critical) finding(s) are unresolved. Each must be "
@@ -1329,14 +1848,222 @@ def _aggregate_cli():
             print(f"cannot acquire the aggregate lock ({lock_path.name}): {e}", file=sys.stderr)
             sys.exit(3)
     try:
-        meta = read_json(run / "run.json")
+        # CodeRabbit r4112007460 (Major, valid): a symlinked, FIFO, or oversized run.json
+        # raises OSError here (read_regular_file_once's own safety checks); left uncaught,
+        # this propagated to main()'s outer `except Exception: sys.exit(3)` -- a controlled
+        # exit, but the WRONG signal (an "unexpected internal error" code, and no
+        # verdict.json) for exactly the class of unsafe-artifact input every OTHER read of
+        # this same file in this codebase already treats as a plain, expected BLOCKED
+        # condition (see load_attested_policy_bundle's very first lines, moments later in
+        # this same aggregation, for the established message pattern). No `meta` exists yet
+        # at this point (this IS the read that produces it), so there is nothing to build a
+        # normal verdict.json from -- fail with a clear stderr message and the same exit
+        # code (2) every other BLOCKED-for-unsafe-input path in this file uses, rather than
+        # the generic exit-3 "unexpected error" path.
+        try:
+            run_json_raw = read_regular_file_once(run / "run.json")
+            meta = json.loads(run_json_raw.decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError, RecursionError) as e:
+            print(f"run.json is unreadable or not valid JSON — cannot aggregate this run; "
+                  f"BLOCKED ({e})", file=sys.stderr)
+            sys.exit(2)
+        if not isinstance(meta, dict):
+            print("run.json is not a JSON object — cannot aggregate this run; BLOCKED",
+                  file=sys.stderr)
+            sys.exit(2)
 
         fail, blocked, notes = [], [], []
         counts = {"gates": 0, "reviewers": 0, "findings_high_critical": 0,
                   "findings_medium_low": 0, "confirmed": 0, "unresolved": 0}
 
-        gates, gcov = check_gates(run, meta["risk"], fail, blocked, notes)
+        # Waiver limits (max_waiver_days, allow_critical_waivers) come ONLY from the policy
+        # attested at init (policy.snapshot.json / policy.absence.json), NEVER the mutable
+        # working-tree policy — a post-init edit must not be able to widen a waiver that is
+        # absent from the audit record. A snapshot/absence that is present but untrustworthy
+        # (unreadable / sha-mismatched / no longer valid) fails closed to strict built-in
+        # defaults AND blocks the run.
+        #
+        # TOCTOU-safe (frontier-gate run pr70-design, 2026-09-21, checklist item 8): this
+        # require_signature=False call is the ONLY read of run.json/policy.snapshot.json for
+        # the whole policy-attestation question in this function. `bundle` keeps the
+        # already-read raw bytes so the conditional signature check below (only needed once
+        # gcov, computed after this, reveals an actual waiver/NOT_APPLICABLE) verifies over
+        # the SAME bytes just content-validated here — never a second, independent read of
+        # policy.snapshot.json that a concurrent, attacker-controlled step in the same job
+        # could race between the two reads.
+        bundle, att_err = load_attested_policy_bundle(run, require_signature=False)
+        pol_data = bundle.data if bundle else {}
+        attested_policy_sha = bundle.sha256 if bundle else None
+        if att_err:
+            # The rejected snapshot did NOT govern the verdict (strict defaults did), so its
+            # sha must not be reported as the governing-policy provenance.
+            pol_data = {}
+            attested_policy_sha = None
+            blocked.append(f"attested policy snapshot could not be trusted: {att_err}")
+        # Finding #11 / checklist items 5 & 9 (frontier-gate run pr70-trust-model2,
+        # 2026-09-22): `meta` above and `bundle.run_meta` here are two INDEPENDENT reads
+        # of run.json. Every downstream use of meta["risk"] in this function (check_gates'
+        # required-gate-set lookup, the rebuttal-required check, next_steps guidance,
+        # coverage/verdict.json's own `risk` field) must be driven by
+        # load_attested_policy_bundle()'s read, not the separate one above — an attacker
+        # able to change what the second read sees (a race, a partial/corrupted write)
+        # could otherwise make gating disagree with what actually got recorded. Rather
+        # than hunt down and update every individual meta["risk"] call site below (and
+        # risk missing one), overwrite meta["risk"] in place, once, right here, so every
+        # existing call site picks up the authenticated value automatically. Only done
+        # when the bundle load itself succeeded (bundle is not None) — when it failed,
+        # `att_err` is already reported above and meta["risk"] is left as the sole
+        # available reading rather than discarded.
+        if bundle is not None:
+            b_risk = bundle.run_meta.get("risk")
+            if not b_risk:
+                blocked.append("load_attested_policy_bundle's read of run.json had no "
+                                "risk tier recorded — cannot confirm the risk tier used "
+                                "for gating is authenticated")
+                # Downstream code (check_gates, coverage, next_steps, the print/report
+                # below) all index meta["risk"] unconditionally and predate this fix —
+                # this run is already BLOCKED above; only fill in a clearly-labeled
+                # placeholder here so a genuinely missing key degrades to that BLOCKED
+                # verdict rendering normally, never an uncaught KeyError crash.
+                meta.setdefault("risk", "UNKNOWN")
+            elif b_risk != meta.get("risk"):
+                # CodeRabbit 4077668514 (Minor, valid): both values come straight from
+                # attacker-editable run.json; repr() (!r) does not HTML-escape, so
+                # _oneline(repr(...)) them the same way every other untrusted string this
+                # function interpolates into `blocked` already is.
+                blocked.append(
+                    f"risk tier mismatch: load_attested_policy_bundle's read of "
+                    f"run.json saw risk {_oneline(repr(b_risk))}, but a separate read in "
+                    f"this function saw {_oneline(repr(meta.get('risk')))} — this run's "
+                    "risk tier is not internally consistent (possible tampering between "
+                    "two reads of run.json, or a concurrent write); re-run aggregate")
+            else:
+                meta["risk"] = b_risk
+        else:
+            meta.setdefault("risk", "UNKNOWN")
+
+        # Checklist item 6 (frontier-gate run pr70-item6-scope, 2026-09-23, refined
+        # Option A / scope_down_never_break_unsigned, panel consensus 0.97): the checks
+        # above are unchanged and still govern policy CONTENT (pol_data/
+        # attested_policy_sha) and, further below, a waived/NOT_APPLICABLE gate's
+        # signature specifically. This check is broader and runs UNCONDITIONALLY,
+        # whether or not this run recorded any waiver at all — it must run BEFORE
+        # check_gates() below so a forced CRITICAL escalation actually changes which
+        # gates are required (MINIMUM_GATES), not just adds a note after the fact. See
+        # authenticate_risk_tier's own docstring for the full state machine; in short: a
+        # repository where signing was expected (a verifier resolves here, or its own
+        # AR_SIGNING_REQUIRED anchor says so) but cannot be cryptographically verified is
+        # forced to CRITICAL and BLOCKED here, regardless of what tier it self-reported
+        # — CRITICAL's `mutation` floor gate can never be waived, which is what actually
+        # makes this un-bypassable. A never-configured repository is unaffected.
+        auth = authenticate_risk_tier(run)
+        if auth.status == "UNAUTHENTICATED":
+            meta["risk"] = auth.risk or "CRITICAL"
+            # auth.detail may embed a configured verifier's raw, attacker-influenceable
+            # stderr (via load_attested_policy_bundle's att_err) — _oneline() it before
+            # it reaches verdict.md, same as every other untrusted string this function
+            # interpolates into `blocked` (see the sig_err handling just below).
+            blocked.append(f"{auth.label}: {_oneline(auth.detail)}")
+        elif auth.status == "AUTHENTICATED":
+            # CodeRabbit r4082557528 (Major, valid): auth.risk here is the CRYPTOGRAPHICALLY
+            # AUTHENTICATED tier (verified against the signed bundle inside
+            # authenticate_risk_tier itself), but meta["risk"] at this point still holds
+            # whatever the EARLIER, require_signature=False read above (lines ~1559-1602)
+            # saw — unsigned content only. An attacker with concurrent write access to the
+            # run directory could lower run.json's risk between that first read and this
+            # one, then restore it, so the two reads disagree and only the unsigned one
+            # would otherwise reach check_gates/check_rebuttal below. Prefer the
+            # authenticated value and BLOCK (not silently overwrite) on any disagreement,
+            # exactly like the require_signature=False block already does for its own two
+            # reads a few lines up — this is the same TOCTOU class, just against the
+            # signature-backed reading instead of the unsigned one.
+            if auth.risk != meta.get("risk"):
+                # Same _oneline(repr(...)) treatment as the require_signature=False
+                # mismatch block above (CodeRabbit 4077668514, Minor, valid, caught here
+                # too on review — this branch is this session's own new code and had the
+                # same unescaped-repr gap).
+                blocked.append(
+                    f"risk tier mismatch: authenticated read saw "
+                    f"{_oneline(repr(auth.risk))}, but an earlier unsigned read of "
+                    f"run.json saw {_oneline(repr(meta.get('risk')))} — this run's risk "
+                    "tier is not internally consistent (possible tampering between reads "
+                    "of run.json, or a concurrent write); re-run aggregate")
+            meta["risk"] = auth.risk
+        elif auth.status == "UNSIGNED_EXEMPT":
+            notes.append(f"{auth.label}: {auth.detail}")
+
+        # Resolved once per aggregate run: GITHUB_RUN_STARTED_AT's date if set (else today
+        # UTC). A set-but-unparseable value is fail-closed — every waiver is BLOCKED rather
+        # than silently falling back to today (see check_gates/resolve_waiver_clock).
+        clock = resolve_waiver_clock()
+        if clock[1]:
+            # Codex 4082681166 (P2, valid): clock[1]'s error text embeds the raw,
+            # attacker-influenceable GITHUB_RUN_STARTED_AT env value (see
+            # resolve_waiver_clock's docstring in _common.py); _oneline() it before it
+            # reaches `blocked`, same as every other untrusted string appended here.
+            blocked.append(_oneline(clock[1]))
+
+        gates, gcov = check_gates(run, meta["risk"], fail, blocked, notes, pol_data, clock)
         counts["gates"] = len(gates)
+
+        # PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only,
+        # Paul's decision), extended by the GAP A fix (frontier-gate run pr70-design,
+        # 2026-09-21, checklist item 2): the no-exception path above stays
+        # infrastructure-free, but the moment this run recorded a WAIVED or NOT_APPLICABLE
+        # gate, the policy that governed it must be AUTHENTICATED — either a verifiably-
+        # signed policy.snapshot.json, or a verifiably-signed policy.absence.json explicitly
+        # attesting that no policy governed this run. `not att_err` so this never re-blocks a
+        # run already BLOCKED above for the same underlying reason.
+        # Codex 4099660083 (P2, valid): populated by verify_policy_*_signature below with
+        # the EXACT policy.snapshot.sig/policy.absence.sig bytes it read and checked, so
+        # compute_attestation() (further down this function) can hash those same bytes
+        # instead of independently re-reading the sidecar from its live, attacker-
+        # writable path a second time — see compute_attestation's own `pinned_bytes`
+        # docstring paragraph for the TOCTOU this closes. Stays empty (and changes
+        # nothing) on every path that never verifies a signature at all.
+        captured_sig_bytes = {}
+        if (gcov["waived"] or gcov["not_applicable"]) and not att_err:
+            if bundle.absence_raw is not None:
+                sig_err = verify_policy_absence_signature(
+                    run, bundle.run_meta, absence_bytes=bundle.absence_raw,
+                    capture_sig_bytes=captured_sig_bytes)
+                if sig_err:
+                    # _oneline(): sig_err may embed a configured verifier's raw, attacker-
+                    # influenceable stderr (see verify_policy_absence_signature's `detail`).
+                    # Collapse/HTML-escape it before it reaches verdict.md, same as every
+                    # other untrusted string this function interpolates into `blocked`.
+                    # Codex r4055706481 (P2).
+                    blocked.append(
+                        "run recorded a waived or not-applicable gate but its signed "
+                        f"no-policy attestation is not verifiably signed: {_oneline(sig_err)}")
+            elif bundle.raw is not None:
+                sig_err = verify_policy_snapshot_signature(
+                    run, bundle.run_meta, snap_bytes=bundle.raw,
+                    capture_sig_bytes=captured_sig_bytes)
+                if sig_err:
+                    blocked.append(
+                        "run recorded a waived or not-applicable gate but its attested "
+                        f"policy snapshot is not verifiably signed: {_oneline(sig_err)}")
+            else:
+                # No policy.snapshot.json and no policy.absence.json were present at the
+                # content-only (require_signature=False) load above. Re-derive the
+                # authoritative answer via require_signature=True — this decides, based
+                # SOLELY on whether a verifier is configured in THIS environment (never
+                # on anything read from the run directory itself, which is exactly what
+                # an attacker with write access to it could forge to look like "no
+                # signer was ever configured" — see load_attested_policy_bundle's own
+                # docstring), whether this is the historically exempt "no verification
+                # infra configured at all" case or the GAP-A hole this fix closes (a run
+                # whose environment DOES expect authentication getting an unauthenticated
+                # free pass merely because both artifacts are absent). This second call
+                # costs only a second run.json read — there is no snapshot/absence FILE
+                # here to re-read, so it does not reintroduce the TOCTOU this refactor
+                # exists to eliminate.
+                _, sig_err = load_attested_policy_bundle(run, require_signature=True)
+                if sig_err:
+                    blocked.append(
+                        "run recorded a waived or not-applicable gate but there is no "
+                        f"attested policy snapshot for this run: {_oneline(sig_err)}")
 
         plan_path = run / "panel" / "plan.json"
         plan = read_json(plan_path) if plan_path.exists() else {}
@@ -1375,19 +2102,78 @@ def _aggregate_cli():
         # shows which cap actually applied, not just total spend.
         cpol = read_json(run / "cost_policy.json") if (run / "cost_policy.json").exists() else None
         cpol = cpol if isinstance(cpol, dict) else {}
+        # Tamper-evident attestation over every recorded input, computed before the verdict
+        # file exists so re-aggregating an untouched run reproduces it (#5). Computed here,
+        # ahead of the verdict/steps decision below (not right before write_json as before),
+        # so a read failure can actually BLOCK rather than crash past it.
+        #
+        # CodeRabbit 4088318850 / Codex 4088467040 (P2, valid): compute_attestation can raise
+        # OSError (a symlinked/oversized/non-regular sidecar or tracked *.json — see its
+        # docstring) since the Codex-4077803884 hardening. check_digest already catches this as
+        # cannot-verify (exit 2); this, the MAIN aggregate path, did not — an attacker with
+        # write access to the run directory could plant such a file and crash aggregation with
+        # an uncaught traceback before verdict.json is ever written, exiting 1 (which the exit
+        # map reads as FAIL) with no verdict recorded at all. That breaks this module's own
+        # design rule (see the AGENTS.md-documented contract and the comment on `blocked`
+        # above): ordinary aggregation always writes a verdict, and an unreadable/untrusted
+        # input is a BLOCKER, never a crash. Fold it into `blocked` like every other
+        # attacker-reachable failure this function already handles, and fall back to a
+        # digest-less attestation record (digest=None mirrors the existing "computed before #5 /
+        # malformed" shape check_digest and verify_signature already treat as unverifiable,
+        # never as a false PASS or false drift).
+        # Codex 4099660083 (P2, valid): reuse the exact policy.snapshot.json/.sig (or
+        # policy.absence.json/.sig) bytes already read once above -- load_attested_
+        # policy_bundle()'s bundle.raw/.absence_raw for the JSON content, captured_sig_
+        # bytes for whichever sidecar verify_policy_*_signature actually checked -- so
+        # compute_attestation() hashes the SAME bytes that governed this run's gating and
+        # signature-verification decisions, never an independent, later re-read of a path
+        # an attacker with concurrent write access to the run directory could have
+        # swapped in between. Any of the four legitimately absent (no policy at all, or
+        # no signature ever checked because nothing was waived) simply contributes no
+        # entry, exactly as compute_attestation's own pinned_bytes docstring describes.
+        pinned_bytes = dict(captured_sig_bytes)
+        # Same reuse, for run.json: the raw bytes read once above (into `meta` via
+        # json.loads) are the ones that governed this run's risk-tier and v4 canonical-
+        # policy-field verification decisions, so compute_attestation must hash those
+        # exact bytes rather than independently re-reading run.json from disk a second
+        # time — otherwise an actor with concurrent write access to the run directory
+        # could swap run.json between the read above and compute_attestation's own
+        # rglob loop, and the digest --check-digest later trusts would cover content this
+        # run never actually verified against.
+        pinned_bytes["run.json"] = run_json_raw
+        # `bundle` is None when the earlier content-only load itself failed (att_err set,
+        # already folded into `blocked` above) — same guard this file already uses for
+        # pol_data/attested_policy_sha just above, since bundle.raw/.absence_raw would
+        # otherwise raise AttributeError on None.
+        if bundle is not None and bundle.raw is not None:
+            pinned_bytes["policy.snapshot.json"] = bundle.raw
+        if bundle is not None and bundle.absence_raw is not None:
+            pinned_bytes[POLICY_ABSENCE_FILENAME] = bundle.absence_raw
+        try:
+            attestation = compute_attestation(run, pinned_bytes=pinned_bytes)
+        except OSError as e:
+            blocked.append(
+                "run artifacts could not be attested safely — a recorded artifact is a "
+                f"symlink, not a regular file, or exceeds the size cap: {_oneline(e)}")
+            attestation = {"algorithm": _ATTESTATION_ALGO, "inputs": 0, "digest": None, "files": {}}
         coverage = {"risk": meta["risk"], "gates": gcov, "panel": pcov,
                     "rebuttal": rcov, "findings": fcov,
                     "cost_usd": round(panel_cost_usd, 6), "cost_aborted": bool(cost_abort),
                     "cost_cap_usd": cpol.get("cap_usd"), "cost_cap_source": cpol.get("source"),
+                    # The sha256 of the policy attested at init, whose waiver limits governed
+                    # this verdict — so the audit shows exactly which policy the waiver checks
+                    # ran against (null when the run had no policy file).
+                    "policy_snapshot_sha256": attested_policy_sha,
                     "areas_not_reviewed": sorted(areas)}
 
         verdict = "FAIL" if fail else ("BLOCKED" if blocked else "PASS")
         # Plain-language next steps are derived from the verdict + coverage above; they are
-        # read-only over that state and cannot change it (guidance, not gate).
-        steps = next_steps(verdict, fail, blocked, gcov, fcov, counts)
-        # Tamper-evident attestation over every recorded input, computed before the
-        # verdict file exists so re-aggregating an untouched run reproduces it (#5).
-        attestation = compute_attestation(run)
+        # read-only over that state and cannot change it (guidance, not gate). The
+        # allow_critical_waivers flag comes from the SAME attested pol_data the gates
+        # themselves were just checked against (never the mutable working-tree policy),
+        # so the guidance can never suggest an action the gate above it already rejected.
+        steps = next_steps(verdict, fail, blocked, gcov, fcov, counts, risk=meta["risk"],
+                           allow_critical_waivers=_policy_bool(pol_data.get("allow_critical_waivers")) or False)
         out = {"verdict": verdict, "reasons": fail + blocked, "notes": notes,
                "next_steps": steps,
                "counts": counts, "coverage": coverage, "attestation": attestation,
@@ -1396,9 +2182,17 @@ def _aggregate_cli():
 
         md = [f"# Release verdict: {verdict}", "",
               f"Run `{meta['run_id']}`, risk {meta['risk']}, computed {out['computed_at']}.", ""]
+        # fail/blocked reasons are already escaped where they interpolate untrusted text (reviewer
+        # strings via _snippet; tampered gate names are rejected by validate_gate_name; a malformed
+        # manifest entry is shown via repr, which escapes newlines; and, as of security-4/Codex
+        # finding #6, every gates/<name>.json-sourced summary/validation-error text check_gates()
+        # appends to `fail`/`blocked` is now _oneline()-escaped at that append site, closing the gap
+        # where a crafted BLOCKED/FAIL record summary rendered raw markup into this report) — so
+        # they are NOT re-escaped here (that would double-escape, e.g. &lt; -> &amp;lt;). Notes are
+        # raw, so they are escaped at render.
         md += [f"- FAIL: {r}" for r in fail]
         md += [f"- BLOCKED: {r}" for r in blocked]
-        md += [f"- note: {n}" for n in notes]
+        md += [f"- note: {_oneline(n)}" for n in notes]
         # Plain-language guidance up top, where a non-expert will actually read it — before
         # the technical counts/coverage that follow.
         md += ["", "## Next steps", ""]
@@ -1410,13 +2204,25 @@ def _aggregate_cli():
                f"({len(gcov['missing'])} missing, {len(gcov['blocked'])} blocked, "
                f"{len(gcov['not_applicable'])} n/a, {len(gcov['waived'])} waived); "
                f"panel {len(pcov['roles_filled'])}/{len(pcov['roles_required'])} roles; "
-               f"rebuttal policy '{rcov['policy']}' {reb}; "
+               # CodeRabbit 4077668514 (Minor, valid): rcov['policy'] is the same
+               # attacker-editable meta['rebuttal_policy'] string that's already
+               # _oneline()'d when it reaches `blocked` above — this summary line
+               # rendered it raw instead.
+               f"rebuttal policy '{_oneline(rcov['policy'])}' {reb}; "
                f"findings {fcov['triaged']}/{fcov['raised']} triaged; "
                f"{len(coverage['areas_not_reviewed'])} reviewer-attested unreviewed areas"]
         # Surface every not-applicable determination and its authorizer distinctly — a
         # skipped gate must never be silent, even when it does not restrict the verdict.
+        # Authorizer/reason/expiry are operator-supplied — HTML-escape (via _oneline) before
+        # interpolating into verdict.md so a crafted value cannot forge markup in the report.
         md += [f"- not applicable: gate '{na['name']}' (authorized by "
-               f"{na['authorized_by']}): {na['reason']}" for na in gcov["not_applicable"]]
+               f"{_oneline(na['authorized_by'])}): {_oneline(na['reason'])}"
+               for na in gcov["not_applicable"]]
+        # Surface every active waiver and its authorizer/expiry distinctly too — a waived
+        # gate must never be silent, even though (like N/A) it does not restrict the verdict.
+        md += [f"- waived: gate '{w['name']}' (authorized by {_oneline(w['authorized_by'])}, "
+               f"expires {_oneline(w['expires'])}): {_oneline(w['reason'])}"
+               for w in gcov["waived"]]
         if jev_priors:
             # Informational only, read straight from the recorded triage/<id>.json files —
             # never fed back into fail/blocked/notes above. Showing it here, next to the

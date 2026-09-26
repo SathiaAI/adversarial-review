@@ -414,6 +414,64 @@ def _panel_timeout():
     return max(1800, req * (17 + 2 * (hs - 1)) * 6 + 600)
 
 
+def _sign_subprocess_timeout():
+    """AR_SIGN_TIMEOUT budget (seconds) for ONE out-of-process signer/verifier call (cosign,
+    minisign, or a custom AR_SIGNER_CMD/AR_VERIFIER_CMD). Mirrors _common.sign_timeout()'s own
+    parsing exactly (default 120s; a non-positive or non-numeric override falls back to that
+    default) WITHOUT importing _common here — mcp_server.py deliberately runs every pipeline
+    CLI as a separate subprocess (see _run_cli) and never imports _common's signing helpers
+    in-process, so this stays a plain env-var read, same as _panel_timeout() above reads
+    AR_TIMEOUT_S/AR_HIGH_SAMPLES rather than importing panel.py's own resolution logic."""
+    raw = os.environ.get("AR_SIGN_TIMEOUT", "120").strip()
+    try:
+        t = int(raw)
+    except ValueError:
+        return 120
+    return t if t > 0 else 120
+
+
+def _sign_wrapping_timeout(max_calls=1):
+    """Subprocess wrapper timeout for an MCP tool call that can attempt up to `max_calls`
+    out-of-process signer/verifier invocations as part of an otherwise-fast CLI command.
+
+    `max_calls=1` (the default) is `panel.py init`: an opportunistic, best-effort
+    policy.snapshot.sig OR policy.absence.sig signing attempt — the two are mutually
+    exclusive per run, see _sign_policy_snapshot_if_possible / _sign_policy_absence_if_possible
+    in panel.py — so init genuinely never attempts more than one.
+
+    `max_calls=2` is for `gate.py plan --waive` / `gate.py record` (for a NOT_APPLICABLE
+    gate) and plain `aggregate.py`: each of these now calls authenticate_risk_tier() (which
+    itself invokes the verifier via load_attested_policy_bundle(require_signature=True)
+    whenever signing is "expected" for this repository — see authenticate_risk_tier's own
+    docstring) AND separately, later in the same process, its own fail-closed signature
+    VERIFICATION pre-check for the waiver/NOT_APPLICABLE gate or exception being planned/
+    recorded/aggregated — a SECOND, independent load_attested_policy_bundle(require_signature=
+    True) call. Both are real out-of-process subprocess invocations against the SAME
+    AR_SIGN_TIMEOUT budget; budgeting for only one left the wrapper with zero margin for the
+    second even when each individual call succeeds well within its own timeout (Codex
+    r4111581317, P2, valid — found on gate.py/aggregate.py's call sites specifically; CLI/MCP
+    automation never sees a false "accepted" signal before aggregate.py's own later,
+    authoritative check either way, but a call that legitimately needs two verifier round
+    trips must not be killed by an outer wrapper sized for one).
+
+    Before the ORIGINAL (single-call) form of this fix, these call sites used _run_cli's/
+    _cli_result's bare 120s DEFAULT — the exact same 120s _common.sign_timeout() itself
+    defaults to — giving the OUTER MCP subprocess wrapper ZERO margin over even a single
+    INNER signer/verifier subprocess it wraps. Keyless cosign in particular does a real
+    network round trip to Fulcio/Rekor and can legitimately run close to its own timeout
+    budget under load; a slow-but-would-eventually-succeed attempt could then have the outer
+    wrapper kill the WHOLE tool call first — discarding an otherwise fully-created run at
+    init, or forcing a spurious retry at plan/record/aggregate — before the inner call's own
+    timeout (and, for init, its surrounding best-effort try/except that only warns and
+    continues on signer failure) ever got a chance to run to completion. security-4
+    (frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21). The +90s margin covers
+    Python/subprocess startup and the CLI's own (normally fast) surrounding work — generous
+    by design, matching the pattern _panel_timeout() already uses above for a much larger
+    multi-request budget; it is added once, not once per call, since it is fixed overhead
+    for the wrapper itself, not the signer/verifier subprocess."""
+    return _sign_subprocess_timeout() * max_calls + 90
+
+
 def _run_cli(module, argv, timeout=120):
     """Invoke a pipeline CLI module as a subprocess (shell=False — no injection).
     Returns (returncode, stdout, stderr). The child inherits this process's environment — h_aggregate uses
@@ -514,7 +572,7 @@ def h_init(args):
         if rp not in ("critical", "contention", "any"):
             raise ToolError("rebuttal_policy must be critical, contention, or any")
         argv += ["--rebuttal-policy", rp]
-    rc, out, err = _run_cli("panel", argv)
+    rc, out, err = _run_cli("panel", argv, timeout=_sign_wrapping_timeout())
     if rc != 0:
         return _result(f"init failed:\n{(out + err).strip()}", is_error=True)
     # Report the EXACT run id init just created by parsing its stdout ("initialized <run-dir
@@ -564,9 +622,27 @@ def h_gate_plan(args):
             raise ToolError(f"invalid waive gate name {w!r}")
         argv += ["--waive", w]
     auth = _opt_authorizer(args)
+    if waive:
+        # A waiver is never produced half-formed here: reason, expiry, and an authorizer
+        # are all required up front, so this tool can never hand gate.py a request that
+        # would only be caught later at aggregate time.
+        reason = args.get("waive_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ToolError("waiving a gate requires waive_reason (a real justification, "
+                            "at least 16 characters, not a placeholder)")
+        expires = args.get("waive_expires")
+        if not isinstance(expires, str) or not expires.strip():
+            raise ToolError("waiving a gate requires waive_expires 'YYYY-MM-DD'")
+        if not auth:
+            raise ToolError("waiving a gate requires authorized_by")
+        argv += ["--waive-reason", reason, "--waive-expires", expires]
     if auth:
         argv += ["--authorized-by", auth]
-    return _cli_result("gate", argv)
+    # A --waive plan authenticates the run's risk tier AND separately verifies the run's
+    # policy signature at plan time (two independent verifier calls -- see
+    # _sign_wrapping_timeout's max_calls=2 docstring) -- give the wrapper margin over BOTH
+    # inner verifier subprocesses' own timeout budgets, not just one.
+    return _cli_result("gate", argv, timeout=_sign_wrapping_timeout(max_calls=2))
 
 
 def h_gate_record(args):
@@ -590,7 +666,10 @@ def h_gate_record(args):
     auth = _opt_authorizer(args)
     if auth:
         argv += ["--authorized-by", auth]
-    return _cli_result("gate", argv)
+    # A NOT_APPLICABLE record authenticates the run's risk tier AND separately verifies the
+    # run's policy signature at record time too (same two-call shape as the --waive path
+    # above) -- same max_calls=2 timeout margin reasoning.
+    return _cli_result("gate", argv, timeout=_sign_wrapping_timeout(max_calls=2))
 
 
 def h_panel_assign(args):
@@ -978,7 +1057,15 @@ def h_aggregate(args):
             if lock_fd is not None and lock_token is not None:
                 os.environ["AR_AGGREGATE_LOCK_TOKEN"] = lock_token
             try:
-                rc, out, err = _run_cli("aggregate", run_args)
+                # timeout=_sign_wrapping_timeout(max_calls=2): plain aggregation calls
+                # authenticate_risk_tier() (itself a verifier invocation whenever signing is
+                # expected) and separately invokes verify_policy_snapshot_signature/
+                # verify_policy_absence_signature (via check_gates) -- two independent
+                # AR_SIGN_TIMEOUT-bounded calls, not one. Codex r4055706491 (P2) found the
+                # original bare-120s gap here (fixed to a single-call budget); Codex
+                # r4111581317 (P2, valid) found that single-call budget itself under-counts
+                # this call site by one verifier invocation.
+                rc, out, err = _run_cli("aggregate", run_args, timeout=_sign_wrapping_timeout(max_calls=2))
             finally:
                 if _prev_tok is None:
                     os.environ.pop("AR_AGGREGATE_LOCK_TOKEN", None)
@@ -1259,7 +1346,21 @@ TOOLS = [
         "require": {"type": "array", "items": {"type": "string"},
                     "description": "Explicit gate names to require, overriding the tier default."},
         "waive": {"type": "array", "items": {"type": "string"},
-                  "description": "Gate names to drop from the required set (each needs authorized_by)."},
+                  "description": "Gate names to waive. The gate stays required — a waiver is "
+                                 "recorded as its own accountable, time-boxed exception "
+                                 "(status WAIVED) and independently re-validated at aggregate "
+                                 "time (expiry, cap, authorizer, reason). Each entry needs "
+                                 "waive_reason, waive_expires, and authorized_by; mutation can "
+                                 "never be waived on CRITICAL tier."},
+        "waive_reason": {"type": "string",
+                         "description": "Required when waiving: a real justification for the "
+                                        "waiver, at least 16 characters and not a placeholder "
+                                        "like 'tbd' or 'n/a'."},
+        "waive_expires": {"type": "string",
+                          "description": "Required when waiving: expiry date 'YYYY-MM-DD', "
+                                         "strictly after the aggregate run's clock date and "
+                                         "within the policy's max_waiver_days cap (default 14) "
+                                         "of when it was planned."},
         "authorized_by": {"type": "string", "description": "Named authorizer, required when waiving a gate."}},
        [], _WRITE_LOCAL, h_gate_plan),
 

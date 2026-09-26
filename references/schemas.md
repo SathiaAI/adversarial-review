@@ -100,19 +100,69 @@ this file.
 
 ```json
 {"gate": "unit", "command": "npm test", "exit_code": 0,
- "status": "PASS|FAIL|BLOCKED|NOT_APPLICABLE",
+ "status": "PASS|FAIL|BLOCKED|NOT_APPLICABLE|WAIVED",
  "summary": "312 passed", "output_tail": "...", "recorded_at": "ISO-8601",
- "source": "run|record", "authorized_by": "name (NOT_APPLICABLE only)"}
+ "source": "run|record|plan", "authorized_by": "name (NOT_APPLICABLE/WAIVED only)"}
 ```
 
 `status` BLOCKED marks required coverage that could not be run or verified (`exit_code`
 may be null there). `status` NOT_APPLICABLE marks a required gate that genuinely does not
 apply to this stack (e.g. a config-only repo with no build or unit gate); unlike BLOCKED
 it does **not** restrict the verdict, but it is an accountable determination — the
-aggregator requires a named `authorized_by` and a non-empty `summary`, and an N/A record
-missing either is itself BLOCKED. Every N/A gate is listed distinctly (with its
+aggregator requires a named `authorized_by` and a non-empty `summary` (stripped), and an
+N/A record missing either is itself BLOCKED. The stricter waiver-reason rule (>=16 chars,
+no placeholder) applies to WAIVED `reason`s only, **not** to N/A `summary`s. Every N/A gate
+is listed distinctly (with its
 authorizer) in `verdict.json` coverage (`gates.not_applicable`) and in `verdict.md`, so a
 skipped gate is never silent. Absent `status` falls back to the exit code.
+
+`status` WAIVED (written by `gate.py plan --waive`, `source: "plan"`) is the third
+accountable, non-restricting exception: `{"gate": "mutation", "status": "WAIVED",
+"authorized_by": "name", "reason": "why (>=16 chars, not a placeholder)",
+"expires": "YYYY-MM-DD", "tier": "SENSITIVE", "planned_at": "ISO-8601",
+"source": "plan"}`. Unlike the pre-M1 waiver, the waived gate is **never removed from
+`required`** — this record is what the aggregator checks for it, and it is
+**independently re-validated at every aggregate run** (never trusted just because
+`gate.py plan` wrote it — and `gate.py plan` now runs the **same** validator, so an invalid
+waiver is rejected at plan time and never produces an artifact): a named `authorized_by`, a
+`reason` (>=16 chars, not a placeholder); `expires` must be a strict `YYYY-MM-DD` strictly
+after the run's clock date — the **later** of today UTC and the date part of
+`GITHUB_RUN_STARTED_AT` when that's set (a stale/backdated run-start timestamp can never
+un-expire a waiver; a forward-dated one is still honored — a set-but-unparseable value
+BLOCKS the run rather than guessing); and `expires` must be no more than `max_waiver_days`
+after the run's planning time, anchored to the **earlier** of the record's own `planned_at`
+and the run plan's `planned_at` in `gates/_required.json` (so editing either one forward
+alone cannot slide the window — an honest run always has both equal, since `gate.py plan`
+writes them together). A `planned_at` in the future relative to the run's clock — on either
+the record or the manifest — is rejected as tampered; there is no lower bound requiring the
+record's `planned_at` to be no earlier than the manifest's. `max_waiver_days` (default 14) is bounded to 1–365 at policy
+load, and the limits (`max_waiver_days`, `allow_critical_waivers`) are read from the policy
+**attested at init** (`policy.snapshot.json`), never a post-init working-tree edit. On
+CRITICAL tier, waiving (or marking NOT_APPLICABLE)
+any gate is refused unless policy sets `allow_critical_waivers: true`; `mutation` on
+CRITICAL is refused regardless of that setting — it stays BLOCKED until real CRITICAL
+mutation coverage ships (M4). Every waived gate is listed distinctly (with its
+authorizer, reason, and expiry) in `verdict.json` coverage (`gates.waived`) and in
+`verdict.md`.
+
+`authorized_by` (WAIVED and NOT_APPLICABLE) and `reason`/`summary` must additionally be
+**UTF-8 encodable** — a JSON string may legally contain a lone UTF-16 surrogate (e.g.
+`"\ud800"`), which `isinstance`/`len()` accept but which crashes `.encode("utf-8")`. Since
+all three are copied verbatim into `verdict.json`'s `gates.waived`/`gates.not_applicable`
+entries and `write_json()` always writes with `ensure_ascii=False`, an unencodable value
+there is rejected at validation time (BLOCKED, `"...contains characters that cannot be
+represented in UTF-8"`) rather than crashing the whole aggregation run with no
+`verdict.json` written at all.
+
+The tier-floor gates aggregate.py's `check_gates()` reconstructs independently from
+`gate.py`'s `MINIMUM_GATES` are not the only ones it re-derives: it also reconstructs
+whatever the **attested policy** additionally requires for this tier via
+`required_gates.<tier>` in `.adversarial-review.yml`/`.json` (see `gate.py cmd_plan`'s
+`base_required = requested | MINIMUM_GATES[tier]`, where `requested` can come from the
+policy). A `gates/_required.json` manifest that omits a policy-required gate entirely —
+never waived, never marked NOT_APPLICABLE, simply absent — is BLOCKED exactly like one
+missing a tier-floor gate, not silently accepted just because the omitted gate was never
+part of `MINIMUM_GATES` to begin with.
 
 ## Validation record — `validation/<slug>.json` (one per deduped issue)
 
@@ -235,6 +285,67 @@ A `resolved_by_patch ≥ 0.8` item is a **proposal**, not a closed finding — t
 still inspects the patch and still updates `validation/<slug>.json` by hand; nothing in
 `patch_check/` closes a finding on its own.
 
+## Policy-attestation signing — `policy.snapshot.sig` / `policy.absence.sig` (v4)
+
+The signed payload behind `policy.snapshot.sig` (the detached signature over
+`policy.snapshot.json`) and `policy.absence.sig` (the detached signature over
+`policy.absence.json`, GAP A's "checked, found no policy file" claim) is built by
+`policy_attest_bytes()` / `policy_absence_attest_bytes()` in `_common.py`.
+`POLICY_ATTEST_VERSION` is currently `"4"`. **Bound** into the signed message, at both
+sign time (`panel.py init`) and verify time (`aggregate.py`, `gate.py plan`/`record`),
+in order:
+
+1. The version tag (`ar-policy-attest-v4` / `ar-policy-absence-attest-v4` — different
+   domain-separation prefixes, so a signature minted for one can never verify as the
+   other).
+2. `run_id`, `run_nonce`, the run directory's own name, and the resolved `risk` tier —
+   unchanged since v2; `run_name` and `risk` are checked separately from `run.json`'s own
+   content, not via the digest below (see item 5).
+3. The live CI-orchestrator identity (`repository`, `commit`, CI run id, CI run
+   attempt) from `ci_signing_context()`, read fresh from the signing/verifying
+   process's own environment — unchanged since v3.
+4. **New in v4:** a length-prefixed copy of the canonical-JSON bytes themselves (not hashed —
+   `canonical_policy_fields_bytes()`, built by `canonical_json_bytes()`) of `run.json`'s
+   `BOUND_RUN_JSON_KEYS` — currently `dev_providers` and `rebuttal_policy`. A key present in `run.json` at sign
+   time but deleted (not merely edited) by verify time is bound as JSON `null`, never
+   simply omitted, so deletion doesn't silently match "key absent" either.
+5. For a snapshot: `policy.snapshot.json`'s full raw bytes (unchanged since v1). For an
+   absence claim: **new in v4**, a length-prefixed copy of `policy.absence.json`'s exact
+   raw bytes — pre-v4 this file's own content was never bound by its signature at all
+   (see the CHANGELOG "Round 7" entry).
+
+`canonical_json_bytes()` accepts only `str`/`bool`/`None`/`list`/`dict` (of those),
+`sort_keys=True` with fixed separators — dict key order never affects the output, list
+order always does. `int` and `float` are deliberately unsupported (raise `TypeError`):
+float repr is not guaranteed byte-identical across Python versions/platforms, and
+NaN/Infinity have no valid JSON representation at all.
+
+**What's deliberately left unbound, and why** (`UNBOUND_RUN_JSON_KEYS_BY_DESIGN` in
+`_common.py`, confirmed by reading every call site in `panel.py`/`aggregate.py`/`gate.py`
+— none of these are ever branched on by a decision path):
+
+| key | why it's safe to leave unbound |
+|---|---|
+| `product`, `diff_ref` | interpolated into the human-readable reviewer-prompt text only |
+| `sources` | audit trail of where `risk`/`dev_providers`/`rebuttal_policy` were resolved from (CLI flag / env var / policy file) — written once, never read back |
+| `created_at` | a timestamp for a human reading `run.json`; nothing checks it for staleness/expiry |
+| `policy` | the `{file, sha256}` pointer to the policy-file snapshot — redundant with `snap_bytes` itself, which already changes the moment `policy.snapshot.json`'s content does; this pointer only cross-checks a wholesale-swapped snapshot *file* |
+| `attest_version` | not written as of v4 (no dual-version dispatch yet); reserved so adding it later needs no reclassification |
+
+A future run.json key that lands in neither `BOUND_RUN_JSON_KEYS` nor
+`UNBOUND_RUN_JSON_KEYS_BY_DESIGN` is caught by `tests/run_tests.py`'s
+`t_v4_run_json_key_inventory_is_exhaustive` before it can ship silently unbound.
+
+**For `AR_SIGNING_REQUIRED` adopters: v4 is not backward compatible with v3
+signatures, by design.** There is no migration path — this mirrors how v1→v2 and
+v2→v3 were each handled. A run signed under a pre-v4 script version must be
+re-initialized (`panel.py init`) under the v4 script before it will verify; there is no
+silent fallback from a v4 verification failure to v3 leniency, because that would be a
+downgrade vulnerability, not a compatibility feature. If a real population of
+already-signed v3 runs is ever found to need continued verification, the fix is an
+explicit `run.json['attest_version']`-keyed dispatch — never an unconditional
+try-v4-then-silently-try-v3 fallback.
+
 ## Verdict — `verdict.json` (written by aggregate.py only)
 
 ```json
@@ -245,14 +356,16 @@ still inspects the patch and still updates `validation/<slug>.json` by hand; not
  "coverage": {"risk": "TIER",
    "gates": {"plan_recorded": true, "required": [], "recorded": [], "passed": [],
              "failed": [], "blocked": [{"name": "", "reason": ""}], "missing": [],
-             "waived": [{"name": "", "authorized_by": ""}]},
+             "waived": [{"name": "", "authorized_by": "", "reason": "",
+                         "expires": "YYYY-MM-DD", "tier": ""}]},
    "panel": {"roles_required": [], "roles_filled": [], "substitutions": 0,
              "degraded": null, "dev_families_excluded": []},
    "rebuttal": {"policy": "contention", "required": false, "ran": false},
    "findings": {"raised": 0, "triaged": 0, "untriaged_release_blocking": 0},
    "cost_usd": 0.0, "cost_aborted": false, "cost_cap_usd": 20.0, "cost_cap_source": "default",
+   "policy_snapshot_sha256": "hex or null (sha256 of the policy attested at init whose waiver limits governed this verdict; null when the run had no policy file or the snapshot was rejected)",
    "areas_not_reviewed": ["union of reviewer attestations"]},
- "attestation": {"algorithm": "sha256-canonical-json-v2", "inputs": 0,
+ "attestation": {"algorithm": "sha256-canonical-json-v4", "inputs": 0,
    "digest": "hex", "files": {"run.json": "hex", "gates/unit.json": "hex"}},
  "computed_at": "ISO-8601"}
 ```
@@ -283,8 +396,28 @@ path by whichever process created it; a process never unlinks a lock it did not 
 
 The `attestation` block makes the audit record tamper-evident. Every `*.json` file in
 the run directory except `verdict.json` (the output) is canonicalized — sorted keys,
-compact separators, so cosmetic re-serialization is not tampering — and hashed; a
-`.json` file that fails UTF-8 decoding or JSON parsing, **or whose bytes exceed a fixed,
+compact separators, so cosmetic re-serialization is not tampering — and hashed, **plus
+two explicit non-JSON exceptions, each hashed as a raw-bytes input whenever it
+exists: `policy.snapshot.json`'s detached signature sidecar, `policy.snapshot.sig`
+(v3 — a required, pre-verdict input for any policy-backed exception, so deleting or
+corrupting it now changes the digest; v2 and earlier missed this, since
+`compute_attestation` only globbed `*.json`), and `policy.absence.json`'s detached
+signature sidecar, `policy.absence.sig` (v4 — GAP A's signed no-policy attestation,
+folded into the attestation coverage the same way v3 already covered
+`policy.snapshot.sig`, closing the same gap for a policyless exception run)**. Both
+sidecars — and every tracked `*.json` artifact — are read the hardened way (`read_regular_file_once`:
+no-follow at the leaf, size-capped), so a symlink planted in place of any of them is refused rather
+than read through or silently skipped. That refusal raises `NotRegularFileError` (an `OSError`), which
+every caller of `compute_attestation` (`--check-digest`, `--sign`, `--verify-signature`, and ordinary
+aggregation) treats as **cannot verify**, never as a hashed value and never as detected drift: it is
+not a `raw:`-prefixed digest entry, `--check-digest` exits 2 (not 1), `--sign`/`--verify-signature`
+refuse with exit 2, and ordinary aggregation folds it into a `BLOCKED` verdict rather than crashing
+before `verdict.json` is written. A verdict computed under v3 (no `policy.absence.sig`
+in scope yet) is a recognized legacy algorithm for `--check-digest`, not a current one;
+see the legacy-transition handling below. The unrelated, post-verdict `attestation.sig` (the standalone
+`--sign` feature's detached signature *over* `verdict.json` itself) stays excluded —
+including it would be circular. A `.json` file that fails UTF-8 decoding or JSON
+parsing, **or whose bytes exceed a fixed,
 version-independent cap on nesting depth OR integer-literal width**, is hashed over its raw
 bytes (`raw:` prefix) rather than crashing the aggregator — these cases are treated
 identically and deliberately. Deciding raw-vs-canonical **from the bytes, *before* parsing**
@@ -293,6 +426,23 @@ across Python versions *and* interpreter configurations: both the recursion-dept
 integer-string-conversion limit (`PYTHONINTMAXSTRDIGITS`) are per-runtime, so a byte-measured
 policy is the only portable one. The per-file hashes are folded into one manifest digest.
 Re-aggregating an untouched run reproduces the digest bit-for-bit, on any supported runtime.
+Within the ONE call site that computes this digest for the first time in the same
+process invocation that also verified a policy-snapshot/absence signature (ordinary
+aggregation, not `--check-digest`/`--sign`/`--verify-signature` — those are standalone,
+re-checking an *existing* `verdict.json` against whatever is on disk now, with no
+signature-verification call in scope, so they always read fresh, unchanged), the four
+signature-adjacent inputs — `policy.snapshot.json`, `policy.snapshot.sig`,
+`policy.absence.json`, `policy.absence.sig` — are hashed from the *exact bytes the
+signature check already read and verified* (`load_attested_policy_bundle()`'s `.raw`/
+`.absence_raw`, and `verify_policy_*_signature`'s `capture_sig_bytes`), never from a
+second, independent re-read of the live path moments later (Codex 4099660083, P2,
+valid). Without this, an actor with concurrent write access to the run directory could
+swap any of the four between the signature check and this later read, so the digest
+baked into `verdict.json` — and anything signed over it afterward via `--sign` — would
+silently attest to different bytes than the ones actually verified. This changes
+*which read* feeds the hash for those four inputs in that one flow; it does not change
+what gets hashed, the algorithm, or any field shape above.
+
 `aggregate.py --check-digest` recomputes it against the stored value: exit 0 intact;
 exit 1 with each drifted artifact named `DRIFT modified|added|removed`; exit 2 when the
 digest cannot be checked at all — no verdict, an unreadable/malformed or non-object
