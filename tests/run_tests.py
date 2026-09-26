@@ -16606,5 +16606,92 @@ def t_reviewer_messages_confines_product_and_diff_ref_inside_boundary():
     assert user.count(">>>") == 2, "attacker payload must not introduce extra '>>>' sequences"
 
 
+# ------------------------------------------------- round-8 CodeRabbit follow-up findings
+# (commit a62b4d0, reviewed 2026-09-26): valid findings on round 8's OWN new code, caught
+# by the fresh review this session requested after pushing round 8's fixes. Each is
+# evaluated and fixed here rather than taken on faith (pr-review-loop hard rule 3), with
+# its own regression test.
+
+def t_run_executes_authorized_degraded_plan_despite_tier_floor_check():
+    # CodeRabbit r4112007468 (Major, valid): cmd_run's new authenticated-tier floor check
+    # (checklist item 3/8, this same round) did not exempt a LEGITIMATELY degraded plan
+    # (cmd_assign's own pre-existing --allow-degraded --authorized-by path) from counting
+    # its sanctioned shortfall as "missing" -- so `panel.py run` rejected every degraded
+    # plan outright, even a properly authorized one, before a single reviewer ever ran.
+    # This is the exact regression test that would have caught it.
+    repo = fresh_repo()
+    dev = "anthropic,openai,google,xai,qwen,mistral,deepseek"
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", dev], repo)
+    sh(["panel.py", "assign", "--allow-degraded", "--authorized-by", "Paul"], repo)
+    run = latest_run(repo)
+    plan = read(run / "panel" / "plan.json")
+    assert plan["degraded"]["missing_roles"], "sanity: this plan must actually be short roles"
+
+    sh(["panel.py", "run", "--context-file", "context.md"], repo, expect=0)
+    for role in plan["roles"]:
+        assert (run / "panel" / f"{role}.json").exists(), f"{role} should have been reviewed"
+
+
+def t_load_reports_rejects_non_dict_json_treats_as_missing():
+    # CodeRabbit r4112007447 (Major, valid): read_json(p) raises nothing for a report file
+    # that is valid JSON but not an object (e.g. hand-edited to `null` or `[]`) -- the old
+    # bare try/except (OSError, ValueError, RecursionError) let a non-dict value through
+    # into `reports[role]`, and every downstream `.get(...)` on it (check_rebuttal,
+    # check_findings, collect_jev_priors) would crash instead of treating it as missing.
+    import aggregate
+    repo, run = t_run_panel_and_malformed_retry(), None
+    run = latest_run(repo)
+    plan = read(run / "panel" / "plan.json")
+    role = next(iter(plan["roles"]))
+    write(run / "panel" / f"{role}.json", None)   # valid JSON, not an object
+    reports = aggregate.load_reports(run, plan)
+    assert role not in reports, "a non-dict report must be treated as missing, not stored"
+
+
+def t_check_panel_malformed_degraded_field_blocks_not_crash():
+    # CodeRabbit r4112007456 (Major, valid): check_panel() built `set((deg or {}).get(
+    # "missing_roles", []))` directly from plan.json's untrusted, hand-editable
+    # `degraded` field -- a non-dict `degraded`, or a `missing_roles` list containing an
+    # unhashable item (e.g. `[[]]`), raised AttributeError/TypeError instead of producing
+    # the controlled BLOCKED verdict this whole function exists to compute.
+    import aggregate
+    meta = {"risk": "NORMAL", "dev_providers": []}
+    blocked = []
+    # (a) degraded present but not an object at all.
+    pcov = aggregate.check_panel(None, meta, {"roles": {"security": {"family": "x"}},
+                                               "degraded": "not-an-object"}, {}, blocked)
+    assert any("degraded" in b and "not an object" in b for b in blocked), blocked
+    assert pcov["roles_required"], "must not crash before roles_required is even computed"
+    # (b) degraded.missing_roles is a well-shaped list but contains an unhashable item --
+    # the "not a list" shape check above must not fire (it IS a list), but building the
+    # actual role set from it (safe_degraded_missing_roles) must silently skip the
+    # unhashable entry rather than raising TypeError on `set([[]])`.
+    blocked2 = []
+    pcov2 = aggregate.check_panel(
+        None, meta,
+        {"roles": {"security": {"family": "x"}}, "degraded": {"missing_roles": [[]]}},
+        {}, blocked2)
+    assert not any("not a list" in b for b in blocked2), blocked2
+    assert isinstance(pcov2["roles_required"], list), "must not raise TypeError on set([[]])"
+
+
+def t_aggregate_run_json_directory_is_blocked_not_exit3_crash():
+    # CodeRabbit r4112007460 (Major, valid): aggregate.py's very first read of run.json
+    # (producing `meta`) had no exception handling of its own, unlike every OTHER read of
+    # this same file in this codebase (see load_attested_policy_bundle's first lines) --
+    # an unsafe run.json (here, a directory named run.json — the platform-independent
+    # unreadable-artifact fixture this file already uses elsewhere, no symlink privilege
+    # needed) fell through to main()'s generic `except Exception: sys.exit(3)`, the wrong
+    # signal for a plainly-BLOCKED condition this codebase treats as BLOCKED (exit 2)
+    # everywhere else it reads this exact file.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    (run / "run.json").unlink()
+    (run / "run.json").mkdir()  # dir named run.json -> read_regular_file_once raises OSError
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "run.json is unreadable" in (r.stdout + r.stderr), (r.stdout, r.stderr)
+    assert not (run / "verdict.json.lock").exists(), "the lock must still be released on this path"
+
+
 if __name__ == "__main__":
     main()

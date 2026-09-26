@@ -39,8 +39,8 @@ from _common import (MAX_HIGH_SAMPLES, POLICY_ABSENCE_FILENAME, POLICY_ABSENCE_S
                      minisign_sign_argv, now_iso, policy_absence_attest_bytes,
                      policy_attest_bytes, read_json,
                      resolve_run, resolve_setting, resolve_signing_tool,
-                     run_signing_tool, trusted_signer_guard_error, write_bytes_atomic,
-                     write_json,
+                     run_signing_tool, safe_degraded_missing_roles, trusted_signer_guard_error,
+                     write_bytes_atomic, write_json,
                      # Codex 4099660092: reused here only to give
                      # _sign_policy_snapshot_if_possible's unsigned-outcome note an
                      # accurate, context-sensitive message -- the same three signals
@@ -1291,9 +1291,20 @@ def cmd_run(args):
     # the plan happens to contain; this also catches a plan.json hand-edited to drop
     # roles outright. Re-running `panel.py assign` under the current (authenticated)
     # risk produces a plan that passes this check.
+    #
+    # CodeRabbit r4112007468 (Major, valid): a LEGITIMATELY degraded plan (cmd_assign's
+    # own pre-existing --allow-degraded --authorized-by path, when independent provider
+    # families genuinely run out) is a sanctioned, recorded shortfall, not an attack --
+    # the check above must not reject one just because it doesn't cover every role the
+    # tier's full floor names. Exclude the plan's own recorded degraded.missing_roles
+    # from what counts as "missing" here, exactly like aggregate.py's check_panel()
+    # already does; aggregate.py's separate "degraded panel without recorded
+    # authorization" check remains the backstop against a forged/unauthorized
+    # `degraded` field, so this exclusion does not need to re-check authorized_by itself.
     required = set(TIER_ROLES[meta["risk"]])
     plan_roles = set(plan.get("roles", {}))
-    missing_from_plan = required - plan_roles
+    deg_missing = safe_degraded_missing_roles(plan)
+    missing_from_plan = required - plan_roles - deg_missing
     if missing_from_plan:
         die(f"panel plan does not meet this run's authenticated risk tier "
             f"({meta['risk']!r})'s role floor -- missing from plan.json: "

@@ -1510,6 +1510,30 @@ TIER_ROLES = {
     "SENSITIVE": ROLES,
     "CRITICAL": ROLES,
 }
+
+
+def safe_degraded_missing_roles(plan):
+    """Validated set of role names from plan.get("degraded", {}).get("missing_roles", []),
+    tolerating any malformed shape without ever raising -- plan.json is untrusted,
+    hand-editable input (CodeRabbit r4112007456, round 8): `degraded` itself might not be
+    a dict (a truthy non-dict value crashes `.get()`), and `missing_roles` might not be a
+    list, or might contain an unhashable item (e.g. a nested list), which crashes
+    `set(...)`. Both panel.py's cmd_run and aggregate.py's check_panel() build a set from
+    this value to decide whether a role's absence from the plan is a sanctioned shortfall
+    (an authorized degraded panel) or exactly the flip-and-restore attack's signature
+    (frontier-gate run pr70-round8-riskauth) -- a crash here would take down the very
+    fail-closed check meant to catch that attack. A malformed shape returns an empty set,
+    which is itself fail-closed: it widens nothing, so a real shortfall the malformed
+    `degraded` field was supposed to explain still shows up as missing/under-provisioned
+    in the caller's own check, exactly as if no degraded authorization had been recorded
+    at all."""
+    deg = plan.get("degraded")
+    if not isinstance(deg, dict):
+        return set()
+    raw = deg.get("missing_roles")
+    if not isinstance(raw, list):
+        return set()
+    return {r for r in raw if isinstance(r, str)}
 MAX_HIGH_SAMPLES = 25  # practical upper bound on corroboration samples (E4-S3): bounds the
                        # cost blast radius and the not_run list built on a cost-abort.
 # Scoped/bounded mutation budget — a repo-tunable cost cap so mutation testing survives

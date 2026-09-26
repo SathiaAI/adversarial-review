@@ -40,6 +40,7 @@ from _common import (POLICY_ABSENCE_FILENAME, POLICY_ABSENCE_SIG_FILENAME,
                      minisign_verify_argv as _minisign_verify_argv, now_iso,
                      read_json, read_regular_file_once, resolve_run,
                      resolve_signing_tool as _resolve_tool, resolve_waiver_clock,
+                     safe_degraded_missing_roles,
                      verify_policy_absence_signature,
                      verify_policy_snapshot_signature,
                      run_signing_tool as _run_tool, sign_fail as _sign_fail,
@@ -60,10 +61,19 @@ def load_reports(run, plan):
         p = run / "panel" / f"{role}.json"
         if p.exists():
             try:
-                reports[role] = read_json(p)
+                parsed = read_json(p)
             except (OSError, ValueError, RecursionError):
-                pass  # unreadable/malformed report -> treated as missing; check_panel()
-                       # already reports "reviewer reports missing for: ..." for this
+                continue  # unreadable/malformed report -> treated as missing; check_panel()
+                          # already reports "reviewer reports missing for: ..." for this
+            # CodeRabbit r4112007447 (Major, valid): read_json succeeds -- no exception --
+            # for any valid JSON value, not just an object; a hand-edited report.json of
+            # `null` or `[]` is valid JSON that is not a report. Every downstream reader
+            # (check_rebuttal, check_findings, collect_jev_priors, etc.) calls `.get(...)`
+            # on each reports.values() entry expecting a dict, so storing a non-dict here
+            # crashed those callers instead of being treated as "missing" like any other
+            # malformed report.
+            if isinstance(parsed, dict):
+                reports[role] = parsed
     return reports
 
 
@@ -393,10 +403,27 @@ def check_panel(run, meta, plan, reports, blocked):
     under-provisioned check below -- a degraded panel with recorded authorization is not
     "missing roles from the plan," it is explicitly allowed to be short those roles;
     "degraded panel without recorded authorization" (further below) already catches an
-    unauthorized degrade."""
+    unauthorized degrade.
+
+    CodeRabbit r4112007456 (Major, valid): plan.json is untrusted, hand-editable input --
+    a `degraded` value that is present but not a dict, or a `missing_roles` list
+    containing an unhashable item (e.g. a hand-edited `[[]]`), used to crash `set(...)`
+    here. safe_degraded_missing_roles() validates the shape instead of raising; a
+    malformed `degraded` is treated as if no degraded authorization were recorded at all
+    (deg_missing stays empty), which is itself fail-closed -- it widens nothing, so any
+    real shortfall the malformed field was supposed to explain still surfaces via
+    under_provisioned below. Flagged explicitly as its own blocked reason anyway, so the
+    audit trail names the actual problem (malformed metadata) rather than only the
+    downstream role-shortfall symptom."""
     roles = list(plan.get("roles", {}))
     deg = plan.get("degraded")
-    deg_missing = set((deg or {}).get("missing_roles", []))
+    if deg is not None and not isinstance(deg, dict):
+        blocked.append("panel plan's 'degraded' field is malformed (not an object) — "
+                        "cannot honor it as a degraded-panel authorization")
+    elif isinstance(deg, dict) and not isinstance(deg.get("missing_roles"), (list, type(None))):
+        blocked.append("panel plan's degraded.missing_roles is malformed (not a list) — "
+                        "cannot honor it as a degraded-panel authorization")
+    deg_missing = safe_degraded_missing_roles(plan)
     required = sorted(set(TIER_ROLES.get(meta.get("risk"), [])) | deg_missing)
     pcov = {"roles_required": required,
             "roles_filled": [r for r in roles if r in reports],
@@ -423,7 +450,11 @@ def check_panel(run, meta, plan, reports, blocked):
     missing = [r for r in roles if r not in reports]
     if missing:
         blocked.append(f"reviewer reports missing for: {', '.join(missing)}")
-    if deg and not deg.get("authorized_by"):
+    # `not isinstance(deg, dict)` first: this pre-existing check predates round 8's
+    # malformed-shape guard above and had the exact same crash (CodeRabbit r4112007456)
+    # on a non-dict `deg` -- a truthy non-dict value can never carry a valid
+    # authorized_by either way, so it is correctly "without recorded authorization" too.
+    if deg and (not isinstance(deg, dict) or not deg.get("authorized_by")):
         blocked.append("degraded panel without recorded authorization")
     return pcov
 
@@ -1803,8 +1834,29 @@ def _aggregate_cli():
             print(f"cannot acquire the aggregate lock ({lock_path.name}): {e}", file=sys.stderr)
             sys.exit(3)
     try:
-        run_json_raw = read_regular_file_once(run / "run.json")
-        meta = json.loads(run_json_raw.decode("utf-8"))
+        # CodeRabbit r4112007460 (Major, valid): a symlinked, FIFO, or oversized run.json
+        # raises OSError here (read_regular_file_once's own safety checks); left uncaught,
+        # this propagated to main()'s outer `except Exception: sys.exit(3)` -- a controlled
+        # exit, but the WRONG signal (an "unexpected internal error" code, and no
+        # verdict.json) for exactly the class of unsafe-artifact input every OTHER read of
+        # this same file in this codebase already treats as a plain, expected BLOCKED
+        # condition (see load_attested_policy_bundle's very first lines, moments later in
+        # this same aggregation, for the established message pattern). No `meta` exists yet
+        # at this point (this IS the read that produces it), so there is nothing to build a
+        # normal verdict.json from -- fail with a clear stderr message and the same exit
+        # code (2) every other BLOCKED-for-unsafe-input path in this file uses, rather than
+        # the generic exit-3 "unexpected error" path.
+        try:
+            run_json_raw = read_regular_file_once(run / "run.json")
+            meta = json.loads(run_json_raw.decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError, RecursionError) as e:
+            print(f"run.json is unreadable or not valid JSON — cannot aggregate this run; "
+                  f"BLOCKED ({e})", file=sys.stderr)
+            sys.exit(2)
+        if not isinstance(meta, dict):
+            print("run.json is not a JSON object — cannot aggregate this run; BLOCKED",
+                  file=sys.stderr)
+            sys.exit(2)
 
         fail, blocked, notes = [], [], []
         counts = {"gates": 0, "reviewers": 0, "findings_high_critical": 0,

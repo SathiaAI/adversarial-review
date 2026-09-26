@@ -154,11 +154,18 @@ and every one of the checks above would accept them at face value. Naming this p
 reading as "this proves you are really inside GitHub/GitLab's infrastructure" — it does not,
 and never has.
 
-What these signals **do** provide: replay-binding entropy. `policy_attest_bytes` v3 binds
-repository/commit/CI-run-id/CI-run-attempt fresh from the *verifying* process's own
-environment (never from a copyable file), so a validly-signed run's artifacts cannot be
-replayed onto a different run/commit/repository even when the run directory's own name is
-forced to match (batch 2, above). `_ci_identity_established()` exists purely so that two
+What these signals **do** provide: replay-binding entropy, conditioned on the *verifying*
+process's own environment being trustworthy. `policy_attest_bytes` v3 binds
+repository/commit/CI-run-id/CI-run-attempt fresh from that process's own environment (never
+from a copyable file), so a validly-signed run's artifacts cannot be replayed onto a
+different run/commit/repository as long as the values the verifier reads for that
+comparison are themselves genuine — the same self-reported-variable limitation just
+described above applies just as much at verify time as at sign time. An attacker who
+controls the *verifying* process's own environment (not merely the signing one) could feed
+it the original run's values and defeat this replay check the same way; this mechanism
+protects against replay onto a run whose OWN verifying environment is honest, not against a
+verifier that has itself been compromised or run outside the topology described in
+"adopter (workflow-configuration) responsibilities" above. `_ci_identity_established()` exists purely so that two
 independently unidentified environments (two laptops, or a laptop and an unrecognized
 third-party CI system) — which would otherwise compute byte-for-byte identical "local"
 placeholders and provide *no* actual distinction — are told apart from a genuine
@@ -215,6 +222,7 @@ separately-evaluated feature. **Open, tracked** — not silently dropped.
 | `run.json` fields other than `risk` that affect the computed verdict are not bound into the policy-attestation signature, so editing them post-signing (with the signature staying valid) can silently change verdict-relevant behavior: `rebuttal_policy` (contention→critical drops a required SENSITIVE-tier rebuttal round), `dev_providers` (makes a development-only review look independent), and the absence-attestation's `captured_at`/`dev_providers` | `POLICY_ATTEST_VERSION` **v4**: `canonical_policy_fields_bytes()` binds a canonical-JSON digest of `BOUND_RUN_JSON_KEYS` (`dev_providers`, `rebuttal_policy`) into both `policy_attest_bytes` and `policy_absence_attest_bytes`, closing the whole class at once rather than one field at a time; a new `t_v4_run_json_key_inventory_is_exhaustive` guard test fails CI if a future `run.json` key is added without being classified into `BOUND_RUN_JSON_KEYS` or `UNBOUND_RUN_JSON_KEYS_BY_DESIGN`. Deliberately no v3-signature migration path — see `references/schemas.md`'s policy-attestation-signing section | **Shipped round 7** (commit pending) |
 | `policy.absence.json`'s OWN file content (`{policy_absent, captured_at}`) was never bound by its own signature at all — `verify_policy_absence_signature` accepted an `absence_bytes` keyword that `policy_absence_attest_bytes` never actually referenced, so editing the claim file post-signing (without touching `policy.absence.sig`) went completely undetected | `POLICY_ATTEST_VERSION` **v4**: `panel.py`'s `_sign_policy_absence_if_possible` now computes `policy.absence.json`'s exact bytes in memory, signs over them (threaded through as `absence_bytes`), and only writes them to disk afterward; `verify_policy_absence_signature` verifies against those same bytes | **Shipped round 7** (commit pending) |
 | `GITHUB_ACTIONS`/`GITHUB_REPOSITORY`/etc. (and their GitLab equivalents) are entirely self-reported environment variables, never verified against the platform's own OIDC identity or API — a process outside real CI infrastructure that sets them is indistinguishable, to `ci_signing_context()`/`_ci_identity_established()`/`_pr_author_controlled_trigger()`, from a genuine CI job | Documented, not code-fixed this round — see "What CI-identity signals do and do not prove" above for the actual trust boundary (signer-secret isolation + job separation, both adopter-configured) and the tracked OIDC-attestation follow-up | **Open, tracked** (documentation-only round 8; round-8 panel decision `fix_b_and_c_now_document_a`, consensus 0.97) |
+| `aggregate.py`'s `main()` reads `run.json` multiple independent times within one invocation — once at the top for `meta` (`rebuttal_policy`/`dev_providers`, used by `check_rebuttal()`/`check_panel()`), and again inside `authenticate_risk_tier()`'s own `read_run_risk()`/`load_attested_policy_bundle()` calls (used to authenticate and rebind `meta["risk"]`). Only `risk` gets rebound to the authenticated value; a write to `run.json` landing in the (narrow, intra-process) window between these reads could leave `rebuttal_policy`/`dev_providers` reflecting a stale snapshot while `risk` reflects a fresher, authenticated one — e.g. a stale `"rebuttal_policy": "critical"` suppressing a rebuttal round the current, signed policy would require (CodeRabbit r4112007466, round 8) | Not fixed this round — flagged as a "Heavy lift" by CodeRabbit's own review and confirmed on inspection: closing it properly means threading pinned `run.json` bytes through `authenticate_risk_tier()`/`read_run_risk()`/`load_attested_policy_bundle()` (mirroring the `snap_bytes`/`policy_fields_bytes` pinning pattern already used elsewhere in this module), which changes a shared function `gate.py` also calls with no pinned bytes available in its own context — a real design decision, not a mechanical fix, and a genuinely narrower/harder-to-exploit window than the round-8 flip-and-restore attack (which spans separate CLI invocations with a large time gap) rather than one intra-process race | **Open, tracked** — flagged for its own frontier-gate panel run before implementation, not decided unilaterally while closing out round 8's other findings |
 
 ## Round 5 — unauthenticated risk-tier fallback (checklist item 6, refined)
 
