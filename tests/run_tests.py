@@ -1677,7 +1677,7 @@ def t_policy_sig_signed_at_init_when_signer_configured():
     # checking that `init` actually invokes the signer over the CURRENT canonical
     # payload, which the replay/tamper/version-specific tests elsewhere in this file
     # cover directly.
-    from _common import policy_attest_bytes
+    from _common import canonical_policy_fields_bytes, policy_attest_bytes
     env = _stub_signer_env()
     repo = fresh_repo()
     write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
@@ -1688,6 +1688,11 @@ def t_policy_sig_signed_at_init_when_signer_configured():
     sig = (run / "policy.snapshot.sig").read_bytes()
     meta = read(run / "run.json")
     run_nonce, risk = meta["run_nonce"], meta["risk"]
+    # v4 (frontier-gate run pr70-round7-v4design, 2026-09-26): the canonical digest of
+    # run.json's policy-relevant fields (dev_providers, rebuttal_policy) is now part of
+    # what gets signed -- built from the run's own real run.json content, same
+    # discipline as the rest of this test's expected-message construction.
+    policy_fields_bytes = canonical_policy_fields_bytes(meta)
     # Build the expected ci_context from `env` -- the dict the SUBPROCESS actually saw --
     # not by calling ci_signing_context() fresh in THIS (the test runner's own) process.
     # This test suite itself may be running inside real CI (this repo's own ci.yml
@@ -1705,7 +1710,8 @@ def t_policy_sig_signed_at_init_when_signer_configured():
         "run_attempt": env.get("GITHUB_RUN_ATTEMPT", "").strip() or "local",
     }
     msg = policy_attest_bytes(run.name, run_nonce, run.name, risk,
-                               run / "policy.snapshot.json", ci_context=ci_context)
+                               run / "policy.snapshot.json", ci_context=ci_context,
+                               policy_fields_bytes=policy_fields_bytes)
     assert sig == b"STUBSIG-v1:" + hashlib.sha256(msg).hexdigest().encode(), sig
 
 
@@ -1791,7 +1797,7 @@ def t_policy_sig_absence_signed_at_init_allows_waiver_run_to_pass():
     # path end-to-end: init writes+signs the absence attestation, `gate.py plan --waive`
     # accepts it, and `aggregate.py` (in a DIFFERENT process, re-verifying independently)
     # accepts it too.
-    from _common import policy_absence_attest_bytes
+    from _common import canonical_policy_fields_bytes, policy_absence_attest_bytes
     env = _stub_signer_env()
     repo = fresh_repo()   # deliberately NO .adversarial-review.json policy file
     r = sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
@@ -1822,8 +1828,14 @@ def t_policy_sig_absence_signed_at_init_allows_waiver_run_to_pass():
         "run_id": env.get("GITHUB_RUN_ID", "").strip() or "local",
         "run_attempt": env.get("GITHUB_RUN_ATTEMPT", "").strip() or "local",
     }
+    # v4 (frontier-gate run pr70-round7-v4design, 2026-09-26): both newly-bound
+    # ingredients built the same way the rest of this test builds its expected
+    # message -- from the run's own real on-disk content, not a hand-copied value.
+    absence_bytes = (run / "policy.absence.json").read_bytes()
+    policy_fields_bytes = canonical_policy_fields_bytes(meta)
     msg = policy_absence_attest_bytes(run.name, meta["run_nonce"], run.name, meta["risk"],
-                                       ci_context=ci_context)
+                                       ci_context=ci_context, absence_bytes=absence_bytes,
+                                       policy_fields_bytes=policy_fields_bytes)
     assert sig == b"STUBSIG-v1:" + hashlib.sha256(msg).hexdigest().encode(), sig
     absence = read(run / "policy.absence.json")
     assert absence["policy_absent"] is True, absence
@@ -2583,6 +2595,235 @@ def t_policy_sig_risk_tamper_blocks():
     assert "not verifiably signed" in r.stderr, r.stderr
 
 
+# ------------------------------------------------- v4 policy-attest bump (frontier-gate
+# run pr70-round7-v4design, 2026-09-26): closes the 3rd independently-discovered instance
+# of "a run.json field that affects the verdict/rebuttal/waiver outcome is never bound
+# into the policy signature" (dev_providers, rebuttal_policy) plus a 4th, related gap
+# (policy.absence.json's OWN content was never bound at all -- a dead `absence_bytes`
+# parameter). See POLICY_ATTEST_VERSION's module comment in _common.py for the full
+# rationale and the deliberate no-migration-path scope decision the last test below
+# exercises.
+
+def t_policy_sig_dev_providers_tamper_blocks():
+    # THE actual regression test for the live exploit this fix closes: pre-v4,
+    # dev_providers was never bound into the policy signature at all, so an actor with
+    # write access to the run directory could edit it post-signing (e.g. adding a fake
+    # exempted provider) with ZERO effect on signature verification -- silently widening
+    # which reviewer providers get excluded as "dev" without invalidating anything. v4's
+    # canonical_policy_fields_bytes digest binds dev_providers, so this tamper must now
+    # BLOCK, mirroring t_policy_sig_risk_tamper_blocks's exact shape for the risk field.
+    env = _stub_signer_env()
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})  # allow_critical_waivers unset
+    sh(["panel.py", "init", "--risk", "CRITICAL", "--dev-providers", "anthropic"], repo, env=env)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.sig").exists()
+
+    rj = read(run / "run.json")
+    assert rj["dev_providers"] == ["anthropic"], rj
+    rj["dev_providers"] = ["anthropic", "openai"]  # attacker adds a fake exempted provider
+    write(run / "run.json", rj)
+
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI for this repo yet",
+            "--waive-expires", (date.today() + timedelta(days=7)).isoformat()],
+           repo, env=env, expect=1)
+    assert "not verifiably signed" in r.stderr, r.stderr
+
+
+def t_policy_sig_rebuttal_policy_tamper_blocks():
+    # Same regression class as the dev_providers test above, for the OTHER field v4
+    # newly binds: pre-v4, editing run.json's rebuttal_policy post-signing (e.g. loosening
+    # "contention" to "critical", changing which findings require a rebuttal round) left
+    # the signature untouched. v4's canonical_policy_fields_bytes digest binds
+    # rebuttal_policy too, so this tamper must now BLOCK.
+    env = _stub_signer_env()
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})  # allow_critical_waivers unset
+    sh(["panel.py", "init", "--risk", "CRITICAL", "--dev-providers", "anthropic"], repo, env=env)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.sig").exists()
+
+    rj = read(run / "run.json")
+    assert rj["rebuttal_policy"] == "contention", rj  # cmd_init's default
+    rj["rebuttal_policy"] = "critical"
+    write(run / "run.json", rj)
+
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI for this repo yet",
+            "--waive-expires", (date.today() + timedelta(days=7)).isoformat()],
+           repo, env=env, expect=1)
+    assert "not verifiably signed" in r.stderr, r.stderr
+
+
+def t_policy_sig_absence_file_content_tamper_blocks():
+    # The 4th gap this fix closes, found while doing the fix's own mandated field
+    # inventory: pre-v4, verify_policy_absence_signature accepted an `absence_bytes`
+    # keyword argument that was NEVER actually referenced inside
+    # policy_absence_attest_bytes -- dead code that looked like a check. That meant
+    # policy.absence.json's own file content ({policy_absent, captured_at}) could be
+    # edited post-signing -- WITHOUT touching policy.absence.sig at all -- with zero
+    # effect on verification. Before this fix, this exact tamper would have gone
+    # COMPLETELY UNDETECTED: the signature would still verify, because nothing it
+    # covered ever actually depended on this file's bytes. v4 threads real
+    # absence_bytes through, so this tamper must now BLOCK.
+    env = _stub_signer_env()
+    repo = fresh_repo()   # deliberately NO .adversarial-review.json policy file
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
+       repo, env=env)
+    run = latest_run(repo)
+    assert (run / "policy.absence.json").exists()
+    assert (run / "policy.absence.sig").exists()
+
+    absence = read(run / "policy.absence.json")
+    assert absence["policy_absent"] is True, absence
+    absence["captured_at"] = "1999-01-01T00:00:00+00:00"  # tamper the claim's OWN content
+    write(run / "policy.absence.json", absence)
+    # policy.absence.sig is deliberately left untouched -- this is the point of the test:
+    # the signature file itself is unmodified, only the thing it's supposed to attest to.
+
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast",
+            "--waive", "mutation", "--authorized-by", "Paul",
+            "--waive-reason", "mutation runner not wired into CI for this repo yet",
+            "--waive-expires", (date.today() + timedelta(days=7)).isoformat()],
+           repo, env=env, expect=1)
+    assert "not verifiably signed" in r.stderr, r.stderr
+
+
+def t_canonical_json_bytes_rejects_float():
+    # canonical_json_bytes (the v4 digest builder, _common.py) deliberately excludes int
+    # and float from its accepted value types -- float repr is not guaranteed
+    # byte-identical across Python versions/platforms, and NaN/Infinity have no valid
+    # JSON representation at all (see the function's own docstring). Confirm the refusal
+    # is a loud TypeError, never a silent json.dumps that would produce a
+    # platform-dependent digest.
+    from _common import canonical_json_bytes
+    for bad in ({"x": 1.5}, {"x": float("nan")}, {"x": float("inf")}, {"x": float("-inf")},
+                {"x": [1.5]}, {"x": {"y": 1.5}}):
+        try:
+            canonical_json_bytes(bad)
+            raise AssertionError(f"expected TypeError for {bad!r}")
+        except TypeError:
+            pass
+    # accepted types -- str/bool/None/list/dict, nested -- must NOT raise
+    canonical_json_bytes({"a": "x", "b": True, "c": None, "d": ["y", "z"], "e": {"f": "g"}})
+    canonical_json_bytes([])
+    canonical_json_bytes({})
+    # a non-str dict key must also raise, at any nesting depth
+    try:
+        canonical_json_bytes({1: "x"})
+        raise AssertionError("expected TypeError for a non-str top-level dict key")
+    except TypeError:
+        pass
+    try:
+        canonical_json_bytes({"a": {1: "x"}})
+        raise AssertionError("expected TypeError for a non-str nested dict key")
+    except TypeError:
+        pass
+
+
+def t_canonical_json_bytes_key_order_irrelevant():
+    # sort_keys=True (plus fixed separators) is what makes canonical_json_bytes a real
+    # CANONICAL form: two dicts built in different key order must serialize
+    # byte-for-byte identically, or the same logical run.json content could produce two
+    # different signed digests depending on incidental dict-construction order alone.
+    from _common import canonical_json_bytes
+    a = canonical_json_bytes({"b": ["x"], "a": ["y"]})
+    b = canonical_json_bytes({"a": ["y"], "b": ["x"]})
+    assert a == b, (a, b)
+    # built via literal re-ordering of the same keys, not just two separate literals
+    d1 = {"b": ["x"], "a": ["y"]}
+    d2 = {k: d1[k] for k in reversed(list(d1.keys()))}
+    assert canonical_json_bytes(d1) == canonical_json_bytes(d2)
+    # list order, by contrast, IS preserved -- e.g. dev_providers' configured order is
+    # itself part of what was actually configured, not an unordered set for this purpose.
+    c = canonical_json_bytes({"a": ["x", "y"]})
+    e = canonical_json_bytes({"a": ["y", "x"]})
+    assert c != e, (c, e)
+
+
+def t_v4_run_json_key_inventory_is_exhaustive():
+    # THE guard test (checklist item 7, frontier-gate run pr70-round7-v4design): the one
+    # thing that stops a FUTURE PR from silently repeating this exact bug a 4th time. Run
+    # a real `panel.py init` (with a real policy file, so run.json gets its full field
+    # set, including the `policy` pointer) and assert every key it actually writes is
+    # accounted for by either BOUND_RUN_JSON_KEYS, UNBOUND_RUN_JSON_KEYS_BY_DESIGN, or the
+    # three fields bound separately as positional arguments to policy_attest_bytes
+    # (run_id, run_nonce, risk -- never listed in either tuple; see BOUND_RUN_JSON_KEYS'
+    # own module comment for why). A new run.json key that lands in neither classification
+    # fails this test outright, by design, with an actionable message.
+    import _common
+    env = _stub_signer_env()
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
+    sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
+       repo, env=env)
+    run = latest_run(repo)
+    meta = read(run / "run.json")
+    classified = (set(_common.BOUND_RUN_JSON_KEYS)
+                  | set(_common.UNBOUND_RUN_JSON_KEYS_BY_DESIGN)
+                  | {"run_id", "run_nonce", "risk"})
+    unclassified = set(meta.keys()) - classified
+    assert unclassified == set(), (
+        f"run.json has unclassified keys: {unclassified} -- add each to "
+        "BOUND_RUN_JSON_KEYS (if it affects any decision) or "
+        "UNBOUND_RUN_JSON_KEYS_BY_DESIGN (if it's purely informational, with a comment "
+        "explaining why) in scripts/_common.py")
+
+
+def t_policy_sig_v3_signature_fails_closed_under_v4():
+    # Proves the deliberate no-migration-path scope decision (POLICY_ATTEST_VERSION's
+    # module comment) behaves correctly: not a crash, not a silent accept -- a fail-closed
+    # BLOCKED-reason string. Hand-construct exactly what a v3 signer would have produced
+    # (the OLD wire format: version tag b"ar-policy-attest-v3", run_id, run_nonce,
+    # run_name, risk, the 4 ci_context fields, then snap_bytes directly -- NO
+    # length-prefixed policy_fields_bytes digest, since v3 predates BOUND_RUN_JSON_KEYS
+    # entirely), sign it with the same stub scheme _stub_signer_env() wires up, place it
+    # as policy.snapshot.sig, and confirm verify_policy_snapshot_signature -- which only
+    # ever builds v4-shaped bytes now, with no dispatch back to v3 -- rejects it instead
+    # of raising or crashing.
+    import _common
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=False)
+    run = latest_run(repo)
+    assert (run / "policy.snapshot.sig").exists()
+    meta = read(run / "run.json")
+    run_id, run_nonce, risk = meta["run_id"], meta["run_nonce"], meta["risk"]
+    snap_bytes = (run / "policy.snapshot.json").read_bytes()
+    # _stub_signer_env() neutralizes GITHUB_*/GITLAB_* to "" and opts into
+    # AR_ALLOW_LOCAL_CI_IDENTITY=1, so both sign time (above) and verify time (below)
+    # compute the same all-"local" ci_context.
+    ci_context = {"repository": "local", "commit": "local", "run_id": "local",
+                  "run_attempt": "local"}
+    v3_msg = (b"ar-policy-attest-v3\n"
+              + run_id.encode("utf-8") + b"\n" + run_nonce.encode("utf-8") + b"\n"
+              + run.name.encode("utf-8") + b"\n" + risk.encode("utf-8") + b"\n"
+              + ci_context["repository"].encode("utf-8") + b"\n"
+              + ci_context["commit"].encode("utf-8") + b"\n"
+              + ci_context["run_id"].encode("utf-8") + b"\n"
+              + ci_context["run_attempt"].encode("utf-8") + b"\n"
+              + snap_bytes)
+    v3_sig = b"STUBSIG-v1:" + hashlib.sha256(v3_msg).hexdigest().encode()
+    (run / "policy.snapshot.sig").write_bytes(v3_sig)  # overwrite the real v4 signature
+
+    touched = [k for k in env if k.startswith("AR_") or k.startswith("GITHUB_")]
+    saved = {k: os.environ.get(k) for k in touched}
+    for k in touched:
+        os.environ[k] = env[k]
+    try:
+        sig_err = _common.verify_policy_snapshot_signature(run, meta, snap_bytes=snap_bytes)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert sig_err is not None, "a v3-shaped signature must not verify under v4"
+    assert isinstance(sig_err, str) and sig_err, sig_err
+
+
 # ------------------------------------------------- PR70 architecture hardening v3
 # (frontier-gate run pr70-architecture-review, 2026-09-20, Paul's decision "A -
 # redesign_signing_boundary", 3/4 panel consensus 0.84): v2 closed directory-identity
@@ -2818,7 +3059,8 @@ def t_policy_sig_ci_context_gitlab_fixed_run_attempt_marker_is_what_gets_signed(
     # dropped, not "local") by reconstructing the exact signed message with it and
     # matching the real signature byte-for-byte -- mirrors
     # t_policy_sig_signed_at_init_when_signer_configured's reconstruction pattern.
-    from _common import _GITLAB_NO_RUN_ATTEMPT, policy_attest_bytes
+    from _common import (_GITLAB_NO_RUN_ATTEMPT, canonical_policy_fields_bytes,
+                          policy_attest_bytes)
     env = _stub_signer_env(extra=_gitlab_ci_env(pipeline_id="900000003"))
     repo = _sensitive_repo_with_policy(env=env, waive=True)
     run = latest_run(repo)
@@ -2830,7 +3072,8 @@ def t_policy_sig_ci_context_gitlab_fixed_run_attempt_marker_is_what_gets_signed(
     gl_ctx = {"repository": env["CI_PROJECT_PATH"], "commit": env["CI_COMMIT_SHA"],
               "run_id": env["CI_PIPELINE_ID"], "run_attempt": _GITLAB_NO_RUN_ATTEMPT}
     msg = policy_attest_bytes(run.name, meta["run_nonce"], run.name, meta["risk"],
-                              run / "policy.snapshot.json", ci_context=gl_ctx)
+                              run / "policy.snapshot.json", ci_context=gl_ctx,
+                              policy_fields_bytes=canonical_policy_fields_bytes(meta))
     assert sig == b"STUBSIG-v1:" + hashlib.sha256(msg).hexdigest().encode(), sig
     # Retrying the same pipeline reuses the same CI_PIPELINE_ID -- re-verifying under the
     # identical env (what a real retry would report) must still pass, since nothing about
@@ -15301,15 +15544,21 @@ def t_toctou_sign_uses_caller_supplied_bytes_never_rereads():
                 raise AssertionError(
                     "policy.snapshot.json was reread during signing -- TOCTOU regression")
             return orig_open(path, *a, **kw)
+        meta = {"run_id": run_id, "run_nonce": run_nonce, "risk": risk}
+        # v4 (frontier-gate run pr70-round7-v4design, 2026-09-26): policy_fields_bytes
+        # is now a required signing ingredient too -- built from this test's own
+        # `meta` (which has no dev_providers/rebuttal_policy keys, binding both as JSON
+        # null) so the exact same value the verify calls below independently recompute
+        # from the same `meta` is what was actually signed.
+        policy_fields_bytes = _common.canonical_policy_fields_bytes(meta)
         _common.os.open = refusing_open
         try:
             panel._sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk,
-                                                      intended_bytes)
+                                                      intended_bytes, policy_fields_bytes)
         finally:
             _common.os.open = orig_open
         sig_p = run / _common.POLICY_SIG_FILENAME
         assert sig_p.exists(), "signer stub should have produced a signature"
-        meta = {"run_id": run_id, "run_nonce": run_nonce, "risk": risk}
         assert _common.verify_policy_snapshot_signature(run, meta,
                                                           snap_bytes=intended_bytes) is None
         tampered = b'{"file": "policy.yml", "sha256": "tampered", "text": "tampered"}'

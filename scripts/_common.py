@@ -223,7 +223,136 @@ POLICY_ABSENCE_FILENAME = "policy.absence.json"
 POLICY_ABSENCE_SIG_FILENAME = "policy.absence.sig"
 
 
-POLICY_ATTEST_VERSION = "3"
+POLICY_ATTEST_VERSION = "4"
+
+# v4 (frontier-gate run pr70-round7-v4design, 2026-09-26; panel: Fable 5.1, GPT-6
+# Astra, Grok 4.6, Gemini 3.1 Pro, unanimous 4/4, consensus 0.93): closes the 3rd
+# independently-discovered instance of "a run.json field that affects the verdict,
+# rebuttal requirement, or reviewer independence is never bound into the policy
+# signature" -- dev_providers and rebuttal_policy, both attacker-editable in an
+# untrusted run directory, neither previously checked against anything the signature
+# covers. Also closes a 4th, related gap found while doing this fix's mandated field
+# inventory: policy.absence.json's OWN file content was never bound by its signature
+# AT ALL (verify_policy_absence_signature took an `absence_bytes` parameter that was
+# never actually referenced in its body -- dead code masquerading as a check).
+#
+# Rather than keep adding named positional fields one at a time -- the exact pattern
+# that produced this recurrence twice already (v1->v2 closed run_name/risk; v3's own
+# remaining gaps produced round 6 and this round) -- v4 adds ONE canonical-JSON digest
+# of an explicitly enumerated, versioned set of policy-relevant run.json fields
+# (BOUND_RUN_JSON_KEYS below), plus the full raw bytes of policy.absence.json itself
+# for the absence case (mirroring how policy.snapshot.json's full bytes are already
+# bound via snap_bytes for the snapshot case). See canonical_json_bytes and
+# canonical_policy_fields_bytes below, and the guard test
+# t_v4_run_json_key_inventory_is_exhaustive in tests/run_tests.py that fails CI the
+# moment a future PR adds a run.json key without classifying it into one of the two
+# tuples below.
+#
+# Deliberate scope decision, disclosed rather than silently made: v4 does NOT add
+# dual-version verification (a v3-signed run failing v4 verification is intentional
+# fail-closed behavior -- re-init to get a v4-signable/verifiable run -- exactly the
+# same "no migration path, bump the version and re-init" shape this module's own v2
+# and v3 introductions already used, per their own docstrings' stated rationale that
+# no real deployment existed yet with the superseded format). This repo's own status
+# as of this fix: viaid's adoption of AR_SIGNING_REQUIRED is itself still being built
+# (SAT-1117, docs/... handback), not a mature population of already-signed runs that
+# would be broken by a clean version bump. If real v3-signed runs needing continued
+# verification are found to already exist, extend this with an explicit
+# run.json['attest_version']-keyed dispatch (never a try-v4-then-silently-try-v3
+# fallback -- that would be a genuine downgrade oracle: a run whose dev_providers/
+# rebuttal_policy really was tampered with would legitimately fail v4 verification,
+# and unconditionally retrying under v3 -- which never checked those fields at all --
+# would then incorrectly accept it).
+#
+# Fields from run.json that affect the computed verdict, rebuttal requirement, waiver
+# eligibility, or reviewer-independence outcome, and so MUST be bound into the v4
+# signature via canonical_policy_fields_bytes() below. risk/run_id/run_nonce/run_name
+# are deliberately NOT listed here: they are already separately bound as positional
+# arguments to policy_attest_bytes/policy_absence_attest_bytes (unchanged since v2/v3)
+# -- including them here too would bind them twice for no benefit and would make the
+# "what does v4 add" diff harder to review.
+BOUND_RUN_JSON_KEYS = ("dev_providers", "rebuttal_policy")
+
+# Fields from run.json confirmed, by reading every call site in panel.py/aggregate.py/
+# gate.py (frontier-gate run pr70-round7-v4design field inventory, 2026-09-26), to
+# affect nothing but human-facing display or audit trail -- never branched on by any
+# decision path. Deliberately left unbound. This tuple, and the guard test that checks
+# it against every key cmd_init actually writes to run.json, is what stops a FUTURE
+# field from silently falling into the same gap a 4th time: a new run.json key that
+# lands in neither this tuple nor BOUND_RUN_JSON_KEYS fails the test outright.
+#   product, diff_ref: interpolated into the human-readable reviewer-prompt text only
+#     (panel.py's review-request body) -- never read by any control-flow branch.
+#   sources: audit trail of where risk/dev_providers/rebuttal_policy were resolved
+#     from (CLI flag / env var / policy file) -- written once at init, never read back.
+#   created_at: timestamp for a human reading run.json; no staleness/expiry logic
+#     anywhere in this codebase reads it.
+#   policy: {file, sha256} pointer to the policy-file snapshot -- redundant with the
+#     existing snap_bytes binding, since editing policy.snapshot.json's actual content
+#     changes snap_bytes (which the signature already binds directly); this pointer is
+#     a same-run cross-check for a wholesale-swapped snapshot file (see
+#     load_attested_policy_bundle), not an independent trust boundary of its own.
+#   attest_version: NOT written as of this fix (see the scope-decision note above --
+#     no dual-version dispatch yet), reserved here so adding it later needs no
+#     re-classification of this guard test.
+UNBOUND_RUN_JSON_KEYS_BY_DESIGN = ("product", "diff_ref", "sources", "created_at",
+                                    "policy", "attest_version")
+
+
+def canonical_json_bytes(obj):
+    """Deterministic, canonical UTF-8 JSON bytes for `obj` -- the ONE serialization
+    every v4 signer and verifier must agree on byte-for-byte, or a canonicalization bug
+    fails EVERY run's verification identically (loud -- caught by the test suite
+    before merge) rather than one field silently not binding (quiet -- exactly what
+    v1/v2/v3 each individually missed; see checklist item 8, frontier-gate run
+    pr70-round7-v4design).
+
+    Deliberately narrow: only str, bool, None, and list/dict composed of those are
+    accepted -- NOT int, and NOT float. int is excluded because nothing this is used
+    for today needs it (BOUND_RUN_JSON_KEYS is dev_providers: list[str] and
+    rebuttal_policy: str) and adding it back is a one-line change if a future bound
+    field needs it. float is excluded permanently: float repr is not guaranteed
+    byte-identical across Python versions/platforms for every value, and NaN/Infinity
+    have no valid JSON representation at all -- exactly the platform-dependent
+    instability checklist item 8 calls out as the failure mode to design against, so
+    this function refuses to guess a canonicalization for one rather than risk it.
+
+    `sort_keys=True` plus fixed separators (",", ":") is what makes dict key order
+    irrelevant to the output and removes incidental whitespace differences. List order
+    is preserved, never sorted -- e.g. dev_providers' configured order is itself part
+    of what was actually configured, not an unordered set for this purpose."""
+    def _check(x):
+        if isinstance(x, bool) or x is None or isinstance(x, str):
+            return
+        if isinstance(x, list):
+            for item in x:
+                _check(item)
+            return
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if not isinstance(k, str):
+                    raise TypeError(
+                        f"canonical_json_bytes: dict key {k!r} is not a str")
+                _check(v)
+            return
+        raise TypeError(
+            f"canonical_json_bytes: value {x!r} of type {type(x).__name__} is not one "
+            "of str/bool/None/list/dict -- refusing to guess a canonicalization for it "
+            "(int and float are deliberately unsupported; see this function's "
+            "docstring)")
+    _check(obj)
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False).encode("utf-8")
+
+
+def canonical_policy_fields_bytes(meta):
+    """The v4 canonical-digest bytes for run.json's policy-relevant fields
+    (BOUND_RUN_JSON_KEYS), extracted from `meta` (an already-parsed run.json dict).
+    A key missing from `meta` is bound as JSON null, never simply omitted -- so a
+    run.json that HAD e.g. dev_providers at sign time but has the key deleted (not
+    merely edited) by verify time still fails to verify, rather than silently matching
+    whatever this function would produce for "key absent"."""
+    fields = {k: meta.get(k) for k in BOUND_RUN_JSON_KEYS}
+    return canonical_json_bytes(fields)
 
 # CI context values with no CI-provided source (a local/dev run, or a CI system that
 # doesn't set the GitHub Actions env vars below) fall back to this literal marker rather
@@ -368,8 +497,20 @@ def _ci_identity_established(ci_context):
 
 
 def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path=None, ci_context=None,
-                         version=POLICY_ATTEST_VERSION, snap_bytes=None):
+                         version=POLICY_ATTEST_VERSION, snap_bytes=None,
+                         policy_fields_bytes=None):
     """The exact bytes signed/verified for the policy-snapshot signature.
+
+    v4 (current) additionally binds `policy_fields_bytes` -- canonical_policy_fields_
+    bytes(meta), i.e. a length-prefixed canonical-JSON digest of run.json's
+    BOUND_RUN_JSON_KEYS (dev_providers, rebuttal_policy) -- ahead of the snapshot bytes
+    (frontier-gate run pr70-round7-v4design, 2026-09-26; see POLICY_ATTEST_VERSION's
+    module comment for the full rationale and the field inventory that produced this
+    list). Required as of v4: passing None raises rather than silently signing/
+    verifying without it, so no call site can accidentally construct a v4-tagged
+    payload that doesn't actually bind these fields. Length-prefixed (not merely
+    newline-terminated) so the digest's own bytes can never be confused with what
+    follows it even in a pathological input.
 
     `snap_bytes`, when given, is used verbatim instead of re-reading `snap_path` from
     disk — the TOCTOU fix (frontier-gate run pr70-design, 2026-09-21, checklist item 8):
@@ -381,10 +522,12 @@ def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path=None, ci_co
     could have swapped in between the two reads. `snap_path` stays required when
     `snap_bytes` is omitted (back-compat for any caller that has only a path).
 
-    v3 (current) additionally binds the four ci_signing_context() values -- repository,
-    commit, CI run id, CI run attempt -- ahead of the snapshot bytes (frontier-gate run
-    pr70-architecture-review, 2026-09-20, batch 2 of the redesign_signing_boundary
-    decision). `ci_context` defaults to a fresh ci_signing_context() call when omitted,
+    v3 (superseded) additionally binds the four ci_signing_context() values --
+    repository, commit, CI run id, CI run attempt -- ahead of the snapshot bytes
+    (frontier-gate run pr70-architecture-review, 2026-09-20, batch 2 of the
+    redesign_signing_boundary decision); this binding is unchanged in v4, just joined
+    by policy_fields_bytes above. `ci_context` defaults to a fresh ci_signing_context()
+    call when omitted,
     so both the signer (panel.py, at init) and the verifier (this module, at aggregate/
     gate time) always bind whatever THEIR OWN live environment reports -- never a value
     carried in run.json or any other file a copied run directory could bring with it.
@@ -432,6 +575,12 @@ def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path=None, ci_co
         ci_context = ci_signing_context()
     if snap_bytes is None:
         snap_bytes = Path(snap_path).read_bytes()
+    if policy_fields_bytes is None:
+        raise ValueError(
+            "policy_attest_bytes: policy_fields_bytes is required as of v4 -- pass "
+            "canonical_policy_fields_bytes(meta). There is no dispatch back to v3 (see "
+            "POLICY_ATTEST_VERSION's module comment); a v3-signed run intentionally "
+            "fails v4 verification rather than silently verifying without this field")
     return (b"ar-policy-attest-v" + str(version).encode("ascii") + b"\n"
             + run_id.encode("utf-8") + b"\n" + run_nonce.encode("utf-8") + b"\n"
             + str(run_name).encode("utf-8") + b"\n" + str(risk).encode("utf-8") + b"\n"
@@ -439,11 +588,14 @@ def policy_attest_bytes(run_id, run_nonce, run_name, risk, snap_path=None, ci_co
             + ci_context["commit"].encode("utf-8") + b"\n"
             + ci_context["run_id"].encode("utf-8") + b"\n"
             + ci_context["run_attempt"].encode("utf-8") + b"\n"
+            + str(len(policy_fields_bytes)).encode("ascii") + b"\n"
+            + policy_fields_bytes + b"\n"
             + snap_bytes)
 
 
 def policy_absence_attest_bytes(run_id, run_nonce, run_name, risk, ci_context=None,
-                                 version=POLICY_ATTEST_VERSION):
+                                 version=POLICY_ATTEST_VERSION, absence_bytes=None,
+                                 policy_fields_bytes=None):
     """The exact bytes signed/verified for the policy-ABSENCE signature (GAP A, frontier-
     gate run pr70-design, 2026-09-21, checklist item 2) — the signed claim that THIS run,
     at init, explicitly checked for a repo policy file and found none, as distinct from a
@@ -458,16 +610,43 @@ def policy_absence_attest_bytes(run_id, run_nonce, run_name, risk, ci_context=No
     the snapshot's b"ar-policy-attest-v...") so a signature minted for one can never
     verify as the other even if policy.snapshot.json/.sig and policy.absence.json/.sig
     were swapped between run directories — the two claims ("this text governed the run"
-    vs "no policy governed the run") must never be interchangeable."""
+    vs "no policy governed the run") must never be interchangeable.
+
+    v4 (current) additionally binds two length-prefixed fields (frontier-gate run
+    pr70-round7-v4design, 2026-09-26): `policy_fields_bytes` -- the same
+    canonical_policy_fields_bytes(meta) digest policy_attest_bytes binds, since an
+    absence-signed run's run.json carries dev_providers/rebuttal_policy exactly like a
+    snapshot-signed run's does, and the same post-signing tamper is possible either
+    way -- and `absence_bytes`, the exact raw bytes written for policy.absence.json
+    itself. Pre-v4, this function bound NO bytes from policy.absence.json at all: the
+    file's own content ({policy_absent, captured_at}) was writable post-signing with
+    zero effect on the signature, because nothing here ever hashed it (a previously
+    unused `absence_bytes` keyword accepted by verify_policy_absence_signature's
+    caller-facing signature was never actually referenced in this function -- dead
+    code that looked like a check). Both are required as of v4: passing either as None
+    raises rather than silently constructing a payload that doesn't bind them."""
     if ci_context is None:
         ci_context = ci_signing_context()
+    if policy_fields_bytes is None:
+        raise ValueError(
+            "policy_absence_attest_bytes: policy_fields_bytes is required as of v4 -- "
+            "pass canonical_policy_fields_bytes(meta). There is no dispatch back to v3")
+    if absence_bytes is None:
+        raise ValueError(
+            "policy_absence_attest_bytes: absence_bytes is required as of v4 -- pass "
+            "the exact bytes written for policy.absence.json. Pre-v4 never bound this "
+            "file's own content at all; see this function's docstring")
     return (b"ar-policy-absence-attest-v" + str(version).encode("ascii") + b"\n"
             + run_id.encode("utf-8") + b"\n" + run_nonce.encode("utf-8") + b"\n"
             + str(run_name).encode("utf-8") + b"\n" + str(risk).encode("utf-8") + b"\n"
             + ci_context["repository"].encode("utf-8") + b"\n"
             + ci_context["commit"].encode("utf-8") + b"\n"
             + ci_context["run_id"].encode("utf-8") + b"\n"
-            + ci_context["run_attempt"].encode("utf-8"))
+            + ci_context["run_attempt"].encode("utf-8") + b"\n"
+            + str(len(policy_fields_bytes)).encode("ascii") + b"\n"
+            + policy_fields_bytes + b"\n"
+            + str(len(absence_bytes)).encode("ascii") + b"\n"
+            + absence_bytes)
 
 
 def _encodable_str(s):
@@ -565,8 +744,10 @@ def verify_policy_absence_signature(run, meta, *, absence_bytes, capture_sig_byt
         capture_sig_bytes[POLICY_ABSENCE_SIG_FILENAME] = sig_bytes
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.absence.attest"
-        msg_tmp.write_bytes(policy_absence_attest_bytes(run_id, run_nonce, run_name, risk,
-                                                          ci_context=ci_context))
+        msg_tmp.write_bytes(policy_absence_attest_bytes(
+            run_id, run_nonce, run_name, risk, ci_context=ci_context,
+            absence_bytes=absence_bytes,
+            policy_fields_bytes=canonical_policy_fields_bytes(meta)))
         sig_tmp = Path(td) / POLICY_ABSENCE_SIG_FILENAME
         sig_tmp.write_bytes(sig_bytes)
         proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_tmp, fatal=False)
@@ -734,8 +915,10 @@ def verify_policy_snapshot_signature(run, meta, *, snap_bytes, capture_sig_bytes
         capture_sig_bytes[POLICY_SIG_FILENAME] = sig_bytes
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.snapshot.attest"
-        msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, run_name, risk,
-                                                 snap_bytes=snap_bytes, ci_context=ci_context))
+        msg_tmp.write_bytes(policy_attest_bytes(
+            run_id, run_nonce, run_name, risk, snap_bytes=snap_bytes,
+            ci_context=ci_context,
+            policy_fields_bytes=canonical_policy_fields_bytes(meta)))
         sig_tmp = Path(td) / POLICY_SIG_FILENAME
         sig_tmp.write_bytes(sig_bytes)
         proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_tmp, fatal=False)

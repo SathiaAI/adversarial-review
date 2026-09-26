@@ -32,7 +32,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (MAX_HIGH_SAMPLES, POLICY_ABSENCE_FILENAME, POLICY_ABSENCE_SIG_FILENAME,
                      POLICY_SIG_FILENAME, RUN_ROOT, VALID_REBUTTAL,
-                     VALID_RISKS, capability_of, cosign_sign_argv, die, family_of,
+                     VALID_RISKS, canonical_policy_fields_bytes, capability_of,
+                     cosign_sign_argv, die, family_of,
                      load_capabilities, load_policy, merge_usage, meta_cost,
                      minisign_sign_argv, now_iso, policy_absence_attest_bytes,
                      policy_attest_bytes, read_json,
@@ -580,7 +581,8 @@ def _unsigned_policy_note():
             "marked not-applicable")
 
 
-def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_bytes):
+def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_bytes,
+                                       policy_fields_bytes):
     """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
     Paul's decision, frontier-gate run pr70-provenance, 2026-09-19; hardened per
     frontier-gate run pr70-provenance-2, 2026-09-19, closing 6 Codex-found bypasses;
@@ -652,7 +654,8 @@ def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_bytes):
         # policy_attest_bytes's own `snap_bytes` parameter exists to close (see its
         # docstring); this call site just wasn't using it.
         msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, run.name, risk,
-                                                 snap_bytes=snap_bytes))
+                                                 snap_bytes=snap_bytes,
+                                                 policy_fields_bytes=policy_fields_bytes))
         sig_tmp = Path(td) / "sig.out"
         proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_tmp, fatal=False)
         if err:
@@ -686,7 +689,7 @@ def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_bytes):
     print(f"signed: {run / POLICY_SIG_FILENAME} attests policy.snapshot.json (signer: {kind})")
 
 
-def _sign_policy_absence_if_possible(run, run_id, run_nonce, risk):
+def _sign_policy_absence_if_possible(run, run_id, run_nonce, risk, policy_fields_bytes):
     """GAP A's signed escape hatch (frontier-gate run pr70-design, 2026-09-21, checklist
     item 2): when `init` finds NO repo policy file at all, opportunistically sign a
     policy.absence.json explicitly attesting "this run's own init looked for a policy and
@@ -733,9 +736,23 @@ def _sign_policy_absence_if_possible(run, run_id, run_nonce, risk):
               f"with AR_MINISIGN_KEY){detail} — policy.absence.json was not written; {note}")
         return
     want_sig_out = any("{sig}" in a for a in argv_tmpl)
+    # v4 (frontier-gate run pr70-round7-v4design, 2026-09-26): compute policy.absence
+    # .json's exact bytes IN MEMORY, sign over them, and only write them to disk (via
+    # write_bytes_atomic below, using these SAME bytes -- never a second, independent
+    # re-serialization) once signing has actually succeeded. This preserves the
+    # pre-existing "never write an orphaned unsigned policy.absence.json" invariant
+    # (see this function's docstring) while still closing the gap where the file's own
+    # content was previously not bound by the signature at all: absence_bytes now
+    # actually flows into policy_absence_attest_bytes, unlike the pre-v4 shape where an
+    # identically-named parameter existed on the verify side but was never referenced.
+    absence_obj = {"policy_absent": True, "captured_at": now_iso()}
+    absence_bytes = (json.dumps(absence_obj, indent=2, ensure_ascii=False)
+                      + "\n").encode("utf-8")
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.absence.attest"
-        msg_tmp.write_bytes(policy_absence_attest_bytes(run_id, run_nonce, run.name, risk))
+        msg_tmp.write_bytes(policy_absence_attest_bytes(
+            run_id, run_nonce, run.name, risk, absence_bytes=absence_bytes,
+            policy_fields_bytes=policy_fields_bytes))
         sig_tmp = Path(td) / "sig.out"
         proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_tmp, fatal=False)
         if err:
@@ -759,7 +776,14 @@ def _sign_policy_absence_if_possible(run, run_id, run_nonce, risk):
         print(f"note: no-policy attestation signer '{kind}' produced an empty signature — "
               f"policy.absence.json was not written; {note}")
         return
-    write_json(run / POLICY_ABSENCE_FILENAME, {"policy_absent": True, "captured_at": now_iso()})
+    # write_bytes_atomic (not write_json): absence_bytes above is already the exact,
+    # final serialization that was just signed -- writing it verbatim, rather than
+    # re-serializing the same dict a second time via write_json, guarantees the bytes
+    # on disk are byte-for-byte what the signature covers, with zero risk of a second
+    # json.dumps() call producing anything different (there is no such risk today, but
+    # "sign the bytes you already have, never re-derive them" is this module's own
+    # established TOCTOU discipline -- see policy_attest_bytes's snap_bytes parameter).
+    write_bytes_atomic(run / POLICY_ABSENCE_FILENAME, absence_bytes)
     # Codex 4082681153 (P1, valid) — same symlink-safe write as the snapshot-signature
     # sidecar just above; see that call site's comment.
     write_bytes_atomic(run / POLICY_ABSENCE_SIG_FILENAME, sig)
@@ -802,6 +826,14 @@ def cmd_init(args):
     # second-granularity, non-random run_id) that the policy-snapshot signature is
     # also bound to — see _policy_attest_bytes for why run_id alone is not enough.
     run_nonce = secrets.token_hex(16)
+    # v4 (frontier-gate run pr70-round7-v4design, 2026-09-26): the canonical digest of
+    # run.json's policy-relevant fields, computed from `dev`/`rebuttal` (already
+    # resolved above) rather than re-reading run.json back, since run.json itself isn't
+    # written until after signing (see below) -- this is the same "sign the values you
+    # already have in hand, never re-derive them from a file" discipline snap_bytes
+    # already follows for the policy-snapshot case.
+    policy_fields_bytes = canonical_policy_fields_bytes(
+        {"dev_providers": dev, "rebuttal_policy": rebuttal})
     policy_rec = None
     if pol is not None:
         policy_rec = {"file": pol["path"].name, "sha256": pol["sha256"]}
@@ -812,7 +844,8 @@ def cmd_init(args):
         snap_bytes = write_json(run / "policy.snapshot.json", {
             "file": pol["path"].name, "sha256": pol["sha256"],
             "captured_at": now_iso(), "text": pol["text"]})
-        _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_bytes)
+        _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_bytes,
+                                           policy_fields_bytes)
     else:
         # GAP A (frontier-gate run pr70-design, 2026-09-21, checklist item 2): no repo
         # policy file was found. Opportunistically sign an explicit "checked, found none"
@@ -822,7 +855,7 @@ def cmd_init(args):
         # _sign_policy_absence_if_possible writes policy.absence.json itself, and only
         # when signing actually succeeds (see its docstring for why an unsigned one must
         # never be written).
-        _sign_policy_absence_if_possible(run, run_id, run_nonce, risk)
+        _sign_policy_absence_if_possible(run, run_id, run_nonce, risk, policy_fields_bytes)
     write_json(run / "run.json", {
         "run_id": run_id, "run_nonce": run_nonce, "product": args.product or "",
         "risk": risk,

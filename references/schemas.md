@@ -285,6 +285,67 @@ A `resolved_by_patch ≥ 0.8` item is a **proposal**, not a closed finding — t
 still inspects the patch and still updates `validation/<slug>.json` by hand; nothing in
 `patch_check/` closes a finding on its own.
 
+## Policy-attestation signing — `policy.snapshot.sig` / `policy.absence.sig` (v4)
+
+The signed payload behind `policy.snapshot.sig` (the detached signature over
+`policy.snapshot.json`) and `policy.absence.sig` (the detached signature over
+`policy.absence.json`, GAP A's "checked, found no policy file" claim) is built by
+`policy_attest_bytes()` / `policy_absence_attest_bytes()` in `_common.py`.
+`POLICY_ATTEST_VERSION` is currently `"4"`. **Bound** into the signed message, at both
+sign time (`panel.py init`) and verify time (`aggregate.py`, `gate.py plan`/`record`),
+in order:
+
+1. The version tag (`ar-policy-attest-v4` / `ar-policy-absence-attest-v4` — different
+   domain-separation prefixes, so a signature minted for one can never verify as the
+   other).
+2. `run_id`, `run_nonce`, the run directory's own name, and the resolved `risk` tier —
+   unchanged since v2; `run_name` and `risk` are checked separately from `run.json`'s own
+   content, not via the digest below (see item 5).
+3. The live CI-orchestrator identity (`repository`, `commit`, CI run id, CI run
+   attempt) from `ci_signing_context()`, read fresh from the signing/verifying
+   process's own environment — unchanged since v3.
+4. **New in v4:** a length-prefixed canonical-JSON digest (`canonical_policy_fields_bytes()`,
+   built by `canonical_json_bytes()`) of `run.json`'s `BOUND_RUN_JSON_KEYS` —
+   currently `dev_providers` and `rebuttal_policy`. A key present in `run.json` at sign
+   time but deleted (not merely edited) by verify time is bound as JSON `null`, never
+   simply omitted, so deletion doesn't silently match "key absent" either.
+5. For a snapshot: `policy.snapshot.json`'s full raw bytes (unchanged since v1). For an
+   absence claim: **new in v4**, a length-prefixed copy of `policy.absence.json`'s exact
+   raw bytes — pre-v4 this file's own content was never bound by its signature at all
+   (see the CHANGELOG "Round 7" entry).
+
+`canonical_json_bytes()` accepts only `str`/`bool`/`None`/`list`/`dict` (of those),
+`sort_keys=True` with fixed separators — dict key order never affects the output, list
+order always does. `int` and `float` are deliberately unsupported (raise `TypeError`):
+float repr is not guaranteed byte-identical across Python versions/platforms, and
+NaN/Infinity have no valid JSON representation at all.
+
+**What's deliberately left unbound, and why** (`UNBOUND_RUN_JSON_KEYS_BY_DESIGN` in
+`_common.py`, confirmed by reading every call site in `panel.py`/`aggregate.py`/`gate.py`
+— none of these are ever branched on by a decision path):
+
+| key | why it's safe to leave unbound |
+|---|---|
+| `product`, `diff_ref` | interpolated into the human-readable reviewer-prompt text only |
+| `sources` | audit trail of where `risk`/`dev_providers`/`rebuttal_policy` were resolved from (CLI flag / env var / policy file) — written once, never read back |
+| `created_at` | a timestamp for a human reading `run.json`; nothing checks it for staleness/expiry |
+| `policy` | the `{file, sha256}` pointer to the policy-file snapshot — redundant with `snap_bytes` itself, which already changes the moment `policy.snapshot.json`'s content does; this pointer only cross-checks a wholesale-swapped snapshot *file* |
+| `attest_version` | not written as of v4 (no dual-version dispatch yet); reserved so adding it later needs no reclassification |
+
+A future run.json key that lands in neither `BOUND_RUN_JSON_KEYS` nor
+`UNBOUND_RUN_JSON_KEYS_BY_DESIGN` is caught by `tests/run_tests.py`'s
+`t_v4_run_json_key_inventory_is_exhaustive` before it can ship silently unbound.
+
+**For `AR_SIGNING_REQUIRED` adopters: v4 is not backward compatible with v3
+signatures, by design.** There is no migration path — this mirrors how v1→v2 and
+v2→v3 were each handled. A run signed under a pre-v4 script version must be
+re-initialized (`panel.py init`) under the v4 script before it will verify; there is no
+silent fallback from a v4 verification failure to v3 leniency, because that would be a
+downgrade vulnerability, not a compatibility feature. If a real population of
+already-signed v3 runs is ever found to need continued verification, the fix is an
+explicit `run.json['attest_version']`-keyed dispatch — never an unconditional
+try-v4-then-silently-try-v3 fallback.
+
 ## Verdict — `verdict.json` (written by aggregate.py only)
 
 ```json
