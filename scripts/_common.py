@@ -266,17 +266,19 @@ def ci_signing_context():
     pipeline can retry an individual job without that constituting a different execution
     of the reviewed change; CI_PIPELINE_ID is what actually identifies "this run."
 
-    Fail-closed platform selection: GitLab's fields are read ONLY when GITLAB_CI=="true"
-    -- never merely because a GitLab-named variable happens to be present (e.g. stray
-    env inheritance from an unrelated build image, or a local shell where someone set
-    CI_PIPELINE_ID for an unrelated reason). This keeps the four fields coming from ONE
-    coherent, actually-identified platform rather than an unintentional mix of two
-    unrelated CI systems' variables, which would weaken what "this specific pipeline"
-    even means. When GITLAB_CI is not "true", behavior is completely unchanged from
-    before GAP B: GitHub Actions' GITHUB_REPOSITORY ("owner/repo"), GITHUB_SHA (the
-    commit under test), GITHUB_RUN_ID (unique per workflow execution, never reused),
-    GITHUB_RUN_ATTEMPT (increments per re-run of that same execution) -- runner-provided
-    ambient values a job's own code cannot choose or rewrite (unlike a value read from a
+    Fail-closed platform selection: GitLab's fields are read ONLY when GITLAB_CI=="true",
+    and (Codex 4099660075) GitHub Actions' fields are read ONLY when GITHUB_ACTIONS==
+    "true" -- never merely because a GitLab- or GitHub-named variable happens to be
+    present (e.g. stray env inheritance from an unrelated build image, or a local shell
+    where someone set CI_PIPELINE_ID, or GITHUB_REPOSITORY/SHA/RUN_ID/RUN_ATTEMPT, for an
+    unrelated reason -- or to deliberately mimic a platform this process never actually
+    ran on). This keeps the four fields coming from ONE coherent, actually-identified
+    platform rather than an unintentional mix of two unrelated CI systems' variables,
+    which would weaken what "this specific pipeline" even means. GitHub Actions'
+    GITHUB_REPOSITORY ("owner/repo"), GITHUB_SHA (the commit under test), GITHUB_RUN_ID
+    (unique per workflow execution, never reused), GITHUB_RUN_ATTEMPT (increments per
+    re-run of that same execution) -- runner-provided ambient values a job's own code
+    cannot choose or rewrite (unlike a value read from a
     config file or CLI flag). Neither platform identified (local dev, a different CI
     system) -- all four fall back to "local": this still round-trips correctly (sign and
     verify agree, since both read the same live environment) but provides NO cross-run
@@ -295,11 +297,30 @@ def ci_signing_context():
             "run_id": os.environ.get("CI_PIPELINE_ID", "").strip() or _NO_CI_CONTEXT,
             "run_attempt": _GITLAB_NO_RUN_ATTEMPT,
         })
+    # Codex 4099660075 (P1, valid): mirror the GitLab branch's own fail-closed platform
+    # selection immediately above -- GITHUB_REPOSITORY/GITHUB_SHA/GITHUB_RUN_ID/
+    # GITHUB_RUN_ATTEMPT must only be trusted when GITHUB_ACTIONS itself is exactly
+    # "true" (GitHub Actions' own reliably-set indicator, the direct counterpart to
+    # GITLAB_CI above -- GitHub Actions always sets it to the literal string "true" on
+    # every run), never merely because those four GitHub-named variables happen to be
+    # present. Before this fix, this branch was the unconditional "else": any
+    # environment that was not GitLab CI -- a local shell, an unrelated third-party CI
+    # system, or a step deliberately crafted to mimic GitHub Actions -- that simply had
+    # these four variables set was read by _ci_identity_established() as a genuine
+    # GitHub Actions identity, silently granting the trust AR_ALLOW_LOCAL_CI_IDENTITY
+    # exists to require an explicit opt-in for (see its docstring and the checks around
+    # lines 519-533/653-667 below). Without GITHUB_ACTIONS=="true", fall through to the
+    # same all-"local" shape a genuinely unidentified platform already produces.
+    if os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true":
+        return _sanitize_ci_context({
+            "repository": os.environ.get("GITHUB_REPOSITORY", "").strip() or _NO_CI_CONTEXT,
+            "commit": os.environ.get("GITHUB_SHA", "").strip() or _NO_CI_CONTEXT,
+            "run_id": os.environ.get("GITHUB_RUN_ID", "").strip() or _NO_CI_CONTEXT,
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "").strip() or _NO_CI_CONTEXT,
+        })
     return _sanitize_ci_context({
-        "repository": os.environ.get("GITHUB_REPOSITORY", "").strip() or _NO_CI_CONTEXT,
-        "commit": os.environ.get("GITHUB_SHA", "").strip() or _NO_CI_CONTEXT,
-        "run_id": os.environ.get("GITHUB_RUN_ID", "").strip() or _NO_CI_CONTEXT,
-        "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "").strip() or _NO_CI_CONTEXT,
+        "repository": _NO_CI_CONTEXT, "commit": _NO_CI_CONTEXT,
+        "run_id": _NO_CI_CONTEXT, "run_attempt": _NO_CI_CONTEXT,
     })
 
 
@@ -471,14 +492,16 @@ def _encodable_str(s):
         return False
 
 
-def verify_policy_absence_signature(run, meta, *, absence_bytes):
+def verify_policy_absence_signature(run, meta, *, absence_bytes, capture_sig_bytes=None):
     """The policy-ABSENCE counterpart to verify_policy_snapshot_signature — same checks,
     same fail-closed shape (a short BLOCKED-reason string, never raises), same TOCTOU-safe
     required-keyword `absence_bytes` (the caller's already-read policy.absence.json bytes,
-    normally load_attested_policy_bundle()'s `.absence_raw`), but verifies
-    POLICY_ABSENCE_SIG_FILENAME against policy_absence_attest_bytes(). See
-    verify_policy_snapshot_signature for the full rationale of each check; only the
-    signed-bytes builder and the sidecar filename differ."""
+    normally load_attested_policy_bundle()'s `.absence_raw`), same optional
+    `capture_sig_bytes` (Codex 4099660083 — see verify_policy_snapshot_signature's
+    docstring for the full TOCTOU rationale), but verifies POLICY_ABSENCE_SIG_FILENAME
+    against policy_absence_attest_bytes(). See verify_policy_snapshot_signature for the
+    full rationale of each check; only the signed-bytes builder and the sidecar filename
+    differ."""
     run_id = meta.get("run_id")
     run_nonce = meta.get("run_nonce")
     risk = meta.get("risk")
@@ -532,11 +555,21 @@ def verify_policy_absence_signature(run, meta, *, absence_bytes):
             "'local' placeholder. Run this under a recognized CI provider (GitHub "
             "Actions or GitLab CI), or set AR_ALLOW_LOCAL_CI_IDENTITY=1 to explicitly "
             "accept this reduced guarantee for a local/offline signing setup")
+    # Codex 4099660083 (P2, valid): same single-read-then-materialize treatment as
+    # verify_policy_snapshot_signature — see its matching comment for the full rationale.
+    try:
+        sig_bytes = read_regular_file_once(sig_p)
+    except (OSError, ValueError) as e:
+        return f"{POLICY_ABSENCE_SIG_FILENAME} could not be read safely: {e}"
+    if capture_sig_bytes is not None:
+        capture_sig_bytes[POLICY_ABSENCE_SIG_FILENAME] = sig_bytes
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.absence.attest"
         msg_tmp.write_bytes(policy_absence_attest_bytes(run_id, run_nonce, run_name, risk,
                                                           ci_context=ci_context))
-        proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_p, fatal=False)
+        sig_tmp = Path(td) / POLICY_ABSENCE_SIG_FILENAME
+        sig_tmp.write_bytes(sig_bytes)
+        proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_tmp, fatal=False)
     if err:
         return f"verifier '{kind}' could not run: {err}"
     if proc.returncode != 0:
@@ -546,11 +579,28 @@ def verify_policy_absence_signature(run, meta, *, absence_bytes):
     return None
 
 
-def verify_policy_snapshot_signature(run, meta, *, snap_bytes):
+def verify_policy_snapshot_signature(run, meta, *, snap_bytes, capture_sig_bytes=None):
     """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
     Paul's decision, frontier-gate run pr70-provenance, 2026-09-19; hardened against 3
     further P1 findings from a delayed Codex review, frontier-gate run
     pr70-provenance-2, 2026-09-19 — Paul chose fix_all_six_now).
+
+    `capture_sig_bytes` (Codex 4099660083, P2, valid): optional, keyword-only, default
+    None — every existing caller is unaffected. When a dict is passed, this function
+    stores the EXACT bytes it read from POLICY_SIG_FILENAME into
+    `capture_sig_bytes[POLICY_SIG_FILENAME]` before verifying, so a caller that also
+    computes an attestation digest over this run's files (aggregate.py's
+    compute_attestation, within the SAME process invocation) can hash those same bytes
+    instead of independently re-`read_regular_file_once()`-ing the sidecar moments
+    later. Without this, the verifier subprocess and compute_attestation() each read
+    POLICY_SIG_FILENAME from its live, attacker-writable path at a different instant —
+    a TOCTOU window in which an actor with concurrent write access to the run directory
+    could swap the sidecar between the two reads, so the digest baked into verdict.json
+    (and anything later signed over it, via --sign) would silently reflect different
+    bytes than the ones that were actually verified. Reading the sidecar ONCE here (into
+    a temp-file copy the verifier reads instead of the live path) closes that window for
+    the verifier itself too, the same way `snap_bytes` already closes it for the
+    message content (see this docstring's own TOCTOU-fix paragraph below).
 
     Shared by aggregate.py (verifying at aggregate time) and gate.py (verifying at plan/
     record time, so `plan`/`record` can never report success on a waiver `aggregate`
@@ -666,11 +716,29 @@ def verify_policy_snapshot_signature(run, meta, *, snap_bytes):
             "'local' placeholder. Run this under a recognized CI provider (GitHub "
             "Actions or GitLab CI), or set AR_ALLOW_LOCAL_CI_IDENTITY=1 to explicitly "
             "accept this reduced guarantee for a local/offline signing setup")
+    # Codex 4099660083 (P2, valid): read POLICY_SIG_FILENAME's bytes ONCE, right here,
+    # rather than handing the verifier the live `sig_p` path to open itself — see
+    # `capture_sig_bytes`'s docstring paragraph above for the TOCTOU this closes. The
+    # verifier gets a materialized temp-file copy of exactly what was read (same
+    # no-follow/size-capped hardening read_regular_file_once already applies to every
+    # other untrusted run-directory artifact in this module), and any caller that asked
+    # to capture these bytes (for reuse in an attestation digest computed moments later)
+    # gets the identical bytes the verifier actually checked, never a second read of a
+    # path an attacker with concurrent write access to the run directory could have
+    # swapped in between.
+    try:
+        sig_bytes = read_regular_file_once(sig_p)
+    except (OSError, ValueError) as e:
+        return f"{POLICY_SIG_FILENAME} could not be read safely: {e}"
+    if capture_sig_bytes is not None:
+        capture_sig_bytes[POLICY_SIG_FILENAME] = sig_bytes
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.snapshot.attest"
         msg_tmp.write_bytes(policy_attest_bytes(run_id, run_nonce, run_name, risk,
                                                  snap_bytes=snap_bytes, ci_context=ci_context))
-        proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_p, fatal=False)
+        sig_tmp = Path(td) / POLICY_SIG_FILENAME
+        sig_tmp.write_bytes(sig_bytes)
+        proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_tmp, fatal=False)
     if err:
         return f"verifier '{kind}' could not run: {err}"
     if proc.returncode != 0:
@@ -1455,6 +1523,22 @@ def validate_waiver_reason(reason):
     r = reason.strip()
     if not r:
         return "reason is required"
+    if not _encodable_str(r):
+        # Codex 4099660088 (P2, valid): a reason containing a lone UTF-16 surrogate
+        # (e.g. "\ud800") passes every check below (non-empty, not a placeholder, long
+        # enough) -- isinstance(r, str) is true and len() counts surrogates like any
+        # other code point. But this exact string is later embedded verbatim into
+        # verdict.json's gcov["waived"] entry (aggregate.py's check_gates) and rendered
+        # into verdict.md's next-steps guidance, and both eventually .encode("utf-8")
+        # the whole document -- which raises UnicodeEncodeError on a lone surrogate,
+        # uncaught, crashing aggregation (exit 3, no verdict.json at all) instead of the
+        # controlled BLOCKED verdict every other malformed-waiver-metadata case in this
+        # module produces. Structurally the same "JSON permits it, UTF-8 encoding of it
+        # later crashes" gap _encodable_str() already exists to close for run_id/
+        # run_nonce/risk (see its own docstring) -- reject it here, at the same
+        # validation point already responsible for catching every other malformed
+        # reason shape.
+        return "reason contains characters that cannot be represented in UTF-8"
     if r.lower() in WAIVER_REASON_PLACEHOLDERS:
         return f"reason {r!r} is a placeholder, not a real justification"
     if len(r) < WAIVER_REASON_MIN_LEN:
@@ -1535,12 +1619,26 @@ def _validate_gate_exception_common(kind, gate_name, tier, authorized_by, reason
     who = authorized_by.strip() if isinstance(authorized_by, str) else ""
     if not who:
         return f"{kind} without a named authorizer"
+    if not _encodable_str(who):
+        # Codex 4099660088 (P2, valid): same lone-UTF-16-surrogate gap as
+        # validate_waiver_reason's matching check below (see its docstring for the full
+        # rationale) -- authorized_by is embedded verbatim into verdict.json's
+        # gcov["waived"]/["not_applicable"] entries and verdict.md just like reason/
+        # summary is, and crashes the same way at write_json()/markdown-render time if
+        # it carries one.
+        return f"{kind} authorizer contains characters that cannot be represented in UTF-8"
     if strict_reason:
         err = validate_waiver_reason(reason)
         if err:
             return f"{kind} with an invalid reason: {err}"
     elif not (isinstance(reason, str) and reason.strip()):
         return f"{kind} requires a non-empty summary"
+    elif not _encodable_str(reason):
+        # Codex 4099660088 (P2, valid): the NOT_APPLICABLE `summary` field (passed in as
+        # `reason` here — see this function's own docstring) isn't run through
+        # validate_waiver_reason's stricter checks, so it needs its own encodability
+        # check for the same crash this whole fix closes.
+        return f"{kind} summary contains characters that cannot be represented in UTF-8"
     return None
 
 

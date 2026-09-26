@@ -145,6 +145,25 @@ mutation coverage ships (M4). Every waived gate is listed distinctly (with its
 authorizer, reason, and expiry) in `verdict.json` coverage (`gates.waived`) and in
 `verdict.md`.
 
+`authorized_by` (WAIVED and NOT_APPLICABLE) and `reason`/`summary` must additionally be
+**UTF-8 encodable** — a JSON string may legally contain a lone UTF-16 surrogate (e.g.
+`"\ud800"`), which `isinstance`/`len()` accept but which crashes `.encode("utf-8")`. Since
+all three are copied verbatim into `verdict.json`'s `gates.waived`/`gates.not_applicable`
+entries and `write_json()` always writes with `ensure_ascii=False`, an unencodable value
+there is rejected at validation time (BLOCKED, `"...contains characters that cannot be
+represented in UTF-8"`) rather than crashing the whole aggregation run with no
+`verdict.json` written at all.
+
+The tier-floor gates aggregate.py's `check_gates()` reconstructs independently from
+`gate.py`'s `MINIMUM_GATES` are not the only ones it re-derives: it also reconstructs
+whatever the **attested policy** additionally requires for this tier via
+`required_gates.<tier>` in `.adversarial-review.yml`/`.json` (see `gate.py cmd_plan`'s
+`base_required = requested | MINIMUM_GATES[tier]`, where `requested` can come from the
+policy). A `gates/_required.json` manifest that omits a policy-required gate entirely —
+never waived, never marked NOT_APPLICABLE, simply absent — is BLOCKED exactly like one
+missing a tier-floor gate, not silently accepted just because the omitted gate was never
+part of `MINIMUM_GATES` to begin with.
+
 ## Validation record — `validation/<slug>.json` (one per deduped issue)
 
 ```json
@@ -346,6 +365,23 @@ across Python versions *and* interpreter configurations: both the recursion-dept
 integer-string-conversion limit (`PYTHONINTMAXSTRDIGITS`) are per-runtime, so a byte-measured
 policy is the only portable one. The per-file hashes are folded into one manifest digest.
 Re-aggregating an untouched run reproduces the digest bit-for-bit, on any supported runtime.
+Within the ONE call site that computes this digest for the first time in the same
+process invocation that also verified a policy-snapshot/absence signature (ordinary
+aggregation, not `--check-digest`/`--sign`/`--verify-signature` — those are standalone,
+re-checking an *existing* `verdict.json` against whatever is on disk now, with no
+signature-verification call in scope, so they always read fresh, unchanged), the four
+signature-adjacent inputs — `policy.snapshot.json`, `policy.snapshot.sig`,
+`policy.absence.json`, `policy.absence.sig` — are hashed from the *exact bytes the
+signature check already read and verified* (`load_attested_policy_bundle()`'s `.raw`/
+`.absence_raw`, and `verify_policy_*_signature`'s `capture_sig_bytes`), never from a
+second, independent re-read of the live path moments later (Codex 4099660083, P2,
+valid). Without this, an actor with concurrent write access to the run directory could
+swap any of the four between the signature check and this later read, so the digest
+baked into `verdict.json` — and anything signed over it afterward via `--sign` — would
+silently attest to different bytes than the ones actually verified. This changes
+*which read* feeds the hash for those four inputs in that one flow; it does not change
+what gets hashed, the algorithm, or any field shape above.
+
 `aggregate.py --check-digest` recomputes it against the stored value: exit 0 intact;
 exit 1 with each drifted artifact named `DRIFT modified|added|removed`; exit 2 when the
 digest cannot be checked at all — no verdict, an unreadable/malformed or non-object

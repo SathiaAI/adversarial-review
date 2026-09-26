@@ -1225,7 +1225,21 @@ def _stub_signer_env(extra=None):
            # specific value, exactly as t_trusted_signer_refuses_under_pull_request_
            # event_even_when_opted_in and the t_policy_sig_ci_context_* tests already do.
            "GITHUB_EVENT_NAME": "", "GITHUB_REPOSITORY": "", "GITHUB_SHA": "",
-           "GITHUB_RUN_ID": "", "GITHUB_RUN_ATTEMPT": ""}
+           "GITHUB_RUN_ID": "", "GITHUB_RUN_ATTEMPT": "",
+           # Codex 4099660075 (P1, valid): ci_signing_context() now only trusts the
+           # GITHUB_REPOSITORY/SHA/RUN_ID/RUN_ATTEMPT fallback when GITHUB_ACTIONS is
+           # exactly "true" (mirroring the pre-existing GITLAB_CI=="true" gate on the
+           # GitLab branch) -- a real GitHub Actions runner always sets this. Every
+           # existing test in this file that passes `extra={"GITHUB_REPOSITORY": ...,
+           # ...}` to simulate "a real, established GitHub Actions identity" (the
+           # t_policy_sig_ci_context_* / t_policy_sig_ci_identity_* batches) depends on
+           # that identity actually being read, so it belongs here alongside the other
+           # ambient-CI neutralization above, not repeated at every call site. A test
+           # exercising the NEW fail-closed gap this fix closes (GITHUB_* vars present
+           # without GITHUB_ACTIONS=="true") explicitly overrides this back to "" via
+           # `extra=`, the same pattern AR_TRUSTED_SIGNER/AR_ALLOW_LOCAL_CI_IDENTITY
+           # already use above.
+           "GITHUB_ACTIONS": "true"}
     if extra:
         env.update(extra)
     return env
@@ -2859,6 +2873,53 @@ def t_policy_sig_ci_context_gitlab_vars_ignored_unless_gitlab_ci_true():
                 os.environ[k] = v
     assert ctx == {"repository": "local", "commit": "local",
                    "run_id": "local", "run_attempt": "local"}, ctx
+
+
+def t_policy_sig_ci_context_github_vars_ignored_unless_github_actions_true():
+    # Codex 4099660075 (P1, valid): the GitHub-branch counterpart to the GitLab test
+    # immediately above -- GITHUB_REPOSITORY/SHA/RUN_ID/RUN_ATTEMPT being SET is not by
+    # itself enough to establish a GitHub Actions identity; only GITHUB_ACTIONS=="true"
+    # does (a real GitHub Actions runner always sets this). Before this fix, this branch
+    # was the unconditional fallback whenever GITLAB_CI wasn't "true" -- a local shell,
+    # or any other non-GitHub-Actions environment, that simply had these four
+    # GitHub-named variables set (e.g. deliberately, to mimic a GitHub Actions identity
+    # and bypass AR_ALLOW_LOCAL_CI_IDENTITY's explicit opt-in) was read as a genuine,
+    # established identity. Same in-process os.environ mutation pattern as the GitLab
+    # test above, for the same reason (ci_signing_context() reads os.environ directly).
+    from _common import ci_signing_context
+    stray = {**ENV, "GITHUB_REPOSITORY": "someone/should-be-ignored",
+             "GITHUB_SHA": "e" * 40, "GITHUB_RUN_ID": "424242", "GITHUB_RUN_ATTEMPT": "1",
+             "GITHUB_ACTIONS": "",  # explicitly NOT "true"
+             "GITLAB_CI": "", "CI_PROJECT_PATH": "", "CI_COMMIT_SHA": "",
+             "CI_PIPELINE_ID": ""}
+    old = {k: os.environ.get(k) for k in stray}
+    try:
+        os.environ.update(stray)
+        ctx = ci_signing_context()
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert ctx == {"repository": "local", "commit": "local",
+                   "run_id": "local", "run_attempt": "local"}, ctx
+    # Sanity: the SAME variables, with GITHUB_ACTIONS=="true" added, DO establish the
+    # identity -- proving the test above failed on the missing indicator specifically,
+    # not on some other mistake in the stray dict (e.g. a typo'd variable name).
+    stray_real = {**stray, "GITHUB_ACTIONS": "true"}
+    old = {k: os.environ.get(k) for k in stray_real}
+    try:
+        os.environ.update(stray_real)
+        ctx = ci_signing_context()
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert ctx == {"repository": "someone/should-be-ignored", "commit": "e" * 40,
+                   "run_id": "424242", "run_attempt": "1"}, ctx
 
 
 # ------------------------------------------------- Finding #7: CI identity must be
@@ -15230,9 +15291,14 @@ def t_ci_signing_context_sanitizes_unencodable_env_value():
     sys.path.insert(0, str(SKILL / "scripts"))
     import _common
     saved = {k: os.environ.get(k) for k in
-             ("GITLAB_CI", "GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_RUN_ID",
-              "GITHUB_RUN_ATTEMPT")}
+             ("GITLAB_CI", "GITHUB_ACTIONS", "GITHUB_REPOSITORY", "GITHUB_SHA",
+              "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")}
     os.environ.pop("GITLAB_CI", None)
+    # Codex 4099660075: the GitHub branch below is now only read when GITHUB_ACTIONS==
+    # "true" (mirrors the pre-existing GITLAB_CI=="true" gate) -- set it explicitly so
+    # this test still exercises _sanitize_ci_context()'s per-field handling within that
+    # branch, not the new "neither platform identified" fallback.
+    os.environ["GITHUB_ACTIONS"] = "true"
     os.environ["GITHUB_REPOSITORY"] = "owner/\udcff"
     os.environ["GITHUB_SHA"] = "deadbeef"
     os.environ["GITHUB_RUN_ID"] = "123"
@@ -15513,6 +15579,230 @@ def t_absence_deeply_nested_json_blocks_not_recursion_crash():
     assert "Traceback" not in r.stderr, (r.stdout, r.stderr)
     verdict = read(run / "verdict.json")
     assert verdict["verdict"] == "BLOCKED", verdict
+
+
+# ---------------------------------------------------------------- round 5.5 (2026-09-25)
+
+def t_aggregate_manifest_omitting_policy_required_gate_blocks_not_silently_passes():
+    # Codex 4099660066 (P1, valid): round 5.3's floor-gate reconstruction (see
+    # t_aggregate_manifest_omitting_floor_gate_blocks_not_silently_passes above) only
+    # re-derives MINIMUM_GATES[tier] -- gate.py's own tier floor. It says nothing about a
+    # gate the ATTESTED POLICY itself additionally requires for this tier via
+    # required_gates.<tier> (_common.py's _validate_policy shape-checks this at policy
+    # load; gate.py's cmd_plan reads it as `requested` and folds it into the exact same
+    # `base_required = requested | MINIMUM_GATES[tier]` set, gate.py:83-84,101 -- no
+    # distinction anywhere downstream between a floor gate and a policy-added one). Since
+    # _required.json is written by the same untrusted review job the floor check already
+    # distrusts, dropping a policy-added gate from `required` (never waiving it, never
+    # marking it NOT_APPLICABLE -- just omitting it) sailed through unnoticed before this
+    # fix. Configure a NORMAL-tier policy that requires "integration" beyond the floor,
+    # plan a clean run from that policy (no --require override, so the manifest's
+    # `required` genuinely comes from required_gates.NORMAL), then tamper _required.json
+    # to drop "integration" entirely and confirm aggregation BLOCKS instead of silently
+    # reaching a PASS with a policy-mandated gate never checked at all.
+    repo = fresh_repo()
+    (repo / ".adversarial-review.yml").write_text(
+        "risk: NORMAL\ndev_providers: [anthropic]\nrequired_gates:\n"
+        "  NORMAL: [integration]\n")
+    sh(["panel.py", "init"], repo)                       # risk/dev_providers from policy
+    sh(["panel.py", "assign"], repo)
+    sh(["panel.py", "run", "--context-file", "context.md"], repo)
+    sh(["panel.py", "rebuttal"], repo)
+    sh(["gate.py", "plan"], repo)                         # no --require: policy provides it
+    run = latest_run(repo)
+    req_path = run / "gates" / "_required.json"
+    gplan = read(req_path)
+    assert "integration" in gplan["required"], gplan     # sanity: policy gate was present
+    for g in ["build", "unit", "secrets", "deps", "sast"]:
+        sh(["gate.py", "record", "--name", g, "--exit-code", "0", "--summary", "ok"], repo)
+    # Tamper: drop the policy-required gate from the manifest entirely, as if a
+    # compromised planning step had simply never listed it (never waived, never N/A).
+    gplan["required"] = [g for g in gplan["required"] if g != "integration"]
+    write(req_path, gplan)
+    r = sh(["aggregate.py"], repo, expect=2)             # BLOCKED (exit 2), never a silent PASS
+    assert "Traceback" not in r.stderr, (r.stdout, r.stderr)
+    verdict = read(run / "verdict.json")
+    assert verdict["verdict"] == "BLOCKED", verdict
+    assert any("required_gates" in b and "integration" in b for b in verdict["reasons"]), \
+        verdict["reasons"]
+
+
+def t_aggregate_waived_gate_unencodable_reason_blocks_not_crash():
+    # Codex 4099660088 (P2, valid): a WAIVED gate record's `reason` containing a lone
+    # UTF-16 surrogate (e.g. "\ud800") passes validate_waiver_reason's pre-existing
+    # checks (non-empty, not a placeholder, long enough -- len() counts a surrogate like
+    # any other code point), so check_gates() accepts the waiver and copies `reason`
+    # verbatim into verdict.json's gcov["waived"] entry. write_json() then
+    # json.dumps(..., ensure_ascii=False).encode("utf-8") the whole verdict -- which
+    # raises UnicodeEncodeError on the lone surrogate, uncaught, crashing aggregation
+    # (exit 3, no verdict.json at all) instead of the controlled BLOCKED verdict every
+    # other malformed-waiver-metadata case in this module produces. Plant a WAIVED
+    # mutation record (post-plan tamper -- the same untrusted-run-directory threat model
+    # every other WAIVED/NOT_APPLICABLE check in check_gates() already defends against)
+    # with an unencodable reason and confirm aggregation BLOCKS cleanly instead.
+    # (write()'s plain json.dumps(), no ensure_ascii=False, escapes the surrogate to the
+    # ASCII "\ud800" sequence on disk -- exactly how a real hand-edited/attacker-planted
+    # JSON file would carry it -- and read_json() decodes it back to the live surrogate
+    # in memory, same as it would for a genuinely tampered file.)
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    rec_path = run / "gates" / "mutation.json"
+    rec = read(rec_path)
+    assert rec["status"] == "WAIVED", rec
+    tampered_reason = "a" * 16 + "\ud800"   # long enough, not a placeholder -- just unencodable
+    rec["reason"] = tampered_reason
+    write(rec_path, rec)
+    # The record's authorizer/reason/expiry must match the plan manifest's waiver entry
+    # exactly (check_gates' own raced-or-tampered guard, round 5.x) or aggregation BLOCKs
+    # on THAT mismatch before ever reaching validate_waived_gate's reason check -- update
+    # _required.json's waived entry too, so this test actually exercises the encodability
+    # fix rather than a different, pre-existing guard.
+    req_path = run / "gates" / "_required.json"
+    gplan = read(req_path)
+    for w in gplan["waived"]:
+        if w.get("name") == "mutation":
+            w["reason"] = tampered_reason
+    write(req_path, gplan)
+    r = sh(["aggregate.py"], repo, expect=2, env=env)   # BLOCKED (exit 2), never a crash
+    assert "Traceback" not in r.stderr, (r.stdout, r.stderr)
+    verdict = read(run / "verdict.json")
+    assert verdict["verdict"] == "BLOCKED", verdict
+    assert any("mutation" in b and "UTF-8" in b for b in verdict["reasons"]), verdict["reasons"]
+
+
+def t_aggregate_not_applicable_gate_unencodable_summary_blocks_not_crash():
+    # Codex 4099660088 (P2, valid), NOT_APPLICABLE counterpart: `_validate_gate_exception_
+    # common`'s summary branch (strict_reason=False) checked only isinstance+non-empty,
+    # never encodability, so an unencodable `summary` (or `authorized_by`) sailed through
+    # the same way a WAIVED `reason` did. Plant a NOT_APPLICABLE record with an
+    # unencodable summary and confirm aggregation BLOCKS instead of crashing.
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=False)
+    run = latest_run(repo)
+    write(run / "gates" / "sast.json", {
+        "gate": "sast", "status": "NOT_APPLICABLE", "authorized_by": "Paul",
+        "summary": "not applicable: no server-side code in this diff\ud800"})
+    r = sh(["aggregate.py"], repo, expect=2, env=env)   # BLOCKED (exit 2), never a crash
+    assert "Traceback" not in r.stderr, (r.stdout, r.stderr)
+    verdict = read(run / "verdict.json")
+    assert verdict["verdict"] == "BLOCKED", verdict
+    assert any("sast" in b and "UTF-8" in b for b in verdict["reasons"]), verdict["reasons"]
+
+
+def t_panel_init_unsigned_note_warns_of_critical_escalation_when_verifier_configured():
+    # Codex 4099660092 (P2, valid): _sign_policy_snapshot_if_possible's unsigned-outcome
+    # note used to unconditionally claim "this run will BLOCK at aggregate time if any
+    # gate is later waived or marked not-applicable" -- describing only the pre-
+    # checklist-item-6 GAP-A signature check. But authenticate_risk_tier() (_common.py)
+    # forces a run to CRITICAL, UNCONDITIONALLY, whenever a verifier is configured (or
+    # AR_SIGNING_REQUIRED is set) and the run is not PR/MR-author-controlled-triggered --
+    # regardless of whether any gate is ever waived. Same setup as
+    # t_trusted_signer_unset_skips_signing_even_with_working_signer (a fully working
+    # VERIFIER via _stub_signer_env, just no AR_TRUSTED_SIGNER, so signing itself is
+    # skipped) -- confirm the printed note now names the actual consequence.
+    env = _stub_signer_env()
+    del env["AR_TRUSTED_SIGNER"]
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
+    r = sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
+           repo, env=env)
+    assert not (latest_run(repo) / "policy.snapshot.sig").exists()
+    assert "escalated to CRITICAL" in r.stdout, r.stdout
+    assert "regardless of whether any gate is later waived" in r.stdout, r.stdout
+
+
+def t_panel_init_unsigned_note_stays_accurate_with_no_verifier_configured():
+    # Counterpart: with NO verifier configured at all (and no AR_SIGNING_REQUIRED
+    # anchor), authenticate_risk_tier's infrastructure-free exemption still applies --
+    # this run is NOT forced to CRITICAL regardless of waiver, so the ORIGINAL note
+    # ("BLOCKs if a gate is later waived or marked not-applicable") is still the accurate
+    # one and must NOT be replaced by the CRITICAL-escalation wording.
+    env = {**_no_signer_env(), "AR_VERIFIER_CMD": "", "AR_SIGNING_REQUIRED": "",
+           "AR_ALLOW_KEYLESS": "", "AR_COSIGN_IDENTITY": "", "AR_COSIGN_ISSUER": "",
+           "AR_MINISIGN_PUBKEY": "", "AR_MINISIGN_PUBKEY_FILE": "",
+           "GITHUB_EVENT_NAME": ""}
+    repo = fresh_repo()
+    write(repo / ".adversarial-review.json", {"max_waiver_days": 30})
+    r = sh(["panel.py", "init", "--risk", "SENSITIVE", "--dev-providers", "anthropic"],
+           repo, env=env)
+    assert not (latest_run(repo) / "policy.snapshot.sig").exists()
+    assert "escalated to CRITICAL" not in r.stdout, r.stdout
+    assert ("this run will BLOCK at aggregate time if any gate is later waived or "
+            "marked not-applicable") in r.stdout, r.stdout
+
+
+def t_compute_attestation_pinned_bytes_survives_post_verify_sig_swap():
+    # Codex 4099660083 (P2, valid): TOCTOU between verify_policy_snapshot_signature's
+    # own read of policy.snapshot.sig and compute_attestation()'s later, INDEPENDENT
+    # read of the same live path. An actor with concurrent write access to the run
+    # directory could swap the sidecar in between the two reads: the signature check
+    # would verify the ORIGINAL (real) bytes, but the digest baked into verdict.json
+    # would silently hash the SWAPPED bytes instead -- so a tampered sidecar could ride
+    # along inside an attestation that claims to cover "what was verified."
+    #
+    # This test builds a real signed SENSITIVE run, verifies its real
+    # policy.snapshot.sig capturing the exact bytes read (capture_sig_bytes=), then
+    # physically swaps the on-disk sidecar with garbage to simulate the race. It then
+    # proves BOTH halves of the fix in one test: (1) compute_attestation(pinned_bytes=)
+    # with the captured (pre-swap, verified) bytes reflects the ORIGINAL content, not
+    # the swapped garbage -- the fix genuinely closes the window; and (2)
+    # compute_attestation() with NO pinning (the pre-fix behavior every other caller
+    # still uses, by design -- see the function's own docstring) reflects the SWAPPED
+    # garbage instead -- proving the fix is not a no-op and the two code paths
+    # genuinely differ.
+    import _common
+    import aggregate
+    env = _stub_signer_env()
+    repo = _sensitive_repo_with_policy(env=env, waive=True)
+    run = latest_run(repo)
+    sig_path = run / "policy.snapshot.sig"
+    assert sig_path.exists()
+    original_sig_bytes = sig_path.read_bytes()
+
+    touched = [k for k in env if k.startswith("AR_") or k.startswith("GITHUB_")]
+    saved = {k: os.environ.get(k) for k in touched}
+    for k in touched:
+        os.environ[k] = env[k]
+    try:
+        bundle, err = _common.load_attested_policy_bundle(run, require_signature=False)
+        assert err is None, err
+        captured = {}
+        sig_err = _common.verify_policy_snapshot_signature(
+            run, bundle.run_meta, snap_bytes=bundle.raw, capture_sig_bytes=captured)
+        assert sig_err is None, sig_err
+        assert captured.get("policy.snapshot.sig") == original_sig_bytes, (
+            "capture_sig_bytes did not capture the exact bytes verify_policy_snapshot_"
+            "signature actually read and verified")
+
+        # Simulate the race: an actor swaps the sidecar on disk immediately after
+        # verification completes, before compute_attestation() gets to it.
+        sig_path.write_bytes(b"attacker-swapped-signature-bytes-post-verify")
+
+        pinned = {"policy.snapshot.sig": captured["policy.snapshot.sig"],
+                  "policy.snapshot.json": bundle.raw}
+        att_pinned = aggregate.compute_attestation(run, pinned_bytes=pinned)
+        expected_original_hash = "raw:" + hashlib.sha256(original_sig_bytes).hexdigest()
+        assert att_pinned["files"]["policy.snapshot.sig"] == expected_original_hash, (
+            "pinned compute_attestation must hash the bytes verify_policy_snapshot_"
+            "signature actually verified, not whatever is on disk now")
+
+        # Negative control: with NO pinning, the pre-fix behavior (every OTHER caller --
+        # --check-digest/--sign/--verify-signature -- still uses this path by design,
+        # since they have no bundle/verification call in scope) genuinely re-reads the
+        # live, now-tampered path.
+        att_unpinned = aggregate.compute_attestation(run)
+        expected_swapped_hash = "raw:" + hashlib.sha256(
+            b"attacker-swapped-signature-bytes-post-verify").hexdigest()
+        assert att_unpinned["files"]["policy.snapshot.sig"] == expected_swapped_hash, (
+            "sanity check failed: unpinned compute_attestation should still reflect "
+            "the swapped bytes, proving pinning is not a no-op")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 if __name__ == "__main__":

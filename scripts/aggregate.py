@@ -158,6 +158,40 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
                 f"{', '.join(missing_floor)} entirely — not present, not waived, not "
                 "marked NOT_APPLICABLE; re-run `gate.py plan` for the current tier "
                 "(a manifest missing a floor gate outright is not honored)")
+    # Codex 4099660066 (P1, valid): everything above this point only reconstructs
+    # MINIMUM_GATES[tier] -- the tier's baseline floor. It says nothing about a gate the
+    # ATTESTED POLICY itself additionally requires for this tier via required_gates.<tier>
+    # (shape validated at policy load by _common.py's _validate_policy: a mapping of
+    # tier -> list of non-empty gate-name strings). At plan time, gate.py's cmd_plan reads
+    # required_gates.<tier> as the policy source of `requested` and folds it directly into
+    # `base_required = requested | MINIMUM_GATES[tier]` (gate.py:83-84,101) -- i.e. once a
+    # policy adds a gate for this tier, that gate is exactly as required as a floor gate,
+    # with no distinction anywhere else in the system. But _required.json is written by
+    # the same untrusted review job the floor check above already distrusts, so a
+    # tampered/replanned manifest that just drops a policy-specific requirement (e.g. a
+    # policy that adds "integration" for NORMAL, on top of build/unit/secrets/deps/sast)
+    # sailed through unnoticed -- the floor reconstruction has nothing to say about a gate
+    # that was never part of MINIMUM_GATES to begin with. `pol_data` here is the same
+    # attested policy bundle this function already uses for waiver limits above (never the
+    # mutable working-tree policy), so this reuses an already-authenticated value rather
+    # than reading anything new. A repo with no required_gates key, or none for this tier,
+    # has nothing extra to enforce -- {}/[] is a legitimate "policy adds nothing beyond the
+    # floor" configuration, not a gap to report.
+    policy_required_map = pol_data.get("required_gates")
+    if isinstance(policy_required_map, dict):
+        policy_tier_required = policy_required_map.get(tier)
+        if isinstance(policy_tier_required, list):
+            missing_policy = sorted(
+                g for g in set(policy_tier_required) - required_set
+                if isinstance(g, str) and g.strip())
+            if missing_policy:
+                blocked.append(
+                    "gate plan (_required.json) omits gate(s) the attested policy "
+                    f"requires for {_oneline(repr(tier))} via required_gates: "
+                    f"{_oneline(', '.join(missing_policy))} — not present, not waived, "
+                    "not marked NOT_APPLICABLE; re-run `gate.py plan` for the current "
+                    "policy and tier (a manifest missing a policy-required gate outright "
+                    "is not honored)")
     # The manifest's `waived` list must be well-formed before anything is built from it — a
     # non-list, or an entry that is not an object with a safe string `name` (an unhashable value
     # such as {"name": []}, or a newline/markdown name that could forge output, would otherwise
@@ -672,7 +706,7 @@ def _json_nesting_depth(raw):
     return maxd
 
 
-def compute_attestation(run):
+def compute_attestation(run, *, pinned_bytes=None):
     """Reproducible SHA-256 over every recorded JSON artifact that can feed the
     verdict — everything except verdict.json, which is the output (#5).
 
@@ -684,7 +718,28 @@ def compute_attestation(run):
     per-file hashes are folded into one manifest digest, and returned alongside it
     so --check-digest can name exactly which artifact drifted.
     Same untouched run in, same digest out — bit for bit, from the BYTES, so the raw-vs-canonical choice
-    never depends on a per-runtime parser limit (recursion depth or integer-string width)."""
+    never depends on a per-runtime parser limit (recursion depth or integer-string width).
+
+    `pinned_bytes` (Codex 4099660083, P2, valid): optional {relative_path: bytes} map,
+    default None — every existing caller (--check-digest, --sign, --verify-signature, all
+    STANDALONE commands re-checking an EXISTING verdict.json against whatever is
+    currently on disk, with no bundle/signature-verification call in scope) is
+    unaffected and keeps reading everything fresh, exactly as before. The ONE caller
+    that computes this digest for the FIRST time within the SAME invocation that also
+    verified a policy-snapshot/absence signature (aggregate.py's main aggregation path)
+    passes the exact bytes that verification already read and content-validated —
+    policy.snapshot.json/.sig and policy.absence.json/.sig, sourced from
+    load_attested_policy_bundle()'s `.raw`/`.absence_raw` and verify_policy_*_signature's
+    `capture_sig_bytes` — instead of this function independently re-reading those same
+    paths moments later. Without this, an actor with concurrent write access to the run
+    directory could swap any of the four between the earlier verification and this
+    later, independent read, so the digest baked into verdict.json (and anything signed
+    over it afterward via --sign) would silently reflect different bytes than the ones
+    actually verified — the same TOCTOU class this module's other `snap_bytes`/
+    `absence_bytes` parameters already close for verification itself, just not yet for
+    the attestation digest. A path with no entry in `pinned_bytes` is read fresh exactly
+    as before; this only ever narrows what gets re-read, never widens it."""
+    pinned_bytes = pinned_bytes or {}
     files = {}
     # POLICY_SIG_FILENAME (policy.snapshot.sig) and POLICY_ABSENCE_SIG_FILENAME
     # (policy.absence.sig) are non-JSON, PRE-verdict artifacts — both are written by panel.py
@@ -710,23 +765,36 @@ def compute_attestation(run):
     # other artifact it cannot safely read; only a genuinely MISSING sidecar (the
     # ordinary case for most runs) is still silently skipped, same as before this fix.
     for sig_filename in (POLICY_SIG_FILENAME, POLICY_ABSENCE_SIG_FILENAME):
-        try:
-            raw = read_regular_file_once(run / sig_filename)
-        except FileNotFoundError:
-            continue
+        if sig_filename in pinned_bytes:
+            # Codex 4099660083: reuse the exact bytes verify_policy_*_signature already
+            # read and checked, never a second independent read of the live path — see
+            # this function's own docstring paragraph on `pinned_bytes`.
+            raw = pinned_bytes[sig_filename]
+        else:
+            try:
+                raw = read_regular_file_once(run / sig_filename)
+            except FileNotFoundError:
+                continue
         files[sig_filename] = "raw:" + hashlib.sha256(raw).hexdigest()
     for p in sorted(run.rglob("*.json")):
         rel = p.relative_to(run).as_posix()
         if rel == "verdict.json":
             continue
-        # Same hardening as the sidecar loop above, for the same reason — a symlinked
-        # tracked-JSON artifact must not be read through, and reading it the hardened way
-        # here also closes a second symlink bypass beyond what Codex 4077803884 named:
-        # rglob("*.json") matches by name, so it can list a symlink too, and the previous
-        # plain p.read_bytes() would have followed it exactly like the two sidecars did. A
-        # refusal here is an OSError, which propagates to this function's own caller and is
-        # already treated as "cannot verify," never silently absorbed or misread as drift.
-        raw = read_regular_file_once(p)
+        if rel in pinned_bytes:
+            # Codex 4099660083: same reuse as the sidecar loop above, for
+            # policy.snapshot.json/policy.absence.json — the bytes load_attested_policy_
+            # bundle() already read once and content-validated (bundle.raw/.absence_raw),
+            # never re-read independently here.
+            raw = pinned_bytes[rel]
+        else:
+            # Same hardening as the sidecar loop above, for the same reason — a symlinked
+            # tracked-JSON artifact must not be read through, and reading it the hardened way
+            # here also closes a second symlink bypass beyond what Codex 4077803884 named:
+            # rglob("*.json") matches by name, so it can list a symlink too, and the previous
+            # plain p.read_bytes() would have followed it exactly like the two sidecars did. A
+            # refusal here is an OSError, which propagates to this function's own caller and is
+            # already treated as "cannot verify," never silently absorbed or misread as drift.
+            raw = read_regular_file_once(p)
         if _json_nesting_depth(raw) > _MAX_CANON_DEPTH or _max_int_digit_run(raw) > _MAX_INT_DIGITS:
             # Nested beyond the depth cap, OR carrying an integer literal wider than the digit cap:
             # whether json.loads accepts either hinges on a PER-RUNTIME limit (the RecursionError
@@ -1851,10 +1919,19 @@ def _aggregate_cli():
         # signed policy.snapshot.json, or a verifiably-signed policy.absence.json explicitly
         # attesting that no policy governed this run. `not att_err` so this never re-blocks a
         # run already BLOCKED above for the same underlying reason.
+        # Codex 4099660083 (P2, valid): populated by verify_policy_*_signature below with
+        # the EXACT policy.snapshot.sig/policy.absence.sig bytes it read and checked, so
+        # compute_attestation() (further down this function) can hash those same bytes
+        # instead of independently re-reading the sidecar from its live, attacker-
+        # writable path a second time — see compute_attestation's own `pinned_bytes`
+        # docstring paragraph for the TOCTOU this closes. Stays empty (and changes
+        # nothing) on every path that never verifies a signature at all.
+        captured_sig_bytes = {}
         if (gcov["waived"] or gcov["not_applicable"]) and not att_err:
             if bundle.absence_raw is not None:
-                sig_err = verify_policy_absence_signature(run, bundle.run_meta,
-                                                           absence_bytes=bundle.absence_raw)
+                sig_err = verify_policy_absence_signature(
+                    run, bundle.run_meta, absence_bytes=bundle.absence_raw,
+                    capture_sig_bytes=captured_sig_bytes)
                 if sig_err:
                     # _oneline(): sig_err may embed a configured verifier's raw, attacker-
                     # influenceable stderr (see verify_policy_absence_signature's `detail`).
@@ -1865,8 +1942,9 @@ def _aggregate_cli():
                         "run recorded a waived or not-applicable gate but its signed "
                         f"no-policy attestation is not verifiably signed: {_oneline(sig_err)}")
             elif bundle.raw is not None:
-                sig_err = verify_policy_snapshot_signature(run, bundle.run_meta,
-                                                            snap_bytes=bundle.raw)
+                sig_err = verify_policy_snapshot_signature(
+                    run, bundle.run_meta, snap_bytes=bundle.raw,
+                    capture_sig_bytes=captured_sig_bytes)
                 if sig_err:
                     blocked.append(
                         "run recorded a waived or not-applicable gate but its attested "
@@ -1948,8 +2026,27 @@ def _aggregate_cli():
         # digest-less attestation record (digest=None mirrors the existing "computed before #5 /
         # malformed" shape check_digest and verify_signature already treat as unverifiable,
         # never as a false PASS or false drift).
+        # Codex 4099660083 (P2, valid): reuse the exact policy.snapshot.json/.sig (or
+        # policy.absence.json/.sig) bytes already read once above -- load_attested_
+        # policy_bundle()'s bundle.raw/.absence_raw for the JSON content, captured_sig_
+        # bytes for whichever sidecar verify_policy_*_signature actually checked -- so
+        # compute_attestation() hashes the SAME bytes that governed this run's gating and
+        # signature-verification decisions, never an independent, later re-read of a path
+        # an attacker with concurrent write access to the run directory could have
+        # swapped in between. Any of the four legitimately absent (no policy at all, or
+        # no signature ever checked because nothing was waived) simply contributes no
+        # entry, exactly as compute_attestation's own pinned_bytes docstring describes.
+        pinned_bytes = dict(captured_sig_bytes)
+        # `bundle` is None when the earlier content-only load itself failed (att_err set,
+        # already folded into `blocked` above) — same guard this file already uses for
+        # pol_data/attested_policy_sha just above, since bundle.raw/.absence_raw would
+        # otherwise raise AttributeError on None.
+        if bundle is not None and bundle.raw is not None:
+            pinned_bytes["policy.snapshot.json"] = bundle.raw
+        if bundle is not None and bundle.absence_raw is not None:
+            pinned_bytes[POLICY_ABSENCE_FILENAME] = bundle.absence_raw
         try:
-            attestation = compute_attestation(run)
+            attestation = compute_attestation(run, pinned_bytes=pinned_bytes)
         except OSError as e:
             blocked.append(
                 "run artifacts could not be attested safely — a recorded artifact is a "

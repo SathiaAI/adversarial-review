@@ -38,7 +38,14 @@ from _common import (MAX_HIGH_SAMPLES, POLICY_ABSENCE_FILENAME, POLICY_ABSENCE_S
                      policy_attest_bytes, read_json,
                      resolve_run, resolve_setting, resolve_signing_tool,
                      run_signing_tool, trusted_signer_guard_error, write_bytes_atomic,
-                     write_json)
+                     write_json,
+                     # Codex 4099660092: reused here only to give
+                     # _sign_policy_snapshot_if_possible's unsigned-outcome note an
+                     # accurate, context-sensitive message -- the same three signals
+                     # authenticate_risk_tier() (_common.py) checks to decide whether
+                     # signing was actually expected for this run.
+                     _pr_author_controlled_trigger, _signing_required_anchor,
+                     _verifier_configured_here)
 
 DEFAULT_BASE = "https://openrouter.ai/api/v1"
 
@@ -544,6 +551,35 @@ def validate_obj(obj, schema, path="$"):
 
 # ---------------------------------------------------------------- subcommands
 
+def _unsigned_policy_note():
+    """The accurate, context-sensitive consequence of THIS init leaving policy.snapshot.
+    json/policy.absence.json unsigned -- shared by _sign_policy_snapshot_if_possible and
+    _sign_policy_absence_if_possible (Codex 4099660092, P2, valid; see either caller's
+    former inline `note` for the full history of why this must be two messages, not one).
+
+    Whenever signing was actually EXPECTED for this run -- the exact three signals
+    authenticate_risk_tier() (_common.py) checks -- leaving it unsigned forces this run
+    to CRITICAL at aggregate time UNCONDITIONALLY, via authenticate_risk_tier's
+    require_signature=True branch, whether or not any gate is ever waived or marked
+    not-applicable; CRITICAL's `mutation` floor can never be waived, so the run BLOCKs
+    outright. The old, single note describing only "BLOCKs if a gate is later
+    waived/marked not-applicable" (the separate, pre-existing GAP-A signature check in
+    aggregate.py) was accurate only for the OTHER case: no verifier resolves, no
+    AR_SIGNING_REQUIRED anchor, or this run is PR/MR-author-controlled-triggered (still
+    exempt regardless of a verifier or anchor -- see authenticate_risk_tier's own
+    docstring)."""
+    signing_expected = (not _pr_author_controlled_trigger()
+                        and (_verifier_configured_here() or _signing_required_anchor()))
+    if signing_expected:
+        return ("this run's risk tier will be escalated to CRITICAL at aggregate time "
+                "regardless of whether any gate is later waived or marked not-applicable "
+                "-- a verifier is configured for this repository (or AR_SIGNING_REQUIRED "
+                "is set), so signing was expected; CRITICAL's mutation gate can never be "
+                "waived, so this run will BLOCK unless the snapshot ends up signed")
+    return ("this run will BLOCK at aggregate time if any gate is later waived or "
+            "marked not-applicable")
+
+
 def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_bytes):
     """PR70 provenance-binding fix (Option B / require_signing_for_exceptions_only —
     Paul's decision, frontier-gate run pr70-provenance, 2026-09-19; hardened per
@@ -580,8 +616,9 @@ def _sign_policy_snapshot_if_possible(run, run_id, run_nonce, risk, snap_bytes):
     `record --status NOT_APPLICABLE`, so a waiver can never be written that aggregate.py
     would later reject — the two call sites can never disagree, because they share one
     function."""
-    note = ("this run will BLOCK at aggregate time if any gate is later waived or "
-            "marked not-applicable")
+    # Codex 4099660092 (P2, valid): see _unsigned_policy_note's own docstring for why
+    # this can no longer be a single, hardcoded string.
+    note = _unsigned_policy_note()
     trust_err = trusted_signer_guard_error()
     if trust_err:
         print(f"note: policy-snapshot signing skipped ({trust_err}) — "
@@ -678,7 +715,9 @@ def _sign_policy_absence_if_possible(run, run_id, run_nonce, risk):
     to `init`, and the shared verify_policy_absence_signature() in _common.py is what
     actually enforces this signature — hard BLOCK on failure — from gate.py's plan/
     record and aggregate.py's verdict path, never this function itself."""
-    note = "this run will BLOCK at aggregate time if any gate is later waived or marked not-applicable"
+    # Codex 4099660092 (P2, valid): see _unsigned_policy_note's own docstring for why
+    # this can no longer be a single, hardcoded string.
+    note = _unsigned_policy_note()
     trust_err = trusted_signer_guard_error()
     if trust_err:
         print(f"note: no-policy attestation signing skipped ({trust_err}) — "
