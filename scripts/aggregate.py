@@ -1341,7 +1341,21 @@ def check_findings(run, meta, plan, reports, fail, blocked, counts):
         for p in sorted(vdir.glob("*.json")):
             if p.name.startswith("concur-request"):
                 continue
-            records.append((p.name, read_json(p)))
+            # validation/*.json is written by whoever ran validation and is untrusted in the
+            # same FIFO/symlink/oversized-file sense as run.json and panel/<role>.json --
+            # read_json() -> read_regular_file_once() raises OSError for those, and ValueError
+            # for content that isn't valid JSON. Uncaught, that propagated past this loop to
+            # main()'s outer `except Exception: sys.exit(3)` (Codex r4112073820, round 8):
+            # aggregation crashed instead of writing a BLOCKED verdict.json, same bug class
+            # load_reports() was already fixed for on the panel-report side this round.
+            try:
+                rec = read_json(p)
+            except (OSError, ValueError, RecursionError) as e:
+                blocked.append(f"validation/{_oneline(p.name)}: could not be read "
+                                f"(rejected as unsafe or not valid JSON: {_oneline(e)}) — "
+                                "cannot assess it")
+                continue
+            records.append((p.name, rec))
 
     suppressions = {}
     spath = run / "suppressions.json"

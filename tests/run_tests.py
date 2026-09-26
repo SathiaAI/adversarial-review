@@ -16693,5 +16693,32 @@ def t_aggregate_run_json_directory_is_blocked_not_exit3_crash():
     assert not (run / "verdict.json.lock").exists(), "the lock must still be released on this path"
 
 
+def t_check_findings_unreadable_validation_record_blocks_not_exit3_crash():
+    # Codex r4112073820 (P2, valid, round 8 fresh review of a62b4d0): check_findings()'s
+    # validation/*.json load loop called read_json() -- which raises OSError for a FIFO/
+    # symlink/oversized/directory artifact, same as every other run-directory read in this
+    # codebase -- with no exception handling of its own. Same bug class as the run.json read
+    # CodeRabbit r4112007460 already fixed and load_reports() (r4112007447) already fixed for
+    # panel/<role>.json; this is the third, previously-unfixed sibling: a hostile or corrupted
+    # validation/*.json crashed aggregation with a traceback (exit 3) instead of BLOCKING
+    # (exit 2), and dropped the legitimate records processed in the same directory.
+    repo = _complete_sensitive_repo()
+    run = latest_run(repo)
+    # A legitimate record for the real open finding must still be read and processed even
+    # though a *different* file under validation/ is unreadable -- the fix must not treat one
+    # bad record as reason to give up on the whole directory.
+    write(run / "validation" / "idor.json", {
+        "finding_ids": ["security-1"], "classification": "confirmed",
+        "severity": "high", "evidence": "reproduced cross-tenant read locally",
+        "reproduced": True, "regression_test": "tests/test_invoices.py::test_cross_tenant",
+        "resolution": {"fixed": True, "gates_rerun": ["unit", "sast"]}})
+    (run / "validation" / "evil.json").mkdir()  # dir named *.json -> read_json raises OSError
+    r = sh(["aggregate.py"], repo, expect=2)
+    assert "evil.json" in r.stdout, (r.stdout, r.stderr)
+    assert "could not be read" in r.stdout, (r.stdout, r.stderr)
+    assert "Traceback" not in r.stderr, ("must not crash with a traceback", r.stderr)
+    assert not (run / "verdict.json.lock").exists(), "the lock must still be released on this path"
+
+
 if __name__ == "__main__":
     main()
