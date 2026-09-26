@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (POLICY_ABSENCE_FILENAME, POLICY_ABSENCE_SIG_FILENAME,
-                     POLICY_SIG_FILENAME, _policy_bool,
+                     POLICY_SIG_FILENAME, TIER_ROLES, _policy_bool,
                      authenticate_risk_tier, canonical_finding_digest,
                      cosign_sign_argv as _cosign_sign_argv,
                      cosign_verify_argv as _cosign_verify_argv, family_of,
@@ -59,7 +59,11 @@ def load_reports(run, plan):
     for role in plan.get("roles", {}):
         p = run / "panel" / f"{role}.json"
         if p.exists():
-            reports[role] = read_json(p)
+            try:
+                reports[role] = read_json(p)
+            except (OSError, ValueError, RecursionError):
+                pass  # unreadable/malformed report -> treated as missing; check_panel()
+                       # already reports "reviewer reports missing for: ..." for this
     return reports
 
 
@@ -373,11 +377,28 @@ def check_gates(run, tier, fail, blocked, notes, pol_data=None, clock=(None, Non
 
 
 def check_panel(run, meta, plan, reports, blocked):
-    """Returns panel coverage. roles_required is reconstructed from artifacts only:
-    the assigned roles plus any roles a recorded degraded authorization dropped."""
+    """Returns panel coverage. roles_required comes from the run's AUTHENTICATED risk
+    tier (TIER_ROLES[meta['risk']] -- meta['risk'] is already the cryptographically-
+    authenticated value by the time this runs; see this file's own authenticate_
+    risk_tier() call earlier in the same aggregation, which overwrites meta['risk'] in
+    place), never from the plan's own already-assigned role list. Checklist item 4
+    (frontier-gate run pr70-round8-riskauth, 2026-09-26, panel consensus 0.97): trusting
+    the plan's roles as proof of what was REQUIRED is exactly what a flip-risk-to-
+    NORMAL-then-restore attack between `panel.py assign` and this aggregation defeats --
+    the plan would legitimately only contain NORMAL's 4 roles by the time this
+    authenticated CRITICAL/SENSITIVE re-check runs, so treating "assigned roles" and
+    "required roles" as the same list makes the shortfall invisible. A recorded
+    degraded authorization's own missing_roles are still added to roles_required (its
+    pre-existing, legitimate meaning is unchanged), and is also excluded from the new
+    under-provisioned check below -- a degraded panel with recorded authorization is not
+    "missing roles from the plan," it is explicitly allowed to be short those roles;
+    "degraded panel without recorded authorization" (further below) already catches an
+    unauthorized degrade."""
     roles = list(plan.get("roles", {}))
     deg = plan.get("degraded")
-    pcov = {"roles_required": roles + list((deg or {}).get("missing_roles", [])),
+    deg_missing = set((deg or {}).get("missing_roles", []))
+    required = sorted(set(TIER_ROLES.get(meta.get("risk"), [])) | deg_missing)
+    pcov = {"roles_required": required,
             "roles_filled": [r for r in roles if r in reports],
             "substitutions": len(plan.get("substitutions", [])),
             "degraded": deg,
@@ -385,6 +406,13 @@ def check_panel(run, meta, plan, reports, blocked):
     if not roles:
         blocked.append("panel plan missing or empty — run `panel.py assign`")
         return pcov
+    under_provisioned = set(required) - set(roles) - deg_missing
+    if under_provisioned:
+        blocked.append(
+            f"panel plan does not meet this run's authenticated risk tier "
+            f"({meta.get('risk')!r})'s role floor — missing from the plan itself: "
+            f"{', '.join(sorted(under_provisioned))} (re-run `panel.py assign` under "
+            "the current risk tier)")
     dev = set(meta.get("dev_providers", []))
     fams = [plan["roles"][r]["family"] for r in roles]
     if len(set(fams)) != len(fams):
@@ -1775,7 +1803,8 @@ def _aggregate_cli():
             print(f"cannot acquire the aggregate lock ({lock_path.name}): {e}", file=sys.stderr)
             sys.exit(3)
     try:
-        meta = read_json(run / "run.json")
+        run_json_raw = read_regular_file_once(run / "run.json")
+        meta = json.loads(run_json_raw.decode("utf-8"))
 
         fail, blocked, notes = [], [], []
         counts = {"gates": 0, "reviewers": 0, "findings_high_critical": 0,
@@ -2037,6 +2066,15 @@ def _aggregate_cli():
         # no signature ever checked because nothing was waived) simply contributes no
         # entry, exactly as compute_attestation's own pinned_bytes docstring describes.
         pinned_bytes = dict(captured_sig_bytes)
+        # Same reuse, for run.json: the raw bytes read once above (into `meta` via
+        # json.loads) are the ones that governed this run's risk-tier and v4 canonical-
+        # policy-field verification decisions, so compute_attestation must hash those
+        # exact bytes rather than independently re-reading run.json from disk a second
+        # time — otherwise an actor with concurrent write access to the run directory
+        # could swap run.json between the read above and compute_attestation's own
+        # rglob loop, and the digest --check-digest later trusts would cover content this
+        # run never actually verified against.
+        pinned_bytes["run.json"] = run_json_raw
         # `bundle` is None when the earlier content-only load itself failed (att_err set,
         # already folded into `blocked` above) — same guard this file already uses for
         # pol_data/attested_policy_sha just above, since bundle.raw/.absence_raw would

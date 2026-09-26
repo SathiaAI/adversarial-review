@@ -304,9 +304,9 @@ in order:
 3. The live CI-orchestrator identity (`repository`, `commit`, CI run id, CI run
    attempt) from `ci_signing_context()`, read fresh from the signing/verifying
    process's own environment — unchanged since v3.
-4. **New in v4:** a length-prefixed canonical-JSON digest (`canonical_policy_fields_bytes()`,
-   built by `canonical_json_bytes()`) of `run.json`'s `BOUND_RUN_JSON_KEYS` —
-   currently `dev_providers` and `rebuttal_policy`. A key present in `run.json` at sign
+4. **New in v4:** a length-prefixed copy of the canonical-JSON bytes themselves (not hashed —
+   `canonical_policy_fields_bytes()`, built by `canonical_json_bytes()`) of `run.json`'s
+   `BOUND_RUN_JSON_KEYS` — currently `dev_providers` and `rebuttal_policy`. A key present in `run.json` at sign
    time but deleted (not merely edited) by verify time is bound as JSON `null`, never
    simply omitted, so deletion doesn't silently match "key absent" either.
 5. For a snapshot: `policy.snapshot.json`'s full raw bytes (unchanged since v1). For an

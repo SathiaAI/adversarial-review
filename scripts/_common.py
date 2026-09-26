@@ -191,13 +191,13 @@ def _atomic_replace(path, data):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        os.replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
-    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------- signing (shared)
@@ -413,12 +413,17 @@ def ci_signing_context():
     verify agree, since both read the same live environment) but provides NO cross-run
     identity in that shape, only the pre-existing run_name/run_nonce/risk binding does.
 
-    See docs/THREAT-MODEL.md for what this can and cannot prove on its own, in
-    particular that these values only protect against REPLAY (an old, validly-signed
-    run's files copied elsewhere) -- they do not stop code running in the SAME job that
-    performs the signing from choosing its own policy content to sign; that is what the
+    See docs/THREAT-MODEL.md ("What CI-identity signals do and do not prove") for what
+    this can and cannot prove on its own. Two distinct limits, both disclosed there, not
+    merely one: these values only protect against REPLAY (an old, validly-signed run's
+    files copied elsewhere) -- they do not stop code running in the SAME job that
+    performs the signing from choosing its own policy content to sign, which is what the
     isolated trusted-signer job (see action.yml / ci.yml / examples/.gitlab-ci.yml) is
-    for."""
+    for; AND every one of GITHUB_ACTIONS/GITHUB_REPOSITORY/GITLAB_CI/etc. is itself
+    self-reported by the process's own environment, never verified against the
+    platform's own OIDC identity or API, so this function's return value is
+    replay-binding entropy, never proof the calling process is actually executing
+    inside real CI infrastructure."""
     if os.environ.get("GITLAB_CI", "").strip().lower() == "true":
         return _sanitize_ci_context({
             "repository": os.environ.get("CI_PROJECT_PATH", "").strip() or _NO_CI_CONTEXT,
@@ -490,7 +495,16 @@ def _ci_identity_established(ci_context):
     provides NO actual cross-run identity distinction -- "local" is not an identity, it
     is the absence of one. This predicate is what lets verify_policy_snapshot_signature /
     verify_policy_absence_signature refuse to treat that non-distinction as a real
-    guarantee by default (see AR_ALLOW_LOCAL_CI_IDENTITY below)."""
+    guarantee by default (see AR_ALLOW_LOCAL_CI_IDENTITY below).
+
+    Naming note (checklist items 9-13, frontier-gate run pr70-round8-riskauth,
+    2026-09-26): "established" here means "distinct enough from the 'local' fallback to
+    bind a signature to one specific run" -- NOT "cryptographically verified to be
+    running inside real CI infrastructure." ci_signing_context()'s own fields are
+    entirely self-reported environment variables (see its docstring's pointer to
+    docs/THREAT-MODEL.md); this predicate cannot and does not authenticate the
+    platform, only give the replay-binding actual entropy across two otherwise-
+    indistinguishable environments."""
     return (ci_context.get("repository") != _NO_CI_CONTEXT
             and ci_context.get("commit") != _NO_CI_CONTEXT
             and ci_context.get("run_id") != _NO_CI_CONTEXT)
@@ -742,12 +756,23 @@ def verify_policy_absence_signature(run, meta, *, absence_bytes, capture_sig_byt
         return f"{POLICY_ABSENCE_SIG_FILENAME} could not be read safely: {e}"
     if capture_sig_bytes is not None:
         capture_sig_bytes[POLICY_ABSENCE_SIG_FILENAME] = sig_bytes
+    # Fix (v4 canonical-field verification): see the matching comment in
+    # verify_policy_snapshot_signature for the full rationale -- meta's dev_providers/
+    # rebuttal_policy fields could have been tampered with into a shape
+    # canonical_policy_fields_bytes() cannot canonicalize (a bare TypeError), which must
+    # become a controlled BLOCKED reason here, not an uncaught crash.
+    try:
+        policy_fields_bytes = canonical_policy_fields_bytes(meta)
+    except TypeError as e:
+        return (f"run.json's dev_providers/rebuttal_policy fields cannot be "
+                f"canonicalized for signature verification ({e}) — likely tampered "
+                "or corrupted")
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.absence.attest"
         msg_tmp.write_bytes(policy_absence_attest_bytes(
             run_id, run_nonce, run_name, risk, ci_context=ci_context,
             absence_bytes=absence_bytes,
-            policy_fields_bytes=canonical_policy_fields_bytes(meta)))
+            policy_fields_bytes=policy_fields_bytes))
         sig_tmp = Path(td) / POLICY_ABSENCE_SIG_FILENAME
         sig_tmp.write_bytes(sig_bytes)
         proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_tmp, fatal=False)
@@ -913,12 +938,26 @@ def verify_policy_snapshot_signature(run, meta, *, snap_bytes, capture_sig_bytes
         return f"{POLICY_SIG_FILENAME} could not be read safely: {e}"
     if capture_sig_bytes is not None:
         capture_sig_bytes[POLICY_SIG_FILENAME] = sig_bytes
+    # Fix (v4 canonical-field verification): meta is an already-parsed run.json dict
+    # that could have been tampered with by an actor with run-directory write access
+    # (e.g. dev_providers replaced with an int instead of a list of strings).
+    # canonical_policy_fields_bytes()'s internal _check() raises a bare TypeError for
+    # any value outside str/bool/None/list/dict, which is NOT caught anywhere in this
+    # function -- computing it here, before the TemporaryDirectory block, lets this
+    # function keep its own fail-closed contract (a short BLOCKED-reason string, never
+    # raise) instead of crashing the caller with an uncaught TypeError.
+    try:
+        policy_fields_bytes = canonical_policy_fields_bytes(meta)
+    except TypeError as e:
+        return (f"run.json's dev_providers/rebuttal_policy fields cannot be "
+                f"canonicalized for signature verification ({e}) — likely tampered "
+                "or corrupted")
     with tempfile.TemporaryDirectory() as td:
         msg_tmp = Path(td) / "policy.snapshot.attest"
         msg_tmp.write_bytes(policy_attest_bytes(
             run_id, run_nonce, run_name, risk, snap_bytes=snap_bytes,
             ci_context=ci_context,
-            policy_fields_bytes=canonical_policy_fields_bytes(meta)))
+            policy_fields_bytes=policy_fields_bytes))
         sig_tmp = Path(td) / POLICY_SIG_FILENAME
         sig_tmp.write_bytes(sig_bytes)
         proc, err = run_signing_tool(argv_tmpl, msg_tmp, sig_tmp, fatal=False)
@@ -978,12 +1017,20 @@ def resolve_signing_tool(env_cmd, builders, fatal=True):
     cmd = os.environ.get(env_cmd, "").strip()
     if cmd:
         try:
-            return shlex.split(cmd), "custom", None
+            argv = shlex.split(cmd)
         except ValueError as e:
             msg = f"{env_cmd} is not a valid command template ({e}): {cmd!r}"
             if fatal:
                 sign_fail(msg)
             return None, None, msg
+        if not any("{sig}" in tok for tok in argv):
+            msg = (f"{env_cmd} does not reference {{sig}} in its command template — a "
+                   f"command that never opens the signature file cannot actually verify "
+                   f"or produce one: {cmd!r}")
+            if fatal:
+                sign_fail(msg)
+            return None, None, msg
+        return argv, "custom", None
     for kind, build in builders:
         argv = build()
         if argv is not None:
@@ -1055,7 +1102,11 @@ _UNTRUSTED_GITHUB_EVENTS = frozenset({"pull_request"})
 # template (examples/.gitlab-ci.yml) keeps the keyed ar-panel job's trust independent of
 # this check by never checking out MR-author-controlled refs for the signing step in the
 # first place, but this guard stays defense-in-depth for any adopter's own topology.
-_UNTRUSTED_GITLAB_PIPELINE_SOURCES = frozenset({"merge_request_event"})
+# "external_pull_request_event" is GitLab's "Pipelines for external pull requests"
+# feature (running a GitHub PR's code via a mirrored GitLab pipeline) and is just as
+# MR-author-controlled as merge_request_event, so it belongs in this denylist too.
+_UNTRUSTED_GITLAB_PIPELINE_SOURCES = frozenset({
+    "merge_request_event", "external_pull_request_event"})
 
 
 def _pr_author_controlled_trigger():
@@ -1446,6 +1497,19 @@ POLICY_KEYS = ("risk", "dev_providers", "rebuttal_policy", "required_gates", "pi
                "allow_critical_waivers", "max_waiver_days")
 VALID_RISKS = ("NORMAL", "SENSITIVE", "CRITICAL")
 VALID_REBUTTAL = ("critical", "contention", "any")
+# The panel's reviewer roles and each risk tier's floor. Lives here, not in panel.py,
+# because aggregate.py's check_panel() (frontier-gate run pr70-round8-riskauth,
+# 2026-09-26, panel consensus 0.97) needs the SAME tier->role-floor mapping panel.py's
+# cmd_assign uses, to independently re-derive what a run's AUTHENTICATED risk tier
+# actually requires -- rather than trusting the plan's own already-assigned role list,
+# which is exactly what a flip-risk-to-NORMAL-then-restore attack between assign and
+# aggregate would otherwise let through unnoticed (checklist item 4).
+ROLES = ["security", "correctness", "data_privacy", "test_quality", "reliability", "output_fidelity"]
+TIER_ROLES = {
+    "NORMAL": ["security", "correctness", "test_quality", "output_fidelity"],
+    "SENSITIVE": ROLES,
+    "CRITICAL": ROLES,
+}
 MAX_HIGH_SAMPLES = 25  # practical upper bound on corroboration samples (E4-S3): bounds the
                        # cost blast radius and the not_run list built on a cost-abort.
 # Scoped/bounded mutation budget — a repo-tunable cost cap so mutation testing survives
@@ -2066,7 +2130,7 @@ def read_run_risk(run):
         return None, f"run.json is unreadable ({e})"
     try:
         runjson = json.loads(runjson_bytes.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as e:
+    except (ValueError, UnicodeDecodeError, RecursionError) as e:
         return None, f"run.json is not valid JSON/UTF-8 ({e})"
     if not isinstance(runjson, dict):
         return None, "run.json is not a JSON object"

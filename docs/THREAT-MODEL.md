@@ -15,9 +15,12 @@ independently by `aggregate.py` from recorded gate evidence.
 ## What this mechanism is (and is not)
 
 A policy file (`.adversarial-review.yml`/`.json`) can raise the waiver ceiling above the strict
-built-in defaults — e.g. allow a CRITICAL-tier waiver, or extend `max_waiver_days`. Whenever a
-policy file is configured, `panel.py init` opportunistically signs the exact policy text it
-resolved (`policy.snapshot.json`) — bound, as of batch 3, to: the run's id, a random per-run
+built-in defaults — e.g. allow a CRITICAL-tier waiver, or extend `max_waiver_days`. As of batch 3,
+signing is never opportunistic merely because a policy file is configured and a working signer
+happens to be available: a designated trusted job must explicitly set `AR_TRUSTED_SIGNER=1`
+(`trusted_signer_guard_error()`) before `panel.py init` will attempt to sign anything. Only once
+that opt-in is set does `panel.py init` sign the exact policy text it resolved
+(`policy.snapshot.json`) — bound, as of batch 3, to: the run's id, a random per-run
 nonce, the run directory's own immutable name, the run's resolved risk tier, and the live
 CI-orchestrator identity (repository/commit/CI-run-id/CI-run-attempt). Any run that later records
 a WAIVED or NOT_APPLICABLE gate must present a signature that verifies against this exact payload,
@@ -133,6 +136,65 @@ for their specific branch-protection configuration, is *also* reachable by an un
 easily-testable backstop for the single most common misconfiguration (copy-pasting one job's env
 into another), not a general trust-topology verifier.
 
+## What CI-identity signals do and do not prove (checklist items 9-13, frontier-gate run
+pr70-round8-riskauth, 2026-09-26, panel consensus 0.97 — documentation only, no code
+behavior change)
+
+`ci_signing_context()`, `_ci_identity_established()`, and `_pr_author_controlled_trigger()`
+all read the same handful of environment variables: `GITHUB_ACTIONS`, `GITHUB_REPOSITORY`,
+`GITHUB_SHA`, `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`, `GITHUB_EVENT_NAME`, `GITLAB_CI`,
+`CI_PROJECT_PATH`, `CI_COMMIT_SHA`, `CI_PIPELINE_ID`, `CI_PIPELINE_SOURCE`. Every one of
+these is **self-reported by the process's own environment** — nothing in this codebase
+calls out to GitHub's or GitLab's own API, or verifies an OIDC identity token issued by
+their platform, to independently confirm the job is actually executing on their
+infrastructure. A local shell, a self-hosted runner, a container someone builds by hand, or
+any other process can set `GITHUB_ACTIONS=true` plus plausible-looking values for the rest,
+and every one of the checks above would accept them at face value. Naming this predicate
+`_ci_identity_established` (and the escape-hatch flag `AR_ALLOW_LOCAL_CI_IDENTITY`) risks
+reading as "this proves you are really inside GitHub/GitLab's infrastructure" — it does not,
+and never has.
+
+What these signals **do** provide: replay-binding entropy. `policy_attest_bytes` v3 binds
+repository/commit/CI-run-id/CI-run-attempt fresh from the *verifying* process's own
+environment (never from a copyable file), so a validly-signed run's artifacts cannot be
+replayed onto a different run/commit/repository even when the run directory's own name is
+forced to match (batch 2, above). `_ci_identity_established()` exists purely so that two
+independently unidentified environments (two laptops, or a laptop and an unrecognized
+third-party CI system) — which would otherwise compute byte-for-byte identical "local"
+placeholders and provide *no* actual distinction — are told apart from a genuine
+recognized-provider run, where the four fields carry real (if self-reported) per-run
+entropy. That is a **cross-run distinguishability** guarantee, never a **platform
+authentication** guarantee. Read every occurrence of "CI-provided identity" / "CI identity
+is established" in this codebase's docstrings and error strings with that scope in mind:
+"a value distinct enough to bind a signature to one specific run" — never "verified proof
+this is really CI infrastructure."
+
+Where the actual, load-bearing trust boundary lives instead (see "adopter
+(workflow-configuration) responsibilities" above, restated here because it is the direct
+answer to "then what stops someone from just setting these env vars themselves?"): (a) the
+trusted signer's own secret (`AR_SIGNER_CMD`'s key material, `AR_MINISIGN_KEY`, or a cosign
+OIDC token) never being available to a job an untrusted contributor's code can reach —
+that's a property of the adopter's own workflow YAML and platform-level job/environment
+secret scoping, not of anything this codebase reads from the run directory; and (b) which
+job, with which permissions, a workflow file tells the runner to execute for the *signing*
+step — `trusted_signer_guard_error()` is a narrow, best-effort backstop for one common
+misconfiguration of this (see above), not a substitute for it. An attacker who can forge
+`GITHUB_ACTIONS=true` on their own laptop still cannot produce a valid signature without the
+signer's actual secret, which this whole CI-identity mechanism was never the thing
+protecting in the first place.
+
+A real fix for "prove this process is genuinely executing inside GitHub Actions/GitLab CI
+infrastructure" exists and is well-understood — verifying the platform's own OIDC identity
+token (the same class of mechanism cosign keyless already leans on for signer identity,
+"Cryptographic CI-identity pinning" above) against that platform's OIDC issuer, rather than
+trusting self-reported environment variables at all. This is a genuinely new feature, not a
+wording fix, and building it now would force every adopter without an OIDC-capable CI
+provider (in particular every minisign-only or plain-`AR_SIGNER_CMD` setup) into
+`AR_ALLOW_LOCAL_CI_IDENTITY=1` permanently just to keep working — a worse regression than
+the gap it would close. The round-8 frontier panel's explicit decision was: document this
+scope honestly now (this section), build the OIDC-based attestation later as its own,
+separately-evaluated feature. **Open, tracked** — not silently dropped.
+
 ## Threats → mitigation → status
 
 | Threat | Mitigation | Status |
@@ -149,9 +211,10 @@ into another), not a general trust-topology verifier.
 | A signed repo's policy.snapshot.json/signature is deleted or its verification starts failing (rotated key, tampered artifact), and the run self-reports a low risk tier so it slips through with reduced gates | `authenticate_risk_tier()` forces risk to CRITICAL and BLOCKS whenever signing was expected (a verifier resolves, or `AR_SIGNING_REQUIRED` says so) but cannot be verified — CRITICAL's `mutation` gate can never be waived | **Shipped round 5** (`AR_SIGNING_REQUIRED` anchor + `RISK TIER UNAUTHENTICATED`) |
 | Downgrade-to-exempt: an attacker deletes BOTH `policy.snapshot.json` and any signed absence attestation, AND strips the verifier from the job env, making a previously-signed repo look exactly like one that was never signed | `AR_SIGNING_REQUIRED`, but only when its source is one a same-repo PR genuinely cannot edit | **Partially shipped round 5** — the mechanism (a forced anchor) shipped; closing the gap for real requires an anchor source outside the calling repo's own workflow file, which most adopters have not yet configured. See the corrected section below |
 | A repository with no signing infrastructure at all gets forced to CRITICAL on every run once `mutation` is checked | Deliberately NOT built this round — see "What round 5 deliberately did not build" below | **Open, tracked** (roadmap `pr70-round5-signing-hardening-and-keyless-onboarding.md`, M4-dependent) |
-| A process that merely sets `GITHUB_EVENT_NAME=pull_request` (never running inside real GitHub Actions) is trusted by `_pr_author_controlled_trigger()` as a PR-author-controlled job, letting `authenticate_risk_tier()`'s unsigned-exempt path be forced even when `AR_SIGNING_REQUIRED=1` demands strict authentication | `_pr_author_controlled_trigger()` now only reads `GITHUB_EVENT_NAME` when `GITHUB_ACTIONS=="true"` — the same fail-closed platform-selection gate `ci_signing_context()` already had | **Shipped round 6** (commit pending) |
+| A process that merely sets `GITHUB_EVENT_NAME=pull_request` (never running inside real GitHub Actions) is trusted by `_pr_author_controlled_trigger()` as a PR-author-controlled job, letting `authenticate_risk_tier()`'s unsigned-exempt path be forced even when `AR_SIGNING_REQUIRED=1` demands strict authentication | `_pr_author_controlled_trigger()` now only reads `GITHUB_EVENT_NAME` when `GITHUB_ACTIONS=="true"` — the same fail-closed platform-selection gate `ci_signing_context()` already had | **Shipped round 6** |
 | `run.json` fields other than `risk` that affect the computed verdict are not bound into the policy-attestation signature, so editing them post-signing (with the signature staying valid) can silently change verdict-relevant behavior: `rebuttal_policy` (contention→critical drops a required SENSITIVE-tier rebuttal round), `dev_providers` (makes a development-only review look independent), and the absence-attestation's `captured_at`/`dev_providers` | `POLICY_ATTEST_VERSION` **v4**: `canonical_policy_fields_bytes()` binds a canonical-JSON digest of `BOUND_RUN_JSON_KEYS` (`dev_providers`, `rebuttal_policy`) into both `policy_attest_bytes` and `policy_absence_attest_bytes`, closing the whole class at once rather than one field at a time; a new `t_v4_run_json_key_inventory_is_exhaustive` guard test fails CI if a future `run.json` key is added without being classified into `BOUND_RUN_JSON_KEYS` or `UNBOUND_RUN_JSON_KEYS_BY_DESIGN`. Deliberately no v3-signature migration path — see `references/schemas.md`'s policy-attestation-signing section | **Shipped round 7** (commit pending) |
 | `policy.absence.json`'s OWN file content (`{policy_absent, captured_at}`) was never bound by its own signature at all — `verify_policy_absence_signature` accepted an `absence_bytes` keyword that `policy_absence_attest_bytes` never actually referenced, so editing the claim file post-signing (without touching `policy.absence.sig`) went completely undetected | `POLICY_ATTEST_VERSION` **v4**: `panel.py`'s `_sign_policy_absence_if_possible` now computes `policy.absence.json`'s exact bytes in memory, signs over them (threaded through as `absence_bytes`), and only writes them to disk afterward; `verify_policy_absence_signature` verifies against those same bytes | **Shipped round 7** (commit pending) |
+| `GITHUB_ACTIONS`/`GITHUB_REPOSITORY`/etc. (and their GitLab equivalents) are entirely self-reported environment variables, never verified against the platform's own OIDC identity or API — a process outside real CI infrastructure that sets them is indistinguishable, to `ci_signing_context()`/`_ci_identity_established()`/`_pr_author_controlled_trigger()`, from a genuine CI job | Documented, not code-fixed this round — see "What CI-identity signals do and do not prove" above for the actual trust boundary (signer-secret isolation + job separation, both adopter-configured) and the tracked OIDC-attestation follow-up | **Open, tracked** (documentation-only round 8; round-8 panel decision `fix_b_and_c_now_document_a`, consensus 0.97) |
 
 ## Round 5 — unauthenticated risk-tier fallback (checklist item 6, refined)
 
