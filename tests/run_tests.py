@@ -2922,6 +2922,74 @@ def t_policy_sig_ci_context_github_vars_ignored_unless_github_actions_true():
                    "run_id": "424242", "run_attempt": "1"}, ctx
 
 
+def t_pr_author_controlled_trigger_requires_github_actions_true():
+    # Codex 4110155767 (P1, valid): _pr_author_controlled_trigger()'s GitHub-branch
+    # check is now only read when GITHUB_ACTIONS=="true" -- the same fail-closed
+    # platform-selection gate round 5.5 (commit 567f558) added to the sibling function
+    # ci_signing_context() (see t_policy_sig_ci_context_github_vars_ignored_unless_
+    # github_actions_true just above), backported here to this second, independent call
+    # site. Before this fix, GITHUB_EVENT_NAME=='pull_request' alone was trusted
+    # regardless of GITHUB_ACTIONS, so a process that simply had that one variable set --
+    # never touching real GitHub Actions -- was read by authenticate_risk_tier() as "this
+    # run structurally cannot have been signed," taking the unsigned-exempt path even
+    # when AR_SIGNING_REQUIRED=1 demanded strict authentication (the end-to-end
+    # regression this enables is covered by
+    # t_item6_pull_request_event_without_github_actions_forces_unauthenticated below).
+    # Same in-process os.environ mutation pattern as the ci_signing_context tests above,
+    # for the same reason (_pr_author_controlled_trigger reads os.environ directly).
+    from _common import _pr_author_controlled_trigger
+    stray = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_ACTIONS": "",  # explicitly NOT "true"
+             "GITLAB_CI": "", "CI_PIPELINE_SOURCE": ""}
+    old = {k: os.environ.get(k) for k in stray}
+    try:
+        os.environ.update(stray)
+        result = _pr_author_controlled_trigger()
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert result is False, result
+    # Sanity: the SAME GITHUB_EVENT_NAME, with GITHUB_ACTIONS=="true" added, DOES
+    # establish the PR-author-controlled trigger -- proving the assertion above failed
+    # on the missing indicator specifically, not some other mistake in the stray dict.
+    stray_real = {**stray, "GITHUB_ACTIONS": "true"}
+    old = {k: os.environ.get(k) for k in stray_real}
+    try:
+        os.environ.update(stray_real)
+        result = _pr_author_controlled_trigger()
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert result is True, result
+
+
+def t_item6_pull_request_event_without_github_actions_forces_unauthenticated():
+    # THE Finding A regression, end-to-end. Before this fix, anything that could simply
+    # SET GITHUB_EVENT_NAME=pull_request -- without ever running inside real GitHub
+    # Actions (GITHUB_ACTIONS is explicitly "" here, unlike the genuine-exemption tests
+    # above which use _stub_signer_env()'s GITHUB_ACTIONS: "true" default) -- could force
+    # authenticate_risk_tier()'s PR-exemption path, silently bypassing
+    # AR_SIGNING_REQUIRED's CRITICAL escalation even though this was never a real GitHub
+    # Actions pull_request-triggered job. After the fix, GITHUB_ACTIONS not being "true"
+    # means _pr_author_controlled_trigger() returns False here, so this falls through to
+    # the ordinary AR_SIGNING_REQUIRED anchor check exactly like
+    # t_item6_signing_required_anchor_blocks_even_without_local_verifier's
+    # workflow_dispatch case -- RISK TIER UNAUTHENTICATED, not UNSIGNED EXEMPT.
+    env = {**ENV, "AR_SIGNING_REQUIRED": "1", "GITHUB_EVENT_NAME": "pull_request",
+           "GITHUB_ACTIONS": ""}
+    assert not env.get("AR_VERIFIER_CMD"), "ENV's own neutralized baseline (see its def)"
+    repo = fresh_repo()
+    sh(["panel.py", "init", "--risk", "NORMAL", "--dev-providers", "anthropic"], repo, env=env)
+    r = sh(["gate.py", "plan", "--require", "build,unit,secrets,deps,sast"], repo, env=env)
+    assert "RISK TIER UNAUTHENTICATED" in r.stderr, r.stderr
+    assert "AR_SIGNING_REQUIRED is set for this repository" in r.stderr, r.stderr
+
+
 # ------------------------------------------------- Finding #7: CI identity must be
 # ESTABLISHED, not merely self-consistent (frontier-gate run pr70-trust-model2,
 # 2026-09-22, checklist item 3). The CI-context MATCH tests above prove sign-time and

@@ -888,10 +888,30 @@ def _pr_author_controlled_trigger():
     trusted_signer_guard_error) -- that flag decides whether THIS job may attempt to
     sign; this function answers a narrower, purely factual question (can a job with
     this trigger structurally sign AT ALL, regardless of what it's opted into) that
-    authenticate_risk_tier needs independently of any signing intent."""
-    event = os.environ.get("GITHUB_EVENT_NAME", "").strip()
-    if event in _UNTRUSTED_GITHUB_EVENTS:
-        return True
+    authenticate_risk_tier needs independently of any signing intent.
+
+    Codex 4110155767 (P1, valid): the GitHub-branch check below is now only read when
+    GITHUB_ACTIONS=="true" -- the exact fail-closed platform-selection gate round 5.5
+    (commit 567f558) already added to ci_signing_context()'s own GitHub Actions branch,
+    backported here to this second, independent call site. Before this fix,
+    GITHUB_EVENT_NAME=='pull_request' alone was trusted regardless of GITHUB_ACTIONS --
+    so any process that simply had that one variable set (a local shell, an unrelated
+    third-party CI system, or a step deliberately crafted to mimic a GitHub Actions
+    pull_request run) was read by authenticate_risk_tier() as "this run structurally
+    cannot have been signed," taking its fast, unsigned-exempt path even when
+    AR_SIGNING_REQUIRED=1 explicitly demanded strict authentication -- an attacker who
+    can set one env var (never touching real GitHub Actions) could silently downgrade a
+    signing-required repository to the same no-infrastructure-configured path a
+    never-signed repository takes. Requiring GITHUB_ACTIONS=="true" first closes that
+    gap the same way it already closes it for ci_signing_context(): a real GitHub
+    Actions runner always sets it, so this narrows trust, never widens it -- every
+    existing test that simulates a genuine pull_request-triggered job already sets
+    GITHUB_ACTIONS: "true" via _stub_signer_env() (round 5.5's own fixture default) and
+    is unaffected."""
+    if os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true":
+        event = os.environ.get("GITHUB_EVENT_NAME", "").strip()
+        if event in _UNTRUSTED_GITHUB_EVENTS:
+            return True
     if os.environ.get("GITLAB_CI", "").strip().lower() == "true":
         source = os.environ.get("CI_PIPELINE_SOURCE", "").strip()
         if source in _UNTRUSTED_GITLAB_PIPELINE_SOURCES:
