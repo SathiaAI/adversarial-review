@@ -2694,8 +2694,13 @@ def t_mcp_aggregate_wraps_signing_call_with_margin_not_bare_default():
     orig = mcpsrv._run_cli
     mcpsrv._run_cli = fake
     try:
-        expect = mcpsrv._sign_wrapping_timeout()
-        assert expect > 120, "test is only meaningful if the margin actually exceeds the bare default"
+        # Codex r4111581317 (P2, valid): h_aggregate's plain aggregation invokes the verifier
+        # TWICE in one process -- once inside authenticate_risk_tier() (whenever signing is
+        # expected) and again for check_gates' own waiver/NOT_APPLICABLE signature check --
+        # so its wrapper margin must budget for max_calls=2, not the single-call default.
+        expect = mcpsrv._sign_wrapping_timeout(max_calls=2)
+        assert expect > mcpsrv._sign_wrapping_timeout(), (
+            "the two-call budget must exceed the single-call one, or this test proves nothing")
         r = mcpsrv.h_aggregate({"run": run_id})
         assert not r.get("isError"), r
         assert calls and calls[-1]["module"] == "aggregate" and calls[-1]["timeout"] == expect, calls
@@ -11082,6 +11087,16 @@ def t_mcp_sign_wrapping_timeout_margin():
             os.environ["AR_SIGN_TIMEOUT"] = bad
             assert mcpsrv._sign_subprocess_timeout() == 120, bad  # bad/non-positive -> default
             assert mcpsrv._sign_wrapping_timeout() == 210, bad
+        # max_calls=2 (Codex r4111581317, P2, valid): gate.py plan/record and aggregate.py
+        # can each invoke the verifier TWICE in one process (authenticate_risk_tier() plus a
+        # separate waiver/NOT_APPLICABLE/exception signature check) -- the wrapper must budget
+        # for both, not silently reuse the single-call margin for these call sites.
+        os.environ.pop("AR_SIGN_TIMEOUT", None)
+        assert mcpsrv._sign_wrapping_timeout(max_calls=2) == 330, "2*120 + 90"
+        os.environ["AR_SIGN_TIMEOUT"] = "300"
+        assert mcpsrv._sign_wrapping_timeout(max_calls=2) == 690, "2*300 + 90"
+        assert mcpsrv._sign_wrapping_timeout(max_calls=2) > mcpsrv._sign_wrapping_timeout(), (
+            "the two-call budget must exceed the one-call budget at the same AR_SIGN_TIMEOUT")
     finally:
         if old is None:
             os.environ.pop("AR_SIGN_TIMEOUT", None)
@@ -11107,18 +11122,25 @@ def t_mcp_init_and_gate_wrap_signing_calls_with_margin_not_bare_default():
 
     mcpsrv._run_cli = fake_run_cli
     try:
-        expect = mcpsrv._sign_wrapping_timeout()
-        assert expect > 120, "test is only meaningful if the margin actually exceeds the bare default"
+        # init attempts at most ONE verifier call (opportunistic, mutually-exclusive
+        # snapshot-or-absence signing); gate.py plan/record can invoke the verifier TWICE
+        # (authenticate_risk_tier() plus a separate waiver/NOT_APPLICABLE signature check --
+        # Codex r4111581317, P2, valid) -- so their margins differ, both must still exceed
+        # the bare 120s default this fix replaces.
+        expect_init = mcpsrv._sign_wrapping_timeout()
+        expect_gate = mcpsrv._sign_wrapping_timeout(max_calls=2)
+        assert expect_init > 120, "test is only meaningful if the margin actually exceeds the bare default"
+        assert expect_gate > expect_init, "gate's two-call budget must exceed init's one-call budget"
         r = mcpsrv.h_init({"risk": "NORMAL", "dev_providers": ["anthropic"]})
-        assert calls[-1][0] == "panel" and calls[-1][2] == expect, calls[-1]
+        assert calls[-1][0] == "panel" and calls[-1][2] == expect_init, calls[-1]
         assert not r.get("isError"), r
         mcpsrv.h_gate_plan({"run": "run-20260921-000000", "require": ["unit"]})
-        assert calls[-1][0] == "gate" and calls[-1][2] == expect, calls[-1]
+        assert calls[-1][0] == "gate" and calls[-1][2] == expect_gate, calls[-1]
         mcpsrv.h_gate_record({"run": "run-20260921-000000", "name": "unit", "summary": "ok",
                               "status": "PASS", "exit_code": 0})
-        assert calls[-1][0] == "gate" and calls[-1][2] == expect, calls[-1]
-        # Every captured call used the margin, never the bare 120s default this fix replaces.
-        assert all(c[2] == expect for c in calls), calls
+        assert calls[-1][0] == "gate" and calls[-1][2] == expect_gate, calls[-1]
+        # Every captured call used its margin, never the bare 120s default this fix replaces.
+        assert all(c[2] in (expect_init, expect_gate) for c in calls), calls
     finally:
         mcpsrv._run_cli = orig_run_cli
 

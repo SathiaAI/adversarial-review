@@ -430,30 +430,46 @@ def _sign_subprocess_timeout():
     return t if t > 0 else 120
 
 
-def _sign_wrapping_timeout():
-    """Subprocess wrapper timeout for an MCP tool call that can attempt AT MOST ONE
-    out-of-process signer/verifier invocation as part of an otherwise-fast CLI command:
-    `panel.py init` (an opportunistic, best-effort policy.snapshot.sig OR policy.absence.sig
-    signing attempt — the two are mutually exclusive per run, see
-    _sign_policy_snapshot_if_possible / _sign_policy_absence_if_possible in panel.py) and
-    `gate.py plan --waive` / `gate.py record` for a NOT_APPLICABLE gate (a fail-closed
-    signature VERIFICATION pre-check, so CLI/MCP automation never sees a false "accepted"
-    signal before aggregate.py's own later, authoritative check).
+def _sign_wrapping_timeout(max_calls=1):
+    """Subprocess wrapper timeout for an MCP tool call that can attempt up to `max_calls`
+    out-of-process signer/verifier invocations as part of an otherwise-fast CLI command.
 
-    Before this, both call sites used _run_cli's/​_cli_result's bare 120s DEFAULT — the exact
-    same 120s _common.sign_timeout() itself defaults to — giving the OUTER MCP subprocess
-    wrapper ZERO margin over the INNER signer/verifier subprocess it wraps. Keyless cosign in
-    particular does a real network round trip to Fulcio/Rekor and can legitimately run close
-    to its own timeout budget under load; a slow-but-would-eventually-succeed attempt could
-    then have the outer wrapper kill the WHOLE tool call first — discarding an otherwise
-    fully-created run at init, or forcing a spurious retry at plan/record — before the
-    inner call's own timeout (and, for init, its surrounding best-effort try/except that only
-    warns and continues on signer failure) ever got a chance to run to completion.
-    security-4 (frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21). The +90s margin
-    covers Python/subprocess startup and the CLI's own (normally fast) surrounding work —
-    generous by design, matching the pattern _panel_timeout() already uses above for a much
-    larger multi-request budget."""
-    return _sign_subprocess_timeout() + 90
+    `max_calls=1` (the default) is `panel.py init`: an opportunistic, best-effort
+    policy.snapshot.sig OR policy.absence.sig signing attempt — the two are mutually
+    exclusive per run, see _sign_policy_snapshot_if_possible / _sign_policy_absence_if_possible
+    in panel.py — so init genuinely never attempts more than one.
+
+    `max_calls=2` is for `gate.py plan --waive` / `gate.py record` (for a NOT_APPLICABLE
+    gate) and plain `aggregate.py`: each of these now calls authenticate_risk_tier() (which
+    itself invokes the verifier via load_attested_policy_bundle(require_signature=True)
+    whenever signing is "expected" for this repository — see authenticate_risk_tier's own
+    docstring) AND separately, later in the same process, its own fail-closed signature
+    VERIFICATION pre-check for the waiver/NOT_APPLICABLE gate or exception being planned/
+    recorded/aggregated — a SECOND, independent load_attested_policy_bundle(require_signature=
+    True) call. Both are real out-of-process subprocess invocations against the SAME
+    AR_SIGN_TIMEOUT budget; budgeting for only one left the wrapper with zero margin for the
+    second even when each individual call succeeds well within its own timeout (Codex
+    r4111581317, P2, valid — found on gate.py/aggregate.py's call sites specifically; CLI/MCP
+    automation never sees a false "accepted" signal before aggregate.py's own later,
+    authoritative check either way, but a call that legitimately needs two verifier round
+    trips must not be killed by an outer wrapper sized for one).
+
+    Before the ORIGINAL (single-call) form of this fix, these call sites used _run_cli's/
+    _cli_result's bare 120s DEFAULT — the exact same 120s _common.sign_timeout() itself
+    defaults to — giving the OUTER MCP subprocess wrapper ZERO margin over even a single
+    INNER signer/verifier subprocess it wraps. Keyless cosign in particular does a real
+    network round trip to Fulcio/Rekor and can legitimately run close to its own timeout
+    budget under load; a slow-but-would-eventually-succeed attempt could then have the outer
+    wrapper kill the WHOLE tool call first — discarding an otherwise fully-created run at
+    init, or forcing a spurious retry at plan/record/aggregate — before the inner call's own
+    timeout (and, for init, its surrounding best-effort try/except that only warns and
+    continues on signer failure) ever got a chance to run to completion. security-4
+    (frontier-gate run pr70-design-crypto-ci-identity, 2026-09-21). The +90s margin covers
+    Python/subprocess startup and the CLI's own (normally fast) surrounding work — generous
+    by design, matching the pattern _panel_timeout() already uses above for a much larger
+    multi-request budget; it is added once, not once per call, since it is fixed overhead
+    for the wrapper itself, not the signer/verifier subprocess."""
+    return _sign_subprocess_timeout() * max_calls + 90
 
 
 def _run_cli(module, argv, timeout=120):
@@ -622,10 +638,11 @@ def h_gate_plan(args):
         argv += ["--waive-reason", reason, "--waive-expires", expires]
     if auth:
         argv += ["--authorized-by", auth]
-    # A --waive plan verifies the run's policy signature at plan time (fail-closed pre-check,
-    # see _sign_wrapping_timeout's docstring) -- give the wrapper margin over that inner
-    # verifier subprocess's own timeout budget, same as h_init above.
-    return _cli_result("gate", argv, timeout=_sign_wrapping_timeout())
+    # A --waive plan authenticates the run's risk tier AND separately verifies the run's
+    # policy signature at plan time (two independent verifier calls -- see
+    # _sign_wrapping_timeout's max_calls=2 docstring) -- give the wrapper margin over BOTH
+    # inner verifier subprocesses' own timeout budgets, not just one.
+    return _cli_result("gate", argv, timeout=_sign_wrapping_timeout(max_calls=2))
 
 
 def h_gate_record(args):
@@ -649,9 +666,10 @@ def h_gate_record(args):
     auth = _opt_authorizer(args)
     if auth:
         argv += ["--authorized-by", auth]
-    # A NOT_APPLICABLE record verifies the run's policy signature at record time too (same
-    # fail-closed pre-check as the --waive path above) -- same timeout margin reasoning.
-    return _cli_result("gate", argv, timeout=_sign_wrapping_timeout())
+    # A NOT_APPLICABLE record authenticates the run's risk tier AND separately verifies the
+    # run's policy signature at record time too (same two-call shape as the --waive path
+    # above) -- same max_calls=2 timeout margin reasoning.
+    return _cli_result("gate", argv, timeout=_sign_wrapping_timeout(max_calls=2))
 
 
 def h_panel_assign(args):
@@ -1039,12 +1057,15 @@ def h_aggregate(args):
             if lock_fd is not None and lock_token is not None:
                 os.environ["AR_AGGREGATE_LOCK_TOKEN"] = lock_token
             try:
-                # timeout=_sign_wrapping_timeout(): plain aggregation can invoke
-                # verify_policy_snapshot_signature/verify_policy_absence_signature (via
-                # check_gates), which is bounded by AR_SIGN_TIMEOUT (120s default) --
-                # the same mismatch h_init/h_gate_plan/h_gate_record were already fixed
-                # for. Codex r4055706491 (P2) found this same bare-120s gap here too.
-                rc, out, err = _run_cli("aggregate", run_args, timeout=_sign_wrapping_timeout())
+                # timeout=_sign_wrapping_timeout(max_calls=2): plain aggregation calls
+                # authenticate_risk_tier() (itself a verifier invocation whenever signing is
+                # expected) and separately invokes verify_policy_snapshot_signature/
+                # verify_policy_absence_signature (via check_gates) -- two independent
+                # AR_SIGN_TIMEOUT-bounded calls, not one. Codex r4055706491 (P2) found the
+                # original bare-120s gap here (fixed to a single-call budget); Codex
+                # r4111581317 (P2, valid) found that single-call budget itself under-counts
+                # this call site by one verifier invocation.
+                rc, out, err = _run_cli("aggregate", run_args, timeout=_sign_wrapping_timeout(max_calls=2))
             finally:
                 if _prev_tok is None:
                     os.environ.pop("AR_AGGREGATE_LOCK_TOKEN", None)
