@@ -157,8 +157,8 @@ tree. Filenames with spaces need `-z`/`xargs -0` variants.)
 Recommended at NORMAL and above, like `sast`. Standard tri-state semantics apply:
 nonzero exit on a required `ai-defects` gate = FAIL; tooling unavailable on the stack ⇒
 `gate.py record --name ai-defects --status BLOCKED --summary "<what could not run>"` or
-an on-record waiver (`gate.py plan --waive ai-defects --authorized-by "<user>"`) —
-never silence. `MINIMUM_GATES` floors are unchanged (promoting `ai-defects` into the
+an on-record, time-boxed waiver (`gate.py plan --waive ai-defects --authorized-by "<user>"
+--waive-reason "<why>" --waive-expires "YYYY-MM-DD"`) — never silence. `MINIMUM_GATES` floors are unchanged (promoting `ai-defects` into the
 floors would be a separate, breaking decision), and no aggregator change is involved —
 gates are already tool-agnostic commands with exit codes.
 
@@ -219,11 +219,46 @@ and restricts the verdict; NOT_APPLICABLE means "there is nothing here to verify
 self-service skip: `gate.py record --name build --status NOT_APPLICABLE --authorized-by
 "<user>" --summary "<why this stack has no build gate>"` requires a named authorizer and a
 reason, the aggregator BLOCKS an N/A record missing either, and every N/A gate is listed
-with its authorizer in the verdict — accountable and never silent. (Contrast with
-`plan --waive`, which drops a gate from the required set entirely; NOT_APPLICABLE keeps it
-on the record as an explicit, attributed determination — prefer it when the gate is simply
-inapplicable to the stack.) Floors are unchanged: an N/A floor gate is still *required to
-be addressed*, just addressed as inapplicable-with-accountability rather than skipped.
+with its authorizer in the verdict — accountable and never silent. Floors are unchanged: an
+N/A floor gate is still *required to be addressed*, just addressed as
+inapplicable-with-accountability rather than skipped.
+
+**Waivers (`gate.py plan --waive`) are a second accountable exception, not an escape hatch.**
+A waived gate is **never dropped from the required set** — it stays there, and is written as
+its own `gates/<name>.json` record (`status: WAIVED`) alongside the ordinary PASS/FAIL/BLOCKED/
+NOT_APPLICABLE ones, so aggregate.py always has *something* to check for it. Waiving requires
+all three of `--authorized-by "<user>"`, `--waive-reason "<why>"` (a real explanation, at least
+16 characters, not a placeholder like `tbd`/`n/a`/`todo`), and `--waive-expires "YYYY-MM-DD"`
+(strictly in the future, and no more than `max_waiver_days` — policy-configurable, default 14
+— after the waiver was planned). Naming a gate that isn't actually required is rejected outright
+(gate-name smuggling). None of this is trusted on faith: **aggregate.py independently
+re-validates the on-disk waiver record** every time it runs — expiry, the day cap, the
+authorizer, the reason — exactly as if it had never seen `gate.py plan` do the same checks, so
+a hand-edited or otherwise tampered record is caught exactly like a fresh one. An invalid or
+expired waiver BLOCKS the required gate it was meant to cover.
+
+**Waiving (and marking NOT_APPLICABLE) also requires a signed policy snapshot, whenever a
+policy file is configured.** `panel.py init` opportunistically signs `policy.snapshot.json`
+if a signer is available (`AR_SIGNER_CMD`, or auto-detected cosign/minisign — see
+`references/config.md`, *Signing the verdict*). A clean run that never waives or marks a gate
+NOT_APPLICABLE never needs this. But the moment it does, `gate.py plan --waive` / `gate.py
+record --status NOT_APPLICABLE` refuse outright — and `aggregate.py` independently BLOCKS —
+without a verifiably-signed snapshot, so the two commands can never disagree (`plan` cannot
+report success on an exception `aggregate` will later reject as unsigned). The signature is
+bound to the run's id, a random per-run nonce, the run directory's own immutable name, and
+the run's resolved risk tier, so it cannot be replayed onto a different run, a colliding run
+id, a copied run directory, or a run whose risk was edited after signing. A repo with no
+policy file at all is exempt — waiver limits fall back to strict built-in defaults, which
+are not a mutable attested artifact.
+
+**CRITICAL tier is more restrictive by design.** Waiving or marking NOT_APPLICABLE *any*
+CRITICAL-tier gate is refused by default; a repo must opt in with policy
+`allow_critical_waivers: true`. **`mutation` on CRITICAL is the one exception that policy
+cannot override**: it can never be waived or marked NOT_APPLICABLE, full stop. Real CRITICAL
+mutation coverage is a later milestone (M4) — until it ships, a CRITICAL run with no genuine,
+recorded mutation-gate result stays BLOCKED. That is intentional: it is exactly the
+"waive-the-one-gate-that-would-catch-the-gap" hole this milestone closes, and it must not
+reopen through NOT_APPLICABLE either.
 
 Specifically blocking, per tool:
 

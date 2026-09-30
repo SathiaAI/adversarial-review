@@ -95,6 +95,17 @@ These mirror `action.yml` exactly — do not pass anything not listed here.
   influence the transmission decision.
 - **The verdict is written to the job summary** (`verdict.md`), and `verdict` / `exit-code` are
   exposed as step outputs you can branch on.
+- **Waivers/NOT_APPLICABLE need a *trusted* signer job, not this one.** The single job above is
+  fine for the ordinary PASS/FAIL/BLOCKED path with no policy file. The moment a repo configures a
+  policy file to allow waiving a gate, the job that signs `policy.snapshot.json` must be isolated
+  from PR-controlled code — this single `pull_request`-triggered job is explicitly **not** that
+  job (`trusted_signer_guard_error()` refuses to sign from it even if `AR_TRUSTED_SIGNER` is set).
+  See `docs/THREAT-MODEL.md` for the attacker model and `examples/policy-signer-workflow.yml` for
+  what a trusted job's trigger/checkout/secret-scoping looks like — that file also documents an
+  open design question (the cross-job signature hand-off) that is not yet solved, so there is no
+  fully worked, deployment-ready two-job GitHub topology to copy yet. The GitLab template below
+  solves the analogous problem for its own (different) trust boundary — the secrets-scan
+  transmission gate, not policy-snapshot signing.
 
 ### Secure adoption (required checks)
 

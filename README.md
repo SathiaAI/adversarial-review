@@ -436,8 +436,19 @@ silenced); details in [`references/gates.md`](references/gates.md).
 
 Mutation testing is scoped to changed code (Stryker `--incremental`, PIT incremental
 analysis, path-scoped mutmut) so the gate survives real repositories. A minimum gate
-floor per tier cannot be silently dropped — only waived on the record with a named
-authorizer, which the verdict surfaces.
+floor per tier cannot be silently dropped — it can only be waived on the record, with a
+named authorizer, a real reason (>=16 chars, no placeholders), and a strict expiry date
+(capped at `max_waiver_days`, default 14, bounded 1–365). A waiver is an **accountable
+exception, not a pass**: the waived gate stays required, its record is independently
+re-checked every time the verdict is computed, and a PASS that rests on a waiver says so —
+it names the waived gate, its authorizer and expiry, rather than claiming every check
+passed. The lifetime cap is anchored to the run's planning time (the run manifest), and the
+waiver limits come from the policy **attested at init**, so neither a hand-edited record nor
+a post-init policy change can quietly stretch a waiver. `gate.py plan` runs the same
+validator, rejecting an invalid waiver up front. CRITICAL tier waivers (and NOT_APPLICABLE)
+are off by default (policy `allow_critical_waivers`), and `mutation` on CRITICAL can never
+be waived or marked NOT_APPLICABLE at all — it stays BLOCKED until real CRITICAL mutation
+coverage ships. Details in [`references/gates.md`](references/gates.md).
 
 A gate that genuinely doesn't apply to a stack (a config-only repo has no build to run,
 no unit suite to execute) is recorded `--status NOT_APPLICABLE --authorized-by "<user>"
