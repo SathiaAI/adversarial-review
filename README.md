@@ -664,4 +664,4 @@ explicitly in scope and especially welcome.
 
 ## License
 
-[MIT](LICENSE) © 2026 SathiaAI.
+[MIT](LICENSE) © 2026 Viaknox Holding LLC.
