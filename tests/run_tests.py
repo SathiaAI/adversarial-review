@@ -11002,7 +11002,7 @@ def t_jev_patch_check_no_confirmed_findings_is_a_noop():
 
 _JEV_CRED_ENV_KEYS = ("AR_API_KEY", "OPENROUTER_API_KEY", "AR_KEY_FILE", "AR_BASE_URL",
                      "AR_JEV_API_KEY", "AR_JEV_KEY_FILE", "AR_JEV_BASE_URL",
-                     "AR_JEV_ENDPOINT", "AR_JEV_DISABLE", "AR_JEV_MODEL")
+                     "AR_JEV_ENDPOINT", "AR_JEV_DISABLE", "AR_JEV_MODEL", "TYPESAFE_API_KEY")
 
 
 def _patch_env(**kv):
@@ -11023,6 +11023,37 @@ def _patch_env(**kv):
             else:
                 os.environ[k] = v
     return restore
+
+
+def t_jev_typesafe_direct_is_tried_first_with_its_own_model_id():
+    import jev_triage
+    mock_router.reset()
+    seen = []
+    mock_router.STATE["jev_response_provider"] = lambda body: seen.append(body) or None
+    restore = _patch_env(TYPESAFE_API_KEY="ts-key")
+    saved = jev_triage.JEV_DIRECT_ENDPOINT
+    jev_triage.JEV_DIRECT_ENDPOINT = f"http://127.0.0.1:{PORT}/alpha/decisions"
+    try:
+        q = {"a": {"type": "noul", "instructions": "x"}}
+        result, err = jev_triage.call_jev("state", q, risk="NORMAL")
+        assert err is None and result["answers"]["a"]["noul"] == 0.1
+        assert seen[0]["model"] == "jev-1.13.0" and "provider" not in seen[0], seen
+        assert jev_triage.jev_available()["mode"] == "typesafe_direct"
+        # SENSITIVE/CRITICAL keep their OpenRouter privacy routing: direct is never attempted
+        assert jev_triage._call_jev_direct("state", q, "typesafe/jev-1.13", 15, "CRITICAL") == (None, None, False)
+        mock_router.STATE["jev_fail"] = True
+        result, err, attempted = jev_triage._call_jev_direct("state", q, "typesafe/jev-1.13", 15, "NORMAL")
+        assert result is None and err and attempted  # a failed direct call is reported so call_jev falls back
+        os.environ["AR_JEV_BASE_URL"] = "https://pinned.example"
+        assert jev_triage._call_jev_direct("state", q, "typesafe/jev-1.13", 15, "NORMAL")[2] is False  # pinned route wins
+        assert jev_triage._direct_model("typesafe/jev-1.14") == "jev-1.14.0"
+        assert jev_triage._direct_model("~typesafe/jev-latest") == "jev-latest"
+        assert jev_triage._direct_model("other/model") is None
+    finally:
+        jev_triage.JEV_DIRECT_ENDPOINT = saved
+        os.environ.pop("AR_JEV_BASE_URL", None)
+        restore()
+        mock_router.reset()
 
 
 def t_jev_available_dedicated_key_wins():

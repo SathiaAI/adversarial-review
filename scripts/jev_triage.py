@@ -77,6 +77,10 @@ JEV_MODEL_DEFAULT = "typesafe/jev-1.13"
 JEV_BASE_DEFAULT = "https://openrouter.ai/api"
 JEV_PATH = "/alpha/decisions"
 JEV_TIMEOUT_DEFAULT = 60  # seconds; Jev calls run ~0.3s, this is a generous ceiling
+# TypeSafe's own API serves the same Jev model (docs.typesafe.ai/api). With TYPESAFE_API_KEY set and no pinned
+# AR_JEV_BASE_URL/AR_JEV_ENDPOINT, call_jev() asks it first and falls back to the configured route on any error.
+JEV_DIRECT_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+JEV_DIRECT_USD_PER_INPUT_TOKEN = 0.042e-6  # docs.typesafe.ai/models: $0.042 per million input tokens, output free
 
 # provider/model-id shape only -- not a live-catalog fetch (would add a network round trip
 # to every Jev call for a check the operator can already get wrong loudly via AR_JEV_MODEL;
@@ -192,9 +196,16 @@ def jev_available():
     """The mandatory preflight (SKILL.md, references/jev.md): side-effect-free, no
     network, safe to call before every Jev command -- and safe to print/log, since it
     never carries a key. Returns {"available": bool, "mode": "dedicated" |
-    "panel_fallback" | "disabled" | "unavailable", "reason": str|None}."""
+    "panel_fallback" | "typesafe_direct" | "disabled" | "unavailable", "reason": str|None}."""
     status, _ = _jev_credentials()
+    if not status["available"] and _direct_only():
+        return {"available": True, "mode": "typesafe_direct", "reason": None}
     return status
+
+
+def _direct_only():
+    """True when TypeSafe direct is the only Jev route configured (TYPESAFE_API_KEY set, no pinned endpoint)."""
+    return bool(os.environ.get("TYPESAFE_API_KEY", "").strip()) and not base_is_pinned()
 
 
 _fallback_logged = False  # module-level: the tier-2 notice, once per process
@@ -214,12 +225,48 @@ def require_jev_key():
     jev_available()) -- a triage run with no key must refuse cleanly rather than silently
     produce empty/fabricated records."""
     status, key = _jev_credentials()
+    if not status["available"] and _direct_only():
+        return None
     if not status["available"]:
         die(f"no API key configured for Jev ({status['mode']}: {status['reason']}). Skip "
             "Jev and continue Step 4 by hand, or configure AR_JEV_API_KEY "
             "(references/jev.md).", 2)
     _log_fallback_once(status)
     return key
+
+
+def _direct_model(model):
+    """'typesafe/jev-1.13' -> 'jev-1.13.0' (TypeSafe's own id for the same version); None when there is no match."""
+    m = re.match(r"^~?typesafe/jev-(latest|\d+\.\d+)$", model or "", re.IGNORECASE)
+    if not m:
+        return None
+    v = m.group(1).lower()
+    return "jev-latest" if v == "latest" else f"jev-{v}.0"
+
+
+def _call_jev_direct(state, questions, model, timeout, risk):
+    """(result, error, attempted). Only for privacy mode 'default': the SENSITIVE/CRITICAL data-handling preferences
+    (panel.privacy_provider_prefs) are OpenRouter routing controls the direct API has no equivalent for."""
+    key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    direct_model = _direct_model(model)
+    if (not key or not direct_model or base_is_pinned()
+            or (risk and panel.privacy_provider_prefs(risk)[1] != "default")):
+        return None, None, False
+    try:
+        resp = panel.http_json(JEV_DIRECT_ENDPOINT, payload={"model": direct_model, "state": state, "questions": questions},
+                               key=key, timeout=timeout)
+    except Exception as e:  # noqa: BLE001 -- any failure falls back to the configured route
+        return None, f"{type(e).__name__}: {e}", True
+    result, err = _parse_jev(resp, questions)
+    if result is not None and result["cost"] is None:
+        tokens = (resp.get("usage") or {}).get("input_tokens")
+        if isinstance(tokens, int) and not isinstance(tokens, bool):
+            result["cost"] = tokens * JEV_DIRECT_USD_PER_INPUT_TOKEN
+    return result, err, True
+
+
+def base_is_pinned():
+    return bool(os.environ.get("AR_JEV_ENDPOINT", "").strip() or os.environ.get("AR_JEV_BASE_URL", "").strip())
 
 
 def call_jev(state, questions, model=None, base=None, timeout=None, endpoint=None, risk=None):
@@ -232,11 +279,19 @@ def call_jev(state, questions, model=None, base=None, timeout=None, endpoint=Non
     controls, not a separate policy."""
     model = model or JEV_MODEL_DEFAULT
     timeout = timeout or JEV_TIMEOUT_DEFAULT
+    direct_err = None
+    if endpoint is None and base is None:
+        result, direct_err, attempted = _call_jev_direct(state, questions, model, timeout, risk)
+        if result is not None:
+            return result, None
+        if attempted:
+            print(f"jev: TypeSafe direct failed ({str(direct_err)[:200]}); trying the configured route", file=sys.stderr)
     if endpoint is None:
         endpoint, _ = jev_endpoint(base=base)
     status, key = _jev_credentials()
     if not status["available"]:
-        return None, f"no API key configured for Jev ({status['mode']}: {status['reason']})"
+        why = f"no API key configured for Jev ({status['mode']}: {status['reason']})"
+        return None, f"TypeSafe direct: {direct_err}; {why}" if direct_err else why
     _log_fallback_once(status)
     body = {"model": model, "state": state, "questions": questions}
     if risk:
@@ -247,6 +302,11 @@ def call_jev(state, questions, model=None, base=None, timeout=None, endpoint=Non
         resp = panel.http_json(endpoint, payload=body, key=key, timeout=timeout)
     except Exception as e:  # noqa: BLE001 -- fail-closed: any transport/HTTP failure is an error
         return None, f"{type(e).__name__}: {e}"
+    return _parse_jev(resp, questions)
+
+
+def _parse_jev(resp, questions):
+    """(result, error) from a Jev response body -- the same checks for either route."""
     if not isinstance(resp, dict):
         return None, "malformed Jev response (not a JSON object)"
     if "error" in resp:
