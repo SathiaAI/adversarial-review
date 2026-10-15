@@ -205,7 +205,8 @@ def jev_available():
 
 def _direct_only():
     """True when TypeSafe direct is the only Jev route configured (TYPESAFE_API_KEY set, no pinned endpoint)."""
-    return bool(os.environ.get("TYPESAFE_API_KEY", "").strip()) and not base_is_pinned()
+    return (bool(os.environ.get("TYPESAFE_API_KEY", "").strip()) and _direct_allowed()
+            and bool(_direct_model(os.environ.get("AR_JEV_MODEL", "") or JEV_MODEL_DEFAULT)))
 
 
 _fallback_logged = False  # module-level: the tier-2 notice, once per process
@@ -249,8 +250,7 @@ def _call_jev_direct(state, questions, model, timeout, risk):
     (panel.privacy_provider_prefs) are OpenRouter routing controls the direct API has no equivalent for."""
     key = os.environ.get("TYPESAFE_API_KEY", "").strip()
     direct_model = _direct_model(model)
-    if (not key or not direct_model or base_is_pinned()
-            or (risk and panel.privacy_provider_prefs(risk)[1] != "default")):
+    if not key or not direct_model or not _direct_allowed(risk):
         return None, None, False
     try:
         resp = panel.http_json(JEV_DIRECT_ENDPOINT, payload={"model": direct_model, "state": state, "questions": questions},
@@ -258,8 +258,9 @@ def _call_jev_direct(state, questions, model, timeout, risk):
     except Exception as e:  # noqa: BLE001 -- any failure falls back to the configured route
         return None, f"{type(e).__name__}: {e}", True
     result, err = _parse_jev(resp, questions)
-    if result is not None and result["cost"] is None:
-        tokens = (resp.get("usage") or {}).get("input_tokens")
+    usage = resp.get("usage") if isinstance(resp, dict) else None
+    if result is not None and result["cost"] is None and isinstance(usage, dict):
+        tokens = usage.get("input_tokens")
         if isinstance(tokens, int) and not isinstance(tokens, bool):
             result["cost"] = tokens * JEV_DIRECT_USD_PER_INPUT_TOKEN
     return result, err, True
@@ -267,6 +268,15 @@ def _call_jev_direct(state, questions, model, timeout, risk):
 
 def base_is_pinned():
     return bool(os.environ.get("AR_JEV_ENDPOINT", "").strip() or os.environ.get("AR_JEV_BASE_URL", "").strip())
+
+
+def _direct_allowed(risk=None):
+    """TypeSafe direct may be used: Jev not disabled, no pinned endpoint, and the effective privacy mode (AR_PRIVACY,
+    else the run's risk tier) is 'default'."""
+    if os.environ.get("AR_JEV_DISABLE", "").strip().lower() in ("1", "true", "yes", "on") or base_is_pinned():
+        return False
+    mode = os.environ.get("AR_PRIVACY") or (panel.privacy_provider_prefs(risk)[1] if risk else "default")
+    return mode == "default"
 
 
 def call_jev(state, questions, model=None, base=None, timeout=None, endpoint=None, risk=None):
@@ -280,7 +290,7 @@ def call_jev(state, questions, model=None, base=None, timeout=None, endpoint=Non
     model = model or JEV_MODEL_DEFAULT
     timeout = timeout or JEV_TIMEOUT_DEFAULT
     direct_err = None
-    if endpoint is None and base is None:
+    if endpoint is None:  # `base` comes from jev_config(); a pinned AR_JEV_BASE_URL/ENDPOINT is checked in _direct_allowed
         result, direct_err, attempted = _call_jev_direct(state, questions, model, timeout, risk)
         if result is not None:
             return result, None

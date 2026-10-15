@@ -50,7 +50,10 @@ credentials are resolved independently of the reviewer panel's, with three tiers
    forwarded to a different host just because Jev's own base URL happens to differ or was
    left at its default. When this tier is used, a one-line notice is printed to stderr
    (once per process) so it's never silent.
-3. **Neither applies** (including `AR_JEV_DISABLE=1`, an explicit off switch): Jev is
+3. **Only `TYPESAFE_API_KEY`**: Jev is available through TypeSafe direct alone (mode
+   `typesafe_direct`, see *TypeSafe direct first* below). A SENSITIVE/CRITICAL run has no
+   route in this case, so each of its Jev calls fails closed.
+4. **None of these applies** (including `AR_JEV_DISABLE=1`, an explicit off switch): Jev is
    simply **unavailable** — this is not an error. Every command here refuses cleanly
    (`require_jev_key()` exits 2, no partial triage, no Jev call, no file write), and
    nothing else in the pipeline requires Jev at all — `SKILL.md` documents Jev triage as
@@ -71,7 +74,8 @@ nor `AR_JEV_ENDPOINT` pins an endpoint, each Jev call goes first to TypeSafe's o
 (`https://api.typesafe.ai/v1/systemone`, docs.typesafe.ai/api) with the same Jev version
 (`typesafe/jev-1.13` is sent as `jev-1.13.0`). Any error there falls back to the route
 above, with a one-line notice on stderr; the fail-closed defaults still apply if both fail.
-This happens only in the `default` privacy mode: SENSITIVE and CRITICAL runs keep their
+`AR_JEV_DISABLE` turns it off too. This happens only in the `default` privacy mode
+(`AR_PRIVACY`, else the run's risk tier): SENSITIVE and CRITICAL runs keep their
 OpenRouter `data_collection`/`zdr` routing, which the direct API has no field for. The key
 is sent only to that fixed https address, and redirects are refused. The direct API
 reports no cost, so `cost` is estimated from `usage.input_tokens` at TypeSafe's published
