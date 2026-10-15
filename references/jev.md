@@ -50,25 +50,36 @@ credentials are resolved independently of the reviewer panel's, with three tiers
    forwarded to a different host just because Jev's own base URL happens to differ or was
    left at its default. When this tier is used, a one-line notice is printed to stderr
    (once per process) so it's never silent.
-3. **Neither applies** (including `AR_JEV_DISABLE=1`, an explicit off switch): Jev is
+3. **Only `TYPESAFE_API_KEY`**: Jev is available through TypeSafe direct alone (mode
+   `typesafe_direct`, see *TypeSafe direct first* below). A SENSITIVE/CRITICAL run has no
+   route in this case, so each of its Jev calls fails closed.
+4. **None of these applies** (including `AR_JEV_DISABLE=1`, an explicit off switch): Jev is
    simply **unavailable** — this is not an error. Every command here refuses cleanly
    (`require_jev_key()` exits 2, no partial triage, no Jev call, no file write), and
    nothing else in the pipeline requires Jev at all — `SKILL.md` documents Jev triage as
    optional, skippable by going straight to Step 4 by hand.
 
 `jev_available()` is the mandatory, side-effect-free (no network) preflight: it returns
-`{"available": bool, "mode": "dedicated"|"panel_fallback"|"disabled"|"unavailable",
+`{"available": bool, "mode": "dedicated"|"panel_fallback"|"typesafe_direct"|"disabled"|"unavailable",
 "reason": str|None}` and never carries a key, so it's safe to call, print, or log before
 deciding whether to run any Jev command at all.
 
 **Endpoint.** `AR_JEV_BASE_URL` (default OpenRouter, `https://openrouter.ai/api`) selects
 the endpoint by the same base+`/alpha/decisions`-path convention the credential tiers
 above assume. `AR_JEV_ENDPOINT` is a full-URL override for a decisions-capable relay that
-doesn't follow that convention — for example TypeSafe's own direct API
-(`https://api.typesafe.ai/v1/systemone`, `docs.typesafe.ai/api`), a separate product from
-OpenRouter's beta integration of Jev, with its own (currently waitlisted, batch-issued, no
-published free tier) signup — set both `AR_JEV_API_KEY` and `AR_JEV_ENDPOINT` to use it;
-`AR_JEV_BASE_URL` is ignored whenever `AR_JEV_ENDPOINT` is set.
+doesn't follow that convention; `AR_JEV_BASE_URL` is ignored whenever it is set.
+
+**TypeSafe direct first.** When `TYPESAFE_API_KEY` is set and neither `AR_JEV_BASE_URL`
+nor `AR_JEV_ENDPOINT` pins an endpoint, each Jev call goes first to TypeSafe's own API
+(`https://api.typesafe.ai/v1/systemone`, docs.typesafe.ai/api) with the same Jev version
+(`typesafe/jev-1.13` is sent as `jev-1.13.0`). Any error there falls back to the route
+above, with a one-line notice on stderr; the fail-closed defaults still apply if both fail.
+`AR_JEV_DISABLE` turns it off too. This happens only in the `default` privacy mode
+(`AR_PRIVACY`, else the run's risk tier): SENSITIVE and CRITICAL runs keep their
+OpenRouter `data_collection`/`zdr` routing, which the direct API has no field for. The key
+is sent only to that fixed https address, and redirects are refused. The direct API
+reports no cost, so `cost` is estimated from `usage.input_tokens` at TypeSafe's published
+$0.042 per million input tokens.
 
 State sent to Jev is capped at roughly 25k tokens (approximated in characters, at a
 deliberately low chars-per-token estimate so the char cap stays conservative even when the

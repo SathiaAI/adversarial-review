@@ -11002,7 +11002,7 @@ def t_jev_patch_check_no_confirmed_findings_is_a_noop():
 
 _JEV_CRED_ENV_KEYS = ("AR_API_KEY", "OPENROUTER_API_KEY", "AR_KEY_FILE", "AR_BASE_URL",
                      "AR_JEV_API_KEY", "AR_JEV_KEY_FILE", "AR_JEV_BASE_URL",
-                     "AR_JEV_ENDPOINT", "AR_JEV_DISABLE", "AR_JEV_MODEL")
+                     "AR_JEV_ENDPOINT", "AR_JEV_DISABLE", "AR_JEV_MODEL", "TYPESAFE_API_KEY")
 
 
 def _patch_env(**kv):
@@ -11023,6 +11023,56 @@ def _patch_env(**kv):
             else:
                 os.environ[k] = v
     return restore
+
+
+def t_jev_typesafe_direct_is_tried_first_with_its_own_model_id():
+    import jev_triage
+    mock_router.reset()
+    seen = []
+    mock_router.STATE["jev_response_provider"] = lambda body: seen.append(body) or None
+    restore = _patch_env(TYPESAFE_API_KEY="ts-key", AR_PRIVACY="")
+    saved = jev_triage.JEV_DIRECT_ENDPOINT
+    jev_triage.JEV_DIRECT_ENDPOINT = f"http://127.0.0.1:{PORT}/alpha/decisions"
+    try:
+        q = {"a": {"type": "noul", "instructions": "x"}}
+        _, base, timeout = jev_triage.jev_config()  # exactly what triage / rebuttal-gate / patch-check pass
+        result, err = jev_triage.call_jev("state", q, base=base, timeout=timeout, risk="NORMAL")
+        assert err is None and result["answers"]["a"]["noul"] == 0.1
+        assert seen[0]["model"] == "jev-1.13.0" and "provider" not in seen[0], seen
+        assert jev_triage.jev_available()["mode"] == "typesafe_direct"
+        # SENSITIVE/CRITICAL keep their OpenRouter privacy routing: direct is never attempted
+        assert jev_triage._call_jev_direct("state", q, "typesafe/jev-1.13", 15, "CRITICAL") == (None, None, False)
+        mock_router.STATE["jev_fail"] = True
+        result, err, attempted = jev_triage._call_jev_direct("state", q, "typesafe/jev-1.13", 15, "NORMAL")
+        assert result is None and err and attempted  # a failed direct call is reported so call_jev falls back
+        mock_router.STATE["jev_fail"] = False
+        mock_router.STATE["jev_response_provider"] = None
+        saved_http = jev_triage.panel.http_json
+        jev_triage.panel.http_json = lambda *a, **k: {"answers": {"a": {"noul": 0.5}}, "usage": "not-a-dict"}
+        try:  # a malformed usage block never raises; the answers still count
+            result, err, _ = jev_triage._call_jev_direct("state", q, "typesafe/jev-1.13", 15, "NORMAL")
+            assert err is None and result["cost"] is None
+        finally:
+            jev_triage.panel.http_json = saved_http
+        for k, v in (("AR_JEV_DISABLE", "1"), ("AR_PRIVACY", "zdr")):  # off switch and privacy override win
+            os.environ[k] = v
+            assert jev_triage._call_jev_direct("state", q, "typesafe/jev-1.13", 15, None)[2] is False, k
+            assert jev_triage.jev_available()["mode"] != "typesafe_direct", k
+            os.environ.pop(k)
+        os.environ["AR_JEV_MODEL"] = "other/model"  # no TypeSafe id for this model: not available through direct
+        assert jev_triage.jev_available()["available"] is False
+        os.environ.pop("AR_JEV_MODEL")
+        os.environ["AR_JEV_BASE_URL"] = "https://pinned.example"
+        assert jev_triage._call_jev_direct("state", q, "typesafe/jev-1.13", 15, "NORMAL")[2] is False  # pinned route wins
+        assert jev_triage._direct_model("typesafe/jev-1.14") == "jev-1.14.0"
+        assert jev_triage._direct_model("~typesafe/jev-latest") == "jev-latest"
+        assert jev_triage._direct_model("other/model") is None
+    finally:
+        jev_triage.JEV_DIRECT_ENDPOINT = saved
+        for k in ("AR_JEV_BASE_URL", "AR_JEV_DISABLE", "AR_PRIVACY", "AR_JEV_MODEL"):
+            os.environ.pop(k, None)
+        restore()
+        mock_router.reset()
 
 
 def t_jev_available_dedicated_key_wins():
